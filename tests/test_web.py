@@ -122,10 +122,16 @@ def main() -> int:
     # 写回响应的关键字段 —— 生效链的可见性全靠它们
     section("③ 写回响应：重载状态必须可见")
     for f in ("reload_ok", "reload_msg", "written", "backup", "diffs"):
+        # 后端那侧找的是 JSON 键的字面量（带引号），所以先把带引号的形态
+        # 算成普通变量，别塞进 f-string 的表达式里 —— Python 3.9 的 f-string
+        # 表达式部分**不允许出现反斜杠**（3.12 才放开），而 CI 的下限是 3.9。
+        # 本机 3.14 上编译得过、CI 3.9 上 SyntaxError，是最容易漏的一类。
+        quoted = '"' + f + '"'
+        in_js = "有" if ("d." + f) in js else "无"
+        in_srv = "有" if quoted in srv else "无"
         truthy(f"d.{f} 前后端都有",
-               f"d.{f}" in js and f'"{f}"' in srv,
-               f"前端 {'有' if f'd.{f}' in js else '无'} / "
-               f"后端 {'有' if f'\"{f}\"' in srv else '无'}")
+               ("d." + f) in js and quoted in srv,
+               f"前端 {in_js} / 后端 {in_srv}")
 
     # ── ④ 长任务防护 ───────────────────────────────────────────────
     section("④ 长任务防护")
