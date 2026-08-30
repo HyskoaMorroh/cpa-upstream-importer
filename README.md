@@ -154,9 +154,13 @@ Settings → Secrets and variables → Actions
 
 | 变量 | 放哪 | 为什么 |
 |---|---|---|
-| `DOCKERHUB_USERNAME` | Variables | 用户名本来就公开，明文便于排查 |
+| `DOCKERHUB_USERNAME` | Variables（放 Secrets 也能用） | 用户名本来就公开，明文便于排查 |
 | `DOCKERHUB_IMAGE` | Variables | 同上；Docker Hub 命名空间只有一层，镜像名常与仓库名不同 |
 | `DOCKERHUB_TOKEN` | **Secrets** | Variables 在构建日志里是**明文**，放这里等于把 token 印在每次日志上 |
+
+用户名放 Variables 或 Secrets 都能工作（工作流两处都读，`vars` 优先），
+但**推荐 Variables**：放进 Secrets 后它在日志里会被打成 `***`，镜像名跟着
+显示成 `***/xxx` —— 推失败时看不出到底推去了哪个命名空间。
 
 Access Token 在 `hub.docker.com/settings/security` 生成，权限 `Read & Write`
 就够。**不要填登录密码** —— token 可单独吊销、可限权限；密码泄露等于整个
