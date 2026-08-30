@@ -1,0 +1,63 @@
+[Unit]
+# CPA 上游批量导入服务
+#
+# 安装：
+#   cp deploy/upstream-importer.service /etc/systemd/system/
+#   openssl rand -hex 16 > /opt/deploy/secrets/importer_token
+#   chmod 600 /opt/deploy/secrets/importer_token
+#   systemctl daemon-reload && systemctl enable --now upstream-importer
+#
+# 打开（token 在那个文件里）：
+#   ssh -L 8765:127.0.0.1:8765 root@<VPS>
+#   浏览器开 http://127.0.0.1:8765/?token=$(cat /opt/deploy/secrets/importer_token)
+#
+# 看日志：journalctl -u upstream-importer -f
+Description=CPA upstream batch importer
+Documentation=file:/opt/deploy/upstream-importer/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/deploy/upstream-importer
+
+# token 从文件读，不写在 unit 里 —— unit 文件是 world-readable
+EnvironmentFile=/opt/deploy/secrets/importer.env
+
+# 只绑 127.0.0.1。这个服务持有明文上游 Key 且能改写 config.yaml，
+# 等价于 CPA 的写权限。要外网访问走 nginx 加 TLS + 访问控制，
+# 不要把 --host 改成 0.0.0.0 直接暴露。
+ExecStart=/usr/bin/python3 /opt/deploy/upstream-importer/server.py \
+    --config /opt/deploy/config.yaml \
+    --host 127.0.0.1 \
+    --port 8765
+
+Restart=on-failure
+RestartSec=5s
+
+# ── 加固 ──
+# 需要写 config.yaml 与备份文件，所以 /opt/deploy 必须可写；其余全部只读。
+ProtectSystem=strict
+ReadWritePaths=/opt/deploy
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+# 只需要 IPv4/IPv6 与本地回环
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+
+# 日志里可能出现上游主机名，但不会有完整 Key（服务一律脱敏后再记）
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=upstream-importer
+
+[Install]
+WantedBy=multi-user.target

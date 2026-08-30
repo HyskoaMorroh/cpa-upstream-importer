@@ -1,0 +1,572 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>投喂台 · CPA 上游灌输</title>
+<style>
+/* ═══════════════════════════════════════════════════════════════════
+   三套主题。判定色在三套里都保持同一语义位置 —— 长表格里靠颜色
+   分辨「可用 / 余额 / 封号 / 换模」，主题换了这层认知不能变。
+
+   midnight  深色仪表盘，长时间盯屏用
+   parchment 纸感暖白，打印与截图用
+   neon      高对比，投影/远看用
+   ═══════════════════════════════════════════════════════════════════ */
+:root,
+[data-theme="midnight"]{
+  --bg:#0d1117; --bg-2:#0a0e14; --card:#161b22; --card-2:#1c2129;
+  --line:#2b3138; --line-2:#21262d;
+  --ink:#e6edf3; --ink-2:#9aa7b4; --ink-3:#6b7681;
+  --accent:#4d9fff; --accent-2:#1f6feb; --accent-soft:#122a45;
+  --ok:#3fb950; --ok-bg:#0f2c17; --ok-line:#238636;
+  --warn:#e3a008; --warn-bg:#2d2004; --warn-line:#9e6a03;
+  --bad:#f85149; --bad-bg:#2d1214; --bad-line:#da3633;
+  --info:#39c5cf; --info-bg:#0c2a2d; --info-line:#1b7f86;
+  --mute:#7d8590; --mute-bg:#1a1f26;
+  --shadow:0 1px 0 rgba(255,255,255,.03) inset,0 8px 24px rgba(1,4,9,.6);
+  --topbar:63px;   /* .top .wrap 的 62px + border-bottom 1px */
+  --glow:0 0 0 1px var(--accent-2),0 0 18px -6px var(--accent);
+}
+[data-theme="parchment"]{
+  --bg:#f6f3ec; --bg-2:#efeade; --card:#fffdf8; --card-2:#f9f6ee;
+  --line:#ddd5c4; --line-2:#eae4d6;
+  --ink:#231f18; --ink-2:#5b5346; --ink-3:#8a8172;
+  --accent:#0b6bcb; --accent-2:#08529c; --accent-soft:#e3eefb;
+  --ok:#1f7a3d; --ok-bg:#e6f4ea; --ok-line:#2f9e52;
+  --warn:#9a6400; --warn-bg:#fdf3dc; --warn-line:#c58a12;
+  --bad:#b3261e; --bad-bg:#fce9e7; --bad-line:#d8453b;
+  --info:#00697a; --info-bg:#e0f2f4; --info-line:#0e8b9d;
+  --mute:#7d7566; --mute-bg:#f1ece0;
+  --shadow:0 1px 2px rgba(60,50,30,.05),0 8px 22px rgba(60,50,30,.07);
+  --glow:0 0 0 1px var(--accent-2),0 0 0 4px var(--accent-soft);
+}
+[data-theme="neon"]{
+  --bg:#07070c; --bg-2:#04040a; --card:#101019; --card-2:#161624;
+  --line:#2c2c44; --line-2:#20203a;
+  --ink:#f0f0ff; --ink-2:#a9a9d4; --ink-3:#6f6f9c;
+  --accent:#7c5cff; --accent-2:#5a34ff; --accent-soft:#1c1440;
+  --ok:#00e6a0; --ok-bg:#04241d; --ok-line:#00b57e;
+  --warn:#ffc400; --warn-bg:#2a2000; --warn-line:#c79a00;
+  --bad:#ff3d71; --bad-bg:#2b0a17; --bad-line:#d31a52;
+  --info:#00d0ff; --info-bg:#032630; --info-line:#00a2c7;
+  --mute:#8080a8; --mute-bg:#15152a;
+  --shadow:0 0 0 1px rgba(124,92,255,.12),0 10px 30px rgba(0,0,0,.7);
+  --glow:0 0 0 1px var(--accent-2),0 0 22px -4px var(--accent);
+}
+
+*{box-sizing:border-box}
+/* 全局 hidden 兜底。任何带 display 的作者样式都会压过浏览器 UA 的
+   [hidden]{display:none} —— 实测踩到：.spin{display:inline-block} 让
+   `$('#spin').hidden = true` 完全失效，探测结束后转圈永不停，
+   看起来像卡住了（步骤条已跳到 3、进度条 100%，但 spinner 还在转）。
+   这条放在最前面并加 !important，所有 el.hidden = true 才真正生效。 */
+[hidden]{display:none!important}
+html{color-scheme:dark}
+[data-theme="parchment"] html,html[data-theme="parchment"]{color-scheme:light}
+body{
+  margin:0;background:var(--bg);color:var(--ink);
+  font:15.5px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",
+       "PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+  min-height:100vh;
+}
+.mono,code,kbd,.m{
+  font-family:ui-monospace,"SF Mono",SFMono-Regular,"Cascadia Code",
+              Menlo,Consolas,monospace;
+  font-size:.9em;font-variant-ligatures:none;
+}
+.wrap{max-width:1280px;margin:0 auto;padding:0 26px}
+
+/* ── 顶栏 ── */
+.top{
+  position:sticky;top:0;z-index:60;
+  background:color-mix(in srgb,var(--bg) 82%,transparent);
+  backdrop-filter:blur(16px) saturate(140%);
+  border-bottom:1px solid var(--line);
+}
+.top .wrap{display:flex;align-items:center;gap:16px;height:62px}
+.logo{
+  width:32px;height:32px;border-radius:9px;flex:none;display:grid;place-items:center;
+  background:linear-gradient(140deg,var(--accent),var(--accent-2));
+  color:#fff;font-size:17px;font-weight:700;box-shadow:var(--glow);
+}
+.brand{display:flex;flex-direction:column;line-height:1.25}
+.brand b{font-size:17px;font-weight:680;letter-spacing:-.015em}
+.brand span{font-size:12.5px;color:var(--ink-3)}
+.top .sp{flex:1}
+.meta{font-size:12.5px;color:var(--ink-3);font-family:ui-monospace,monospace}
+.themes{display:flex;gap:5px;background:var(--card);border:1px solid var(--line);
+        border-radius:10px;padding:4px}
+.themes button{
+  border:0;background:transparent;color:var(--ink-3);cursor:pointer;
+  font:inherit;font-size:12.5px;padding:5px 11px;border-radius:7px;
+  transition:.15s;white-space:nowrap;
+}
+.themes button:hover{color:var(--ink)}
+.themes button.on{background:var(--accent-soft);color:var(--accent)}
+
+/* ── 步骤条 ── */
+.rail{display:flex;margin:28px 0 24px;gap:12px}
+.rstep{
+  flex:1;background:var(--card);border:1px solid var(--line);border-radius:13px;
+  padding:15px 18px;display:flex;align-items:center;gap:13px;
+  box-shadow:var(--shadow);transition:.2s;position:relative;overflow:hidden;
+}
+.rstep::after{
+  content:'';position:absolute;inset:0 auto 0 0;width:3px;background:transparent;
+  transition:.2s;
+}
+.rstep .no{
+  width:30px;height:30px;border-radius:9px;flex:none;display:grid;place-items:center;
+  background:var(--mute-bg);color:var(--ink-3);font-size:14px;font-weight:660;
+  font-family:ui-monospace,monospace;transition:.2s;
+}
+.rstep .tx b{display:block;font-size:15px;font-weight:640;color:var(--ink-2)}
+.rstep .tx span{font-size:12.5px;color:var(--ink-3)}
+.rstep.on{border-color:var(--accent-2);background:var(--card-2)}
+.rstep.on::after{background:linear-gradient(var(--accent),var(--accent-2))}
+.rstep.on .no{background:linear-gradient(140deg,var(--accent),var(--accent-2));color:#fff}
+.rstep.on .tx b{color:var(--ink)}
+.rstep.done .no{background:var(--ok-bg);color:var(--ok);box-shadow:0 0 0 1px var(--ok-line)}
+
+/* ── 面板 ── */
+.panel{
+  background:var(--card);border:1px solid var(--line);border-radius:15px;
+  padding:24px 26px;margin-bottom:20px;box-shadow:var(--shadow);
+}
+.panel[hidden]{display:none!important}
+.ph{display:flex;align-items:baseline;gap:12px;margin-bottom:6px;flex-wrap:wrap}
+.ph h2{margin:0;font-size:20px;font-weight:660;letter-spacing:-.02em}
+.ph .tag{font-size:12.5px;color:var(--ink-3);font-family:ui-monospace,monospace}
+.psub{margin:0 0 20px;color:var(--ink-2);font-size:14px;max-width:88ch}
+.psub b{color:var(--ink)}
+
+/* ── 表单 ── */
+textarea{
+  width:100%;min-height:210px;padding:15px 17px;
+  border:1px solid var(--line);border-radius:11px;
+  background:var(--bg-2);color:var(--ink);
+  font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  font-size:13.5px;line-height:1.85;resize:vertical;transition:.15s;
+}
+textarea:focus{outline:0;border-color:var(--accent-2);box-shadow:var(--glow)}
+textarea::placeholder{color:var(--ink-3)}
+.drop{
+  border:1.5px dashed var(--line);border-radius:11px;padding:20px;
+  text-align:center;color:var(--ink-3);font-size:13.5px;margin-top:12px;
+  transition:.15s;cursor:pointer;
+}
+.drop:hover,.drop.over{
+  border-color:var(--accent);color:var(--accent);background:var(--accent-soft);
+}
+.opts{display:flex;flex-wrap:wrap;gap:11px 24px;margin:20px 0 6px;font-size:13.5px}
+.opt{display:flex;align-items:center;gap:8px;color:var(--ink-2)}
+.opt input[type=checkbox]{
+  appearance:none;width:19px;height:19px;flex:none;cursor:pointer;
+  border:1.5px solid var(--line);border-radius:5px;background:var(--bg-2);
+  transition:.15s;position:relative;
+}
+.opt input[type=checkbox]:checked{
+  background:var(--accent-2);border-color:var(--accent-2);
+}
+.opt input[type=checkbox]:checked::after{
+  content:'';position:absolute;left:5px;top:1.5px;width:5px;height:10px;
+  border:2px solid #fff;border-top:0;border-left:0;transform:rotate(42deg);
+}
+.opt input[type=number],.opt input[type=text],.opt input[type=password]{
+  border:1px solid var(--line);border-radius:8px;padding:6px 10px;
+  background:var(--bg-2);color:var(--ink);font:inherit;
+  font-family:ui-monospace,monospace;font-size:13px;transition:.15s;
+}
+.opt input:focus{outline:0;border-color:var(--accent-2);box-shadow:var(--glow)}
+.opt input[type=number]{width:74px}
+.hint{color:var(--ink-3);font-size:12.5px}
+.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:20px}
+button.go{
+  background:linear-gradient(140deg,var(--accent),var(--accent-2));
+  color:#fff;border:0;padding:11px 24px;border-radius:10px;
+  font:inherit;font-weight:640;font-size:14.5px;cursor:pointer;transition:.15s;
+}
+button.go:hover{filter:brightness(1.1);transform:translateY(-1px)}
+button.go:active{transform:none}
+button.go:disabled{opacity:.4;cursor:not-allowed;filter:none;transform:none}
+button.ghost{
+  background:var(--card-2);border:1px solid var(--line);color:var(--ink-2);
+}
+button.ghost:hover{border-color:var(--accent);color:var(--accent);filter:none}
+button.danger{background:linear-gradient(140deg,var(--bad),var(--bad-line))}
+button.sm{padding:6px 13px;font-size:13px;border-radius:8px}
+
+/* ── 徽标 ── */
+.pill{
+  display:inline-flex;align-items:center;gap:5px;padding:2.5px 10px;
+  border-radius:20px;font-size:12.5px;font-weight:620;white-space:nowrap;
+  line-height:1.6;
+}
+.p-ok{background:var(--ok-bg);color:var(--ok);box-shadow:0 0 0 1px var(--ok-line)}
+.p-w{background:var(--warn-bg);color:var(--warn);box-shadow:0 0 0 1px var(--warn-line)}
+.p-b{background:var(--bad-bg);color:var(--bad);box-shadow:0 0 0 1px var(--bad-line)}
+.p-i{background:var(--info-bg);color:var(--info);box-shadow:0 0 0 1px var(--info-line)}
+.p-m{background:var(--mute-bg);color:var(--mute);box-shadow:0 0 0 1px var(--line)}
+
+/* ── 表格：每列都有表头 ── */
+.tw{overflow-x:auto;margin:0 -4px;border-radius:11px}
+table{border-collapse:separate;border-spacing:0;width:100%;font-size:13.5px}
+thead th{
+  font-size:12px;text-transform:uppercase;letter-spacing:.07em;
+  color:var(--ink-3);font-weight:680;text-align:left;
+  padding:11px 13px;background:var(--card-2);white-space:nowrap;
+  border-bottom:1px solid var(--line);
+  /* 不做 sticky。原来写 position:sticky;top:62px 会遮住第 1 行数据 ——
+     .tw 有 overflow-x:auto，那建立了一个新的滚动容器，表头的 top 参照的是
+     那个容器的顶端而不是视口，于是它悬在表格上方压住首行（实测截图确认）。
+     表格本来不长，页面级滚动足够；要恢复 sticky 必须先去掉 .tw 的 overflow，
+     而那会让宽表格无法横向滚动。 */
+}
+thead th:first-child{border-radius:9px 0 0 0}
+thead th:last-child{border-radius:0 9px 0 0}
+tbody td{padding:11px 13px;border-bottom:1px solid var(--line-2);vertical-align:top}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover td{background:var(--card-2)}
+td.m,th.m{font-family:ui-monospace,monospace;font-size:12.5px}
+.num{text-align:right;font-family:ui-monospace,monospace;
+     font-variant-numeric:tabular-nums}
+td.pick{width:44px;text-align:center}
+tr.off td{opacity:.5}
+tr.rec td{background:color-mix(in srgb,var(--ok-bg) 40%,transparent)}
+tr.rec:hover td{background:color-mix(in srgb,var(--ok-bg) 60%,transparent)}
+
+/* ── 探测流水 ── */
+.stream{
+  max-height:340px;overflow-y:auto;background:var(--bg-2);
+  border:1px solid var(--line);border-radius:11px;padding:13px 15px;
+  font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:12.5px;
+  line-height:1.9;
+}
+.stream div{white-space:pre;color:var(--ink-3)}
+.stream .s2{color:var(--ok)}
+.stream .s4{color:var(--warn)}
+.stream .s5{color:var(--bad)}
+.stream .hd{color:var(--ink);font-weight:640;margin-top:8px}
+.stream .note{color:var(--info)}
+.bar{height:6px;border-radius:4px;background:var(--line-2);overflow:hidden;
+     margin:15px 0}
+.bar i{display:block;height:100%;border-radius:4px;transition:width .35s ease;
+       background:linear-gradient(90deg,var(--accent),var(--accent-2))}
+.stat{display:flex;gap:26px;font-size:13.5px;color:var(--ink-3);
+      margin-bottom:6px;flex-wrap:wrap}
+.stat b{color:var(--ink);font-family:ui-monospace,monospace;
+        font-variant-numeric:tabular-nums;font-size:15px}
+
+/* ── 站点卡 ── */
+.site{border:1px solid var(--line);border-radius:13px;margin-bottom:16px;
+      overflow:hidden;background:var(--card-2)}
+.site>.sh{
+  padding:13px 17px;background:var(--card);border-bottom:1px solid var(--line);
+  display:flex;align-items:center;gap:13px;flex-wrap:wrap;
+}
+.site>.sh .h{font-weight:660;font-family:ui-monospace,monospace;font-size:14.5px}
+.site>.sh .sp{flex:1}
+.pedit{display:flex;align-items:center;gap:7px;font-size:13px}
+.pedit input{
+  width:86px;border:1px solid var(--line);border-radius:7px;padding:5px 9px;
+  background:var(--bg-2);color:var(--ink);font-family:ui-monospace,monospace;
+  font-size:13px;
+}
+.pedit input:focus{outline:0;border-color:var(--accent-2);box-shadow:var(--glow)}
+.warn{
+  font-size:13px;color:var(--warn);margin-top:8px;padding:9px 13px;
+  background:var(--warn-bg);border-radius:8px;border-left:3px solid var(--warn-line);
+}
+.warn.b{color:var(--bad);background:var(--bad-bg);border-left-color:var(--bad-line)}
+.mlist{font-family:ui-monospace,monospace;font-size:12.5px;color:var(--ink-3);
+       line-height:1.75;overflow-wrap:anywhere}
+/* 错误正文（503 的 model_not_found JSON、CF 拦截页片段）能有一两百字符，
+   在窄列里会折成四五行，把整行撑到 200px+ —— 表头被顶到视觉中部，
+   看起来就像遮住了数据（实测截图确认）。
+   限高 3 行并折叠：想看全文点一下展开。 */
+.mlist.clip{
+  max-height:calc(1.75em * 3);overflow:hidden;position:relative;cursor:pointer;
+}
+.mlist.clip::after{
+  content:'⋯ 点击展开';position:absolute;right:0;bottom:0;
+  padding-left:14px;font-size:11.5px;color:var(--accent);
+  background:linear-gradient(90deg,transparent,var(--card) 40%);
+}
+.mlist.clip.open{max-height:none;cursor:default}
+.mlist.clip.open::after{display:none}
+
+/* ── diff ── */
+.diff{background:var(--bg-2);border:1px solid var(--line);border-radius:11px;
+      overflow:hidden;margin-bottom:15px}
+.diff>.dh{
+  padding:10px 15px;background:var(--card);border-bottom:1px solid var(--line);
+  font-size:13px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;
+}
+.diff pre{margin:0;padding:13px 15px;overflow-x:auto;
+          font-family:ui-monospace,monospace;font-size:12.5px;line-height:1.8}
+.diff pre .a{color:var(--ok);display:block}
+.cp{
+  margin-left:auto;border:1px solid var(--line);background:var(--card-2);
+  color:var(--ink-3);padding:5px 12px;border-radius:8px;cursor:pointer;
+  font:inherit;font-size:12.5px;transition:.15s;
+}
+.cp:hover{border-color:var(--accent);color:var(--accent)}
+.cp.done{border-color:var(--ok-line);color:var(--ok)}
+
+/* ── 提示条 ── */
+.note{
+  padding:13px 17px;border-radius:11px;font-size:13.5px;margin:15px 0;
+  border-left:3px solid var(--info-line);background:var(--info-bg);color:var(--ink-2);
+}
+.note.w{border-left-color:var(--warn-line);background:var(--warn-bg)}
+.note.b{border-left-color:var(--bad-line);background:var(--bad-bg)}
+.note.g{border-left-color:var(--ok-line);background:var(--ok-bg)}
+.note b{color:var(--ink)}
+.note code{background:color-mix(in srgb,var(--ink) 10%,transparent);
+           padding:2px 6px;border-radius:5px}
+
+/* ── 档位谱 ── */
+.bands{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
+.band{border:1px solid var(--line);border-radius:11px;padding:15px 17px;
+      background:var(--bg-2)}
+.band .bt{font-family:ui-monospace,monospace;font-size:13px;color:var(--ink-2);
+          margin-bottom:11px;display:flex;justify-content:space-between;gap:10px}
+.band .bt b{color:var(--ink);font-size:14px}
+.tier{display:flex;gap:9px;align-items:baseline;font-size:12.5px;padding:2.5px 0;
+      font-family:ui-monospace,monospace}
+.tier .p{width:52px;text-align:right;color:var(--ink);font-weight:640;
+         font-variant-numeric:tabular-nums}
+.tier .h{color:var(--ink-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tier.gap .p,.tier.gap .h{color:var(--accent)}
+.tier.gap .h{font-style:italic}
+/* 档位谱里的站按健康度着色。
+   「这一档挡住 9 个站」与「挡住 9 个**死**站」是完全不同的风险 ——
+   只报数字会让人误判，所以逐站标出来。 */
+.tier .h .hdead{color:var(--bad);opacity:.72;text-decoration:line-through}
+.tier .h .hunwell{color:var(--warn)}
+/* 段级告警：单点、顶层全死、注释短名匹配不上。
+   这三条不是样式装饰 —— 它们是唯一能让用户看见结构性风险的地方。
+   white-space:normal 覆盖 .tier .h 的 nowrap，让长文案能换行显示全。 */
+.tier.warn,.tier.bad{display:block;white-space:normal;line-height:1.5;
+  padding:6px 8px;margin:4px 0;border-radius:6px;font-size:12px}
+.tier.warn{background:color-mix(in srgb,var(--warn) 12%,transparent);
+  color:var(--ink-2);border-left:2px solid var(--warn)}
+.tier.bad{background:color-mix(in srgb,var(--bad) 12%,transparent);
+  color:var(--ink-2);border-left:2px solid var(--bad)}
+
+.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--line);
+      border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.err{padding:13px 17px;border-radius:11px;background:var(--bad-bg);color:var(--bad);
+     font-size:13.5px;margin:13px 0;border-left:3px solid var(--bad-line)}
+.err pre{margin:8px 0 0;font-size:12px;white-space:pre-wrap;color:var(--ink-2)}
+footer{color:var(--ink-3);font-size:12.5px;padding:30px 0 48px;text-align:center}
+footer code{color:var(--ink-2)}
+
+/* ── 登录门 ── */
+.gate{max-width:520px;margin:64px auto;text-align:center}
+.gate .logo{width:54px;height:54px;font-size:27px;border-radius:15px;margin:0 auto 20px}
+.gate h1{font-size:25px;font-weight:680;margin:0 0 10px;letter-spacing:-.02em}
+.gate p{color:var(--ink-2);font-size:14.5px;margin:0 0 26px}
+.gate .panel{text-align:left}
+.gate input{
+  width:100%;border:1px solid var(--line);border-radius:10px;padding:12px 15px;
+  background:var(--bg-2);color:var(--ink);font-family:ui-monospace,monospace;
+  font-size:13.5px;
+}
+.gate input:focus{outline:0;border-color:var(--accent-2);box-shadow:var(--glow)}
+
+@media (max-width:900px){
+  .rail{flex-wrap:wrap}
+  .rstep{min-width:calc(50% - 6px)}
+}
+</style>
+
+<div class="top"><div class="wrap">
+  <div class="logo">灌</div>
+  <div class="brand">
+    <b>投喂台</b>
+    <span>CPA 上游批量灌输 · 探测 · 定档 · 写回</span>
+  </div>
+  <div class="sp"></div>
+  <span class="meta" id="cfgmeta"></span>
+  <div class="themes" id="themes">
+    <button data-t="midnight" class="on">午夜</button>
+    <button data-t="parchment">纸感</button>
+    <button data-t="neon">霓虹</button>
+  </div>
+</div></div>
+
+<!-- ═══ 登录门 ═══ -->
+<div class="wrap gate" id="gate" hidden>
+  <div class="logo">灌</div>
+  <h1>投喂台</h1>
+  <p>这个界面持有明文上游 Key，且能改写 <code>config.yaml</code>。<br>
+     需要访问令牌才能进入。</p>
+  <div class="panel">
+    <div class="ph"><h2>访问令牌</h2></div>
+    <p class="psub">令牌在服务启动时打印在终端；容器部署则在 <code>.env</code> 的
+       <code>IMPORTER_TOKEN</code>。</p>
+    <input type="password" id="tokin" placeholder="粘贴 token 后回车">
+    <div class="row"><button class="go" id="toksave">进入</button></div>
+  </div>
+</div>
+
+<!-- ═══ 主体 ═══ -->
+<div class="wrap" id="app" hidden>
+
+<div class="rail">
+  <div class="rstep on" data-s="1"><div class="no">1</div>
+    <div class="tx"><b>投喂</b><span>粘贴或上传 url,key</span></div></div>
+  <div class="rstep" data-s="2"><div class="no">2</div>
+    <div class="tx"><b>探测</b><span>段 · 模型 · 代理 · 上限</span></div></div>
+  <div class="rstep" data-s="3"><div class="no">3</div>
+    <div class="tx"><b>定档</b><span>推荐勾选 + 影响面</span></div></div>
+  <div class="rstep" data-s="4"><div class="no">4</div>
+    <div class="tx"><b>写回</b><span>diff 预览 → 落盘</span></div></div>
+</div>
+
+<!-- ── 步骤 1 ── -->
+<div class="panel" id="p1">
+  <div class="ph"><h2>① 投喂上游账号</h2>
+    <span class="tag">每行一组 url,key</span></div>
+  <p class="psub">填你<b>买的中转站</b>网址与它给的 key。<b>带不带 <code>/v1</code> 都行</b> ——
+     段决定形态，系统自动补齐。空行与 <code>#</code> 开头行忽略；同一站多个 key 写多行。</p>
+  <textarea id="input" spellcheck="false" placeholder="https://relay-i.example,sk-xxxxxxxxxxxxxxxx
+https://其他站.com,sk-yyyyyyyyyyyyyyyy
+# 同一站多个 key 就写多行，系统会复用该站已探明的形态"></textarea>
+  <div class="drop" id="drop">拖 txt 文件到此，或<b>点击选择</b>
+    <span class="hint">· 文件与粘贴走同一解析器</span></div>
+  <input type="file" id="file" accept=".txt,.csv,text/plain" hidden>
+
+  <div class="opts">
+    <label class="opt"><input type="checkbox" id="o_ctx" checked> 探测上下文上限
+      <span class="hint">写入 max-context-length</span></label>
+    <label class="opt"><input type="checkbox" id="o_proxy" checked> 失败时试代理
+      <span class="hint">预检不通则自动跳过</span></label>
+    <label class="opt">同站间隔 <input type="number" id="o_gap" value="3" min="0" max="30" step="0.5"> 秒
+      <span class="hint">同站同段生效，其余互不等待</span></label>
+    <label class="opt">换模采样 <input type="number" id="o_swap" value="3" min="0" max="12"> 次</label>
+    <label class="opt"><input type="checkbox" id="o_fast" checked> 并行探测
+      <span class="hint">四段同时 + 多站同时，快 4–8 倍</span></label>
+  </div>
+  <div class="note w" id="costnote">
+    <b>上下文探测会计费。</b>每个可用段额外 4–6 次大 body 请求（最大约 110 万字符）。
+    它是唯一能修掉「<code>Context window is full</code>」那条 400 的探测 ——
+    真实上限写进 <code>max-context-length</code> 后，客户端才在正确的点自动压缩。
+  </div>
+  <div class="row">
+    <button class="go ghost" id="btnparse">解析（零请求）</button>
+    <button class="go" id="btnprobe" disabled>开始探测</button>
+    <span class="hint" id="parsemsg"></span>
+  </div>
+</div>
+
+<div class="panel" id="pparse" hidden>
+  <div class="ph"><h2>解析结果</h2><span class="tag">未发任何请求</span></div>
+  <div id="parsebody"></div>
+</div>
+
+<!-- ── 步骤 2 ── -->
+<div class="panel" id="p2" hidden>
+  <div class="ph"><h2 id="p2h">② 探测中</h2><span class="spin" id="spin"></span>
+    <span class="hint" id="p2tag"></span></div>
+  <p class="psub">四段各打一次定归属；不通的先试代理、再按「由省到全」回退标识头找最小必需头。
+     <b>同一主机的第 2 个 Key 起复用已探明的形态</b>，只验凭证本身。</p>
+  <div class="note b" id="p2resume" hidden>
+    <b>轮询中断，但任务仍在服务端跑。</b>
+    探测不会因为浏览器断连而停止 —— 点下面接回，不用重跑。
+    <div style="margin-top:8px">
+      <button class="btn" id="btnresume">接回任务</button>
+      <span class="hint" id="resumeid"></span>
+    </div>
+  </div>
+  <div class="stat">
+    <span>候选 <b id="st_rows">0/0</b></span>
+    <span>请求 <b id="st_calls">0</b></span>
+    <span>耗时 <b id="st_time">0</b>s</span>
+    <span id="st_saved"></span>
+  </div>
+  <div class="bar"><i id="prog" style="width:0"></i></div>
+  <div class="stream" id="stream"></div>
+</div>
+
+<!-- ── 步骤 3 ── -->
+<div class="panel" id="p3" hidden>
+  <div class="ph"><h2>③ 判定与定档</h2>
+    <span class="tag" id="pickstat"></span></div>
+  <p class="psub"><b>系统已按判定结果预勾选</b> —— 换模、抢顶层、上限由截断反推的三类
+     默认不勾（仍可手工勾上）。<code>priority</code> 数值大者优先且分层隔离，
+     所以新站默认走<b>试用期档位</b>：取挡住现有站最少的那一档。</p>
+  <div class="opts" style="margin-bottom:16px">
+    <label class="opt"><input type="checkbox" id="o_probation" checked> 试用期定档
+      <span class="hint">关掉则按探测得分定档，高分新站会挡住已验证的站</span></label>
+    <button class="go ghost sm" id="pickrec">只勾推荐项</button>
+    <button class="go ghost sm" id="pickall">全勾</button>
+    <button class="go ghost sm" id="picknone">全不勾</button>
+  </div>
+  <div id="results"></div>
+  <div class="row">
+    <button class="go" id="btnplan">生成写回方案</button>
+    <button class="go ghost" id="btnback">改输入重来</button>
+  </div>
+</div>
+
+<!-- ── 步骤 4 ── -->
+<div class="panel" id="p4" hidden>
+  <div class="ph"><h2>④ diff 预览与写回</h2>
+    <span class="tag">只追加，不改现有行</span></div>
+  <p class="psub">写回前自动备份 —— CPA 的 <code>PUT config.yaml</code> 落盘用
+     <code>O_TRUNC</code> 且失败不回滚，备份是唯一保险。</p>
+  <div id="planmeta"></div>
+  <div id="diffs"></div>
+  <div class="opts" style="margin-top:20px">
+    <label class="opt">CPA 地址 <input type="text" id="o_base"
+      placeholder="留空 = 容器内直连（推荐）" style="width:250px">
+      <span class="hint">留空走服务端配好的 CPA_UPSTREAM_URL</span></label>
+    <label class="opt">管理密码 <input type="password" id="o_mgmt"
+      placeholder="留空 = 复用登录凭据" style="width:200px">
+      <span class="hint">用 CPA 密码登录的就不用填</span></label>
+    <label class="opt">客户端 key <input type="password" id="o_client"
+      placeholder="留空 = 自动取 api-keys 之一" style="width:200px">
+      <span class="hint">端到端验证用；留空自动取，一般不用填</span></label>
+  </div>
+  <div class="note w">
+    <b>CPA 地址不要填公网域名。</b>公网入口在 Cloudflare 后面，管理端点的
+    <code>PUT</code> 会被挡成 <code>403 error code 1010</code> —— 那是 CF 的拦截码，
+    不是 CPA 拒绝了配置。留空即走容器内服务名直连
+    （<code>http://cli-proxy-api:8317</code>），既绕开 CF 也不出公网。</div>
+  <div class="note b">
+    <b>这一步真正落盘。</b>确认前核对每一处插入 —— <code>priority</code> 定错在分层隔离下
+    不是「略微靠后」，而是<b>永远轮不到</b>或<b>完全取代现有顶层站</b>。
+  </div>
+  <div class="row">
+    <button class="go danger" id="btnapply">确认写回</button>
+    <button class="go ghost" id="btnreplan">返回调整</button>
+    <span class="hint" id="applymsg"></span>
+  </div>
+</div>
+
+<div class="panel" id="pdone" hidden>
+  <div class="ph"><h2>✓ 已写回</h2></div>
+  <div id="donebody"></div>
+  <div class="row"><button class="go ghost" id="btnrestart">再投喂一批</button></div>
+</div>
+
+<div class="panel" id="pbands" hidden>
+  <div class="ph"><h2>参考 · 当前档位谱</h2>
+    <span class="tag">新条目只插空档</span></div>
+  <p class="psub">绝不改动现有值。<span style="color:var(--accent)">空档</span>是可插位置；
+     <code>gemini</code> 段那个宽空档留给将来站方开通的站。</p>
+  <div class="bands" id="bands"></div>
+</div>
+
+</div>
+
+<footer class="wrap">
+  cpa_probe 共享库 · 判定规则源自
+  <code>probe-fix</code> / <code>audit-upstreams</code> /
+  <code>context-probe</code> / <code>swap-watch</code> 实测沉淀
+</footer>
+
+<script src="/static/app.js"></script>

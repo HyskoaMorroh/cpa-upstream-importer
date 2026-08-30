@@ -1,0 +1,870 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>cpa-upstream-importer · 图解教程</title>
+<style>
+:root{
+  --ink:#16202B; --ink-2:#3A4A5C; --ink-3:#6B7C8E;
+  --paper:#F6F8FA; --card:#FFFFFF; --line:#DCE3EA; --line-2:#EDF1F5;
+  --accent:#0F6E8C; --accent-soft:#E4F0F4; --brass:#A8763E;
+  --ok:#2F7D52; --ok-bg:#E6F2EA;
+  --warn:#A8762A; --warn-bg:#F7EEDC;
+  --bad:#A83B32; --bad-bg:#F8E8E6;
+  --odd:#6C4E96; --odd-bg:#EFE9F6;
+  --code-bg:#111A24; --code-fg:#D6E2EC; --code-line:#243444;
+  --f-body:system-ui,-apple-system,"Segoe UI","Noto Sans CJK SC",sans-serif;
+  --f-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --r:4px;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --ink:#E3EAF1; --ink-2:#A8B8C8; --ink-3:#7A8B9C;
+    --paper:#0E151D; --card:#151E28; --line:#26333F; --line-2:#1C2731;
+    --accent:#4EACC8; --accent-soft:#15303A; --brass:#C99A62;
+    --ok:#63B98A; --ok-bg:#14291E;
+    --warn:#D0A254; --warn-bg:#2B2312;
+    --bad:#DB7A70; --bad-bg:#2E1917;
+    --odd:#A98FD0; --odd-bg:#211B2E;
+    --code-bg:#0A1017; --code-fg:#C8D6E2; --code-line:#1B2833;
+  }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);
+     font:15px/1.72 var(--f-body);-webkit-font-smoothing:antialiased}
+.wrap{max-width:1000px;margin:0 auto;padding:0 22px}
+.top{border-bottom:1px solid var(--line);background:var(--card);
+     position:sticky;top:0;z-index:20}
+.top .wrap{display:flex;align-items:center;gap:14px;height:52px}
+.top b{font-size:14px;letter-spacing:.01em}
+.top .sp{flex:1}
+.top .meta{font:12px/1 var(--f-mono);color:var(--ink-3)}
+.hero{padding:44px 0 26px}
+h1{margin:0 0 12px;font-size:30px;line-height:1.24;letter-spacing:-.01em}
+.lede{margin:0;max-width:76ch;color:var(--ink-2);font-size:16px}
+.lede b{color:var(--ink);font-weight:600}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+      gap:10px;margin:26px 0 8px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+     padding:13px 15px}
+.kpi .n{font:600 22px/1.1 var(--f-mono);color:var(--accent)}
+.kpi .l{margin-top:5px;font-size:12px;color:var(--ink-3)}
+nav.toc{border-bottom:1px solid var(--line);background:var(--card)}
+nav.toc .wrap{display:flex;gap:3px;overflow-x:auto;padding:9px 22px}
+nav.toc a{flex:none;padding:5px 11px;border-radius:99px;font-size:12.5px;
+          color:var(--ink-2);text-decoration:none;white-space:nowrap}
+nav.toc a:hover{background:var(--accent-soft);color:var(--accent)}
+section{padding:40px 0;border-bottom:1px solid var(--line-2)}
+.sech{display:flex;align-items:baseline;gap:11px;margin-bottom:6px}
+.sech .no{font:600 12px/1 var(--f-mono);color:var(--brass);
+          padding-top:6px;letter-spacing:.06em}
+h2{margin:0;font-size:22px;letter-spacing:-.005em}
+.sub{margin:2px 0 20px 0;color:var(--ink-3);font-size:13.5px}
+h3{margin:30px 0 9px;font-size:16px}
+p{margin:0 0 13px;max-width:80ch}
+code{font:13px var(--f-mono);background:var(--line-2);
+     padding:1px 5px;border-radius:3px}
+a{color:var(--accent)}
+figure{margin:22px 0;padding:18px;background:var(--card);
+       border:1px solid var(--line);border-radius:var(--r);overflow-x:auto}
+figcaption{margin-top:13px;font-size:12.5px;color:var(--ink-3);
+           border-top:1px solid var(--line-2);padding-top:10px}
+svg{display:block;max-width:100%;height:auto;margin:0 auto}
+.tw{overflow-x:auto;margin:18px 0}
+table{width:100%;border-collapse:collapse;font-size:13.5px}
+th{text-align:left;padding:8px 11px;border-bottom:2px solid var(--line);
+   font-weight:600;color:var(--ink-2);white-space:nowrap}
+td{padding:8px 11px;border-bottom:1px solid var(--line-2);vertical-align:top}
+tbody tr:last-child td{border-bottom:none}
+td.n,th.n{text-align:right;font-family:var(--f-mono)}
+td.m{font:12.5px var(--f-mono)}
+.pill{display:inline-block;padding:1px 8px;border-radius:99px;
+      font:600 11.5px/1.6 var(--f-body);white-space:nowrap}
+.p-ok{background:var(--ok-bg);color:var(--ok)}
+.p-b{background:var(--bad-bg);color:var(--bad)}
+.p-w{background:var(--warn-bg);color:var(--warn)}
+.p-o{background:var(--odd-bg);color:var(--odd)}
+.cmd{margin:16px 0;border:1px solid var(--code-line);border-radius:var(--r);
+     overflow:hidden;background:var(--code-bg)}
+.cmd .bar{display:flex;align-items:center;padding:6px 12px;
+          border-bottom:1px solid var(--code-line);
+          font:11.5px var(--f-mono);color:#7D93A6}
+.cmd pre{margin:0;padding:13px 15px;overflow-x:auto;
+         font:13px/1.66 var(--f-mono);color:var(--code-fg)}
+.cmd pre .c{color:#5C7387}
+.cmd pre .k{color:#8FD1A8}
+.note{margin:18px 0;padding:13px 16px;border-left:3px solid var(--accent);
+      background:var(--accent-soft);border-radius:0 var(--r) var(--r) 0}
+.note.w{border-color:var(--warn);background:var(--warn-bg)}
+.note.b{border-color:var(--bad);background:var(--bad-bg)}
+.note.g{border-color:var(--ok);background:var(--ok-bg)}
+.note .t{font-weight:600;margin-bottom:4px;font-size:13.5px}
+.note p{margin:0;font-size:13.5px;max-width:none}
+.note p+p{margin-top:8px}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(268px,1fr));
+       gap:13px;margin:18px 0}
+.card{background:var(--card);border:1px solid var(--line);
+      border-radius:var(--r);padding:15px 17px}
+.card .h{font-weight:600;margin-bottom:7px;font-size:14px}
+.card ul{margin:0;padding-left:19px;font-size:13.5px;color:var(--ink-2)}
+.card li{margin:4px 0}
+footer{padding:32px 0 46px;color:var(--ink-3);font-size:13px}
+footer code{background:none;padding:0}
+</style>
+</head>
+<body>
+<div class="top"><div class="wrap">
+  <b>cpa-upstream-importer</b>
+  <span class="sp"></span>
+  <span class="meta">图解教程</span>
+</div></div>
+
+<div class="wrap hero">
+  <h1>把一堆中转站账号，接进 CPA 的多上游轮询</h1>
+  <p class="lede">粘贴 <code>url,key</code> → 四段各打一次真实请求定归属 →
+  读现有档位谱给出 <b>不挡在用站</b>的 priority → diff 确认 → 行级写回
+  <code>config.yaml</code>（保注释）→ 触发 CPA 重载 → 端到端验证。<br>
+  这份教程讲的是<b>每一步为什么这么设计</b> —— 每条判定背后都是一次实测
+  误判的修正。</p>
+
+  <div class="kpis">
+    <div class="kpi"><div class="n">4</div>
+      <div class="l">协议段各自的 base-url 形态与路径</div></div>
+    <div class="kpi"><div class="n">9</div>
+      <div class="l">响应定性类别，正文关键词优先于状态码</div></div>
+    <div class="kpi"><div class="n">8</div>
+      <div class="l">测试套件，零外网请求，自带最小样本</div></div>
+    <div class="kpi"><div class="n">2</div>
+      <div class="l">层去重：五元组指纹 + (key, base) 对</div></div>
+  </div>
+</div>
+
+<nav class="toc"><div class="wrap">
+  <a href="#s1">01 全景</a>
+  <a href="#s2">02 段与形态</a>
+  <a href="#s3">03 四阶段探测</a>
+  <a href="#s4">04 定性九类</a>
+  <a href="#s5">05 换模检测</a>
+  <a href="#s6">06 定档</a>
+  <a href="#s7">07 写回</a>
+  <a href="#s8">08 生效链</a>
+  <a href="#s9">09 上手</a>
+  <a href="#s10">10 发布</a>
+</div></nav>
+
+<section id="s1"><div class="wrap">
+  <div class="sech"><span class="no">01</span><h2>全景：一次导入经过什么</h2></div>
+  <p class="sub">六个阶段，每个阶段都可以停下来看结果再决定要不要往下走。</p>
+
+  <figure>
+  <svg viewBox="0 0 940 232" role="img"
+       aria-label="导入流程图：粘贴、解析、探测、定档、diff 确认、写回、重载验证七个阶段依次相连，其中 diff 确认是人工闸门">
+    <defs>
+      <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+    <g font-family="var(--f-body)" font-size="12.5" color="#6B7C8E">
+      <!-- 阶段框 -->
+      <g fill="none" stroke="#DCE3EA" stroke-width="1.5">
+        <rect x="8"   y="62" width="118" height="52" rx="4" fill="#FFFFFF"/>
+        <rect x="166" y="62" width="118" height="52" rx="4" fill="#FFFFFF"/>
+        <rect x="324" y="62" width="118" height="52" rx="4" fill="#FFFFFF"/>
+        <rect x="482" y="62" width="118" height="52" rx="4" fill="#FFFFFF"/>
+        <rect x="640" y="62" width="118" height="52" rx="4"
+              fill="#E4F0F4" stroke="#0F6E8C" stroke-width="2"/>
+        <rect x="798" y="62" width="118" height="52" rx="4" fill="#FFFFFF"/>
+      </g>
+      <g fill="#16202B" font-size="13" font-weight="600" text-anchor="middle">
+        <text x="67"  y="84">粘贴</text>
+        <text x="225" y="84">解析</text>
+        <text x="383" y="84">探测</text>
+        <text x="541" y="84">定档</text>
+        <text x="699" y="84" fill="#0F6E8C">diff 确认</text>
+        <text x="857" y="84">写回 + 重载</text>
+      </g>
+      <g fill="#6B7C8E" font-size="11" text-anchor="middle">
+        <text x="67"  y="102">url,key 多行</text>
+        <text x="225" y="102">补 https · 剥 /v1</text>
+        <text x="383" y="102">四段各一次</text>
+        <text x="541" y="102">读现有档位谱</text>
+        <text x="699" y="102">人工闸门</text>
+        <text x="857" y="102">读回校验</text>
+      </g>
+      <!-- 连线 -->
+      <g stroke="#6B7C8E" stroke-width="1.4" marker-end="url(#ar)" color="#6B7C8E">
+        <line x1="126" y1="88" x2="160" y2="88"/>
+        <line x1="284" y1="88" x2="318" y2="88"/>
+        <line x1="442" y1="88" x2="476" y2="88"/>
+        <line x1="600" y1="88" x2="634" y2="88"/>
+        <line x1="758" y1="88" x2="792" y2="88"/>
+      </g>
+      <!-- 上方标注：只读区间 -->
+      <g stroke="#2F7D52" stroke-width="1.2" fill="none" stroke-dasharray="4 3">
+        <path d="M8,44 L8,32 L600,32 L600,44"/>
+      </g>
+      <text x="304" y="24" fill="#2F7D52" font-size="11.5"
+            text-anchor="middle" font-weight="600">只读 —— 到这里为止不动任何文件</text>
+      <!-- 下方标注：可回滚 -->
+      <g stroke="#A8762A" stroke-width="1.2" fill="none" stroke-dasharray="4 3">
+        <path d="M798,132 L798,146 L916,146 L916,132"/>
+      </g>
+      <text x="857" y="164" fill="#A8762A" font-size="11.5"
+            text-anchor="middle" font-weight="600">写前必备份</text>
+      <text x="857" y="180" fill="#6B7C8E" font-size="11"
+            text-anchor="middle">就地覆写不原子，备份是唯一退路</text>
+      <!-- 失败回边 -->
+      <path d="M699,120 L699,206 L383,206 L383,120" fill="none"
+            stroke="#A83B32" stroke-width="1.3" stroke-dasharray="5 3"
+            marker-end="url(#ar)" color="#A83B32"/>
+      <text x="541" y="222" fill="#A83B32" font-size="11.5"
+            text-anchor="middle">不满意 → 改 priority / 取消勾选，重新生成方案</text>
+    </g>
+  </svg>
+  <figcaption>前四步完全只读，可以反复跑。第五步是唯一的人工闸门 ——
+  它同时也是最后一道防线：写回会改一份被多个容器 bind mount 的生产配置。</figcaption>
+  </figure>
+
+  <div class="note">
+    <div class="t">为什么不做「全自动导入」</div>
+    <p>探测只能证明<b>此刻这一次请求成功了</b>。它证明不了余额够用、限流
+    阈值、长时间稳定性、深夜是否降级。而写进 <code>config.yaml</code> 的
+    <code>priority</code> 一旦过高，会让已经跑了两夜、证明过自己的站
+    <b>一次都不被尝试</b>。所以定档默认走试用期，且写回前必须人看一眼 diff。</p>
+  </div>
+</div></section>
+
+<section id="s2"><div class="wrap">
+  <div class="sech"><span class="no">02</span><h2>段决定形态：url 带不带 /v1 都行</h2></div>
+  <p class="sub">同一个域名在四个段里的 base-url 形态与请求路径都不同。
+  用户不必记 —— 解析时按目标段自动规范化。</p>
+
+  <div class="tw"><table>
+    <thead><tr>
+      <th>段</th><th>base-url 形态</th><th>请求路径</th><th>鉴权头</th>
+    </tr></thead>
+    <tbody>
+      <tr><td class="m">gemini-api-key</td><td>裸域名</td>
+          <td class="m">/v1beta/models/{model}:generateContent?key=</td>
+          <td class="m">查询串</td></tr>
+      <tr><td class="m">claude-api-key</td><td>裸域名</td>
+          <td class="m">/v1/messages</td>
+          <td class="m">Bearer + x-api-key + anthropic-version</td></tr>
+      <tr><td class="m">codex-api-key</td><td>带 <code>/v1</code></td>
+          <td class="m">/responses</td><td class="m">Bearer</td></tr>
+      <tr><td class="m">openai-compatibility</td><td>带 <code>/v1</code></td>
+          <td class="m">/chat/completions</td><td class="m">Bearer</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>解析时做的四件事</h3>
+  <div class="grid2">
+    <div class="card"><div class="h">裸域名自动补 https</div>
+      <ul><li><code>x.example</code> → <code>https://x.example</code></li>
+          <li>形态无法识别的行进「无效」清单，不静默丢弃</li></ul></div>
+    <div class="card"><div class="h">剥尾部 /v1，但不误剥 /v1beta</div>
+      <ul><li><code>/v1beta</code> 是 gemini 的真实路径段</li>
+          <li>剥掉它请求必然 404</li></ul></div>
+    <div class="card"><div class="h">主机名统一小写</div>
+      <ul><li>大小写不同不该算两台机器</li>
+          <li>否则同站两种拼写各探一遍，白烧配额</li></ul></div>
+    <div class="card"><div class="h">Key 一律脱敏后展示</div>
+      <ul><li>前 6 后 4，中间省略</li>
+          <li>短 Key 只留前 2 位</li></ul></div>
+  </div>
+
+  <div class="note b">
+    <div class="t">踩过的坑：剥协议的正则忘了忽略大小写</div>
+    <p>取主机名的实现是「剥掉 <code>^https?://</code> 再取第一段」。这个正则
+    <b>不带</b> <code>re.I</code> 时，<code>HTTPS://x.example</code> 剥不掉，
+    取出来的主机名是 <code>HTTPS:</code> ——</p>
+    <p>于是任意两个用大写 scheme 粘贴的站，会撞进<b>同一个</b>形态缓存键。
+    第二个站直接套用第一个站学到的模型清单、代理、必需头，然后写进
+    <code>config.yaml</code>。这不是浪费配额，是写错配置。</p>
+  </div>
+</div></section>
+
+<section id="s3"><div class="wrap">
+  <div class="sech"><span class="no">03</span><h2>四阶段探测</h2></div>
+  <p class="sub">每一阶段问的是不同的问题，前一阶段的结论决定后一阶段要不要跑。</p>
+
+  <figure>
+  <svg viewBox="0 0 940 268" role="img"
+       aria-label="四阶段探测流程：阶段一段接受性判定，通过后进入阶段二模型发现，再进入阶段三换模采样与阶段四上下文二分；阶段一不通时按处置优先级尝试代理与补标识头">
+    <defs>
+      <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+    <g font-family="var(--f-body)">
+      <g fill="none" stroke="#DCE3EA" stroke-width="1.5">
+        <rect x="10"  y="96" width="150" height="58" rx="4" fill="#FFFFFF"/>
+        <rect x="250" y="96" width="150" height="58" rx="4" fill="#FFFFFF"/>
+        <rect x="490" y="96" width="150" height="58" rx="4" fill="#FFFFFF"/>
+        <rect x="730" y="96" width="150" height="58" rx="4" fill="#FFFFFF"/>
+      </g>
+      <g fill="#16202B" font-size="13" font-weight="600" text-anchor="middle">
+        <text x="85"  y="120">① 段接受性</text>
+        <text x="325" y="120">② 模型发现</text>
+        <text x="565" y="120">③ 换模采样</text>
+        <text x="805" y="120">④ 上下文二分</text>
+      </g>
+      <g fill="#6B7C8E" font-size="11" text-anchor="middle">
+        <text x="85"  y="137">这个 Key 在这一段</text>
+        <text x="85"  y="150">通不通</text>
+        <text x="325" y="137">/models 目录 +</text>
+        <text x="325" y="150">种子模型逐个验</text>
+        <text x="565" y="137">重复采样，比对</text>
+        <text x="565" y="150">返回的 model 字段</text>
+        <text x="805" y="137">找出真实可吃下的</text>
+        <text x="805" y="150">最大上下文</text>
+      </g>
+      <g stroke="#6B7C8E" stroke-width="1.4" marker-end="url(#ar2)" color="#6B7C8E">
+        <line x1="160" y1="125" x2="244" y2="125"/>
+        <line x1="400" y1="125" x2="484" y2="125"/>
+        <line x1="640" y1="125" x2="724" y2="125"/>
+      </g>
+      <!-- 阶段一的三步回退 -->
+      <g fill="none" stroke="#A8762A" stroke-width="1.3" stroke-dasharray="4 3">
+        <path d="M85,96 L85,64"/>
+      </g>
+      <g fill="#A8762A" font-size="11" text-anchor="middle">
+        <text x="85" y="54" font-weight="600">不通时按处置优先级回退</text>
+        <text x="85" y="38">基线 → 试代理 → 试补标识头</text>
+      </g>
+      <!-- 门禁标注 -->
+      <text x="205" y="112" fill="#2F7D52" font-size="11" font-weight="600"
+            text-anchor="middle">可用</text>
+      <!-- 每阶段都过 model_matches 的横向标注 -->
+      <g stroke="#0F6E8C" stroke-width="1.2" fill="none" stroke-dasharray="4 3">
+        <path d="M10,178 L10,196 L880,196 L880,178"/>
+      </g>
+      <text x="445" y="214" fill="#0F6E8C" font-size="11.5"
+            text-anchor="middle" font-weight="600">
+        每一处「200 就算通过」都必须再过一次 model_matches
+      </text>
+      <text x="445" y="232" fill="#6B7C8E" font-size="11" text-anchor="middle">
+        曾经阶段①漏了这一步，换模站因此拿到免检通行证
+      </text>
+      <text x="445" y="252" fill="#6B7C8E" font-size="11" text-anchor="middle">
+        同主机的第 2..N 个 Key 复用已学到的形态，只验凭证本身（36 次请求降到 4 次）
+      </text>
+    </g>
+  </svg>
+  <figcaption>形态（有哪些模型、要不要代理、最小必需头、上下文上限、有没有换模）
+  是<b>主机</b>的属性，换 Key 不会变；而凭证有效性是 <b>Key</b> 的属性。
+  所以同主机第 2 个 Key 起只打一次基线，不重跑后三阶段。</figcaption>
+  </figure>
+</div></section>
+
+<section id="s4"><div class="wrap">
+  <div class="sech"><span class="no">04</span><h2>定性九类：正文关键词优先于状态码</h2></div>
+  <p class="sub">同一个 403 可能是三件完全不同的事，处置方向相反。
+  只看状态码必然误判。</p>
+
+  <div class="tw"><table>
+    <thead><tr>
+      <th>类别</th><th class="n">典型码</th><th>判据</th><th>处置</th><th>降权</th>
+    </tr></thead>
+    <tbody>
+      <tr><td><span class="pill p-w">余额</span></td><td class="n">403/402</td>
+          <td>正文含额度 / quota 字样</td><td>充值即自愈</td><td>否</td></tr>
+      <tr><td><span class="pill p-b">IP封</span></td><td class="n">403</td>
+          <td>Cloudflare 特征词</td><td>换出口 IP</td><td>是</td></tr>
+      <tr><td><span class="pill p-o">边缘</span></td><td class="n">403</td>
+          <td>正文为空</td><td>重试即可</td><td>否</td></tr>
+      <tr><td><span class="pill p-b">门禁</span></td><td class="n">403</td>
+          <td>有正文但无上述特征</td><td>站方策略</td><td>是</td></tr>
+      <tr><td><span class="pill p-o">反测活</span></td><td class="n">400</td>
+          <td>命中测活探针关键词</td><td>换探测载荷</td><td>否</td></tr>
+      <tr><td><span class="pill p-w">限频</span></td><td class="n">429</td>
+          <td>bulk probing detected</td><td>降并发</td><td>否</td></tr>
+      <tr><td><span class="pill p-b">死路</span></td><td class="n">400/404/500</td>
+          <td>model_not_found / 无可用渠道</td><td>不接入</td><td>是</td></tr>
+      <tr><td><span class="pill p-b">鉴权</span></td><td class="n">401</td>
+          <td>unauthorized</td><td>Key 无效</td><td>是</td></tr>
+      <tr><td><span class="pill p-w">临时</span></td><td class="n">500/503</td>
+          <td>upstream busy</td><td>稍后重试</td><td>否</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note b">
+    <div class="t">判定顺序本身就是一条实测教训</div>
+    <p><b>余额判定必须排在 Cloudflare 判定之前。</b> 有个站的 403 正文是
+    「预扣费额度失败, 剩余 $0.19」—— 那是余额不足，不是门禁。而同一条正文里
+    可能同时出现 CF 的 <code>cdn-cgi</code> 字样。</p>
+    <p>判错的代价是处置方向<b>完全相反</b>：一个该充值，一个该换 IP。
+    按 CF 判就会把一个充钱就能用的站永久降权。</p>
+  </div>
+
+  <div class="note">
+    <div class="t">「降权」与「不可接入」是两个独立判断</div>
+    <p>余额不足 → 可接入（充值自愈）、不降权。限流 → 可接入（CPA 自带轮换）、
+    不降权。403 空正文 → 概率性边缘拦截，不代表站点坏，不降权。<br>
+    只有死路 / IP封 / 鉴权 / 门禁这四类才真正降权。</p>
+  </div>
+</div></section>
+
+<section id="s5"><div class="wrap">
+  <div class="sech"><span class="no">05</span><h2>静默换模：比不可用更危险</h2></div>
+  <p class="sub">站方照常计费，却返回另一个模型。HTTP 200，一路绿灯。</p>
+
+  <h3>为什么响应 id 比 model 字段可靠</h3>
+  <p>上游能随手改 <code>model</code> 字段的值，改不了 id 的<b>生成方式</b>。</p>
+
+  <div class="tw"><table>
+    <thead><tr><th>id 形态</th><th>推断的真实后端</th></tr></thead>
+    <tbody>
+      <tr><td class="m">msg_bdrk_…</td><td>AWS Bedrock</td></tr>
+      <tr><td class="m">msg_01 + base58（排除 0OIl）</td><td>Anthropic 官方</td></tr>
+      <tr><td class="m">msg_ + 32 位 hex</td><td>中转自造</td></tr>
+      <tr><td class="m">chatcmpl-…</td><td>OpenAI Chat 兼容，多为中转</td></tr>
+      <tr><td class="m">resp_ + 40 位以上 hex</td><td>OpenAI Responses 官方形态</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3>宽松匹配的边界在哪</h3>
+  <p><code>model_matches(requested, actual)</code> 要放行合法的版本差异，
+  又要抓住降级。两个方向都容易做错：</p>
+
+  <div class="grid2">
+    <div class="card"><div class="h">必须放行</div>
+      <ul>
+        <li><code>actual</code> 为空 —— 无证据不判换模</li>
+        <li>纯数字日期后缀：<code>-20260101</code>、<code>-0827</code></li>
+        <li>能力开关：<code>-thinking</code>、<code>-latest</code></li>
+      </ul></div>
+    <div class="card"><div class="h">必须判换模</div>
+      <ul>
+        <li>档位降级：<code>-mini</code>、<code>-lite</code>、<code>-haiku</code></li>
+        <li>带字母的实验后缀：<code>-exp-0827</code></li>
+        <li>凑巧共享前缀的不同族：<code>gpt-4</code> vs <code>gpt-40</code></li>
+      </ul></div>
+  </div>
+
+  <div class="note b">
+    <div class="t">两个方向都真的踩过</div>
+    <p><b>放行过头：</b>为兼容日期后缀写了裸 <code>startswith</code>，结果把
+    <code>gemini-2.5-flash → gemini-2.5-flash-lite</code> 也判成同一模型。
+    站方拿 lite 冒充 flash 照常计费，探测一路绿灯，条目被写进配置。</p>
+    <p><b>抓得过头：</b>更早的版本在 <code>actual</code> 为空时返回「换模」。
+    真因是响应读取被截断 —— Codex 的 <code>/v1/responses</code> 把 40KB+ 的
+    系统提示放在前面，<code>model</code> 字段排其后被切掉。结果是
+    <b>100% 假换模率</b>。所以现在的规则是：无证据不判换模。</p>
+  </div>
+
+  <h3>截断校验：200 不代表真吃下了那么多</h3>
+  <p>发出 105 万字符，上游回 200 且报 <code>input_tokens: 132696</code> ——
+  重复字符实测约 1 char/token，这个数字远小于发送量，说明上下文被截断了。
+  低于 50% 即视为截断，那个 200 不可信。</p>
+</div></section>
+
+<section id="s6"><div class="wrap">
+  <div class="sech"><span class="no">06</span><h2>定档：这是整个工具最容易做错的部分</h2></div>
+  <p class="sub">CPA 按 priority 分层隔离。插进去不只是「排序靠前一点」。</p>
+
+  <figure>
+  <svg viewBox="0 0 940 300" role="img"
+       aria-label="档位谱示意：现有站分布在 900、465、30、20、10 五个档位，新站插在 465 不劫持 900 的顶层，但会把 30、20、10 三档的站全部挡在其后">
+    <g font-family="var(--f-body)">
+      <!-- 轴 -->
+      <line x1="120" y1="34" x2="120" y2="258" stroke="#DCE3EA" stroke-width="1.5"/>
+      <text x="120" y="24" fill="#6B7C8E" font-size="11" text-anchor="middle">priority 高</text>
+      <text x="120" y="276" fill="#6B7C8E" font-size="11" text-anchor="middle">低</text>
+
+      <!-- 现有档位 -->
+      <g font-size="12">
+        <g fill="#FFFFFF" stroke="#DCE3EA" stroke-width="1.5">
+          <rect x="150" y="42"  width="240" height="34" rx="4"/>
+          <rect x="150" y="150" width="240" height="34" rx="4"/>
+          <rect x="150" y="190" width="240" height="34" rx="4"/>
+          <rect x="150" y="230" width="240" height="34" rx="4"/>
+        </g>
+        <g fill="#16202B" font-weight="600" font-family="var(--f-mono)" font-size="12">
+          <text x="163" y="64">900</text>
+          <text x="163" y="172">30</text>
+          <text x="163" y="212">20</text>
+          <text x="163" y="252">10</text>
+        </g>
+        <g fill="#3A4A5C" font-size="11.5">
+          <text x="210" y="64">在用，顶层</text>
+          <text x="210" y="172">3 个站</text>
+          <text x="210" y="212">4 个站</text>
+          <text x="210" y="252">2 个站</text>
+        </g>
+      </g>
+
+      <!-- 新站插入 -->
+      <g>
+        <rect x="150" y="96" width="240" height="34" rx="4"
+              fill="#E4F0F4" stroke="#0F6E8C" stroke-width="2"/>
+        <text x="163" y="118" fill="#0F6E8C" font-weight="600"
+              font-family="var(--f-mono)" font-size="12">465</text>
+        <text x="210" y="118" fill="#0F6E8C" font-size="11.5" font-weight="600">新站插这里</text>
+      </g>
+
+      <!-- 右侧两类影响 -->
+      <g font-size="12">
+        <path d="M400,59 L470,59" stroke="#2F7D52" stroke-width="1.4"
+              stroke-dasharray="4 3"/>
+        <text x="480" y="56" fill="#2F7D52" font-weight="600" font-size="12.5">未劫持</text>
+        <text x="480" y="72" fill="#6B7C8E" font-size="11">900 仍是首选，它照常被先尝试</text>
+
+        <path d="M400,113 L470,113" stroke="#0F6E8C" stroke-width="1.4"/>
+        <text x="480" y="110" fill="#0F6E8C" font-weight="600" font-size="12.5">但挡住了下面 9 个站</text>
+        <text x="480" y="126" fill="#6B7C8E" font-size="11">它们只在新站也不可用时才被尝试</text>
+        <text x="480" y="142" fill="#6B7C8E" font-size="11">不是「排在后面」，是整层被跳过</text>
+
+        <g stroke="#A83B32" stroke-width="1.3" fill="none">
+          <path d="M395,167 L455,167"/>
+          <path d="M395,207 L455,207"/>
+          <path d="M395,247 L455,247"/>
+        </g>
+        <text x="480" y="196" fill="#A83B32" font-weight="600" font-size="12.5">
+          这三档共 9 个站被 shadow</text>
+        <text x="480" y="212" fill="#6B7C8E" font-size="11">
+          若它们本就实测不可用，挡住零代价</text>
+        <text x="480" y="228" fill="#6B7C8E" font-size="11">
+          若还在用，就是用未知替换已知</text>
+      </g>
+
+      <!-- 关键性质 -->
+      <text x="150" y="292" fill="#A8762A" font-size="11.5" font-weight="600">
+        关键：一个空档内取任何值效果都一样 —— 35、200、465、890 挡的是同一批站</text>
+    </g>
+  </svg>
+  <figcaption>所以「把 priority 调低一点」是没有意义的建议。真正的选择是
+  「插哪个空档」，工具因此直接给出下一档的<b>具体数值</b>和它的代价。</figcaption>
+  </figure>
+
+  <h3>三条硬约束</h3>
+  <div class="grid2">
+    <div class="card"><div class="h">1 · 不动任何现有值</div>
+      <ul><li>只在空档里插</li>
+          <li>现有条目的 priority 一个字节都不改</li></ul></div>
+    <div class="card"><div class="h">2 · 不劫持顶层</div>
+      <ul><li>天花板取该候选<b>所有</b>声明模型现有顶层的 <code>min</code></li>
+          <li>取 max 就会漏掉：同时声明 opus（顶层 1000）与 sonnet（顶层 120）时，
+              插 975 不动 opus，却把 sonnet 的顶层整个换掉</li></ul></div>
+    <div class="card"><div class="h">3 · 试用期默认</div>
+      <ul><li>新站进<b>最低可插档</b>，不按分数抢高档</li>
+          <li>分数变成理由里的「稳定运行后可提到 N」</li>
+          <li><code>--by-score</code> 才按分数一步到位</li></ul></div>
+    <div class="card"><div class="h">影响面按模型分别计算</div>
+      <ul><li>同一站的不同模型可能处在不同档位</li>
+          <li>算一次「站的影响」会漏掉一半</li></ul></div>
+  </div>
+
+  <div class="note w">
+    <div class="t">试用期为什么是默认：一个实测出来的代价</div>
+    <p>一个刚探测完、零运行历史的新站，在 claude 段按分数会拿到 975 ——
+    <b>挡住 6 个已经跑了两夜、证明过自己的站</b>。那 6 个站只在新站也不可用时
+    才被尝试，等于用未知替换已知。</p>
+  </div>
+
+  <h3>哪些站「挡住它零代价」</h3>
+  <p>下层站不是等权的。有两个健康度信号说明「挡住它没有任何损失」：</p>
+  <div class="grid2">
+    <div class="card"><div class="h">weight: 0 —— 强信号</div>
+      <ul><li>CPA 的选择器已经把零权重凭据整个剔除</li>
+          <li>它本来就不会被选中</li>
+          <li>同一站多个 Key 时，<b>全部</b>为 0 才算整站死掉</li></ul></div>
+    <div class="card"><div class="h">注释里的实测结论 —— 弱信号</div>
+      <ul><li><code># xxx：实测 503 No available channel</code></li>
+          <li>注释可能过期，所以只用于<b>降低挡住它的代价</b></li>
+          <li>绝不用它直接排除任何站</li></ul></div>
+  </div>
+
+  <div class="note">
+    <div class="t">站名与域名不保证有公共子串</div>
+    <p>注释里写的是人读短名，配置里是域名。一个叫 <code>SwiftRelay</code> 的站
+    可以住在 <code>api.swiftly.example</code> —— 两者<b>没有</b>公共子串。</p>
+    <p>所以别名表必须从 <code>openai-compatibility</code> 段的 <code>name</code>
+    字段建（那是文件里唯一权威的对应关系），而不是靠字符串猜。
+    早期版本用「短名是域名的某个点分标签」来匹配，那个站因此静默漏判 ——
+    实测 503 的结论对定档完全失效，不报错，只让定档悄悄变保守。</p>
+    <p>反过来也不能做前缀匹配：<code>aliyuncs</code> 会被短名
+    <code>aliyun</code> 命中，把两个不同的站判成同一个。误判方向是
+    <b>把活站当死站</b>，后果是新站拿到过高档位 —— 比漏判严重得多。
+    所以宁可漏，不可错；匹配不上的短名会被记进
+    <code>unmatched_notes</code> 显示给你，让漏判可见。</p>
+  </div>
+</div></section>
+
+<section id="s7"><div class="wrap">
+  <div class="sech"><span class="no">07</span><h2>写回：行级编辑，保注释</h2></div>
+  <p class="sub">不用 <code>yaml.dump</code> —— 那会把配置里几百条排障注释全部丢掉。</p>
+
+  <p>那些注释是「哪个站什么时候为什么被降权」的<b>唯一记录</b>，而定档逻辑
+  本身还要读它们。所以流程是：读原文 → 按行插入 → 写原文。</p>
+
+  <div class="cmd">
+    <div class="bar">写回一个条目的形状（字段顺序与现有文件一致，diff 看起来像手写）</div>
+<pre><span class="c">  # 2026-08-31 批量导入 · 得分 100 · 试用期档位 465</span>
+  - api-key: <span class="k">"sk-…"</span>
+    base-url: <span class="k">"https://relay-x.example"</span>
+    prefix: <span class="k">"ANT"</span>
+    priority: 465
+    models:
+      - name: <span class="k">"claude-opus-5"</span>
+        alias: <span class="k">"claude-opus-5"</span>
+        max-context-length: 200000   <span class="c"># 实测值</span></pre>
+  </div>
+
+  <h3>四个容易做错的细节</h3>
+  <div class="grid2">
+    <div class="card"><div class="h">缩进不猜，从现有条目读</div>
+      <ul><li>四段的缩进未必一致</li>
+          <li>猜错整段结构就变形</li></ul></div>
+    <div class="card"><div class="h">max-context-length 只写在实测过的那个模型上</div>
+      <ul><li>同站不同模型的窗口能差一个数量级</li>
+          <li>把 opus 的实测值抄给 haiku，客户端会按错的窗口定压缩点 ——
+              那正是这个字段要治的 400</li></ul></div>
+    <div class="card"><div class="h">prefix 沿用该段主导值</div>
+      <ul><li>它是<b>额外加一个别名</b>，不取代原名</li>
+          <li>缺它不会让站不可用，但按 <code>ANT/xxx</code> 发的请求命中不到新站</li></ul></div>
+    <div class="card"><div class="h">compat 段按站归并</div>
+      <ul><li>一个 provider = 一个站，多个 Key 挂在 <code>api-key-entries</code> 下</li>
+          <li>每个 Key 生成一个同名 provider 会让模型清单重复 N 遍</li></ul></div>
+  </div>
+
+  <div class="note b">
+    <div class="t">段尾在哪：一个不报错的静默错位</div>
+    <p>这份配置的写法是「下一段的说明注释写在下一段段头<b>之前</b>」。于是
+    gemini 段末尾挂着 32 行属于 codex 的说明、codex 段末尾挂着 89 行属于
+    claude 的说明。</p>
+    <p>如果段尾只回退空行、不回退注释，新条目就插到那些注释<b>后面</b> ——
+    结果 codex 的整段文档注释跑到 gemini 的新条目上面去了。YAML 仍然合法
+    （段头还没出现，条目确实还在上一段里），所以不报错、不失败，
+    只是把注释归属悄悄搞乱。</p>
+  </div>
+
+  <div class="note b">
+    <div class="t">值里的控制字符：能凭空多出一个段</div>
+    <p>标量转 YAML 字面量时，只处理引号是不够的。三种输入各有各的破法：</p>
+    <p>· 以单个反斜杠结尾 → 闭合引号被转义掉，整个文件变成非法 YAML。<br>
+       · 含反斜杠 + n → YAML 读成真换行，Key <b>静默变质</b>（长度都变了）。<br>
+       · 含<b>真换行</b> → 写出的行断成两截。YAML 仍解析成功，但段定位是逐行
+       正则扫描，会把折出来的半行当成真段头 —— 实测能凭空多出一个
+       <code>openai-compatibility:</code> 段，下一次写入插进错误位置。</p>
+    <p>所以控制字符必须在这一层一次性转义掉，保证一个标量只占一个物理行。</p>
+  </div>
+</div></section>
+
+<section id="s8"><div class="wrap">
+  <div class="sech"><span class="no">08</span><h2>生效链：写完盘不等于生效</h2></div>
+  <p class="sub">这一段全是容器与文件系统的细节，但每一条都决定「改了却没生效」。</p>
+
+  <figure>
+  <svg viewBox="0 0 940 196" role="img"
+       aria-label="生效链示意：就地覆写保持 inode 不变，容器内挂载点因此能看到新字节，同时主动 PUT 触发一次确定的重载，最后读回校验确认真的生效">
+    <g font-family="var(--f-body)">
+      <g fill="none" stroke="#DCE3EA" stroke-width="1.5">
+        <rect x="12"  y="60" width="176" height="56" rx="4" fill="#FFFFFF"/>
+        <rect x="252" y="60" width="176" height="56" rx="4" fill="#FFFFFF"/>
+        <rect x="492" y="60" width="176" height="56" rx="4" fill="#FFFFFF"/>
+        <rect x="732" y="60" width="196" height="56" rx="4"
+              fill="#E6F2EA" stroke="#2F7D52" stroke-width="2"/>
+      </g>
+      <g fill="#16202B" font-size="13" font-weight="600" text-anchor="middle">
+        <text x="100" y="82">备份</text>
+        <text x="340" y="82">就地覆写</text>
+        <text x="580" y="82">主动 PUT</text>
+        <text x="830" y="82" fill="#2F7D52">读回校验</text>
+      </g>
+      <g fill="#6B7C8E" font-size="11" text-anchor="middle">
+        <text x="100" y="99">唯一的回滚手段</text>
+        <text x="340" y="99">O_TRUNC，inode 不变</text>
+        <text x="580" y="99">把「可能收到事件」</text>
+        <text x="580" y="112">换成「必然产生一次」</text>
+        <text x="830" y="99">条目数对不上就报失败</text>
+      </g>
+      <g stroke="#6B7C8E" stroke-width="1.4" color="#6B7C8E">
+        <defs><marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5"
+                markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+        <line x1="188" y1="88" x2="246" y2="88" marker-end="url(#ar3)"/>
+        <line x1="428" y1="88" x2="486" y2="88" marker-end="url(#ar3)"/>
+        <line x1="668" y1="88" x2="726" y2="88" marker-end="url(#ar3)"/>
+      </g>
+      <text x="470" y="34" fill="#A83B32" font-size="11.5"
+            text-anchor="middle" font-weight="600">
+        绝不用 tmp + rename —— 那会换 inode</text>
+      <text x="470" y="50" fill="#6B7C8E" font-size="11" text-anchor="middle">
+        单文件 bind mount 在容器启动时把宿主 inode 解析定死了</text>
+      <text x="470" y="152" fill="#6B7C8E" font-size="11" text-anchor="middle">
+        实测症状：宿主机看到新内容 212 条目，容器里的面板停在 206，重启才对上</text>
+      <text x="470" y="172" fill="#6B7C8E" font-size="11" text-anchor="middle">
+        不是「通知没送到」，是 CPA 读的根本是另一个文件</text>
+    </g>
+  </svg>
+  <figcaption>就地覆写的代价是<b>不原子</b> —— 写一半崩溃会留下截断文件。
+  所以备份先算出来，备份成功是执行写入的前置条件。</figcaption>
+  </figure>
+
+  <div class="note w">
+    <div class="t">备份文件名撞名 = 把唯一的退路弄丢</div>
+    <p>备份名只到<b>秒</b>、且复制时撞名直接静默覆盖时：同一秒内写两次
+    （并发写回、脚本连续跑），第二次的备份会把第一次的覆盖掉 ——
+    留下来的是「第一次写完之后」的状态，<b>真正的原始文件没了</b>。</p>
+    <p>而就地覆写本身不原子、失败不回滚，备份是唯一的回滚手段。
+    所以撞名不是「多留一份少留一份」的问题。</p>
+  </div>
+
+  <div class="note b">
+    <div class="t">并发写回：两个请求都以为自己拿的是最新基线</div>
+    <p>服务跑在多线程 HTTP 服务器上。「读文件 → 比对基线 → 校验 → 写盘」
+    这四步之间没有互斥时，两个并发的写回请求会各自比对到<b>同一份</b>
+    未改动的基线、双双通过，然后依次写盘 —— 后写的覆盖掉前一次的全部改动，
+    而给前一个客户端回的仍是 200。</p>
+    <p>顺序执行不会有这个问题（第二次的基线比对会正确地报 409），
+    所以顺序跑的测试抓不到它。修法是把那四步整段放进一把锁。</p>
+  </div>
+</div></section>
+
+<section id="s9"><div class="wrap">
+  <div class="sech"><span class="no">09</span><h2>上手</h2></div>
+  <p class="sub">两条路：网页操作，或命令行。都以 <code>--dry-run</code> 起步。</p>
+
+  <h3>网页（推荐）</h3>
+  <div class="cmd">
+    <div class="bar">CONFIG_PATH 必填 —— 指向你的 config.yaml 绝对路径</div>
+<pre><span class="c"># 1. 准备环境变量</span>
+cp .env.example .env
+<span class="c"># 编辑 .env：CONFIG_PATH=/opt/deploy/config.yaml</span>
+
+<span class="c"># 2. 起服务，拿访问地址与 token</span>
+docker compose up -d
+docker compose logs cpa-upstream-importer | head -20
+
+<span class="c"># 3. 本机开隧道（服务只绑 127.0.0.1，不直接对外）</span>
+ssh -L 8765:127.0.0.1:8765 root@&lt;你的VPS&gt;
+
+<span class="c"># 4. 浏览器打开日志里那个带 token 的地址</span>
+<span class="c"># 5. 用完关掉，别长开 —— 它持有明文 Key</span>
+docker compose stop cpa-upstream-importer</pre>
+  </div>
+
+  <h3>命令行</h3>
+  <div class="cmd">
+    <div class="bar">accounts.txt 每行一组 <code>url,key</code></div>
+<pre><span class="c"># 只看方案，不写任何文件</span>
+python3 cli.py -i accounts.txt --dry-run
+
+<span class="c"># 跳过上下文二分（快很多；上限用 CPA 内置目录值）</span>
+python3 cli.py -i accounts.txt --no-context
+
+<span class="c"># 确认后写回 + 触发重载 + 端到端验证</span>
+python3 cli.py -i accounts.txt --no-context --write --push</pre>
+  </div>
+
+  <div class="note g">
+    <div class="t">先跑测试，再跑真实探测</div>
+    <p><code>python3 tests/run.py</code> 零外网请求、零文件写入，
+    <b>不传 config.yaml 路径也必须全过</b> —— 套件自带最小样本。
+    传路径会多跑一轮真实数据那一轮。</p>
+    <p>还有一个整链演练：<code>python3 tools/rehearse.py</code>
+    起本机假上游跑完整流程，写到临时副本，跑完自检真实文件<b>逐字节未变</b>。</p>
+  </div>
+
+  <h3>三条红线</h3>
+  <div class="grid2">
+    <div class="card"><div class="h">服务只绑 127.0.0.1</div>
+      <ul><li>强制 Bearer token，没有免鉴权模式</li>
+          <li>对外必须经 nginx 加 TLS + IP 白名单</li>
+          <li>别加 basic auth —— 它与前端的 Bearer 抢同一个头</li></ul></div>
+    <div class="card"><div class="h">job 状态只在内存</div>
+      <ul><li>刻意不落库：持久化等于把明文 Key 写到磁盘</li>
+          <li>代价是重启丢失进行中的任务与方案 id</li></ul></div>
+    <div class="card"><div class="h">写回前必看 diff</div>
+      <ul><li>它改的是被多个容器 bind mount 的生产配置</li>
+          <li>换模站、劫持顶层的候选默认<b>不勾选</b></li></ul></div>
+    <div class="card"><div class="h">config.yaml 绝不进仓库</div>
+      <ul><li>含明文上游 Key 与管理密钥哈希</li>
+          <li>一旦推上公开仓库，那些 Key 必须视为已泄露并全部轮换</li></ul></div>
+  </div>
+</div></section>
+
+<section id="s10"><div class="wrap">
+  <div class="sech"><span class="no">10</span><h2>发布：CI 与镜像</h2></div>
+  <p class="sub">GHCR 零配置；Docker Hub 配三项，不配就安静跳过。</p>
+
+  <div class="tw"><table>
+    <thead><tr><th>名称</th><th>放哪</th><th>必填</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td class="m">DOCKERHUB_USERNAME</td><td>Variables</td>
+          <td><span class="pill p-b">是</span></td>
+          <td>用户名，同时是「要不要发 Docker Hub」的开关</td></tr>
+      <tr><td class="m">DOCKERHUB_IMAGE</td><td>Variables</td>
+          <td><span class="pill p-ok">可选</span></td>
+          <td>镜像名。留空 = 用 GitHub 仓库名</td></tr>
+      <tr><td class="m">DOCKERHUB_TOKEN</td><td><b>Secrets</b></td>
+          <td><span class="pill p-b">是</span></td>
+          <td>Access Token，权限 Read &amp; Write 即够</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="note w">
+    <div class="t">用户名放 Variables，token 放 Secrets —— 不能颠倒</div>
+    <p>Variables 在构建日志里是<b>明文</b>；Secrets 会被 Actions 自动打码。
+    把 token 放进 Variables 等于把它印在每一次构建日志上。</p>
+    <p>另外：<b>两项必填都要有</b>才会发布。只设用户名、稍后再加 token 是很
+    自然的操作顺序，而那样会让每次构建都红在 401 上，且看不出是「token 还没配」。</p>
+  </div>
+
+  <div class="note">
+    <div class="t">secrets 上下文在 steps 的 if: 里不可用</div>
+    <p>官方的 Context availability 表里，<code>jobs.&lt;job_id&gt;.steps.if</code>
+    允许的是 <code>github, needs, strategy, matrix, job, runner, env, vars,
+    steps, inputs</code> —— <b>没有 secrets</b>。</p>
+    <p>写 <code>if: secrets.X != ''</code> 不报错，只是恒为空，那一步会
+    <b>永远被跳过</b>：「配好了却不发布」而且毫无提示，比直接失败更难查。
+    正确做法是在 job 级 <code>env</code> 里算一个旗标（那一层允许 secrets），
+    步骤只看旗标。</p>
+  </div>
+
+  <h3>发布前必做：隐去域名</h3>
+  <p>要隐去的有两类，第二类最容易漏：</p>
+  <div class="grid2">
+    <div class="card"><div class="h">自有域名</div>
+      <ul><li>客户端入口、管理面板、本服务自身、自己作为上游时的域名</li>
+          <li>同一域名四种角色，替换目标各不相同</li></ul></div>
+    <div class="card"><div class="h">第三方中转站域名</div>
+      <ul><li>它们是排障案例的<b>主体</b></li>
+          <li>公开出去等于公布「我在用这些站、它们各自什么毛病」</li>
+          <li>散在 20 个文件里，比想象的多得多</li></ul></div>
+  </div>
+
+  <div class="cmd">
+    <div class="bar">替换脚本自带备份；替换后测试必须仍全过</div>
+<pre>python3 tools/scrub_domains.py --dry-run   <span class="c"># 先看会改什么</span>
+python3 tools/scrub_domains.py            <span class="c"># 真改</span>
+python3 tests/run.py                      <span class="c"># 必须仍全过</span>
+git status --short                        <span class="c"># 确认没有 config.yaml / .env</span></pre>
+  </div>
+
+  <div class="note b">
+    <div class="t">占位符怎么取名会影响测试是否通过</div>
+    <p>这不是洁癖，是三条真实约束：</p>
+    <p>1 · <b>字母按原名字母序分配</b>。有断言把运行时 <code>sorted()</code>
+    的结果和源码里的字面量比对，字母乱分配会让两边排序不一致 —— 测试失败，
+    而原因跟被测逻辑毫无关系。<br>
+    2 · <b>短名 == 域名首标签</b>。无别名表时的兜底匹配靠这个性质。<br>
+    3 · <b>但有一对故意不共享子串</b>。「必须靠别名表才认得」那条断言靠它。
+    只顾 2 不顾 3，那条断言就恒真而不再验证任何东西。</p>
+    <p>另外，测试里当作<b>前缀误匹配反例</b>的几个域名刻意<b>不</b>替换 ——
+    换成占位符后那条断言会恒真。</p>
+  </div>
+</div></section>
+
+<footer><div class="wrap">
+  <p>本教程与代码同仓库。命令与判定规则若与代码不一致，以代码为准 ——
+  代码里每条判定的注释都写明了它对应哪一次实测教训。</p>
+  <p>设计文档见 <code>docs/upstream-import-spec.md</code>，
+  贡献指南见 <code>CONTRIBUTING.md</code>。</p>
+</div></footer>
+</body>
+</html>

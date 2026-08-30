@@ -1,0 +1,890 @@
+/* 投喂台 —— 前端逻辑。原生 JS，无构建步骤，VPS 上直接跑。
+ *
+ * 进度回报走 HTTP 轮询（与 CPAMP 现有做法一致），不引入 SSE/WebSocket。
+ * token 存 sessionStorage —— 关标签页即失效，不留在 localStorage 里。
+ */
+'use strict';
+
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => [].slice.call(document.querySelectorAll(s));
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
+  (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmt = (n) => (n == null ? '—' : Number(n).toLocaleString('en-US'));
+
+const SECTION_LABEL = {
+  'gemini-api-key': 'gemini',
+  'codex-api-key': 'codex',
+  'claude-api-key': 'claude',
+  'openai-compatibility': 'compat',
+};
+
+// 判定类别 → 徽标样式。与后端 classify 的类别名一一对应。
+const CAT_PILL = {
+  '可用': 'p-ok', '余额': 'p-w', '限流': 'p-w', '边缘': 'p-w', '反测活': 'p-w',
+  '临时': 'p-w', '限频': 'p-w', '门禁': 'p-b', 'IP封': 'p-b', '死路': 'p-b',
+  '鉴权': 'p-b', '注入': 'p-i', '未知': 'p-m',
+};
+
+const THEMES = ['midnight', 'parchment', 'neon'];
+
+const S = {
+  token: '',
+  ctx: null,
+  jobId: null,
+  cursor: 0,
+  timer: null,
+  results: null,
+  planId: null,
+  plans: null,
+  overrides: {},        // {host: {section: {...}}}
+  picks: null,          // Set("host\u0000section")，null = 尚未初始化
+  reuseSaved: 0,        // 形态复用省下的请求数
+};
+
+const pk = (host, sec) => `${host}\u0000${sec}`;
+
+// ── 主题：三套，存 localStorage（这个不含秘密，可持久） ──
+function applyTheme(t) {
+  if (!THEMES.includes(t)) t = THEMES[0];
+  document.documentElement.setAttribute('data-theme', t);
+  try { localStorage.setItem('importer_theme', t); } catch { /* 隐私模式 */ }
+  $$('#themes button').forEach((b) => b.classList.toggle('on', b.dataset.t === t));
+}
+$('#themes').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-t]');
+  if (b) applyTheme(b.dataset.t);
+});
+(() => {
+  let t = THEMES[0];
+  try { t = localStorage.getItem('importer_theme') || t; } catch { /* ignore */ }
+  applyTheme(t);
+})();
+
+// ── 鉴权 ──
+async function api(path, opts = {}) {
+  const o = Object.assign({ headers: {} }, opts);
+  o.headers['Authorization'] = 'Bearer ' + S.token;
+  if (o.body && typeof o.body !== 'string') {
+    o.headers['Content-Type'] = 'application/json';
+    o.body = JSON.stringify(o.body);
+  }
+  const r = await fetch(path, o);
+  const txt = await r.text();
+  let data;
+  try { data = JSON.parse(txt); } catch { data = { error: txt.slice(0, 400) }; }
+  if (!r.ok) throw Object.assign(new Error(data.error || r.statusText),
+    { data, status: r.status });
+  return data;
+}
+
+function step(n) {
+  $$('.rstep').forEach((el) => {
+    const s = +el.dataset.s;
+    el.classList.toggle('on', s === n);
+    el.classList.toggle('done', s < n);
+  });
+}
+
+async function boot() {
+  const q = new URLSearchParams(location.search);
+  S.token = q.get('token') || sessionStorage.getItem('importer_token') || '';
+  if (S.token) {
+    sessionStorage.setItem('importer_token', S.token);
+    // 别把 token 留在地址栏 —— 会进浏览器历史
+    if (q.get('token')) history.replaceState(null, '', location.pathname);
+  }
+  if (!S.token) { $('#gate').hidden = false; return; }
+  try {
+    S.ctx = await api('/api/context');
+  } catch (e) {
+    sessionStorage.removeItem('importer_token');
+    $('#gate').hidden = false;
+    if (e.status !== 401) {
+      $('#gate .panel').insertAdjacentHTML('beforeend',
+        `<div class="err">${esc(e.message)}</div>`);
+    }
+    return;
+  }
+  $('#app').hidden = false;
+  const entries = Object.values(S.ctx.sections).reduce((a, b) => a + b.entries, 0);
+  $('#cfgmeta').textContent =
+    `${S.ctx.lines.toLocaleString()} 行 · ${entries} 条目`;
+  renderBands();
+}
+
+$('#toksave').onclick = () => {
+  const v = $('#tokin').value.trim();
+  if (!v) return;
+  sessionStorage.setItem('importer_token', v);
+  location.reload();
+};
+$('#tokin').onkeydown = (e) => { if (e.key === 'Enter') $('#toksave').click(); };
+
+// ── 档位谱 ──
+// 站是死的还是活的 —— 决定「挡住它」有没有代价。
+// dead   = weight:0，CPA 的 selector 已把它整个剔除（强信号）
+// unwell = config.yaml 注释里记着实测不可用（弱信号，可能过期）
+function hostState(b, host) {
+  const h = String(host || '').toLowerCase();
+  if ((b.dead_hosts || []).some((x) => String(x).toLowerCase() === h)) return 'dead';
+  if ((b.unhealthy_hosts || []).some((x) => String(x).toLowerCase() === h)) return 'unwell';
+  return 'live';
+}
+
+function renderBands() {
+  const box = $('#bands');
+  box.innerHTML = S.ctx.section_order.map((sec) => {
+    const b = S.ctx.sections[sec];
+    const gapSet = new Map(b.gaps.map(([lo, hi]) => [hi, [lo, hi]]));
+    const rows = [];
+    b.tiers.forEach((p) => {
+      // 逐站标出死活 —— 「这一档挡住 9 个站」与「这一档挡住 9 个**死**站」
+      // 是完全不同的两件事，只报数字会让人误判风险。
+      const hs = (b.hosts_at[String(p)] || []).map((h) => {
+        const st = hostState(b, h);
+        if (st === 'dead') {
+          return `<span class="hdead" title="weight:0 —— CPA 已把它逐出调度池，挡住它零代价">${esc(h)} ✗</span>`;
+        }
+        if (st === 'unwell') {
+          return `<span class="hunwell" title="config.yaml 注释里记着实测不可用（弱信号，可能过期）">${esc(h)} ⚠</span>`;
+        }
+        return esc(h);
+      }).join('、');
+      rows.push(`<div class="tier"><span class="p">${p}</span>
+        <span class="h">${hs}</span></div>`);
+      const g = gapSet.get(p);
+      if (g) {
+        rows.push(`<div class="tier gap"><span class="p">${g[0]}↔${g[1]}</span>
+          <span class="h">空档 ${g[1] - g[0]}</span></div>`);
+      }
+    });
+
+    // 顶层是不是单点 —— 层级隔离下这决定「该段一挂就整段不可用」
+    const topHosts = b.hosts_at[String(b.top)] || [];
+    const topLive = topHosts.filter((h) => hostState(b, h) === 'live');
+    let warn = '';
+    if (topHosts.length && topLive.length === 0) {
+      warn = `<div class="tier bad">顶层 ${b.top} 的站全部实测不可用 ——
+        <b>该段现在应该完全不可用</b>。层级隔离下下层一个都轮不到。</div>`;
+    } else if (new Set(topHosts).size === 1) {
+      warn = `<div class="tier warn">顶层只有 1 个站（${esc(topHosts[0])}）——
+        <b>单点</b>。它一挂整段立刻不可用，下层站一个都顶不上。</div>`;
+    }
+
+    // 注释里提到却匹配不上任何站的短名 —— 静默漏判的可见化
+    let unmatched = '';
+    if ((b.unmatched_notes || []).length) {
+      unmatched = `<div class="tier warn">注释里的
+        ${b.unmatched_notes.length} 个短名匹配不上任何站
+        （${esc(b.unmatched_notes.join('、'))}）——
+        它们的「实测不可用」结论<b>没作用到定档上</b>。
+        成因：别名表只能从 compat 段的 name 字段建，
+        把这些站也加进 compat 段即可修复。</div>`;
+    }
+
+    const nDead = (b.dead_hosts || []).length;
+    const nUnwell = (b.unhealthy_hosts || []).length;
+    const health = (nDead || nUnwell)
+      ? ` · <span class="hint">${nDead ? nDead + ' 死' : ''}${nDead && nUnwell ? ' / ' : ''}${nUnwell ? nUnwell + ' 疑' : ''}</span>`
+      : '';
+
+    return `<div class="band">
+      <div class="bt"><b>${esc(SECTION_LABEL[sec] || sec)}</b>
+        <span>${b.entries} 条目 · ${b.tiers.length} 档 · 顶 ${b.top}${health}</span></div>
+      ${warn}${unmatched}${rows.join('')}
+    </div>`;
+  }).join('');
+  $('#pbands').hidden = false;
+}
+
+// ── 输入 ──
+function readFile(f) {
+  if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => { $('#input').value = rd.result; doParse(); };
+  rd.readAsText(f, 'utf-8');
+}
+$('#drop').onclick = () => $('#file').click();
+$('#file').onchange = (e) => readFile(e.target.files[0]);
+['dragover', 'dragenter'].forEach((ev) => $('#drop').addEventListener(ev, (e) => {
+  e.preventDefault(); $('#drop').classList.add('over');
+}));
+['dragleave', 'drop'].forEach((ev) => $('#drop').addEventListener(ev, (e) => {
+  e.preventDefault(); $('#drop').classList.remove('over');
+}));
+$('#drop').addEventListener('drop', (e) => readFile(e.dataTransfer.files[0]));
+$('#o_ctx').onchange = () => { $('#costnote').hidden = !$('#o_ctx').checked; };
+
+$('#btnparse').onclick = doParse;
+
+async function doParse() {
+  const text = $('#input').value;
+  if (!text.trim()) { $('#parsemsg').textContent = '输入为空'; return; }
+  let d;
+  try { d = await api('/api/parse', { method: 'POST', body: { text } }); }
+  catch (e) {
+    $('#parsemsg').innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
+    return;
+  }
+
+  // 同主机分组 —— 让「第 2 个 key 起复用形态」这件事在解析阶段就可见
+  const byHost = {};
+  d.valid.forEach((r) => { (byHost[r.host] = byHost[r.host] || []).push(r); });
+  const hosts = Object.keys(byHost);
+  const dupHosts = hosts.filter((h) => byHost[h].length > 1);
+
+  const rows = d.valid.map((r, i) => {
+    const n = byHost[r.host].length;
+    const first = byHost[r.host][0] === r;
+    return `<tr>
+      <td class="num">${r.line_no}</td>
+      <td class="m"><b>${esc(r.host)}</b>${n > 1
+        ? ` <span class="pill p-i">${first ? '首个 · 全量探测' : '复用形态'}</span>` : ''}</td>
+      <td class="m">${esc(r.key_masked)}</td>
+      <td class="m" style="color:var(--ink-3)">${S.ctx.section_order
+        .map((s) => `${SECTION_LABEL[s]}: ${esc(r.bases[s].replace(/^https?:\/\//, ''))}`)
+        .join('<br>')}</td>
+    </tr>`;
+  }).join('');
+
+  const bad = d.invalid.map((r) => `<tr class="off">
+    <td class="num">${r.line_no}</td>
+    <td colspan="3"><span class="pill p-b">${esc(r.error)}</span>
+      <div class="mlist" style="margin-top:5px">${esc(r.raw || '')}</div></td>
+  </tr>`).join('');
+
+  $('#parsebody').innerHTML = `
+    <div class="stat">
+      <span>有效 <b>${d.valid.length}</b></span>
+      <span>无效 <b>${d.invalid.length}</b></span>
+      <span>主机 <b>${hosts.length}</b></span>
+    </div>
+    ${dupHosts.length ? `<div class="note g">
+      ${dupHosts.length} 个主机有多个 Key（${esc(dupHosts.join('、'))}）——
+      <b>段形态只探一次</b>，之后每个 Key 只验凭证本身。
+      预计省下约 ${d.valid.length - hosts.length} 轮全量探测。</div>` : ''}
+    <div class="tw"><table>
+      <thead><tr>
+        <th style="width:56px">行</th><th>主机</th>
+        <th style="width:190px">Key（脱敏）</th><th>四段 base-url</th>
+      </tr></thead>
+      <tbody>${rows}${bad}</tbody></table></div>`;
+  $('#pparse').hidden = false;
+  $('#btnprobe').disabled = d.valid.length === 0;
+  $('#parsemsg').textContent = d.valid.length
+    ? `${d.valid.length} 行可探测 · ${hosts.length} 个主机` : '没有有效行';
+}
+
+// ── 探测 ──
+$('#btnprobe').onclick = async () => {
+  const body = {
+    text: $('#input').value,
+    opts: {
+      probe_context: $('#o_ctx').checked,
+      proxy: $('#o_proxy').checked ? 'http://mihomo:7890' : '',
+      gap: parseFloat($('#o_gap').value) || 0,
+      swap_samples: parseInt($('#o_swap').value, 10) || 0,
+      // 并行度。关掉时退回完全串行（老行为）—— 留这个开关是为了
+      // 万一撞上「按账号而非按端点」限频的站，能一键回到旧节奏。
+      // 并行不会放松任何站的限频：节流按 (host, section) 分桶，同段
+      // 之间仍严格保持 gap 秒。
+      workers: $('#o_fast').checked ? 4 : 1,
+      candidate_workers: $('#o_fast').checked ? 4 : 1,
+    },
+  };
+  let d;
+  try { d = await api('/api/probe', { method: 'POST', body }); }
+  catch (e) {
+    $('#parsemsg').innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
+    return;
+  }
+
+  S.jobId = d.job_id; S.cursor = 0; S.picks = null; S.reuseSaved = 0;
+  $('#p1').hidden = true; $('#pparse').hidden = true; $('#p2').hidden = false;
+  $('#stream').innerHTML = ''; $('#spin').hidden = false;
+  $('#st_saved').textContent = '';
+  step(2);
+  poll();
+};
+
+// 轮询断了之后的出路。任务在服务端照常跑完，不该让用户重跑 293 秒。
+function showResume() {
+  const box = $('#p2resume');
+  if (!box) return;
+  box.hidden = false;
+  $('#resumeid').textContent = `任务 ${S.jobId}`;
+  // 断连期间的事件已经错过了 —— cursor 归零，重新拉全部日志，
+  // 这样流水与统计都能对上，而不是从断点接一段残缺的。
+  $('#btnresume').onclick = () => {
+    box.hidden = true;
+    S.pollFails = 0;
+    S.cursor = 0;
+    $('#stream').innerHTML = '';
+    $('#spin').hidden = false;
+    $('#p2h').textContent = '② 探测中';
+    $('#p2tag').textContent = '已接回，正在重新拉取完整日志';
+    poll();
+  };
+}
+
+function poll() {
+  clearTimeout(S.timer);
+  S.timer = setTimeout(async () => {
+    let d;
+    try { d = await api(`/api/job/${S.jobId}?since=${S.cursor}`); }
+    catch (e) {
+      // 轮询失败**必须重试**，不能就此放弃。
+      //
+      // 实测踩到：一次探测跑了 293 秒，中途轮询断了一下，UI 就永久停在
+      // 「② 探测中」——转圈不停、不重试、不给出路，而后端其实已经跑完了。
+      // 长任务下断连是常态：nginx 默认 60 秒读超时、笔记本休眠、切换网络
+      // 都会断。任务在服务端照常跑，前端没有理由因为一次失败就自我放弃。
+      //
+      // 401 例外：token 失效了，重试一万次也没用，直接让用户重新登录。
+      if (e.status === 401) {
+        $('#spin').hidden = true;
+        $('#p2h').textContent = '② 登录已失效';
+        $('#p2tag').textContent = '任务仍在服务端运行。重新登录后可用下面的按钮接回';
+        $('#stream').insertAdjacentHTML('beforeend',
+          `<div class="s5">凭据失效（401）。任务 ${esc(S.jobId)} 仍在跑，
+           重新登录后点「接回任务」即可继续看进度。</div>`);
+        showResume();
+        return;
+      }
+      S.pollFails = (S.pollFails || 0) + 1;
+      $('#stream').insertAdjacentHTML('beforeend',
+        `<div class="s4">  轮询第 ${S.pollFails} 次失败（${esc(e.message)}）——
+         任务仍在服务端跑，${S.pollFails >= 20 ? '已停止自动重试' : '继续重试'}</div>`);
+      if (S.pollFails >= 20) {
+        // 连续 20 次（约 1 分钟）都不通，多半不是抖动。停下来给出路，
+        // 而不是无限刷日志。
+        $('#spin').hidden = true;
+        $('#p2h').textContent = '② 轮询中断';
+        $('#p2tag').textContent = '任务可能仍在服务端运行 —— 用下面的按钮接回';
+        showResume();
+        return;
+      }
+      poll();
+      return;
+    }
+    S.pollFails = 0;          // 通了就清零，只关心**连续**失败
+    S.cursor = d.event_cursor;
+    renderStream(d.events);
+    $('#st_rows').textContent = `${d.done_rows}/${d.total_rows}`;
+    $('#st_calls').textContent = d.calls;
+    $('#st_time').textContent = d.elapsed;
+    $('#prog').style.width =
+      (d.total_rows ? d.done_rows / d.total_rows * 100 : 0) + '%';
+    if (S.reuseSaved > 0) {
+      $('#st_saved').innerHTML =
+        `复用省下 <b>${S.reuseSaved}</b> 轮`;
+    }
+
+    if (d.state === 'done') {
+      // 探测完成：停转圈、把标题从「探测中」改成「探测完成」。
+      // 面板本身**不隐藏** —— 那份流水日志是判定依据，用户要能回看
+      // （哪个段在哪个 combo 上通的、403 出现几次）。只是不再假装在跑。
+      $('#spin').hidden = true;
+      $('#p2h').textContent = '② 探测完成';
+      $('#p2tag').textContent =
+        `${d.calls} 次请求 · ${d.elapsed}s · 日志保留在下方可回看`;
+      S.results = d.results;
+      // renderResults 必须包起来。它抛异常时（某个字段形状没料到）原来会
+      // 变成 unhandled rejection —— 转圈已停但第 3 步不出现，页面看着像
+      // 「探测完了却卡住」，而控制台外没有任何线索。宁可显示错误也不要静默。
+      try {
+        renderResults(d.results);
+      } catch (e) {
+        $('#p2').insertAdjacentHTML('beforeend',
+          `<div class="err">结果渲染失败：${esc(e.message)}<br>
+           <span class="hint">探测本身已完成，数据在服务端。
+           这是前端渲染的 bug —— 上面的流水日志仍可用于人工判定。</span>
+           <pre>${esc((e.stack || '').slice(0, 600))}</pre></div>`);
+      }
+      return;
+    }
+    if (d.state === 'error') {
+      $('#spin').hidden = true;
+      $('#p2h').textContent = '② 探测出错';
+      $('#p2').insertAdjacentHTML('beforeend',
+        `<div class="err">探测出错<pre>${esc(d.error)}</pre></div>`);
+      return;
+    }
+    poll();
+  }, 900);
+}
+
+const pad = (s, n) => esc(String(s == null ? '' : s).padEnd(n));
+
+function renderStream(events) {
+  if (!events.length) return;
+  const box = $('#stream');
+  const html = events.map((e) => {
+    if (e.kind === 'candidate-start') {
+      return `<div class="hd">── ${esc(e.host)}  ${esc(e.key || '')}</div>`;
+    }
+    if (e.kind === 'candidate-done') {
+      return `<div class="hd">   可用段 [${esc((e.usable || [])
+        .map((s) => SECTION_LABEL[s]).join(' '))}] · ${e.calls} 次请求</div>`;
+    }
+    if (e.kind === 'proxy-precheck') {
+      return e.ok
+        ? `<div class="note">  代理预检通过：${esc(e.detail)}</div>`
+        : `<div class="s4">  代理预检不通，本轮跳过全部 via-proxy —— ${esc(e.detail)}</div>`;
+    }
+    if (e.kind === 'shape-reused') {
+      S.reuseSaved += 1;
+      return `<div class="note">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `复用主机形态${e.verified ? (e.ok ? '（凭证已验）' : `（凭证不通：${esc(e.reason || '')}）`)
+          : `（${esc(e.reason || '')}）`}</div>`;
+    }
+    if (e.kind === 'shape-reuse-abort') {
+      return `<div class="s4">  ${pad(SECTION_LABEL[e.section], 8)} `
+        + `${esc(e.reason || '')}</div>`;
+    }
+    if (e.kind === 'attempt') {
+      const c = e.status === '200' ? 's2' : (e.status[0] === '4' ? 's4' : 's5');
+      return `<div class="${c}">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `${pad(e.model, 20)} ${pad(e.combo, 18)} ${pad(e.status, 5)} `
+        + `${esc(e.category)}</div>`;
+    }
+    if (e.kind === 'catalog') {
+      return `<div>  ${pad(SECTION_LABEL[e.section], 8)} /models 目录 ${e.count} 个`
+        + `（已按 gemini/gpt/claude 过滤）</div>`;
+    }
+    if (e.kind === 'model-rejected') {
+      return `<div class="s4">  ${pad(SECTION_LABEL[e.section], 8)} `
+        + `拒收：请求 ${esc(e.requested)} 却回 ${esc(e.actual)}（${esc(e.backend)}）</div>`;
+    }
+    if (e.kind === 'swap') {
+      return `<div class="s4">  ${pad(SECTION_LABEL[e.section], 8)} `
+        + `静默换模 ${e.rate_pct}%（${esc(e.model)}）</div>`;
+    }
+    if (e.kind === 'context') {
+      return `<div class="s2">  ${pad(SECTION_LABEL[e.section], 8)} `
+        + `上下文上限 ${fmt(e.limit)}${e.untrusted ? '（由截断反推）' : ''}</div>`;
+    }
+    if (e.kind === 'context-declared') {
+      // 上游在超限错误里**明说**了上限 —— 省掉整轮二分（最多 5 次百万字符
+      // 请求）。这件事值得显示：它解释了为什么这个段没跑满二分轮次。
+      return `<div class="s2">  ${pad(SECTION_LABEL[e.section], 8)} `
+        + `上游自报上限 ${fmt(e.limit)} —— 免掉二分（${esc(e.model)}）</div>`;
+    }
+    if (e.kind === 'section-error') {
+      // 某段探测抛异常。另外三段照常跑完，但这一段的失败必须可见 ——
+      // 不显示的话它会表现成「这个段莫名不可用」。
+      return `<div class="s5">  ${pad(SECTION_LABEL[e.section], 8)} `
+        + `探测异常：${esc(e.error)}</div>`;
+    }
+    if (e.kind === 'section-done') {
+      // 逐段收尾。并行下四段完成先后是乱的，这行让顺序可追溯。
+      return `<div class="${e.usable ? 's2' : 's4'}">  `
+        + `${pad(SECTION_LABEL[e.section], 8)} `
+        + `${e.usable ? '✓' : '✗'} ${esc(e.summary || '')}</div>`;
+    }
+    // 兜底：未认识的事件类型也要留痕，不能静默丢弃 ——
+    // 静默丢弃会让「后端加了新事件、前端忘了处理」这种失配无从发现。
+    if (e.kind && e.kind !== 'attempt') {
+      return `<div class="s4">  [${esc(e.kind)}] ${esc(JSON.stringify(e)
+        .slice(0, 160))}</div>`;
+    }
+    return '';
+  }).join('');
+  box.insertAdjacentHTML('beforeend', html);
+  box.scrollTop = box.scrollHeight;
+}
+
+// ── 结果：每列都有表头，系统预勾选 ──
+function renderResults(results) {
+  $('#results').innerHTML = results.map(siteCard).join('');
+  $('#p3').hidden = false;
+  step(3);
+  bindResultEvents();
+  refreshPlan(true);
+  $('#p3').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function siteCard(r) {
+  const host = r.row.host;
+  const rows = S.ctx.section_order.map((sec) => {
+    const v = r.sections[sec];
+    if (!v) return '';
+    const label = SECTION_LABEL[sec] || sec;
+
+    if (!v.usable) {
+      const pill = CAT_PILL[v.category] || 'p-m';
+      const last = (v.attempts || []).filter((a) => a.status !== '200').slice(-1)[0];
+      return `<tr class="off">
+        <td class="pick">—</td>
+        <td class="m"><b>${esc(label)}</b></td>
+        <td><span class="pill ${pill}">${esc(v.category || '不可用')}</span></td>
+        <td>${esc(v.action || '不写入')}
+          ${last && last.excerpt
+            ? `<div class="mlist">${esc(last.status)} · ${esc(last.excerpt.slice(0, 150))}</div>`
+            : ''}</td>
+        <td colspan="4" class="hint">不写入</td>
+      </tr>`;
+    }
+
+    const flags = [];
+    if (v.need_proxy) flags.push('<span class="pill p-w">需代理</span>');
+    if (Object.keys(v.min_headers || {}).length) {
+      flags.push(`<span class="pill p-i">需 ${esc(Object.keys(v.min_headers).join('+'))}</span>`);
+    }
+    if (v.swap_detected) {
+      flags.push(`<span class="pill p-b">换模 ${v.swap.rate_pct}%</span>`);
+    }
+    const backends = Object.keys((v.swap && v.swap.backends) || {});
+
+    return `<tr data-host="${esc(host)}" data-sec="${esc(sec)}">
+      <td class="pick"><input type="checkbox" class="sel"
+        data-host="${esc(host)}" data-sec="${esc(sec)}"></td>
+      <td class="m"><b>${esc(label)}</b></td>
+      <td><span class="pill p-ok">可用</span></td>
+      <td>
+        <div class="mlist">${esc(v.models.join(', ')) || '<span class="hint">无可信模型</span>'}</div>
+        ${backends.length ? `<div class="hint">后端 ${esc(backends.join(' / '))}</div>` : ''}
+      </td>
+      <td class="num">${v.max_context_length ? fmt(v.max_context_length) : '—'}
+        ${v.context_untrusted ? '<div class="hint">截断反推</div>' : ''}
+        ${v.context_model ? `<div class="hint">@${esc(v.context_model)}</div>` : ''}</td>
+      <td>${flags.join(' ') || '<span class="hint">直连即可</span>'}</td>
+      <td class="prio">
+        <div class="pedit"><input type="number" class="pi"
+          data-host="${esc(host)}" data-sec="${esc(sec)}" placeholder="待定"></div>
+      </td>
+      <td class="rsn"><span class="hint">计算中…</span></td>
+    </tr>
+    <tr class="wrow" data-host="${esc(host)}" data-sec="${esc(sec)}">
+      <td></td><td colspan="7" class="wbox"></td>
+    </tr>`;
+  }).join('');
+
+  return `<div class="site">
+    <div class="sh">
+      <span class="h">${esc(host)}</span>
+      <span class="pill p-m">${esc(r.row.key_masked)}</span>
+      <div class="sp"></div>
+      <span class="hint">${r.total_calls} 次请求 · 可用 ${r.usable_sections.length}/4 段</span>
+    </div>
+    <div class="tw"><table>
+      <thead><tr>
+        <th style="width:44px">写入</th>
+        <th style="width:88px">段</th>
+        <th style="width:96px">判定</th>
+        <th>可信模型</th>
+        <th style="width:118px">上下文上限</th>
+        <th style="width:150px">处置</th>
+        <th style="width:132px">priority</th>
+        <th style="width:290px">系统建议</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+  </div>`;
+}
+
+function bindResultEvents() {
+  const box = $('#results');
+  box.addEventListener('change', (e) => {
+    const inp = e.target.closest('.pi');
+    if (inp) {
+      const h = inp.dataset.host, s = inp.dataset.sec;
+      S.overrides[h] = S.overrides[h] || {};
+      S.overrides[h][s] = Object.assign(S.overrides[h][s] || {},
+        { priority: parseInt(inp.value, 10) });
+      refreshPlan(true);
+      return;
+    }
+    const sel = e.target.closest('.sel');
+    if (sel) {
+      const key = pk(sel.dataset.host, sel.dataset.sec);
+      if (sel.checked) S.picks.add(key); else S.picks.delete(key);
+      syncPickUI();
+    }
+  });
+
+  const pb = $('#o_probation');
+  if (pb) {
+    pb.onchange = () => {
+      // 切模式要清掉手工 priority，否则旧值会盖住重算结果
+      Object.values(S.overrides).forEach((bySec) => {
+        Object.values(bySec).forEach((ov) => { delete ov.priority; });
+      });
+      $$('#results .pi').forEach((i) => { i.value = ''; });
+      refreshPlan(true);
+    };
+  }
+
+  $('#pickrec').onclick = () => { applyPickPreset('rec'); };
+  $('#pickall').onclick = () => { applyPickPreset('all'); };
+  $('#picknone').onclick = () => { applyPickPreset('none'); };
+}
+
+function applyPickPreset(mode) {
+  if (!S.plans) return;
+  S.picks = new Set();
+  S.plans.forEach((p) => {
+    Object.entries(p.sections).forEach(([sec, sp]) => {
+      if (!sp.writable) return;
+      if (mode === 'all' || (mode === 'rec' && sp.recommended)) {
+        S.picks.add(pk(p.host, sec));
+      }
+    });
+  });
+  syncPickUI();
+}
+
+function syncPickUI() {
+  $$('#results .sel').forEach((el) => {
+    el.checked = S.picks.has(pk(el.dataset.host, el.dataset.sec));
+    const tr = el.closest('tr');
+    if (tr) tr.classList.toggle('rec', el.checked);
+  });
+  const n = S.picks ? S.picks.size : 0;
+  $('#pickstat').textContent = n ? `已勾选 ${n} 项写入` : '未勾选任何项';
+  $('#btnplan').disabled = n === 0;
+}
+
+// ── 方案 ──
+async function refreshPlan(silent) {
+  let d;
+  const body = {
+    job_id: S.jobId,
+    overrides: S.overrides,
+    // 勾选框是「试用期定档」；服务端收反义的 by_score。
+    // 元素缺失时回退到试用期（安全侧），不回退到激进档。
+    by_score: $('#o_probation') ? !$('#o_probation').checked : false,
+  };
+  // 只有用户明确动过勾选才传 selected；首次让后端返回全部以便读 recommended
+  if (S.picks) {
+    body.selected = [...S.picks].map((k) => k.split('\u0000'));
+  }
+  try { d = await api('/api/plan', { method: 'POST', body }); }
+  catch (e) {
+    if (!silent) $('#planmeta').innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    return null;
+  }
+  S.planId = d.plan_id; S.plans = d.plans;
+
+  // 首次：按系统建议预勾选
+  if (S.picks === null) {
+    applyPickPreset('rec');
+    // 预勾选变了选择集，重取一次让 diff 与勾选一致
+    return refreshPlan(true);
+  }
+
+  d.plans.forEach((p) => {
+    Object.entries(p.sections).forEach(([sec, sp]) => {
+      const tr = document.querySelector(
+        `#results tr[data-host="${cssq(p.host)}"][data-sec="${cssq(sec)}"]:not(.wrow)`);
+      if (!tr) return;
+      const inp = tr.querySelector('.pi');
+      if (inp && !inp.value) inp.value = sp.priority;
+      const rsn = tr.querySelector('.rsn');
+      if (rsn) {
+        const cls = sp.recommended ? 'p-ok' : (sp.writable ? 'p-w' : 'p-m');
+        const tag = sp.recommended ? '建议写入'
+          : (sp.writable ? '需人工确认' : '不可写入');
+        rsn.innerHTML = `<span class="pill ${cls}">${tag}</span>
+          <div class="hint" style="margin-top:5px">${esc(sp.recommend_reason)}</div>
+          <div class="hint">${esc(sp.priority_reason)}</div>`;
+      }
+      const wrow = document.querySelector(
+        `#results tr.wrow[data-host="${cssq(p.host)}"][data-sec="${cssq(sec)}"]`);
+      if (wrow) {
+        const wb = wrow.querySelector('.wbox');
+        const html = (sp.duplicate
+          ? `<div class="warn b">已存在：${esc(sp.duplicate_note)}</div>` : '')
+          + sp.warnings.map((w) =>
+            `<div class="warn${/抢走|换模/.test(w) ? ' b' : ''}">${esc(w)}</div>`).join('')
+          + impactTable(sp);
+        wb.innerHTML = html;
+        wrow.hidden = !html;
+      }
+    });
+  });
+  syncPickUI();
+  return d;
+}
+const cssq = (s) => String(s).replace(/["\\]/g, '\\$&');
+
+// 逐模型影响面。抢顶层与挡下层是两件事，都要能看见。
+function impactTable(sp) {
+  const imps = sp.impacts || [];
+  if (!imps.length) return '';
+  const rows = imps.map((i) => {
+    const hosts = i.shadowed_hosts || [];
+    let verdict, cls;
+    if (i.hijacks) { verdict = `抢走顶层（原 ${i.current_top}）`; cls = 'p-b'; }
+    else if (i.shares) { verdict = `与顶层同层（${i.current_top}）`; cls = 'p-w'; }
+    else { verdict = `低于顶层 ${i.current_top}`; cls = 'p-ok'; }
+    return `<tr>
+      <td class="m">${esc(i.model)}</td>
+      <td><span class="pill ${cls}">${esc(verdict)}</span></td>
+      <td class="hint">${hosts.length
+        ? `挡住 ${hosts.length} 站：${esc(hosts.slice(0, 6).join(' '))}${hosts.length > 6 ? ' …' : ''}`
+        : '不挡任何站'}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="tw" style="margin-top:9px"><table>
+    <thead><tr><th>模型</th><th style="width:190px">相对现有顶层</th>
+      <th>被挡在其后</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+$('#btnback').onclick = () => {
+  $('#p2').hidden = true; $('#p3').hidden = true; $('#p1').hidden = false;
+  step(1);
+};
+
+$('#btnplan').onclick = async () => {
+  const d = await refreshPlan(false);
+  if (!d) return;
+
+  const nLines = d.diffs.reduce((a, x) => a + x.lines.length, 0);
+  const skipped = d.plans.flatMap((p) =>
+    Object.entries(p.skipped).map(([s, why]) =>
+      `${p.host} · ${SECTION_LABEL[s] || s}：${why}`));
+
+  $('#planmeta').innerHTML = `
+    <div class="stat">
+      <span>插入 <b>${d.diffs.length}</b> 处</span>
+      <span>新增 <b>${nLines}</b> 行</span>
+      <span>${fmt(d.lines_before)} → <b>${fmt(d.lines_after)}</b> 行</span>
+    </div>
+    <div class="note ${d.valid ? 'g' : 'b'}">${esc(d.validate_msg)}</div>
+    ${skipped.length ? `<div class="note">不写入 ${skipped.length} 项：
+      <div class="mlist">${skipped.map(esc).join('<br>')}</div></div>` : ''}`;
+
+  $('#diffs').innerHTML = d.diffs.length ? d.diffs.map((x, i) => `
+    <div class="diff">
+      <div class="dh"><span class="pill p-ok">+${x.lines.length}</span>
+        <span class="m">${esc(x.section)}</span>
+        <span class="hint">← ${esc(x.host)} · 第 ${x.insert_at} 行后</span>
+        <button class="cp" data-i="${i}">复制</button></div>
+      <pre>${x.lines.map((l) => `<span class="a">+ ${esc(l)}</span>`).join('')}</pre>
+    </div>`).join('')
+    : `<div class="note w">无可写入条目 —— 没勾选，或全部不可用 / 已存在</div>`;
+
+  $$('#diffs .cp').forEach((b) => {
+    b.onclick = () => {
+      navigator.clipboard.writeText(d.diffs[+b.dataset.i].lines.join('\n')).then(() => {
+        b.textContent = '已复制'; b.classList.add('done');
+        setTimeout(() => { b.textContent = '复制'; b.classList.remove('done'); }, 1400);
+      });
+    };
+  });
+
+  $('#btnapply').disabled = !d.valid || !d.diffs.length;
+  $('#p3').hidden = true; $('#p4').hidden = false;
+  step(4);
+  $('#p4').scrollIntoView({ behavior: 'smooth', block: 'start' });
+};
+
+$('#btnreplan').onclick = () => {
+  $('#p4').hidden = true; $('#p3').hidden = false; step(3);
+};
+
+// ── 写回 ──
+$('#btnapply').onclick = async () => {
+  const btn = $('#btnapply');
+  btn.disabled = true;
+  $('#applymsg').innerHTML = '<span class="spin"></span> 写回中…';
+  // 写盘之后要让 CPA 立即生效。_cred 总是带上：用户若是用 CPA 管理密码
+  // 登录的（默认路径），服务端直接复用它去 PUT，无需在这里再输一遍。
+  const body = { plan_id: S.planId, confirm: true, _cred: S.token };
+  body.push = {
+    mgmt_key: $('#o_mgmt').value,          // 留空则服务端复用 _cred
+    client_key: $('#o_client').value.trim(),
+  };
+  // 地址**只在用户显式填了才传**。不填就不带这个键，让服务端用它自己配的
+  // CPA_UPSTREAM_URL（容器内 http://cli-proxy-api:8317）。
+  //
+  // 为什么这么小心：这个输入框曾硬编码 https://cpa.example.com，
+  // 于是 PUT 走公网被 Cloudflare 拦成 403 error code 1010 —— 那是 CF 的码，
+  // 不是 CPA 拒绝了配置。看着像「写回失败」，其实是根本没打到 CPA。
+  const baseIn = $('#o_base').value.trim();
+  if (baseIn) body.push.base = baseIn;
+  let d;
+  try { d = await api('/api/apply', { method: 'POST', body }); }
+  catch (e) {
+    $('#applymsg').innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
+    btn.disabled = false;
+    return;
+  }
+  $('#applymsg').textContent = '';
+
+  let verifyHtml = '';
+  if (Array.isArray(d.verified) && d.verified.length) {
+    const bad = d.verify_failed || [];
+    const rows = d.verified.map((v) => `<tr>
+      <td class="m">${esc(v.host)}</td>
+      <td class="m">${esc(SECTION_LABEL[v.section] || v.section)}</td>
+      <td class="m">${esc(v.model)}</td>
+      <td><span class="pill ${v.ok ? 'p-ok' : 'p-b'}">${v.ok ? '通' : '失败'}</span>
+        <div class="hint">${esc(v.msg)}</div></td>
+    </tr>`).join('');
+    verifyHtml = `
+      <div class="note ${bad.length ? 'b' : 'g'}">
+        <b>端到端验证：${d.verified.length - bad.length}/${d.verified.length} 通过</b>
+        —— 用 CPA 的客户端入口真打了一次业务请求，这才叫「能出活」
+        ${d.verify_key_src ? `<br><span class="hint">客户端 Key ${esc(d.verify_key_src)}
+          —— 只在服务端使用，不会出现在页面或响应里</span>` : ''}
+        ${bad.length ? `<br><b>失败项已写入 config.yaml。</b>
+          这些站直连可能是好的，经 CPA 却不行 —— 常见是 CPA 加了自己的头、
+          走了自己的 translator，上游据此换了后端模型。要么找站方处理，
+          要么用上面那份备份回滚。` : ''}
+      </div>
+      <div class="tw"><table>
+        <thead><tr><th>站点</th><th style="width:96px">段</th>
+          <th style="width:170px">模型</th><th>结果</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>`;
+  } else if (d.verify_skipped) {
+    verifyHtml = `<div class="note w">
+      ${esc(d.verify_skipped).split('\n').join('<br>')}</div>`;
+  }
+  // 超出单次验证上限的条目 —— 它们**已经写入 config.yaml**，只是没验。
+  // 不显示的话用户会以为「N/N 通过」覆盖了全部，而其实有一批没测过。
+  if (d.verify_over_limit) {
+    verifyHtml += `<div class="note w">${esc(d.verify_over_limit)}</div>`;
+  }
+
+  // 重载结果单独一条 —— 它决定「CPA 现在到底认不认这份配置」
+  let reloadHtml = '';
+  if (d.reload_ok) {
+    reloadHtml = `<div class="note g">CPA 已重载：${esc(d.reload_msg || '')}<br>
+      <span class="hint">CPAMP 面板另有 30 秒前端缓存，稍等再硬刷新即可看到新条目</span></div>`;
+  } else if (d.reload_msg) {
+    reloadHtml = `<div class="note b"><b>CPA 尚未重载</b><br>
+      ${esc(d.reload_msg).split('\n').join('<br>')}<br>
+      <span class="hint">磁盘已改，但不确定 CPA 用上了没有。它靠 inotify 发现
+      改动，而 inotify 事件可能丢且**没有轮询兜底** —— 丢了就不会自愈。
+      最直接的确认办法：在 VPS 上 <code>docker restart cli-proxy-api</code>。</span></div>`;
+  }
+
+  $('#donebody').innerHTML = reloadHtml + `
+    <div class="note g">已写入 <code>${esc(d.written)}</code> · ${esc(d.diffs)} 处插入<br>
+      ${esc(d.validate_msg)}</div>
+    <div class="note">备份 <code>${esc(d.backup)}</code><br>
+      <span class="hint">出问题就用它覆盖回去。CPA 的 PUT 落盘非原子且失败不回滚，
+      备份是唯一保险。</span></div>
+    ${d.push_ok === undefined ? '' :
+      `<div class="note ${d.push_ok ? 'g' : 'b'}">推送 CPA：${esc(d.push_msg)}</div>`}
+    ${verifyHtml}`;
+  $('#p4').hidden = true; $('#pdone').hidden = false;
+  try { S.ctx = await api('/api/context'); renderBands(); } catch { /* 非致命 */ }
+};
+
+$('#btnrestart').onclick = () => {
+  S.jobId = null; S.planId = null; S.plans = null;
+  S.overrides = {}; S.cursor = 0; S.picks = null; S.reuseSaved = 0;
+  $('#input').value = '';
+  ['#pdone', '#p4', '#p3', '#p2', '#pparse'].forEach((s) => { $(s).hidden = true; });
+  $('#p1').hidden = false;
+  $('#btnprobe').disabled = true;
+  $('#parsemsg').textContent = '';
+  step(1);
+  scrollTo({ top: 0, behavior: 'smooth' });
+};
+
+boot();
