@@ -1,0 +1,63 @@
+# 构建镜像时排除的文件。
+#
+# 这不只是「让镜像小一点」—— 更要紧的是**别把秘密烤进镜像层**。
+# 镜像层是不可变的：即使后续 RUN 删掉某个文件，它仍留在历史层里，
+# `docker save` 或 `docker history` 能挖出来。所以宁可从一开始就不进构建上下文。
+
+# ── 秘密与真实配置：绝不进镜像 ──────────────────────────────
+# config.yaml 含明文上游 Key 与管理密钥的 bcrypt 哈希。
+# 它在运行时以 bind mount 挂进来（compose 的 volumes），不该被 COPY。
+config.yaml
+config.yml
+config.*.yaml
+*.bak-*
+*.scrub-bak-*
+.env
+.env.*
+secrets/
+auths/
+accounts.txt
+accounts*.txt
+*.key
+*.pem
+*.p12
+
+# ── 本机排障产物 ────────────────────────────────────────────
+legacy/
+docs/
+graphify-out/
+logs/
+*.log
+tmp/
+
+# ── 测试与开发文件 ──────────────────────────────────────────
+# 镜像里跑不了它们（要 config.yaml），CI 已经跑过。
+tests/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── 版本控制与 CI ───────────────────────────────────────────
+.git/
+.gitignore
+.github/
+.dockerignore
+
+# ── 编辑器 / 系统 ───────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ── 文档：README 保留（有人 docker run 后想看），其余排除 ──
+CHANGELOG.md
+CONTRIBUTING.md
+LICENSE
+
+# ── compose 文件本身不需要进镜像 ────────────────────────────
+docker-compose.yml
+docker-compose.*.yml

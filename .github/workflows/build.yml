@@ -1,0 +1,210 @@
+# 多架构镜像构建与发布。
+#
+# 触发：推 main、推 tag（v*）、PR、手动。
+# 目标：GHCR 始终发；Docker Hub 仅当仓库变量 DOCKERHUB_USERNAME 已设置时才发。
+#
+# ── 零硬编码 ────────────────────────────────────────────────────────
+# 镜像名、仓库地址、owner 全部来自 GitHub 上下文或仓库变量，fork 后无需改动：
+#   GHCR       ghcr.io/${{ github.repository }}                    自动
+#   Docker Hub ${{ vars.DOCKERHUB_USERNAME }}/${{ vars.DOCKERHUB_IMAGE }}
+#
+# 镜像名不再写死成仓库名：Docker Hub 的命名空间是扁平的（用户名/镜像名），
+# 而 GitHub 仓库名往往带项目前缀。两边想取不同名字是常态，所以留一个变量。
+# 没设 DOCKERHUB_IMAGE 时回落到 GitHub 仓库名（去掉 owner 那一段）。
+#
+# ── 首次使用需要配置（在仓库 Settings 里） ─────────────────────────
+#
+#   GHCR：什么都不用配。GITHUB_TOKEN 自带 packages:write 权限。
+#
+#   Docker Hub（可选，不配就只发 GHCR，那一步会被跳过而不是失败）：
+#     Settings → Secrets and variables → Actions
+#
+#       Variables 标签 → New repository variable
+#         DOCKERHUB_USERNAME  Docker Hub 用户名。**必填**，它同时是
+#                             「要不要发 Docker Hub」的开关
+#         DOCKERHUB_IMAGE     镜像名，可选。留空 = 用 GitHub 仓库名
+#
+#       Secrets 标签 → New repository secret
+#         DOCKERHUB_TOKEN     hub.docker.com/settings/security 生成的
+#                             Access Token。**不要填登录密码** —— token
+#                             可单独吊销、可限定权限（Read & Write 即够），
+#                             密码泄露等于整个 Docker Hub 账号失守
+#
+#   为什么 USERNAME 放 Variables 而 TOKEN 放 Secrets：Variables 在日志里是
+#   明文（用户名本来就公开，明文便于排查），Secrets 会被 Actions 自动打码。
+#   把 token 放进 Variables 等于把它印在每一次构建日志里。
+
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "构建目标平台（逗号分隔）"
+        required: false
+        # armv7 的 bcrypt 要现场编 Rust，慢很多；默认不带，需要时手动加。
+        default: "linux/amd64,linux/arm64"
+
+# 同一分支的新推送取消旧的构建 —— 多架构构建很贵，别让队列堆积
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 先测再构建。测试失败就不该产出镜像 ────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    # 只读源码就够 —— 测试不写任何 GitHub 资源。
+    # 不写这一段的话，token 权限取仓库的默认设置（可能是 read-write all），
+    # 那是没必要的攻击面：测试步骤会执行仓库里的代码，PR 也能触发。
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 是下限：代码用了 dict 有序、f-string、类型注解，但
+        # 没用 match/结构化模式。3.9 能跑说明兼容面够宽。
+        python: ["3.9", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 装依赖
+        run: pip install "PyYAML==6.0.2" "bcrypt==4.2.1"
+
+      - name: 语法编译（先于测试 —— 编译不过就没必要跑）
+        run: |
+          python -m compileall -q cpa_probe server.py cli.py tools tests
+
+      - name: 回归测试
+        # 不传 config.yaml —— 套件自带最小样本（tests/fixture_cfg.py），
+        # CI 里没有真实配置，也**不该**依赖任何一份真实配置。
+        #
+        # 2026-08-31 之前这句话是假的：test_server 与 test_edges 会回落到
+        # ../config.yaml，找不到就 exit 2。刚 clone 的仓库和 CI 上必然红。
+        # 现在两种输入都能跑完，传路径只是多跑一轮真实数据。
+        run: python tests/run.py
+
+      - name: 前端静态契约（DOM id / 事件 / 字段对应）
+        run: python tests/test_web.py
+
+  # ── 构建多架构镜像 ────────────────────────────────────────────────
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # 推 GHCR 需要
+
+    # 「要不要发 Docker Hub」在这里算一次，后面的步骤只看这个旗标。
+    #
+    # 为什么不能在 steps 的 if: 里直接写 secrets.DOCKERHUB_TOKEN != ''：
+    # `secrets` 上下文在 steps.if 里**不可用**。官方 Context availability 表
+    # 给 jobs.<job_id>.steps.if 列的是
+    #     github, needs, strategy, matrix, job, runner, env, vars, steps, inputs
+    # 没有 secrets。写了不报错，只是恒为空 —— 那一步会永远被跳过，
+    # 「配好了却不发布」还没有任何提示，比直接失败更难查。
+    #
+    # jobs.<job_id>.env 那一行**允许** secrets，所以旗标在这里算。
+    # 存进 env 的是 'yes' / ''，不是 token 本身，不构成泄露。
+    env:
+      DOCKERHUB_READY: >-
+        ${{ (vars.DOCKERHUB_USERNAME != ''
+             && secrets.DOCKERHUB_TOKEN != '') && 'yes' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU 让 x86 runner 能构建 arm64/armv7 镜像
+      - name: 装 QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: 装 buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        # PR 不推镜像（fork 的 PR 拿不到写权限，推了也会失败）
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 登录 Docker Hub
+        # 两个都要有才登录。
+        #
+        # 为什么必须同时判 TOKEN（2026-08-31 自查）：原来只判
+        # `vars.DOCKERHUB_USERNAME != ''`，于是「先设用户名、稍后再加 token」
+        # 这个完全正常的操作顺序会让每一次构建都红 —— login-action 拿到空
+        # 密码直接失败，而失败信息是 401，看不出是「token 还没配」。
+        # 现在缺任何一个都安静跳过，Docker Hub 那步不发，GHCR 照常发。
+        if: >-
+          github.event_name != 'pull_request' &&
+          env.DOCKERHUB_READY == 'yes'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 算镜像名与标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # GHCR 用 github.repository（owner/repo，自动小写）。
+          #
+          # Docker Hub 那行：DOCKERHUB_USERNAME 为空时整行展开成空字符串，
+          # metadata-action 会忽略空行 —— 未配置时不会产生错误标签。
+          # 镜像名优先取 vars.DOCKERHUB_IMAGE，没设就用仓库名（github.repository
+          # 是 owner/repo，这里要的是后一段，所以从 github.event.repository.name 取）。
+          #
+          # 为什么不直接写 github.repository：那样 Docker Hub 上会变成
+          # `<user>/owner/repo` —— Docker Hub 的命名空间只有一层，斜杠会被拒。
+          images: |
+            ghcr.io/${{ github.repository }}
+            ${{ env.DOCKERHUB_READY == 'yes' && format('{0}/{1}', vars.DOCKERHUB_USERNAME, vars.DOCKERHUB_IMAGE || github.event.repository.name) || '' }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=${{ github.event.repository.name }}
+            org.opencontainers.image.description=批量导入 CPA 上游账号：探测 → 定档 → diff → 写回
+            org.opencontainers.image.licenses=MIT
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
+          # 层缓存放在 GitHub Actions cache 里 —— 多架构构建很慢，
+          # 没缓存的话每次都要重新装依赖（armv7 上还要编 Rust）。
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 镜像清单（确认多架构真的产出了）
+        if: github.event_name != 'pull_request'
+        run: |
+          set -eux
+          # 取第一个 tag 检查。manifest list 里应能看到每个目标平台。
+          TAG=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
+          docker buildx imagetools inspect "$TAG"

@@ -1,0 +1,820 @@
+"""四阶段探测流水线。
+
+对每个 (url, key) 候选：
+  ① 段归属  —— 四段各打一次，看哪几段通。段决定 URL 形态与协议路径。
+  ② 模型发现 —— 先问 /models 目录，再逐个验。compat 段必须探到至少一个，
+                留空则该 provider 注册 0 个模型（service_models.go:714-717）。
+  ③ 处置    —— 不通的段：先试代理，再试补标识头。
+                优先级 proxy-url > headers > 降 priority，绝不用 weight: 0。
+  ④ 质量    —— 通的段：验静默换模；可选二分探 max-context-length。
+
+节流：每次请求之间等 gap 秒。relay-b.example 有 bulk probe guard
+（60 秒内 4 个不同模型即触发），gap 默认 3 秒。
+
+成本：不开上下文探测时单候选约 10-25 次请求，body 都很小。开上下文探测后
+每个 (段, 模型) 多 4-6 次大 body 请求 —— 那部分明确要算钱，默认只对
+新增候选的首个模型跑。
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import re
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Callable
+
+# 直接导入函数，不要写 `from . import classify as cls`。
+# __init__.py 里 `from .classify import classify` 会把包属性 cpa_probe.classify
+# 从「模块」改写成「函数」，且它排在 `from .pipeline import ...` 之前 ——
+# 那样 cls 拿到的是函数，cls.classify(...) 必然 AttributeError。
+# 这条路径只有真发请求时才会走到，纯逻辑用例覆盖不到，所以必须写死成函数导入。
+from .classify import body_excerpt as _body_excerpt
+from .classify import classify as _classify
+from . import client, fingerprint, request
+from .parse import SECTIONS, ParsedRow, base_for_section, host_of
+
+# 每段的种子模型。/models 目录拿不到时兜底；拿到目录时用来定验证顺序。
+# 按段分开 —— claude 段问 gpt-5.6-sol 必然 404，那是 CPA 的段语义决定的。
+SEED_MODELS: dict[str, list[str]] = {
+    "gemini-api-key": ["gemini-2.5-pro", "gemini-2.5-flash"],
+    "codex-api-key": ["gpt-5.6-sol", "gpt-5.6-terra"],
+    "claude-api-key": ["claude-opus-5", "claude-sonnet-5"],
+    "openai-compatibility": ["gpt-5.6-sol", "claude-opus-5", "gemini-2.5-pro"],
+}
+
+# 只保留这三类 —— 用户 2026-08-29 定的规则：
+# 「模型类型只能是在 gemini、gpt、claude 这三种类型中的才保留」
+MODEL_PREFIX_WHITELIST = ("gemini", "gpt", "claude")
+
+# 每段最多验几个模型。聚合站声明几百个（relay-m 曾 838 个），
+# 全验会触发反测活且极贵。
+MAX_MODELS_PER_SECTION = 4
+
+
+def _encode(body: dict) -> bytes:
+    return json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+
+def model_allowed(name: str) -> bool:
+    """按用户规则过滤模型名：只留 gemini / gpt / claude 三类。"""
+    n = (name or "").strip().lower()
+    # 去掉可能的 provider 前缀（relay-m 会写 Business/gemini-xxx）
+    if "/" in n:
+        n = n.split("/")[-1]
+    return n.startswith(MODEL_PREFIX_WHITELIST)
+
+
+@dataclass
+class Attempt:
+    """一次探测的完整记录。保留正文摘要 —— 判定依赖正文而非状态码。"""
+
+    section: str
+    model: str
+    combo: str
+    status: str
+    category: str
+    action: str
+    elapsed_ms: int
+    proxy: str | None = None
+    resp_model: str | None = None
+    resp_id: str | None = None
+    backend: str = ""
+    input_tokens: int | None = None
+    excerpt: str = ""
+    sent_chars: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "200"
+
+    def as_sample(self) -> dict:
+        """转成 fingerprint.swap_rate 需要的形状。"""
+        return {
+            "status": self.status,
+            "requested": self.model,
+            "actual": self.resp_model,
+            "backend": self.backend,
+            "input_tokens": self.input_tokens,
+        }
+
+
+@dataclass
+class SectionVerdict:
+    """一个候选在一个段上的结论。直接决定要不要写进这一段、带什么字段。"""
+
+    section: str
+    base_url: str = ""
+    usable: bool = False
+    models: list[str] = field(default_factory=list)
+    need_proxy: bool = False
+    min_headers: dict[str, str] = field(default_factory=dict)
+    swap: dict = field(default_factory=dict)
+    max_context_length: int | None = None
+    # 上限是在**哪个模型**上实测的。同站不同模型窗口不同（claude-opus-5
+    # 与 haiku 差一个数量级），把 A 的实测值写到 B 上等于伪造数据 ——
+    # 客户端会按错误的窗口定压缩点，重演那条 400。
+    context_model: str = ""
+    context_untrusted: bool = False
+    category: str = ""
+    action: str = ""
+    attempts: list[Attempt] = field(default_factory=list)
+
+    @property
+    def need_ua(self) -> bool:
+        return bool(self.min_headers)
+
+    @property
+    def swap_detected(self) -> bool:
+        return bool(self.swap.get("swap"))
+
+    def summary(self) -> str:
+        if not self.usable:
+            return f"{self.category or '不可用'} — {self.action}"
+        bits = [f"{len(self.models)} 模型"]
+        if self.need_proxy:
+            bits.append("需代理")
+        if self.min_headers:
+            bits.append("需 " + "+".join(self.min_headers))
+        if self.swap_detected:
+            bits.append(f"⚠ 换模 {self.swap.get('rate_pct', 0)}%")
+        if self.max_context_length:
+            bits.append(f"上限 {self.max_context_length:,}")
+        return " · ".join(bits)
+
+
+@dataclass
+class CandidateResult:
+    row: ParsedRow
+    sections: dict[str, SectionVerdict] = field(default_factory=dict)
+
+    @property
+    def usable_sections(self) -> list[str]:
+        return [s for s, v in self.sections.items() if v.usable]
+
+    @property
+    def total_calls(self) -> int:
+        return sum(len(v.attempts) for v in self.sections.values())
+
+
+class Prober:
+    def __init__(
+        self,
+        *,
+        proxy: str | None = None,
+        gap: float = 3.0,
+        timeout: int = 120,
+        probe_context: bool = True,
+        swap_samples: int = 3,
+        workers: int = 4,
+        on_event: Callable[[str, dict], None] | None = None,
+    ):
+        self.proxy = proxy
+        self.gap = gap
+        self.timeout = timeout
+        self.probe_context = probe_context
+        self.swap_samples = swap_samples
+        # 四段并行度。1 = 完全串行（老行为，出问题时的退路）。
+        # 上限就是 4 —— 段数固定，再高没有意义。
+        self.workers = max(1, min(int(workers), len(SECTIONS)))
+        self.on_event = on_event or (lambda kind, data: None)
+        # 节流按 **host** 分开记。原来是全局一个时间戳，探 A 站要等 B 站的
+        # gap —— 不同站之间没有任何理由互相等。反测活是站方行为，只对同站生效。
+        self._last_call: dict[tuple[str, str], float] = {}
+        # (host, section) -> 已学到的段形态。同一主机的第 2..N 个 Key 直接复用，
+        # 只补一次凭证确认。见 _reuse_shape 的说明。
+        self._shape: dict[tuple[str, str], SectionVerdict] = {}
+        # (host, section) -> 门闩。表示「已有线程在学这个段的形态」。
+        # 同主机多 Key 并发时防止重复做那 12 次昂贵探测。见 _probe_one_section。
+        self._inflight: dict[tuple[str, str], threading.Event] = {}
+        self._lock = threading.RLock()
+        self._proxy_state: bool | None = None   # None=未检 True/False=预检结果
+        # 代理预检专用锁。不复用 _lock —— 预检要占最多 4 秒，
+        # 而 _lock 同时保护节流计时与形态缓存，不能被长时间持有。
+        self._proxy_lock = threading.Lock()
+
+    # ---------- 底层 ----------
+
+    @property
+    def live_proxy(self) -> str | None:
+        """代理地址，仅在预检通过时返回；不通则返回 None。
+
+        为什么不直接用 self.proxy：`via-proxy` 是 IP封/边缘 的首选处置，
+        每段每模型都会试一次。代理不通时每次都干等满 timeout（默认 120 秒）
+        才失败 —— 实测日志里 mihomo:7890 早已不通（preflight 也报了警），
+        5 个 key 多段累计十几分钟纯粹白等，且结果全是无用的 `000 未知`。
+
+        预检只做一次 TCP 握手，4 秒封顶，结果缓存在 _proxy_state。
+        """
+        if not self.proxy:
+            return None
+        if self._proxy_state is None:
+            # 必须在专用锁下做，且锁内再判一次 —— 四段并行时会同时看到
+            # _proxy_state is None，无锁的话每段各做一次 TCP 预检（实测被
+            # 测试抓到：proxy-precheck 事件发了 4 次）。
+            #
+            # 用独立的 _proxy_lock 而不是 self._lock：probe_proxy 要占用最多
+            # 4 秒，而 _lock 同时保护 _throttle 与 _shape —— 拿着它睡 4 秒
+            # 会把另外三段的节流计算一起堵住。
+            with self._proxy_lock:
+                if self._proxy_state is None:
+                    ok, detail = client.probe_proxy(self.proxy, timeout=4)
+                    self.on_event("proxy-precheck", {"proxy": self.proxy, "ok": ok,
+                                                     "detail": detail})
+                    self._proxy_state = ok
+        return self.proxy if self._proxy_state else None
+
+    def _throttle(self, host: str = "", section: str = "") -> None:
+        """按 (host, section) 保持 gap 秒。不同主机、不同段互不等待。
+
+        为什么按 host 而不是全局：gap 存在的理由是站方的 bulk probe guard
+        （relay-b 实测低于 3 秒会触发），那是**站方**的限频。探 A 站时为 B 站
+        的上一次请求等待纯属浪费 —— 多主机批量导入时这笔账按主机数翻倍。
+
+        为什么再按 section 细分（2026-08-30 加）：guard 是**按端点**计的。
+        四段打的是四个不同路径：
+            gemini  /v1beta/models/{model}:generateContent
+            codex   /v1/responses
+            claude  /v1/messages
+            compat  /v1/chat/completions
+        它们共享一个 gap 桶时，单站四段的 56 次请求要串成 55 x 3s = 165 秒
+        纯睡 —— 这是「探测要十几分钟」最大的一笔。拆开后四段各自计时，
+        同段内仍严格保持 gap（guard 该防的东西一点没松）。
+
+        风险与取舍：如果某站的 guard 是按账号（而非端点）全局计的，拆开后
+        瞬时并发会是原来的 4 倍。这就是 --gap 仍然存在、且默认保持 3 秒的
+        原因 —— 撞上那种站把 gap 调大即可，不需要改回全局串行。
+        """
+        # 用元组当键，不用字符串拼接 —— 裸拼接会有歧义碰撞：
+        # ("a", "b|c") 与 ("a|b", "c") 拼出同一个 "a|b|c"，两者会共享
+        # 同一个 gap 桶（测试抓到过）。host 来自用户输入的 URL，
+        # section 虽然是内部常量，也没有理由留这个坑。
+        bucket = (host, section)
+        with self._lock:
+            last = self._last_call.get(bucket, 0.0)
+            wait = self.gap - (time.monotonic() - last)
+            if wait > 0:
+                # 记成「即将发出」，避免同桶并发时多个线程一起放行
+                self._last_call[bucket] = time.monotonic() + wait
+            else:
+                self._last_call[bucket] = time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+
+    def _call(
+        self,
+        section: str,
+        base: str,
+        key: str,
+        model: str,
+        *,
+        combo: str,
+        extra_headers: dict[str, str] | None = None,
+        proxy: str | None = None,
+        text: str | None = None,
+    ) -> Attempt:
+        # 按 (host, section) 节流：同站同段保持 gap，其余互不等待
+        self._throttle(host_of(base), section)
+        kwargs = {"extra_headers": extra_headers}
+        if text is not None:
+            kwargs["text"] = text
+        url, headers, body = request.build_request(section, base, model, key, **kwargs)
+        resp = client.send(
+            url,
+            headers=headers,
+            body=_encode(body),
+            proxy=proxy,
+            timeout=self.timeout,
+        )
+        category, action = _classify(resp.status, resp.body)
+        rid = fingerprint.resp_id(resp.body)
+        sent = len(text) if text is not None else len(request.PROBE_TEXT)
+        att = Attempt(
+            section=section,
+            model=model,
+            combo=combo,
+            status=resp.status,
+            category=category,
+            action=action,
+            elapsed_ms=resp.elapsed_ms,
+            proxy=proxy,
+            resp_model=fingerprint.resp_model(resp.body),
+            resp_id=rid,
+            backend=fingerprint.backend_of(rid),
+            input_tokens=fingerprint.input_tokens(resp.body),
+            excerpt="" if resp.status == "200" else _body_excerpt(resp.body),
+            sent_chars=sent,
+        )
+        self.on_event(
+            "attempt",
+            {
+                "section": section,
+                "model": model,
+                "combo": combo,
+                "status": resp.status,
+                "category": category,
+                "elapsed_ms": resp.elapsed_ms,
+            },
+        )
+        return att
+
+    # ---------- ① 段归属 + ③ 处置 ----------
+
+    def _accept(self, v: SectionVerdict, model: str, att: Attempt) -> list[str]:
+        """200 之后再判「回的是不是我要的模型」，判过才收进清单。
+
+        为什么必须有这一步：`_stage2` 对目录里的模型做了 `model_matches`
+        校验，而 `_stage1` 原先对种子模型直接 `v.models = [model]` ——
+        等于换模站的第一个模型拿到免检通行证。relay-e 那种「请求
+        gpt-5.6-sol 回 agnes-2.0-flash」的站会被判成可用并写进 config.yaml，
+        照常计费却拿不到要的模型，比不可用更危险。
+
+        段仍算 usable（端点确实响应 200，凭证本身有效），但模型不进清单。
+        models 为空 → `SectionPlan.writable` 为 False，不会写入。
+        """
+        if fingerprint.model_matches(model, att.resp_model):
+            return [model]
+        self.on_event("model-rejected", {
+            "section": v.section,
+            "requested": model,
+            "actual": att.resp_model,
+            "backend": att.backend,
+        })
+        return []
+
+    def _stage1(self, row: ParsedRow, section: str) -> SectionVerdict:
+        """基线不通 → 试代理 → 试补标识头。三步都按处置优先级排。"""
+        base = base_for_section(row.bare, section)
+        v = SectionVerdict(section=section, base_url=base)
+
+        for model in SEED_MODELS[section]:
+            att = self._call(section, base, row.api_key, model, combo="baseline")
+            v.attempts.append(att)
+            v.category, v.action = att.category, att.action
+
+            if att.ok:
+                v.usable = True
+                v.models = self._accept(v, model, att)
+                return v
+
+            # 余额 / 死路：换模型、加头、走代理都救不了。立即收敛。
+            if att.category in ("余额", "死路"):
+                return v
+
+            # 反测活：探测文本本身触发了拦截，换一句重试
+            if att.category == "反测活":
+                att = self._call(
+                    section, base, row.api_key, model, combo="alt-text",
+                    text="Explain the TCP three-way handshake in one sentence.",
+                )
+                v.attempts.append(att)
+                v.category, v.action = att.category, att.action
+                if att.ok:
+                    v.usable = True
+                    v.models = self._accept(v, model, att)
+                    return v
+
+            # IP封 / 边缘：代理是最高优先级处置
+            if att.category in ("IP封", "边缘") and self.live_proxy:
+                att = self._call(
+                    section, base, row.api_key, model,
+                    combo="via-proxy", proxy=self.live_proxy,
+                )
+                v.attempts.append(att)
+                if att.ok:
+                    v.usable = True
+                    v.need_proxy = True
+                    v.category, v.action = att.category, att.action
+                    v.models = self._accept(v, model, att)
+                    return v
+
+            # 标识类：按 identity_combos 由省到全回退，第一个 200 即最小必需头
+            if att.category in ("门禁", "IP封", "边缘") or att.status in ("401", "403"):
+                for name, hdrs in request.identity_combos(section):
+                    if not hdrs:
+                        continue  # 空组合等于基线，已试过
+                    att = self._call(
+                        section, base, row.api_key, model, combo=f"id:{name}",
+                        extra_headers=hdrs,
+                        proxy=self.live_proxy if v.need_proxy else None,
+                    )
+                    v.attempts.append(att)
+                    if att.ok:
+                        v.usable = True
+                        v.min_headers = dict(hdrs)
+                        v.category, v.action = att.category, att.action
+                        v.models = self._accept(v, model, att)
+                        return v
+
+        return v
+
+    # ---------- ② 模型发现 ----------
+
+    def _stage2(self, row: ParsedRow, v: SectionVerdict) -> None:
+        """先问 /models 目录，白名单过滤后逐个验。
+
+        compat 段留空 = 注册 0 个模型，所以这一步对 compat 是硬要求。
+        """
+        found = list(v.models)
+        catalog: list[str] = []
+
+        # /models 是目录端点，与该段的推理端点不同路径，但仍算这个站这个段
+        # 的一次请求 —— 用同一个桶。原来这里漏传参数，落到 host="" 的全局桶，
+        # 结果是所有站所有段的 /models 互相等待。
+        self._throttle(host_of(v.base_url), v.section)
+        url, headers = request.models_endpoint(v.section, v.base_url, row.api_key)
+        resp = client.send(
+            url, headers=headers, body=b"", method="GET",
+            proxy=self.live_proxy if v.need_proxy else None, timeout=self.timeout,
+        )
+        if resp.status == "200":
+            catalog = [m for m in request.parse_models_response(v.section, resp.body)
+                       if model_allowed(m)]
+            self.on_event("catalog", {"section": v.section, "count": len(catalog)})
+
+        # 验证顺序：种子模型优先（已知好用），再补目录里的
+        order: list[str] = []
+        for m in SEED_MODELS[v.section] + catalog:
+            if m not in order and m not in found and model_allowed(m):
+                order.append(m)
+
+        for model in order:
+            if len(found) >= MAX_MODELS_PER_SECTION:
+                break
+            att = self._call(
+                v.section, v.base_url, row.api_key, model, combo="model-scan",
+                extra_headers=v.min_headers or None,
+                proxy=self.live_proxy if v.need_proxy else None,
+            )
+            v.attempts.append(att)
+            if att.ok and fingerprint.model_matches(model, att.resp_model):
+                found.append(model)
+
+        v.models = found
+
+    # ---------- ④a 静默换模 ----------
+
+    def _stage4_swap(self, row: ParsedRow, v: SectionVerdict) -> None:
+        """单次测不出来 —— weighted-round-robin 下换模是间歇性的。"""
+        if not v.models or self.swap_samples < 2:
+            return
+        model = v.models[0]
+        samples: list[dict] = []
+        for _ in range(self.swap_samples):
+            att = self._call(
+                v.section, v.base_url, row.api_key, model, combo="swap-sample",
+                extra_headers=v.min_headers or None,
+                proxy=self.live_proxy if v.need_proxy else None,
+            )
+            v.attempts.append(att)
+            samples.append(att.as_sample())
+        v.swap = fingerprint.swap_rate(samples)
+        if v.swap.get("swap"):
+            self.on_event("swap", {"section": v.section, "model": model,
+                                   "rate_pct": v.swap.get("rate_pct")})
+
+    # ---------- ④b 上下文上限 ----------
+
+    def _stage4_context(self, row: ParsedRow, v: SectionVerdict) -> None:
+        """探真实上限，写进 models[].max-context-length。
+
+        这是唯一有 config.yaml 落点的探测：
+          max-context-length → service_models.go:702-706 → model_registry.go:1242
+          → codex/models/models.go:207-211 → context_window / max_context_window
+        客户端据此定压缩点，所以它直接修掉「967k 逼近 995k 只剩 3% 余量」那个 400。
+        """
+        if not self.probe_context or not v.models:
+            return
+        model = v.models[0]
+        limit, untrusted = self._bisect(row, v, model)
+        v.max_context_length = limit
+        v.context_model = model          # 只对这个模型有效，别外推
+        v.context_untrusted = untrusted
+        if limit:
+            self.on_event("context", {"section": v.section, "model": model,
+                                      "limit": limit, "untrusted": untrusted})
+
+    # 上限直接写在错误正文里的常见形态。命中任一即可免掉整轮二分。
+    #
+    # 为什么值得单独做：二分最多 6 次请求，body 20 万-110 万字符，
+    # 上传本身就要数秒到数十秒 —— 这是「探测要十几分钟」的第二大笔。
+    # 而绝大多数上游在超限时会**明说**上限是多少：
+    #   OpenAI 系  maximum context length is 200000 tokens
+    #   Claude 系  prompt is too long: 215000 tokens > 200000 maximum
+    #   国内中转    最大上下文长度为 128000
+    # 有明说就用它，不必自己试出来。
+    _LIMIT_PATTERNS = (
+        # "maximum context length is 200000 tokens"
+        r"maximum\s+context\s+length\s+is\s+(\d{4,8})",
+        # "prompt is too long: 215000 tokens > 200000 maximum"
+        r">\s*(\d{4,8})\s*maximum",
+        # "context_length_exceeded ... limit 128000"
+        r"context[_\s-]?length[^\d]{0,40}?(\d{4,8})",
+        # "max_tokens ... 200000" / "max input tokens: 200000"
+        r"max(?:imum)?[_\s-]?(?:input[_\s-]?)?tokens?[^\d]{0,20}(\d{4,8})",
+        # 中文形态
+        r"最大(?:上下文)?(?:长度|token数?)[^\d]{0,10}(\d{4,8})",
+        r"上下文[^\d]{0,10}(?:上限|限制)[^\d]{0,10}(\d{4,8})",
+    )
+
+    @classmethod
+    def _limit_from_body(cls, excerpt: str) -> int | None:
+        """从错误正文里抠出上游自报的上下文上限（tokens）。抠不到返回 None。
+
+        返回的是 **token 数**，与 max-context-length 的单位一致
+        （service_models.go:702-706 读的就是 token 数）。
+
+        合理性下限 8000：低于这个值的数字几乎不可能是上下文上限，更可能是
+        撞上了 max_tokens 输出上限、错误码或时间戳。宁可放弃走二分，
+        也不能把一个错的小值写进 config.yaml —— 那会让客户端过早压缩。
+        上限 2_000_000：再大的数字不是上下文窗口。
+        """
+        if not excerpt:
+            return None
+        low = excerpt.lower()
+        for pat in cls._LIMIT_PATTERNS:
+            m = re.search(pat, low)
+            if not m:
+                continue
+            try:
+                val = int(m.group(1))
+            except (ValueError, IndexError):
+                continue
+            if 8_000 <= val <= 2_000_000:
+                return val
+        return None
+
+    def _bisect(self, row: ParsedRow, v: SectionVerdict, model: str) -> tuple[int | None, bool]:
+        """二分实际可接受上下文。返回 (上限, 是否因截断而不可信)。
+
+        截断校验：200 但 input_tokens < 发送量*0.5 说明上游截了，那个 200
+        不算通过。relay-m 发 105 万字符只回 132,696 tokens，模型还被换成
+        codex-auto-review —— 200 完全不可信，此时实测 token 数才是真容量。
+        """
+        lo, hi, rounds = 200_000, 1_100_000, 4
+
+        # 上游自报的上限（tokens）。任何一次失败的正文里读到就记下来 ——
+        # 读到就不必再试了，省掉最多 5 次百万字符请求。
+        declared: int | None = None
+
+        def check(chars: int) -> tuple[bool, int | None]:
+            nonlocal declared
+            att = self._call(
+                v.section, v.base_url, row.api_key, model,
+                combo=f"ctx-{chars // 1000}k",
+                extra_headers=v.min_headers or None,
+                proxy=self.live_proxy if v.need_proxy else None,
+                text="x" * chars,
+            )
+            v.attempts.append(att)
+            if not att.ok:
+                if declared is None:
+                    declared = self._limit_from_body(att.excerpt)
+                    if declared is not None:
+                        self.on_event("context-declared",
+                                      {"section": v.section, "model": model,
+                                       "limit": declared})
+                return False, None
+            tok = att.input_tokens
+            if tok is not None and tok < chars * 0.5:
+                return False, tok  # 截断：tok 就是真实容量
+            return True, tok
+
+        # 先打 hi。**顺序从「先 lo 后 hi」改成「先 hi」**，这是省时间的关键：
+        #   · hi 通过  → 上限 >= hi，一次请求就结束（老逻辑要两次）
+        #   · hi 超限  → 正文往往直接写着上限，解析到就结束（老逻辑要 6 次）
+        # 只有「hi 失败且正文没说」才需要往下二分。
+        #
+        # 代价：hi 是 110 万字符，比 lo 贵。但它同时也是最可能一次定音的那一发，
+        # 期望请求数从 2-6 降到 1-2。
+        ok_hi, trunc_hi = check(hi)
+        if ok_hi:
+            return hi, False
+        if trunc_hi:
+            return trunc_hi, True
+        if declared is not None:
+            # 上游明说了上限。注意单位：declared 是 **token 数**，
+            # 而 lo/hi 是 **字符数** —— 二者不能混算。
+            # max-context-length 要的正是 token 数（service_models.go:702-706），
+            # 所以直接返回 declared，不做任何字符换算。
+            return declared, False
+
+        ok, trunc = check(lo)
+        if not ok:
+            if declared is not None:
+                return declared, False
+            return (trunc, True) if trunc else (None, False)
+
+        left, right = lo, hi
+        for _ in range(rounds):
+            if right - left <= 20_000:
+                break
+            mid = (left + right) // 2
+            ok_mid, trunc_mid = check(mid)
+            if ok_mid:
+                left = mid
+            elif trunc_mid:
+                return trunc_mid, True
+            elif declared is not None:
+                return declared, False
+            else:
+                right = mid
+        return left, False
+
+    # ---------- 形态复用 ----------
+
+    def _reuse_shape(
+        self, row: ParsedRow, section: str, shape: SectionVerdict
+    ) -> SectionVerdict:
+        """同主机的第 2..N 个 Key：套用已学到的段形态，只验凭证本身。
+
+        为什么可以复用：段的形态是**主机**的属性 ——
+          · 这个站在这一段上有哪些模型      （站方的渠道配置）
+          · 要不要走代理                    （站方的边缘防护）
+          · 最小必需标识头                  （站方的 UA/Originator 校验）
+          · 上下文窗口上限                  （站方给这个模型的容量）
+          · 有没有静默换模                  （站方的路由行为）
+        换一个 Key 不会改变其中任何一条。实测日志：5 行全是 relay-i.example，
+        却把 4 段从头到尾各探 5 遍 —— 36 次 × 5 = 180 次请求，其中
+        144 次在重复求证同一件事。
+
+        为什么仍要发一次请求：**凭证有效性是 Key 的属性，不是主机的**。
+        同一个站的 5 个 Key 完全可能一个欠费、一个被封、三个正常。所以
+        每段仍打一次基线（带上已学到的 headers 与代理），只是不再重跑
+        模型目录扫描、换模采样、上下文二分 —— 那三步问的都是主机的事。
+
+        代价从 36 次降到 4 次（每段 1 次），且判定精度不降：凭证坏了照样
+        当场发现，只是不再为同一个主机重复学习同一套形态。
+        """
+        base = base_for_section(row.bare, section)
+        v = SectionVerdict(section=section, base_url=base)
+
+        if not shape.models:
+            # 主机在这一段本就没有可信模型 —— 换 Key 也不会变出模型来。
+            # 直接沿用结论，一次请求都不必发。
+            v.usable = shape.usable
+            v.category, v.action = shape.category, shape.action
+            self.on_event("shape-reused", {"section": section, "host": row.host,
+                                           "verified": False,
+                                           "reason": "该段无可信模型，无需逐 Key 复验"})
+            return v
+
+        probe_model = shape.models[0]
+        att = self._call(
+            section, base, row.api_key, probe_model,
+            combo="reuse-verify",
+            extra_headers=shape.min_headers or None,
+            proxy=self.live_proxy if shape.need_proxy else None,
+        )
+        v.attempts.append(att)
+        v.category, v.action = att.category, att.action
+
+        if not att.ok:
+            # 这个 Key 在这一段不通（欠费 / 被封 / 权限不同）。
+            # 不回退到全量探测：形态已知，失败原因就是凭证本身。
+            self.on_event("shape-reused", {"section": section, "host": row.host,
+                                           "verified": True, "ok": False,
+                                           "reason": f"{att.category} — {att.action}"})
+            return v
+
+        if not fingerprint.model_matches(probe_model, att.resp_model):
+            # 同主机换 Key 后开始换模 —— 站方可能按 Key 分渠道。
+            # 这种情况形态不能复用，退回全量探测。
+            self.on_event("shape-reuse-abort", {
+                "section": section, "host": row.host,
+                "reason": f"复验时请求 {probe_model} 却回 {att.resp_model}，"
+                          f"该 Key 渠道与首个 Key 不同，改走全量探测",
+            })
+            return self._full_probe(row, section)
+
+        # 凭证有效且模型对得上 —— 套用主机形态
+        v.usable = True
+        v.models = list(shape.models)
+        v.need_proxy = shape.need_proxy
+        v.min_headers = dict(shape.min_headers)
+        v.swap = dict(shape.swap)
+        v.max_context_length = shape.max_context_length
+        v.context_model = shape.context_model
+        v.context_untrusted = shape.context_untrusted
+        self.on_event("shape-reused", {"section": section, "host": row.host,
+                                       "verified": True, "ok": True,
+                                       "models": len(v.models)})
+        return v
+
+    # ---------- 编排 ----------
+
+    def _full_probe(self, row: ParsedRow, section: str) -> SectionVerdict:
+        """一个段的完整四阶段探测。首个 Key 走这条，之后复用它的形态。"""
+        v = self._stage1(row, section)
+        if v.usable:
+            self._stage2(row, v)
+            self._stage4_swap(row, v)
+            self._stage4_context(row, v)
+        return v
+
+    def _probe_one_section(self, row: ParsedRow, section: str) -> SectionVerdict:
+        """探一个段。probe() 的工作单元，串行与并行共用同一份逻辑。
+
+        (host, section) 上做 single-flight：同一主机同一段的完整探测**最多
+        只有一个在跑**，后到的等它出结果再走复用路径。
+
+        为什么需要这道门闩：形态学习是这里最贵的动作（模型目录扫描 + 换模
+        采样 + 上下文二分，最多 12 次请求，含 4 次百万字符的大 body）。
+        没有门闩时，同一主机的多个 Key 一旦并发进来，都会看到
+        _shape 里还没有条目，于是各自跑一遍完整探测 —— 5 个 Key 就是
+        5 倍开销，而它们学到的形态必然相同（形态是主机的属性）。
+
+        用 per-key 的 Event 而不是全局锁：不同 (host, section) 之间不该互等。
+        """
+        key = (row.host, section)
+        while True:
+            with self._lock:
+                shape = self._shape.get(key)
+                if shape is not None:
+                    break                       # 已有形态，走复用
+                gate = self._inflight.get(key)
+                if gate is None:
+                    # 本线程认领这次形态学习
+                    gate = threading.Event()
+                    self._inflight[key] = gate
+                    owner = True
+                else:
+                    owner = False               # 别人在学，等它
+            if owner:
+                try:
+                    v = self._full_probe(row, section)
+                    with self._lock:
+                        # 只有真正学到东西才存 —— 凭证类失败（欠费）是 Key 的
+                        # 属性，存下来会让后面的 Key 错误地继承别人的欠费结论。
+                        if v.usable:
+                            self._shape[key] = v
+                finally:
+                    # 无论成败都必须放闸，否则等待方永久卡死
+                    with self._lock:
+                        self._inflight.pop(key, None)
+                    gate.set()
+                return v
+            # 等认领者出结果。超时兜底：认领者若卡在长 timeout 上，
+            # 等待方不该被无限期拖住 —— 醒来重判，那时要么有形态可复用，
+            # 要么门闩已清空，由本线程接手认领。
+            gate.wait(timeout=self.timeout + 30)
+
+        return self._reuse_shape(row, section, shape)
+
+    def probe(self, row: ParsedRow) -> CandidateResult:
+        """探一个候选的四段。
+
+        四段并行（workers>1 时）。为什么可以并行：
+          · 四段打的是四个不同端点，业务上互不依赖
+          · _throttle 按 (host, section) 计时，同段内仍严格保持 gap
+          · _shape / _last_call / _proxy_state 三处共享状态都在 self._lock 下
+          · SectionVerdict 每段一个对象，不跨段写
+
+        为什么这一步收益最大：原来四段共享一个 gap 桶且串行，单站 56 次请求
+        要 55 x 3s = 165 秒纯睡。拆桶 + 并行后，四段各自睡自己的，
+        墙钟时间取四段里最慢的那一段，而不是四段之和。
+        """
+        res = CandidateResult(row=row)
+        self.on_event("candidate-start", {"host": row.host, "key": row.masked()})
+
+        if self.workers > 1:
+            # 结果按 SECTIONS 原序回填 —— 前端表格与 CLI 输出都依赖这个顺序，
+            # 不能让完成先后决定展示顺序。
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(self.workers, len(SECTIONS)),
+                    thread_name_prefix="probe-sec") as ex:
+                futs = {ex.submit(self._probe_one_section, row, sec): sec
+                        for sec in SECTIONS}
+                done: dict[str, SectionVerdict] = {}
+                for fut in concurrent.futures.as_completed(futs):
+                    sec = futs[fut]
+                    try:
+                        done[sec] = fut.result()
+                    except Exception as e:      # noqa: BLE001
+                        # 一段炸了不该拖垮另外三段。记成不可用并带上原因，
+                        # 让它照常走「不可用」那条展示路径。
+                        v = SectionVerdict(
+                            section=sec,
+                            base_url=base_for_section(row.bare, sec))
+                        v.category, v.action = "死路", f"探测异常：{e}"
+                        done[sec] = v
+                        self.on_event("section-error",
+                                      {"section": sec, "error": str(e)})
+            for sec in SECTIONS:
+                v = done[sec]
+                res.sections[sec] = v
+                self.on_event("section-done", {"section": sec, "usable": v.usable,
+                                               "summary": v.summary()})
+        else:
+            for section in SECTIONS:
+                v = self._probe_one_section(row, section)
+                res.sections[section] = v
+                self.on_event("section-done", {"section": section, "usable": v.usable,
+                                               "summary": v.summary()})
+
+        self.on_event("candidate-done", {"host": row.host,
+                                         "usable": res.usable_sections,
+                                         "calls": res.total_calls})
+        return res

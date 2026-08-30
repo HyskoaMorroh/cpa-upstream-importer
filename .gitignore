@@ -1,0 +1,83 @@
+# ── 秘密与真实配置：绝不提交 ────────────────────────────────
+#
+# config.yaml 含**明文上游 API Key** 与 CPA 管理密钥的 bcrypt 哈希。
+# 一旦推上公开仓库，即使随后 force-push 删掉，GitHub 的 fork/缓存
+# 与第三方爬虫仍可能留有副本 —— 那些 Key 必须视为已泄露并全部轮换。
+#
+# 这一段是本文件最要紧的部分。宁可多列几条。
+config.yaml
+config.yml
+config.*.yaml
+config.*.yml
+*.bak-*
+*.scrub-bak-*
+.env
+.env.*
+!.env.example
+secrets/
+auths/
+*.key
+*.pem
+*.p12
+*.pfx
+
+# 投喂用的账号清单：每行 `url,key`，全是明文凭据
+accounts.txt
+accounts*.txt
+upstreams.txt
+*.accounts
+
+# ── 本站排障记录：不公开 ────────────────────────────────────
+#
+# cpa-atlas.html 是两夜排障的全记录，里面每一条都是**本部署**的实测：
+# 哪个上游站 403、哪个静默换模、哪个按出口 IP 拉黑、各站的档位与 Key 数。
+# 即使域名换成占位符，这些案例组合起来仍能反推出用了哪些站、各自什么毛病。
+# 本地留着当参考，不进公开仓库。
+#
+# 没有任何代码 import 它 —— 只有 6 处文档引用（README 2、request.py 1、
+# spec 1、legacy 2），全是注释里的「依据见 xx 章」。缺它不影响运行与测试。
+docs/cpa-atlas.html
+
+# ── 工具生成物 ──────────────────────────────────────────────
+#
+# graphify-out/ 是代码图谱（2.1 MB），每次 `graphify .` 重新生成。
+# 它把源码里的字符串抄进 graph.json / graph.html，所以**会连带泄露**
+# scrub 之前的域名 —— 实测 graph.json 里就留着一个真实站名。
+# 生成物不进仓库，需要图谱的人自己跑一次。
+graphify-out/
+
+# ── 运行期产物 ──────────────────────────────────────────────
+logs/
+*.log
+backups/
+tmp/
+*.tmp
+
+# ── Python ──────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── 编辑器 / 系统 ───────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

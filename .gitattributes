@@ -1,0 +1,29 @@
+# 强制 LF —— 这个项目在 Windows 上开发、在 Linux 上部署。
+#
+# 为什么必须有这个文件（2026-08-31 自查）：
+# 三个 .sh 现在是纯 LF（file 命令确认），但没有任何机制**保持**它。
+# git 的 core.autocrlf 是**每台机器各自的**设置，一台开了 true 的 Windows
+# 机器 checkout 再 commit，脚本就带上 CRLF 推回来了 —— 而 Linux 上
+# `#!/usr/bin/env bash\r` 会报 `bad interpreter: No such file or directory`，
+# 提示里完全看不出是行尾问题。.gitattributes 随仓库走，压过本机设置。
+#
+# Python 与 YAML 一并锁 LF：writeback 就地覆写 config.yaml 时写的是 LF
+# （io.open(..., newline="\n")），源文件行尾不统一会让 diff 噪音掩盖真实改动。
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+*.js   text eol=lf
+*.html text eol=lf
+*.conf text eol=lf
+Dockerfile text eol=lf
+
+# 二进制：别碰，也别在 diff 里展开
+*.png binary
+*.jpg binary
+*.ico binary
+*.gz  binary
+*.zip binary
