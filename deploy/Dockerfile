@@ -110,11 +110,21 @@ USER ${APP_UID}
 #
 # 这些值全部可被 compose / docker run -e 覆盖，镜像里没有任何硬编码假设。
 # CPA_UPSTREAM_URL 默认用 compose 网络里的服务名；独立部署时改成可达地址。
+#
+# 这里**故意不声明 IMPORTER_TOKEN**。
+#
+# 原来有一行 IMPORTER_TOKEN=""，buildx 报 SecretsUsedInArgOrEnv 警告。
+# 那个警告是对的，尽管值是空串：ENV 会写进镜像元数据，docker inspect 与
+# 镜像层历史里都能看到这个键。声明一个空的密钥键没有任何好处 ——
+# server.py 的 --token 默认值本就是 os.environ.get("IMPORTER_TOKEN", "")，
+# 环境变量不存在时取到同样的空串，行为完全一致。
+#
+# 真实 token 由 compose 从 .env 注入（docker-compose.yml 的 environment 段），
+# 或 docker run -e IMPORTER_TOKEN=...。两条路都不经过镜像。
 ENV IMPORTER_HOST=0.0.0.0 \
     IMPORTER_PORT=8765 \
     IMPORTER_CONFIG=/data/config.yaml \
     IMPORTER_BACKUP_DIR=/backups \
-    IMPORTER_TOKEN="" \
     CPA_UPSTREAM_URL=http://cli-proxy-api:8317 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
