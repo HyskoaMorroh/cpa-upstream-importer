@@ -21,7 +21,11 @@
 #
 #       Variables 标签 → New repository variable
 #         DOCKERHUB_USERNAME  Docker Hub 用户名。**必填**，它同时是
-#                             「要不要发 Docker Hub」的开关
+#                             「要不要发 Docker Hub」的开关。
+#                             放进 Secrets 也能用（本工作流两处都读），
+#                             但**推荐 Variables**：放 Secrets 会让它在日志里
+#                             被打成 ***，镜像名跟着显示成 ***/xxx，
+#                             出问题时看不出到底推到哪个命名空间去了
 #         DOCKERHUB_IMAGE     镜像名，可选。留空 = 用 GitHub 仓库名
 #
 #       Secrets 标签 → New repository secret
@@ -104,7 +108,7 @@ jobs:
       contents: read
       packages: write        # 推 GHCR 需要
 
-    # 「要不要发 Docker Hub」在这里算一次，后面的步骤只看这个旗标。
+    # Docker Hub 的三个输入在这里统一算好，后面的步骤只看这三个 env。
     #
     # 为什么不能在 steps 的 if: 里直接写 secrets.DOCKERHUB_TOKEN != ''：
     # `secrets` 上下文在 steps.if 里**不可用**。官方 Context availability 表
@@ -112,12 +116,21 @@ jobs:
     #     github, needs, strategy, matrix, job, runner, env, vars, steps, inputs
     # 没有 secrets。写了不报错，只是恒为空 —— 那一步会永远被跳过，
     # 「配好了却不发布」还没有任何提示，比直接失败更难查。
+    # jobs.<job_id>.env 那一行**允许** secrets，所以在这里算。
     #
-    # jobs.<job_id>.env 那一行**允许** secrets，所以旗标在这里算。
-    # 存进 env 的是 'yes' / ''，不是 token 本身，不构成泄露。
+    # 用户名同时接受 Variables 与 Secrets 两种放法（vars 优先）。
+    # 推荐放 Variables —— 用户名本来就公开，而放进 Secrets 会让它在日志里
+    # 被打成 ***，镜像名跟着变成 ***/xxx，排查时看不出推到哪去了。
+    # 但放错地方不该让发布静默失效，所以两处都读。
+    #
+    # 注意 DOCKERHUB_READY 里必须把表达式重算一遍，不能引用上面的
+    # DOCKERHUB_USER —— jobs.<job_id>.env 允许的上下文里**没有 env**，
+    # 同一个 env 块内互相引用取不到值。
     env:
+      DOCKERHUB_USER: ${{ vars.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_REPO: ${{ vars.DOCKERHUB_IMAGE || github.event.repository.name }}
       DOCKERHUB_READY: >-
-        ${{ (vars.DOCKERHUB_USERNAME != ''
+        ${{ ((vars.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USERNAME) != ''
              && secrets.DOCKERHUB_TOKEN != '') && 'yes' || '' }}
     steps:
       - uses: actions/checkout@v4
@@ -151,7 +164,7 @@ jobs:
           env.DOCKERHUB_READY == 'yes'
         uses: docker/login-action@v3
         with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
+          username: ${{ env.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: 算镜像名与标签
@@ -169,7 +182,7 @@ jobs:
           # `<user>/owner/repo` —— Docker Hub 的命名空间只有一层，斜杠会被拒。
           images: |
             ghcr.io/${{ github.repository }}
-            ${{ env.DOCKERHUB_READY == 'yes' && format('{0}/{1}', vars.DOCKERHUB_USERNAME, vars.DOCKERHUB_IMAGE || github.event.repository.name) || '' }}
+            ${{ env.DOCKERHUB_READY == 'yes' && format('{0}/{1}', env.DOCKERHUB_USER, env.DOCKERHUB_REPO) || '' }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
