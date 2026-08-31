@@ -147,12 +147,38 @@ def test_classify() -> None:
         got, _ = cp.classify("403", body)
         eq(f"判余额：{body[:18]}", got, "余额")
     # 反向：这些不能被误判成余额
-    for st, body, want in (("403", "This group is restricted to Claude Code clients", "门禁"),
-                           ("403", "<html>Attention Required!</html>", "IP封"),
+    for st, body, want in (("403", "<html>Attention Required!</html>", "IP封"),
                            ("401", "unauthorized client", "鉴权"),
                            ("404", "model_not_found", "死路")):
         got, _ = cp.classify(st, body)
         eq(f"不误判成余额：{body[:24]}", got, want)
+
+    section("客户端门禁：不看状态码，看正文（2026-08-31 实测）")
+    # 站方只认特定客户端。**必须与「门禁」分开** —— 处置完全不同：
+    # 门禁要站方侧开通，这个补客户端标识就可能过。
+    #
+    # 关键是它可能挂在**任意**状态码上。实测那个站回的是 503，而 503 在
+    # 状态码兜底里是「临时」（usable=True、该重试）—— 于是探测白重试两次，
+    # 而这类拒绝与站方负载无关，重试一万次也一样。
+    for st, body in (("503", '{"error":{"message":"No available accounts: this '
+                             'group only allows Claude Code clients"}}'),
+                     ("403", "This group is restricted to Claude Code clients "
+                             "(/v1/messages only)"),
+                     ("403", "client not allowed"),
+                     ("400", "仅支持 Claude Code 客户端")):
+        got, _ = cp.classify(st, body)
+        eq(f"{st} 判客户端：{body[:34]}", got, "客户端")
+    eq("客户端门禁不可接入", cp.is_usable("客户端"), False)
+    eq("客户端门禁不降权（补标识可能就过）", cp.should_downrank("客户端"), False)
+    # 探测复制不了那个客户端形态时，用户需要知道还有别的出路
+    eq("处置里点明人工接管这条路", "人工接管" in cp.advice("客户端"), True)
+    # 反向：普通 503 仍是「临时」，不能被新规则抢走
+    for st, body, want in (("503", "upstream busy", "临时"),
+                           ("503", "Upstream service temporarily unavailable", "临时"),
+                           ("502", "Bad Gateway", "临时"),
+                           ("503", "No available channel", "死路")):
+        got, _ = cp.classify(st, body)
+        eq(f"不被客户端规则误收：{body[:30]}", got, want)
 
     section("200 但正文是错误体（假阳性防线）")
     # 有的站对**所有**请求都回 200，把真实错误放正文里。而 Attempt.ok 只看
