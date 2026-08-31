@@ -37,6 +37,9 @@ const S = {
   planId: null,
   plans: null,
   overrides: {},        // {host: {section: {...}}}
+  // 人工接管：{host: {section: [模型, ...]}}。探测判不可用但操作员确知可用的段。
+  // 很多中转站不给测活（探针短消息被拦、分组限客户端），而真实对话正常。
+  forced: {},
   picks: null,          // Set("host\u0000section")，null = 尚未初始化
   reuseSaved: 0,        // 形态复用省下的请求数
 };
@@ -442,6 +445,19 @@ function renderStream(events) {
       return `<div class="s4">  ${pad(SECTION_LABEL[e.section], 8)} `
         + `${esc(e.reason || '')}</div>`;
     }
+    // 站方负载上限（503/502/504）会重试一次。要让这一步可见 —— 否则
+    // 用户只看到同一个模型出现两次、不知道为什么，也不知道等了 2 秒。
+    if (e.kind === 'transient-retry') {
+      return `<div class="note">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `${pad(e.model, 20)} ${esc(e.status)} 临时错误，${e.wait}s 后重试一次</div>`;
+    }
+    // 200 但正文是错误体 / 换模 —— 模型被拒收，不进写入清单
+    if (e.kind === 'model-rejected') {
+      const why = e.reason ? esc(e.reason)
+        : `请求 ${esc(e.requested)} 却回 ${esc(String(e.actual))}`;
+      return `<div class="s4">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `${pad(e.requested, 20)} 模型不收：${why}</div>`;
+    }
     if (e.kind === 'attempt') {
       const c = e.status === '200' ? 's2' : (e.status[0] === '4' ? 's4' : 's5');
       return `<div class="${c}">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
@@ -514,15 +530,28 @@ function siteCard(r) {
     if (!v.usable) {
       const pill = CAT_PILL[v.category] || 'p-m';
       const last = (v.attempts || []).filter((a) => a.status !== '200').slice(-1)[0];
-      return `<tr class="off">
-        <td class="pick">—</td>
+      // 探测失败的段也给勾选框 —— 判定会错，必须有人工出口。
+      // 但要求先填模型清单：探测没验成功过任何模型，工具无从推断该注册什么。
+      // 勾选框默认不勾，且只有填了模型才可勾（见 bindResultEvents）。
+      const fm = ((S.forced[host] || {})[sec] || []).join(', ');
+      return `<tr class="off" data-host="${esc(host)}" data-sec="${esc(sec)}">
+        <td class="pick"><input type="checkbox" class="sel force"
+          data-host="${esc(host)}" data-sec="${esc(sec)}"
+          title="探测未通过。要接管请先在右侧填模型名"></td>
         <td class="m"><b>${esc(label)}</b></td>
         <td><span class="pill ${pill}">${esc(v.category || '不可用')}</span></td>
         <td>${esc(v.action || '不写入')}
           ${last && last.excerpt
             ? `<div class="mlist">${esc(last.status)} · ${esc(last.excerpt.slice(0, 150))}</div>`
             : ''}</td>
-        <td colspan="4" class="hint">不写入</td>
+        <td colspan="4">
+          <div class="pedit"><input type="text" class="fm" style="width:100%"
+            data-host="${esc(host)}" data-sec="${esc(sec)}"
+            value="${esc(fm)}"
+            placeholder="不给测活的站：手填模型名，逗号分隔，如 claude-opus-5"></div>
+          <div class="hint">填了才能勾选。工具不会验证这些模型 ——
+            写错会让 CPA 每次轮到它都失败</div>
+        </td>
       </tr>`;
     }
 
@@ -586,6 +615,24 @@ function siteCard(r) {
 function bindResultEvents() {
   const box = $('#results');
   box.addEventListener('change', (e) => {
+    // 人工接管的模型清单
+    const fmi = e.target.closest('.fm');
+    if (fmi) {
+      const h = fmi.dataset.host, sc = fmi.dataset.sec;
+      const list = fmi.value.split(',').map((x) => x.trim()).filter(Boolean);
+      S.forced[h] = S.forced[h] || {};
+      if (list.length) {
+        S.forced[h][sc] = list;
+      } else {
+        delete S.forced[h][sc];
+        // 模型清空了就不能再留着勾选 —— 后端会把空清单当成未接管而跳过该段，
+        // 前端还勾着就成了「看着会写入实际不写」的错觉。
+        S.picks && S.picks.delete(pk(h, sc));
+      }
+      refreshPlan(true);
+      syncPickUI();
+      return;
+    }
     const inp = e.target.closest('.pi');
     if (inp) {
       const h = inp.dataset.host, s = inp.dataset.sec;
@@ -597,6 +644,20 @@ function bindResultEvents() {
     }
     const sel = e.target.closest('.sel');
     if (sel) {
+      // 探测未通过的段：没填模型就不让勾 —— 空清单到后端会被当成
+      // 未接管而跳过，勾了也不会写入。在这里拦住并说清原因。
+      if (sel.classList.contains('force') && sel.checked) {
+        const fl = (S.forced[sel.dataset.host] || {})[sel.dataset.sec] || [];
+        if (!fl.length) {
+          sel.checked = false;
+          const row = sel.closest('tr');
+          const box2 = row && row.querySelector('.fm');
+          if (box2) box2.focus();
+          $('#pickstat').textContent =
+            '该段探测未通过 —— 要接管请先填模型名（逗号分隔）';
+          return;
+        }
+      }
       const key = pk(sel.dataset.host, sel.dataset.sec);
       if (sel.checked) S.picks.add(key); else S.picks.delete(key);
       syncPickUI();
@@ -654,6 +715,7 @@ async function refreshPlan(silent) {
     // 勾选框是「试用期定档」；服务端收反义的 by_score。
     // 元素缺失时回退到试用期（安全侧），不回退到激进档。
     by_score: $('#o_probation') ? !$('#o_probation').checked : false,
+    forced: S.forced,
   };
   // 只有用户明确动过勾选才传 selected；首次让后端返回全部以便读 recommended
   if (S.picks) {
@@ -877,7 +939,7 @@ $('#btnapply').onclick = async () => {
 
 $('#btnrestart').onclick = () => {
   S.jobId = null; S.planId = null; S.plans = null;
-  S.overrides = {}; S.cursor = 0; S.picks = null; S.reuseSaved = 0;
+  S.overrides = {}; S.forced = {}; S.cursor = 0; S.picks = null; S.reuseSaved = 0;
   $('#input').value = '';
   ['#pdone', '#p4', '#p3', '#p2', '#pparse'].forEach((s) => { $(s).hidden = true; });
   $('#p1').hidden = false;

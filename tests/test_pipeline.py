@@ -183,6 +183,44 @@ class FakeUpstream(BaseHTTPRequestHandler):
             self._send(200, self._ok_payload(model, min(max(sent, 20), 300_000)))
             return
 
+        # 200 但正文是错误体。2026-08-31 实测的假阳性：station 全回 200，
+        # 正文却是 {"error":...} 且无 model 字段 —— 原来四段全判可用、
+        # 注册 11 个模型，而那站完全不能用。死站进 config.yaml 会耗尽重试预算。
+        if profile == "okerror":
+            self._send(200, {"error": {"message": "no available channel under this group",
+                                       "type": "server_error"}})
+            return
+
+        # 站方负载上限：前 N 次 503，之后恢复。验「临时」类必须重试 ——
+        # 不重试就会把「忙」当成「坏」。
+        if profile == "flaky":
+            # 计数必须按 (路径, 模型) 分开。四段是**并行**探测的，用一个
+            # 全局计数器时 fail_first=1 只会让最先到达的那个请求收到 503，
+            # 其余三段直接 200 —— 而谁先到取决于线程调度。那样写出来的断言
+            # 时通时不通（我第一版就是这么写的，抓到了）。
+            k = f"{path}|{model}"
+            with FLAKY_LOCK:
+                FLAKY[k] = FLAKY.get(k, 0) + 1
+                n = FLAKY[k]
+            if n <= FLAKY_FAIL_FIRST[0]:
+                self._send(503, {"error": {"message": "upstream busy"}})
+            else:
+                self._send(200, self._ok_payload(model, max(sent, 20)))
+            return
+
+        # 只支持第一个种子模型，第二个种子返回 404 model_not_found。
+        # 验「后一个种子的判定不能覆盖前一个」—— 那个 404 只说明这个分组没有
+        # 该模型，不能据此判死整段。
+        if profile == "onemodel":
+            if model == ONLY_MODEL:
+                self._send(200, self._ok_payload(model, max(sent, 20)))
+            else:
+                self._send(404, {"error": {
+                    "message": f'Model "{model}" is not supported by any '
+                               f'configured account in this group',
+                    "type": "model_not_found"}})
+            return
+
         if profile == "compatonly":
             if path.endswith("/chat/completions"):
                 self._send(200, self._ok_payload(model, max(sent, 20)))
@@ -195,6 +233,16 @@ class FakeUpstream(BaseHTTPRequestHandler):
             self._send(400, {"error": {"message": "bad model"}})
             return
         self._send(200, self._ok_payload(model, max(sent, 20)))
+
+
+# flaky 画像的调用计数，按 (路径, 模型) 分桶 —— 四段并行，全局计数会race。
+FLAKY: dict[str, int] = {}
+FLAKY_LOCK = threading.Lock()
+# 前几次返回 503。用单元素列表以便在闭包外改。
+FLAKY_FAIL_FIRST = [1]
+
+# onemodel 画像唯一支持的模型 —— 取 claude 段的第一个种子。
+ONLY_MODEL = "claude-opus-5"
 
 
 class ProxyMarkingProber(Prober):
@@ -240,11 +288,17 @@ def main() -> int:
     # via-proxy —— 那是生产环境想要的行为，但测试要覆盖代理救回的分支。
     fake_proxy = f"http://127.0.0.1:{port}"
 
+    # 每次 probe() 的事件流。新用例要断言 transient-retry / model-rejected
+    # 这类「过程可见性」事件确实发出去了 —— 不发就等于用户看不到发生了什么。
+    seen_events: list[tuple[str, dict]] = []
+
     def probe(profile: str, **kw):
+        seen_events.clear()
         row = cp.parse_lines(f"{base}/{profile},sk-fake000111222333").valid[0]
         p = ProxyMarkingProber(
             gap=0.0, timeout=10, probe_context=False, swap_samples=0,
-            proxy=fake_proxy, **kw,
+            proxy=fake_proxy,
+            on_event=lambda k, d: seen_events.append((k, d)), **kw,
         )
         return p.probe(row)
 
@@ -466,6 +520,61 @@ def main() -> int:
            all(d.get("verified") for d in reused if d.get("models")), True)
         used_combos = {a.combo for v in r2.sections.values() for a in v.attempts}
         eq("复用只发 reuse-verify", used_combos, {"reuse-verify"})
+
+        # ------------------------------------------------------------------
+        # 以下三组锁住 2026-08-31 三个实测缺陷。它们都不是代码自相矛盾，
+        # 而是「作者对真实中转站行为的假设错了」—— 假上游按旧假设造，
+        # 所以此前 760 项全绿也没暴露。
+        # ------------------------------------------------------------------
+        section("okerror：200 但正文是错误体 —— 不许判成可用（假阳性）")
+        r = probe("okerror")
+        # 端点确实响应了、凭证有效，所以 usable 仍为 True；但模型一个都不能收，
+        # 因为 SectionPlan.writable = not duplicate and bool(models)，
+        # 空清单才是「不写入 config.yaml」的真正闸门。
+        for sec in cp.SECTIONS:
+            eq(f"{sec} 模型清单为空", r.sections[sec].models, [])
+        writable = [s2 for s2, v2 in r.sections.items() if v2.models]
+        eq("没有任何段会被写入", writable, [])
+        rejected = [d for k, d in seen_events if k == "model-rejected"]
+        eq("发出 model-rejected 事件", len(rejected) > 0, True)
+        eq("拒收原因点明是错误体",
+           any("错误体" in str(d.get("reason", "")) for d in rejected), True)
+
+        section("flaky：503 临时错误必须重试 —— 不重试会把「忙」当成「坏」")
+        FLAKY.clear()
+        FLAKY_FAIL_FIRST[0] = 1          # 每个 (段, 模型) 首次 503，之后恢复
+        r = probe("flaky")
+        v = r.sections["claude-api-key"]
+        eq("首次 503 后重试并通过", v.usable, True)
+        eq("定性为可用", v.category, "可用")
+        combos = [a.combo for a in v.attempts]
+        eq("确实发生了重试", any(c.startswith("retry") for c in combos), True)
+        eq("第一次是基线", combos[0], "baseline")
+        retried = [d for k, d in seen_events if k == "transient-retry"]
+        eq("发出 transient-retry 事件", len(retried) > 0, True)
+
+        section("flaky：503 一直不恢复 —— 判「临时」而非「死路」，且重试有上限")
+        FLAKY.clear()
+        FLAKY_FAIL_FIRST[0] = 9999       # 永远 503
+        r = probe("flaky")
+        v = r.sections["claude-api-key"]
+        eq("持续 503 判为临时", v.category, "临时")
+        eq("持续 503 不可用", v.usable, False)
+        n_retry = sum(1 for a in v.attempts if a.combo.startswith("retry"))
+        eq("重试次数有上限（每种子 1 次）",
+           n_retry <= len(cp.pipeline.SEED_MODELS["claude-api-key"]), True)
+
+        section("onemodel：第二个种子 404 不许判死整段")
+        r = probe("onemodel")
+        v = r.sections["claude-api-key"]
+        # 站方只支持 claude-opus-5；claude-sonnet-5 返回 404 model_not_found。
+        # 那个 404 只说明「这个分组没有这个模型」，不能据此判死整段 ——
+        # sonnet-5 只是本工具写死的第二个种子。
+        eq("只支持首个种子时仍判可用", v.usable, True)
+        eq("定性为可用（不是死路）", v.category, "可用")
+        eq("清单里有可用的那个模型", ONLY_MODEL in v.models, True)
+        eq("清单里没有 404 的那个模型",
+           "claude-sonnet-5" in v.models, False)
 
     finally:
         srv.shutdown()

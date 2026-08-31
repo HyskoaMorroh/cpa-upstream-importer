@@ -1094,6 +1094,7 @@ def build_plan(
     seen: dict[str, set[str]] | None = None,
     seen_pairs: dict[str, set[str]] | None = None,
     probation: bool = True,
+    force: dict[str, list[str]] | None = None,
 ) -> ImportPlan:
     """把一个候选的探测结果变成写入方案。
 
@@ -1108,6 +1109,18 @@ def build_plan(
 
     probation 默认 True：新站进最低可插档，不因探测满分就挤掉已验证的站。
     见 suggest_priority 的说明。
+
+    force：{段: [模型, ...]}，人工接管。探测判不可用、但操作员确知可用的段，
+    由调用方显式给出要注册的模型清单。为什么需要这条路（2026-08-31）：
+
+      · 很多中转站**不给测活** —— 探针式短消息被拦、或分组只允许特定客户端，
+        而真实对话完全正常。这类站探测必然判死，此前完全无法导入。
+      · 探测只能证明「此刻这一次请求成功了」，反过来也一样：一次失败不能
+        证明这个站不能用。判定错了必须有人工出口。
+
+    force 只绕过 usable 判定，**不绕过**去重、定档、影响面计算与 diff 确认 ——
+    那几道是防止写坏 config.yaml 的，与「这个站能不能用」是两件事。
+    模型清单必须由操作员显式给出：探测没验成功过任何模型，工具无从推断。
     """
     bands = bands or {}
     existing = seen if seen is not None else existing_fingerprints(cfg)
@@ -1115,8 +1128,10 @@ def build_plan(
 
     plan = ImportPlan(host=row.host, masked_key=row.masked())
 
+    force = force or {}
     for section, v in result.sections.items():
-        if not v.usable:
+        forced_models = [m for m in (force.get(section) or []) if str(m).strip()]
+        if not v.usable and not forced_models:
             plan.skipped[section] = f"{v.category or '不可用'} — {v.action or '不写入'}"
             continue
 
@@ -1140,15 +1155,20 @@ def build_plan(
         band = bands.get(section) or build_band(cfg, section)
         bands[section] = band
 
+        # 人工接管的段：模型清单来自操作员，探测那边是空的。
+        # 定档也要按这份清单算 —— 影响面是「这些模型各自挡住谁」，
+        # 用空清单算出来的影响面恒为 0，等于没算。
+        models = forced_models if (forced_models and not v.usable) else list(v.models)
+
         score = score_verdict(v)
-        pri, reason = suggest_priority(band, score, models=list(v.models),
+        pri, reason = suggest_priority(band, score, models=models,
                                        probation=probation)
 
         sp = SectionPlan(
             section=section,
             base_url=base,
             api_key=row.api_key,
-            models=list(v.models),
+            models=models,
             priority=pri,
             priority_reason=reason,
             proxy_url=proxy,
@@ -1181,6 +1201,14 @@ def build_plan(
         else:
             existing.setdefault(section, set()).add(fp)
             pairs.setdefault(section, set()).add(pair)
+
+        if forced_models and not v.usable:
+            sp.priority_reason = (
+                f"人工接管（探测判「{v.category or '不可用'}」）· {reason}")
+            sp.warnings.append(
+                f"探测未通过（{v.category or '不可用'} — {v.action or ''}），"
+                f"模型清单由你手工指定：{', '.join(models)}。"
+                "工具没有验证过这些模型能用")
 
         sp.impacts = compute_impact(band, sp.models, pri)
 

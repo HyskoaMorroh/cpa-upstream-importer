@@ -260,6 +260,28 @@ def main() -> int:
     truthy("后端读 workers", '"workers"' in srv)
     truthy("后端读 candidate_workers", '"candidate_workers"' in srv)
 
+    section("⑦ 人工接管（探测判不可用但操作员确知可用）")
+    # 2026-08-31 实测缺陷：很多中转站**不给测活**（探针短消息被拦、
+    # 分组只允许特定客户端），而真实对话完全正常。原来不可用的段
+    # 渲染的是 `<td class="pick">—</td>` —— 没有勾选框，这类站完全无法导入。
+    truthy("不可用的段也渲染勾选框", "sel force" in js,
+           "判定会错，必须留人工出口")
+    truthy("有手填模型的输入框", 'class="fm"' in js)
+    truthy("前端把 forced 传给后端", "forced: S.forced" in js)
+    truthy("后端读 forced", '"forced"' in srv)
+    truthy("后端把 force 转给 build_plan", "force=" in srv)
+    truthy("没填模型时拦住勾选",
+           "classList.contains('force')" in js,
+           "空清单到后端会被当成未接管而跳过，勾了也不会写入")
+    truthy("模型清空时同步取消勾选", "S.picks.delete(pk(h, sc))" in js)
+    truthy("重来时清空 forced", "S.forced = {}" in js)
+
+    section("⑧ 过程可见性：新增事件前端都要认")
+    # 后端新发的事件如果前端不认，就在日志里静默丢失 ——
+    # 用户只看到同一个模型出现两次，不知道为什么。
+    truthy("前端认 transient-retry", "transient-retry" in js)
+    truthy("前端认 model-rejected", "model-rejected" in js)
+
     print("\n" + "=" * 62)
     if _fail:
         print(f"失败 {len(_fail)} 项 / 通过 {_pass} 项\n")

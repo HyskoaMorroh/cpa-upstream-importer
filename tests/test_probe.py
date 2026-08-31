@@ -137,6 +137,57 @@ def test_classify() -> None:
     got, _ = cp.classify("403", "cdn-cgi ... 预扣费额度失败")
     eq("余额优先于 CF", got, "余额")
 
+    section("余额的英文说法（2026-08-31 补）")
+    # 原来只认 quota 家族与中文「余额不足」，于是这两种常见英文表述落到
+    # 「门禁」—— 门禁是 usable=False，等于**一个充值就能用的站被判死**。
+    # 判错方向是「把活站当死站」，用户白丢一个可用站且看不出原因。
+    for body in ("insufficient balance", "credit exhausted", "insufficient credits",
+                 "out of credit", "balance is too low", "账户余额不足，请充值",
+                 "您已欠费", "余额已用完"):
+        got, _ = cp.classify("403", body)
+        eq(f"判余额：{body[:18]}", got, "余额")
+    # 反向：这些不能被误判成余额
+    for st, body, want in (("403", "This group is restricted to Claude Code clients", "门禁"),
+                           ("403", "<html>Attention Required!</html>", "IP封"),
+                           ("401", "unauthorized client", "鉴权"),
+                           ("404", "model_not_found", "死路")):
+        got, _ = cp.classify(st, body)
+        eq(f"不误判成余额：{body[:24]}", got, want)
+
+    section("200 但正文是错误体（假阳性防线）")
+    # 有的站对**所有**请求都回 200，把真实错误放正文里。而 Attempt.ok 只看
+    # 状态码、model_matches 拿不到 model 字段时按设计放行 —— 两者叠加会让
+    # 这种站四段全判可用、注册 11 个模型，实际完全不能用。
+    # 死站进 config.yaml 会耗尽重试预算，最终让客户端收到 500。
+    from cpa_probe.classify import has_error_envelope as _hee
+    for body in ('{"error":{"message":"no available channel"}}',
+                 '{"error":"quota exceeded"}',
+                 '{"type":"error","error":{"type":"overloaded_error"}}',
+                 '{"error":[{"code":1}]}'):
+        eq(f"认出错误体：{body[:30]}", _hee(body), True)
+    # 判据必须窄 —— 这些合法响应一个都不能误伤
+    for body in ('{"id":"msg_01AB","model":"claude-opus-5","content":[{"text":"ok"}]}',
+                 '{"choices":[{"message":{"content":"talking about error handling"}}]}',
+                 '{"modelVersion":"gemini-2.5-pro","candidates":[]}',
+                 '{"error":null}', '{"error":""}', '{"error":{}}', '{"error":[]}',
+                 'data: {"delta":"hi"}', '', 'plain text', '[1,2,3]',
+                 '{"type":"message","content":[]}'):
+        eq(f"不误伤：{(body[:30] or '<空>')}", _hee(body), False)
+
+    section("模型白名单：o 系列不能被漏掉")
+    # 白名单规则是「只留 gemini / gpt / claude 三类」。o1 / o3-mini 属于
+    # 「gpt 那一类」，只是 OpenAI 换了命名 —— 2026-08-31 实测被前缀匹配漏掉。
+    from cpa_probe.pipeline import model_allowed as _ma
+    for m in ("o1", "o1-mini", "o3", "o3-mini", "o4-mini", "o1-2024-12-17",
+              "gpt-4o", "claude-opus-5", "gemini-2.5-pro",
+              "Business/gemini-2.5-pro", "anthropic/claude-fable-5"):
+        eq(f"放行 {m}", _ma(m), True)
+    # 不能因为放宽 o 系列就误收这些
+    for m in ("openai-whisper", "omni-moderation", "o", "ollama-llama3",
+              "order-model", "deepseek-chat", "grok-4", "qwen-max",
+              "glm-4", "kimi-k2", "llama-3"):
+        eq(f"排除 {m}", _ma(m), False)
+
     section("处置语义")
     eq("余额不降权（充值自愈）", cp.should_downrank("余额"), False)
     eq("限流不降权（CPA 自带轮换）", cp.should_downrank("限流"), False)
