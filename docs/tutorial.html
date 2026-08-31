@@ -770,6 +770,33 @@ python3 cli.py -i accounts.txt --no-context --write --push</pre>
     起本机假上游跑完整流程，写到临时副本，跑完自检真实文件<b>逐字节未变</b>。</p>
   </div>
 
+  <h3>排障：导出 CPA 的错误日志</h3>
+  <p>要把日志发给别人看时，用项目自带的
+  <code>tools/export-logs.sh</code>，别手动 <code>tar</code>：</p>
+
+  <div class="cmd">
+    <div class="bar">在 config.yaml 所在目录执行；默认取最近 50 个错误日志</div>
+<pre>cd /opt/deploy
+bash upstream-importer/tools/export-logs.sh</pre>
+  </div>
+
+  <div class="note b">
+    <div class="t">错误日志含明文上游 API Key</div>
+    <p>CPA 在 <code>debug: true</code> 下把<b>完整请求体</b>写进错误日志，
+    其中有 <code>Authorization</code> 头。手动打包发出去，那些 Key 就跟着走了。</p>
+    <p>脚本默认脱敏，覆盖 6 种凭据形态；改的是副本，<b>原始日志一个字节都不动</b>，
+    并且脱敏后会自证一遍 —— 仍检出凭据就拒绝打包。上游 URL、状态码、错误消息
+    都保留，排障信息不受影响。</p>
+  </div>
+
+  <p>包里的 <code>digest.txt</code> 是摘要表，一行一个错误日志，
+  <b>先看它</b>再决定翻哪几份原文 —— 单份原文可达 2MB。其中「尝试」列为
+  <code>0</code> 意味着 CPA 在选择阶段就返回 503、请求<b>根本没出门</b>；
+  大于 0 才是真的发到了上游。两者的处置方向完全不同。</p>
+
+  <p>更多（两类日志各自的位置与保留策略、想留更长历史该改哪几个开关、
+  为什么不要开 <code>request-log</code>）见 README 的「导出 CPA 错误日志」一节。</p>
+
   <h3>三条红线</h3>
   <div class="grid2">
     <div class="card"><div class="h">服务只绑 127.0.0.1</div>
