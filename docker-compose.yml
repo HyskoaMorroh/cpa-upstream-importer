@@ -1,123 +1,60 @@
-# 投喂台 · 独立部署模板（不带 CPA 主栈）
+# 投喂台 · 独立部署（不带 CPA 主栈时用这份）
 #
-# ════════════════════════════════════════════════════════════════════
-# 这份文件用于**在别的机器上单独跑这个服务**，或作为主栈那段配置的对照。
-#
-# 如果你的 CPA 与本服务在同一台机器、同一个 compose 栈里，
-# 应该把服务定义并进那份主 compose（见 README「Docker · 已并入主栈」），
-# 这样 depends_on / networks 都是现成的。
-# ════════════════════════════════════════════════════════════════════
-#
-# 快速开始（在本目录，即 cpa-upstream-importer/ 下）：
-#
-#   # 1) 准备环境变量。CONFIG_PATH 必填 —— 指向你的 CPA config.yaml
-#   cp .env.example .env && $EDITOR .env
-#
-#   # 2) 确认 uid 与 config.yaml 属主一致，否则写回时 PermissionError
-#   stat -c '%u:%g' /path/to/config.yaml
-#
-#   # 3) 起服务
+#   cp .env.example .env && $EDITOR .env    # CONFIG_PATH 必填
 #   docker compose up -d
+#   docker compose logs -f                  # 日志里有带 token 的访问地址
+#   docker compose down                     # 用完关掉，它持有明文 Key
 #
-#   # 4) 拿访问地址（token 在日志里；也可直接用 CPA 后台管理密码登录）
-#   docker compose logs cpa-upstream-importer | head -20
-#
-#   # 5) 用完关掉 —— 它持有明文 Key 且能改写 config.yaml
-#   docker compose down
-#
-# 安全模型见 README「安全」一节。要点：端口只发布到宿主 127.0.0.1，
-# 外网访问必须经 nginx 加 TLS + 访问控制（deploy/nginx-snippet.conf）。
+# 默认拉远程镜像。要改代码就本地构建，见下面 build 段的说明。
 
 name: cpa-upstream-importer
 
 services:
   cpa-upstream-importer:
-    # 三种来源，按需二选一（另一个注释掉）：
-    #
-    #   A) 拉现成的多架构镜像（推荐 —— 支持 amd64 / arm64）
-    #      把 IMAGE 写进 .env，例如：
-    #        IMAGE=ghcr.io/<owner>/cpa-upstream-importer:latest
-    #   B) 本地构建（改了代码时用）
-    #
-    # 默认走 A，且在 IMAGE 未设置时回落到本地构建的 tag。
-    image: ${IMAGE:-cpa-upstream-importer:local}
+    image: ${IMAGE:-swhesong/cpa-upstream-importer:latest}
+    # 升级：docker compose pull && docker compose up -d
+    pull_policy: ${PULL_POLICY:-missing}
 
-    # 本地构建。用了 A 方案可以整块注释掉 —— 但留着无害：
-    # 有 pull_policy 时 compose 不会去 registry 找本地 tag。
+    # 本地构建：.env 里设 PULL_POLICY=build，镜像就取本地 tag 而不去 registry。
     build:
       context: .
       dockerfile: deploy/Dockerfile
       args:
-        # 与 config.yaml 属主对齐。见下面 user: 的说明。
         APP_UID: ${IMPORTER_UID:-10001}
         APP_GID: ${IMPORTER_GID:-10001}
 
-    # **不加这行，`docker compose pull` 会失败并中断整条命令。**
-    # compose pull 默认对所有服务尝试从 registry 拉，哪怕有 build:。
-    # 本地构建的 tag 在 registry 上不存在 —— 于是 pull 报
-    # `pull access denied`，`&&` 链断掉，后面的 up -d 根本没执行。
-    # 详见 README「部署踩坑」。
-    #
-    # 若你用的是方案 A（拉现成镜像），把这行改成 missing 或删掉。
-    pull_policy: ${PULL_POLICY:-build}
-
     container_name: ${CONTAINER_NAME:-cpa-upstream-importer}
+    restart: "no"           # 按需启的运维工具，崩了要人看日志
 
-    # 按需启的运维工具，不自动重启；崩了要人看日志
-    restart: "no"
-
-    # 只发布到宿主回环地址。写成 "8765:8765" 会暴露到公网 ——
-    # 这个界面持有明文上游 Key 且能改写 config.yaml。
+    # 只绑回环。写成 "8765:8765" 会暴露到公网 —— 这界面持有明文上游 Key
+    # 且能改写 config.yaml。外网访问经 nginx 加 TLS，见 deploy/nginx-snippet.conf。
     ports:
       - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-8765}:8765"
 
-    # 必须与宿主 config.yaml 的属主一致，否则写回时 PermissionError。
-    # 镜像里的 USER 只是构建期默认，这一行覆盖它。
-    #   查属主：stat -c '%u:%g' /path/to/config.yaml
+    # 必须与 config.yaml 属主一致，否则写回 PermissionError。
+    # 查属主：stat -c '%u:%g' /path/to/config.yaml
     user: "${IMPORTER_UID:-0}:${IMPORTER_GID:-0}"
 
     environment:
-      IMPORTER_HOST: "0.0.0.0"        # 容器内监听；暴露面由上面 ports 限制
+      IMPORTER_HOST: "0.0.0.0"        # 容器内监听，暴露面由上面 ports 限制
       IMPORTER_PORT: "8765"
       IMPORTER_CONFIG: "/data/config.yaml"
       IMPORTER_BACKUP_DIR: "/backups"
-      # 不设则每次重启随机生成并打印到日志。要固定：
-      #   echo "IMPORTER_TOKEN=$(openssl rand -hex 20)" >> .env
-      # 留空也能用 —— 直接拿 CPA 后台管理密码登录（服务端 bcrypt 比对）。
+      # 不设则每次启动随机生成并打印到日志；也可直接用 CPA 后台管理密码登录
       IMPORTER_TOKEN: "${IMPORTER_TOKEN:-}"
-      # 写回后主动 PUT 到这里让 CPA 立即生效，之后再做端到端验证。
-      #
-      # 为什么必须主动推：inotify 事件可能丢，而 CPA **没有轮询兜底** ——
-      # 事件一丢就永远不重载，也不会自愈。PUT 走 CPA 自己的 O_TRUNC 就地写，
-      # 必然产生一次容器内 Write 事件，把「可能丢」换成「必然有」。
-      #
-      # 同栈时用服务名（http://cli-proxy-api:8317）；
-      # 独立部署时改成宿主可达地址（http://127.0.0.1:8317）。
+      # 写回后主动 PUT 让 CPA 立即重载 —— inotify 事件可能丢，而 CPA 没有
+      # 轮询兜底。同栈填服务名，独立部署填宿主可达地址。
       CPA_UPSTREAM_URL: "${CPA_UPSTREAM_URL:-http://127.0.0.1:8317}"
 
     volumes:
-      # 只挂 config.yaml 这一个文件，读写。
-      #
-      # 为什么不挂整个目录：那里通常有 .env、secrets/、auths/、logs/。
-      # 这个服务只需要 config.yaml，挂目录等于把所有上游凭证、管理密钥、
-      # OAuth 授权文件一起递给它 —— 事故面没有理由那么大。
-      #
-      # 单文件挂载在容器启动时就把宿主 inode 解析定死了。所以
-      # writeback.write_local **一律就地 O_TRUNC 覆写，绝不 tmp+os.replace** ——
-      # replace 换的是目录项指向的 inode，宿主机看到新内容，而 CPA
-      # 容器的挂载点仍指着旧 inode，它读的就是另一个文件。
-      # 代价是不原子，所以备份先于写入完成（是前置条件，不是可选项）。
+      # 只挂这一个文件：挂整个目录等于把 .env、secrets/、auths/ 一起递给它。
+      # 单文件挂载把宿主 inode 定死，所以写回是就地 O_TRUNC 覆写而非
+      # tmp+rename —— 换 inode 会让 CPA 永远读旧文件。
       - "${CONFIG_PATH:?必须在 .env 里设 CONFIG_PATH，指向你的 CPA config.yaml}:/data/config.yaml"
-      # 备份落到命名卷 —— 单文件挂载时同目录不可写
-      - importer-backups:/backups
+      - importer-backups:/backups    # 单文件挂载时同目录不可写，备份落命名卷
 
-    # 服务持有明文上游 Key。这些限制不为性能，是缩小事故面。
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-
-    # 健康检查在镜像的 HEALTHCHECK 里（用 python 探活 —— 容器内没有 curl）
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
 
     deploy:
       resources:
@@ -126,9 +63,7 @@ services:
 
     logging:
       driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+      options: { max-size: "10m", max-file: "3" }
 
 volumes:
-  importer-backups:      # 写回前的 config.yaml 备份，独立卷保管
+  importer-backups:
