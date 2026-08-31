@@ -414,7 +414,16 @@ class Prober:
 
     # 判定的严重度排序。全部种子都失败时取**最严重**的那个，而不是最后一个。
     # 越靠前越严重。不在表里的类别按「未知」处理。
-    _SEVERITY = ("死路", "鉴权", "注入", "门禁", "IP封",
+    # 越靠前越严重。全部种子失败时取**最严重**的那个。
+    #
+    # 2026-08-31 修正：原来「死路」排第一，于是一个该站根本不存在的模型
+    # （SEED_MODELS 里写死的猜测）返回 404 model_not_found 时，会盖掉
+    # 另一个种子的真实结论。实测踩到：opus-5 返回 503（客户端门禁）、
+    # sonnet-5 返回 404，整段判「死路」—— 而真正该报的是「客户端」。
+    #
+    # 修法是两层：模型专属死路不进 seen（见 _stage1），这里再把「客户端」
+    # 排在「死路」之前 —— 它更接近根因，且处置明确（补标识或人工接管）。
+    _SEVERITY = ("客户端", "死路", "鉴权", "注入", "门禁", "IP封",
                  "未知", "临时", "限频", "限流", "边缘", "反测活", "余额")
 
     @classmethod
@@ -508,8 +517,13 @@ class Prober:
                     v.models = self._accept(v, model, att)
                     return v
 
-            # 标识类：按 identity_combos 由省到全回退，第一个 200 即最小必需头
-            if att.category in ("门禁", "IP封", "边缘") or att.status in ("401", "403"):
+            # 标识类：按 identity_combos 由省到全回退，第一个 200 即最小必需头。
+            #
+            # 「客户端」必须在列 —— 那类站回的可能是 503（实测），而 503 既不在
+            # 原来的类别集里、也不在 401/403 里，于是标识头一次都没试过。
+            # 用户日志里 claude 段全程只有 baseline 与 retry1，五种组合零尝试。
+            if (att.category in ("客户端", "门禁", "IP封", "边缘")
+                    or att.status in ("401", "403")):
                 for name, hdrs in request.identity_combos(section):
                     if not hdrs:
                         continue  # 空组合等于基线，已试过
