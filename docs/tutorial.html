@@ -838,12 +838,19 @@ python3 cli.py -i accounts.txt --no-context --write --push</pre>
           <li>散在 20 个文件里，比想象的多得多</li></ul></div>
   </div>
 
+  <div class="note b">
+    <div class="t">替换脚本自己不能进仓库</div>
+    <p>这类脚本的规则表里必须逐条写着<b>原始</b>域名，否则认不出要替换什么。
+    也就是说脚本本身就是一份域名清单 —— 进了公开仓库等于把要隐去的东西直接
+    发出去。本项目实际踩过这一步：清理跑得很干净，却把清理器推上去了。</p>
+    <p>放仓库外，或让它从一个被 <code>.gitignore</code> 排除的规则文件里读。</p>
+  </div>
+
   <div class="cmd">
-    <div class="bar">替换脚本自带备份；替换后测试必须仍全过</div>
-<pre>python3 tools/scrub_domains.py --dry-run   <span class="c"># 先看会改什么</span>
-python3 tools/scrub_domains.py            <span class="c"># 真改</span>
-python3 tests/run.py                      <span class="c"># 必须仍全过</span>
-git status --short                        <span class="c"># 确认没有 config.yaml / .env</span></pre>
+    <div class="bar">替换后必须重跑测试 —— 占位符命名会影响断言数据</div>
+<pre>python3 tests/run.py                      <span class="c"># 必须仍全过</span>
+git status --short                        <span class="c"># 确认没有 config.yaml / .env</span>
+git ls-files | grep -iE 'scrub|domain'    <span class="c"># 清理器别在里面</span></pre>
   </div>
 
   <div class="note b">
