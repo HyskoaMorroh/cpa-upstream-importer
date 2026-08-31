@@ -399,8 +399,13 @@ def main() -> int:
            str(got[0].get("prefix") or ""), cp.dominant_prefix(cfg, sec))
     comp = [e for e in new2["openai-compatibility"] if isinstance(e, dict)
             and "pfxtest.example.com" in str(e.get("base-url", ""))]
-    eq("compat 段现有全无 prefix，新条目也不加",
-       comp[0].get("prefix"), None)
+    # 期望值从**被测的那份文件**现算，不写死。
+    # 原来这里断言的是「compat 段现有全无 prefix，新条目也不加」，那是自带
+    # 样本的形状；传真实 config.yaml 进来时该段可能已经有主导 prefix，
+    # 断言就假失败 —— 与今天修掉的那批「基线钉在会变的文件上」同一类缺陷。
+    _want_pfx = cp.dominant_prefix(cfg, "openai-compatibility")
+    eq("compat 段新条目的 prefix 跟随该段主导值",
+       str(comp[0].get("prefix") or ""), _want_pfx)
     # prefix 参与 CPA 的五元组指纹，必须在算 fp 前定下来
     eq("prefix 进了指纹计算",
        cp.dedup_key("claude-api-key", api_key="k", base_url="https://x.com",

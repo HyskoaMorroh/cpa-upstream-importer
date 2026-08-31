@@ -33,6 +33,7 @@ from typing import Callable
 # 这条路径只有真发请求时才会走到，纯逻辑用例覆盖不到，所以必须写死成函数导入。
 from .classify import body_excerpt as _body_excerpt
 from .classify import classify as _classify
+from .classify import has_error_envelope as _has_error_envelope
 from . import client, fingerprint, request
 from .parse import SECTIONS, ParsedRow, base_for_section, host_of
 
@@ -49,6 +50,14 @@ SEED_MODELS: dict[str, list[str]] = {
 # 「模型类型只能是在 gemini、gpt、claude 这三种类型中的才保留」
 MODEL_PREFIX_WHITELIST = ("gemini", "gpt", "claude")
 
+# OpenAI 的推理系列不叫 gpt-*，但它属于上面规则里的「gpt 那一类」。
+# 2026-08-31 实测：o1 / o3-mini 被上面的前缀白名单丢掉 —— 那是规则**想留
+# 却漏掉**的，不是有意排除（deepseek / grok / qwen / glm / kimi 才是有意排除）。
+#
+# 用正则而不是前缀元组：`o1`、`o3`、`o4-mini` 这类是「字母 o + 数字」开头，
+# 而 `openai-xxx`、`omni-xxx` 不该命中，单纯 startswith("o") 会误收。
+_OPENAI_REASONING_RE = re.compile(r"^o\d+(?:[.\-]|$)")
+
 # 每段最多验几个模型。聚合站声明几百个（relay-m 曾 838 个），
 # 全验会触发反测活且极贵。
 MAX_MODELS_PER_SECTION = 4
@@ -58,13 +67,37 @@ def _encode(body: dict) -> bytes:
     return json.dumps(body, ensure_ascii=False).encode("utf-8")
 
 
+def _model_specific_dead_end(att) -> bool:
+    """这个「死路」是不是只针对**当前这个模型**，换个模型可能就通了。
+
+    为什么要区分（2026-08-31 实测）：404 `model_not_found` 说的是「这个分组
+    里没有这个模型」，而 SEED_MODELS 里的模型是本工具写死的猜测 —— 它不存在
+    完全不能说明这个站不可用。实测某站 claude-sonnet-5 返回 404，整段被判死，
+    而该站的 claude-opus-5 是可用的。
+
+    与之相对，敏感词拦截、分组无渠道、路径不存在这几种「死路」与模型无关，
+    换模型也救不了，那种要立即收敛以省请求数。
+    """
+    body = (att.excerpt or "").lower()
+    if att.status == "404" and re.search(r"model_not_found|model .{0,80}(?:not (?:supported|found)|does not exist)|不支持所选模型|模型不存在", body):
+        return True
+    return False
+
+
 def model_allowed(name: str) -> bool:
-    """按用户规则过滤模型名：只留 gemini / gpt / claude 三类。"""
+    """按用户规则过滤模型名：只留 gemini / gpt / claude 三类。
+
+    o1 / o3-mini 这类 OpenAI 推理系列也放行 —— 见 _OPENAI_REASONING_RE 的说明：
+    它们属于规则里的「gpt 那一类」，只是 OpenAI 换了命名，2026-08-31 实测
+    被前缀白名单漏掉了。
+    """
     n = (name or "").strip().lower()
     # 去掉可能的 provider 前缀（relay-m 会写 Business/gemini-xxx）
     if "/" in n:
         n = n.split("/")[-1]
-    return n.startswith(MODEL_PREFIX_WHITELIST)
+    if n.startswith(MODEL_PREFIX_WHITELIST):
+        return True
+    return bool(_OPENAI_REASONING_RE.match(n))
 
 
 @dataclass
@@ -85,6 +118,9 @@ class Attempt:
     input_tokens: int | None = None
     excerpt: str = ""
     sent_chars: int = 0
+    # 200 但正文是错误体。见 _accept 的说明 —— 这是实测过的假阳性来源，
+    # 而 status == "200" 单独看不出来，所以在 _call 里当场判好存下来。
+    error_envelope: bool = False
 
     @property
     def ok(self) -> bool:
@@ -306,6 +342,7 @@ class Prober:
             input_tokens=fingerprint.input_tokens(resp.body),
             excerpt="" if resp.status == "200" else _body_excerpt(resp.body),
             sent_chars=sent,
+            error_envelope=_has_error_envelope(resp.body),
         )
         self.on_event(
             "attempt",
@@ -333,7 +370,32 @@ class Prober:
 
         段仍算 usable（端点确实响应 200，凭证本身有效），但模型不进清单。
         models 为空 → `SectionPlan.writable` 为 False，不会写入。
+
+        为什么还要判「200 包错误体」（2026-08-31 实测的假阳性）
+        ------------------------------------------------------
+        `Attempt.ok` 只看 `status == "200"`，而 `model_matches` 在
+        `resp_model` 为 None 时按设计返回 True（无证据不判换模）。两者叠加，
+        「HTTP 200 + 正文是 {"error":...} + 没有 model 字段」这种站一路绿灯。
+        实测复现：四段全部 usable=True、注册 11 个模型，而那个站**完全不能用**。
+
+        这是**假阳性**，比判死更危险：死站带着模型进生产 config.yaml，每次轮到
+        它就吃一次失败，耗尽 request-retry x max-retry-credentials 预算，
+        最终客户端收到 500 —— 正是 tools/diag403.py 要诊断的那个症状。
+
+        判据必须精准，不能简单地「200 且无 model 字段就拒」：
+          · gemini 段用的是 `modelVersion` 而非 `model`，resp_model 已覆盖；
+          · 有些站的合法响应确实不带 model 字段（流式首包、极简实现）。
+        所以判的是「正文顶层有错误结构」而不是「缺 model 字段」：
+        顶层 error / 顶层 "type":"error"，两者都是明确的错误信号。
         """
+        if att.error_envelope:
+            self.on_event("model-rejected", {
+                "section": v.section,
+                "requested": model,
+                "actual": None,
+                "reason": "200 但正文是错误体",
+            })
+            return []
         if fingerprint.model_matches(model, att.resp_model):
             return [model]
         self.on_event("model-rejected", {
@@ -344,23 +406,79 @@ class Prober:
         })
         return []
 
+    # 「临时」类的重试：站方负载上限（503/502/504）不代表站点不可用。
+    # 实测踩到：某站 claude-opus-5 首次 503，而第二个种子 claude-sonnet-5
+    # 返回 404（该站根本没这个模型），整段被判死 —— 而那站其实可用。
+    _TRANSIENT_RETRIES = 1
+    _TRANSIENT_WAIT = 2.0
+
+    # 判定的严重度排序。全部种子都失败时取**最严重**的那个，而不是最后一个。
+    # 越靠前越严重。不在表里的类别按「未知」处理。
+    _SEVERITY = ("死路", "鉴权", "注入", "门禁", "IP封",
+                 "未知", "临时", "限频", "限流", "边缘", "反测活", "余额")
+
+    @classmethod
+    def _severity_rank(cls, category: str) -> int:
+        """越小越严重。不在表里的排在「未知」的位置。"""
+        try:
+            return cls._SEVERITY.index(category)
+        except ValueError:
+            return cls._SEVERITY.index("未知")
+
     def _stage1(self, row: ParsedRow, section: str) -> SectionVerdict:
-        """基线不通 → 试代理 → 试补标识头。三步都按处置优先级排。"""
+        """基线不通 → 试代理 → 试补标识头。三步都按处置优先级排。
+
+        为什么判定不能「后一个种子覆盖前一个」（2026-08-31 实测）
+        ----------------------------------------------------
+        原来每轮循环无条件 `v.category = att.category`，于是种子列表里
+        **后面**那个模型的结论会盖掉前面的。实测后果：
+            claude-opus-5   -> 503 临时（站方忙，本该重试）
+            claude-sonnet-5 -> 404 死路（该站根本没这个模型）
+        整段判「死路」并 usable=False —— 而 claude-sonnet-5 只是这里写死的
+        第二个种子，它不存在完全不能说明这个站不可用。
+
+        改成：全部种子失败后，取**最严重**的类别（见 _SEVERITY）。
+        「死路」只有在真的是死路时才成立，不会由一个不相干的模型带来。
+        """
         base = base_for_section(row.bare, section)
         v = SectionVerdict(section=section, base_url=base)
+        seen: list[tuple[str, str]] = []      # 每个种子的 (类别, 处置)
 
         for model in SEED_MODELS[section]:
             att = self._call(section, base, row.api_key, model, combo="baseline")
             v.attempts.append(att)
-            v.category, v.action = att.category, att.action
+
+            # 临时错误（站方负载）重试 —— 不重试就会把「忙」当成「坏」。
+            tries = 0
+            while (att.category == "临时" and tries < self._TRANSIENT_RETRIES):
+                tries += 1
+                self.on_event("transient-retry", {
+                    "section": section, "model": model,
+                    "status": att.status, "wait": self._TRANSIENT_WAIT,
+                })
+                time.sleep(self._TRANSIENT_WAIT)
+                att = self._call(section, base, row.api_key, model,
+                                 combo=f"retry{tries}")
+                v.attempts.append(att)
+
+            seen.append((att.category, att.action))
 
             if att.ok:
+                v.category, v.action = att.category, att.action
                 v.usable = True
                 v.models = self._accept(v, model, att)
                 return v
 
             # 余额 / 死路：换模型、加头、走代理都救不了。立即收敛。
-            if att.category in ("余额", "死路"):
+            #
+            # 但「死路」只对**这个模型**成立时不该终止整段：404 model_not_found
+            # 说的是「这个分组没有这个模型」，换个模型完全可能通。只有在
+            # 死路原因与模型无关时（敏感词、分组无渠道）才真的没救。
+            if att.category == "余额":
+                v.category, v.action = att.category, att.action
+                return v
+            if att.category == "死路" and not _model_specific_dead_end(att):
+                v.category, v.action = att.category, att.action
                 return v
 
             # 反测活：探测文本本身触发了拦截，换一句重试
@@ -408,6 +526,11 @@ class Prober:
                         v.models = self._accept(v, model, att)
                         return v
 
+        # 全部种子都没通。取**最严重**的类别，而不是最后一个种子的结论。
+        # 见本方法 docstring：后者会让一个该站不存在的模型判死整段。
+        if seen:
+            best = min(seen, key=lambda ca: self._severity_rank(ca[0]))
+            v.category, v.action = best
         return v
 
     # ---------- ② 模型发现 ----------
@@ -449,7 +572,17 @@ class Prober:
                 proxy=self.live_proxy if v.need_proxy else None,
             )
             v.attempts.append(att)
-            if att.ok and fingerprint.model_matches(model, att.resp_model):
+            # 必须走 _accept，不要在这里自己判 model_matches。
+            #
+            # 2026-08-31 实测：原来这里写的是
+            #     if att.ok and fingerprint.model_matches(model, att.resp_model)
+            # 于是「200 但正文是错误体」的检查被绕过 —— 那道检查只加在
+            # _accept 里，而这条是**第二条接受路径**。结果假阳性照旧：
+            # 站方全回 200 包错误体，四段仍注册 11 个模型。
+            #
+            # 这是同一个坑的第二次：wave 1 修过 _stage1 绕过 model_matches，
+            # 现在换成 _stage2 绕过错误体检查。所以接受与否只留一个入口。
+            if att.ok and self._accept(v, model, att):
                 found.append(model)
 
         v.models = found

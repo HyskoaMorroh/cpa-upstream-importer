@@ -771,6 +771,10 @@ class Handler(BaseHTTPRequestHandler):
         raw, cfg = self._load_cfg()
         overrides = body.get("overrides") or {}     # {host: {section: {...}}}
         selected = body.get("selected")             # [[host, section], ...] 或 None=全选
+        # 人工接管：{host: {section: [模型, ...]}}。探测判不可用但操作员确知
+        # 可用的段，由他显式给模型清单。见 cp.build_plan 的 force 说明 ——
+        # 只绕过 usable 判定，去重/定档/影响面/diff 确认一道都不少。
+        forced = body.get("forced") or {}
         # 默认试用期：新站进最低可插档，不因探测满分就把已验证的站挡在其后
         probation = not bool(body.get("by_score"))
 
@@ -778,8 +782,11 @@ class Handler(BaseHTTPRequestHandler):
         seen = cp.existing_fingerprints(cfg)
         plans = []
         for res in job.results:
+            fh = forced.get(res.row.host) or {}
             p = cp.build_plan(res.row, res, cfg, bands=bands, seen=seen,
-                              probation=probation)
+                              probation=probation,
+                              force={str(k): [str(m) for m in (v or [])]
+                                     for k, v in fh.items()} if fh else None)
             plans.append(p)
 
         # 应用用户覆盖（优先级 / 代理 / 头 / 模型 / 是否写入）
