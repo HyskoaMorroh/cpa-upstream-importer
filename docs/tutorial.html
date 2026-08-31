@@ -406,6 +406,39 @@ footer code{background:none;padding:0}
     不降权。403 空正文 → 概率性边缘拦截，不代表站点坏，不降权。<br>
     只有死路 / IP封 / 鉴权 / 门禁这四类才真正降权。</p>
   </div>
+
+  <h3>HTTP 200 也不等于可用</h3>
+  <p>有的中转站对<b>所有</b>请求都回 200，把真实错误放在正文里。
+  工具因此要检查正文顶层有没有 <code>error</code> 结构（或顶层
+  <code>"type":"error"</code>）—— 命中就不收该模型。</p>
+
+  <div class="note b">
+    <div class="t">为什么这条比判死更危险</div>
+    <p>「是不是 200」只看状态码，而换模判定在拿不到 <code>model</code> 字段时
+    按设计<b>放行</b>（无证据不判换模）。两者叠加，这种站曾被判成
+    <b>四段全可用、注册 11 个模型</b>，而它完全不能用。</p>
+    <p>死站进了 <code>config.yaml</code> 会把
+    <code>request-retry × max-retry-credentials</code> 的尝试预算吃光，
+    最终客户端收到 500 —— 判死只是白丢一个站，判活会拖垮整个轮询池。</p>
+    <p>判据刻意窄：空值 <code>null</code>/<code>""</code>/<code>{}</code>/<code>[]</code>
+    不算，非 JSON 不算，嵌在 <code>choices</code>/<code>candidates</code>/<code>content</code>
+    里的 error 字样不算 —— 模型正常输出完全可能谈论 error。</p>
+  </div>
+
+  <h3>临时错误要重试，一个不存在的模型不能判死整段</h3>
+  <div class="grid2">
+    <div class="card"><div class="h">503 / 502 / 504 重试一次</div>
+      <ul><li>站方负载上限不代表站点不可用</li>
+          <li>持续 503 判「临时」而非「死路」，重试有上限</li></ul></div>
+    <div class="card"><div class="h">全部种子失败时取<b>最严重</b>的类别</div>
+      <ul><li>不是取最后一个种子的结论</li>
+          <li>种子模型是工具写死的<b>猜测</b>，它不存在不能说明站不可用</li></ul></div>
+  </div>
+  <p>实测过的失败链：某站 <code>claude-opus-5</code> 返回 503（站方忙）、
+  <code>claude-sonnet-5</code> 返回 404（该站根本没这个模型）——
+  原来整段判「死路」。而 sonnet-5 只是种子列表里的第二个名字。</p>
+  <p>404 <code>model_not_found</code> 属于<b>模型专属死路</b>，换个模型继续试；
+  敏感词、分组无渠道这类与模型无关的死路才立即收敛以省请求数。</p>
 </div></section>
 
 <section id="s5"><div class="wrap">
@@ -892,6 +925,37 @@ bash upstream-importer/tools/export-logs.sh</pre>
 
   <p>更多（两类日志的完整对照、为什么不要开 <code>request-log</code>）
   见 README 的「导出 CPA 错误日志」一节。</p>
+
+  <h3>站方不给测活怎么办：人工接管</h3>
+  <p>有些站探针式短消息会被拦，或分组只允许特定客户端
+  （<code>This group is restricted to Claude Code clients</code>），而<b>真实对话
+  完全正常</b>。这类站探测必然判死，但它确实可用。</p>
+
+  <p>结果表里判死的那一行也有勾选框，右侧多一个模型输入框：</p>
+
+  <div class="cmd">
+    <div class="bar">填了模型名（逗号分隔）才能勾上</div>
+<pre>写入  段      判定    处置                        模型（手填）
+ <span class="k">☐</span>   claude  门禁   403 且无余额/CF 特征   [claude-opus-5, claude-opus-4-8]</pre>
+  </div>
+
+  <p>为什么必须手填：探测没验成功过任何模型，工具无从推断该注册什么。
+  模型清空会同步取消勾选 —— 避免「看着会写入、实际不写」的错觉。</p>
+
+  <div class="note g">
+    <div class="t">人工接管只绕过「能不能用」这一个判定</div>
+    <p>去重、定档、影响面计算、diff 确认<b>一道都不少</b> ——
+    那几道防的是写坏 <code>config.yaml</code>，与「这个站能不能用」是两件事。</p>
+    <p>试用期策略照常生效，影响面按你给的模型清单<b>实算</b>而不是恒为 0。
+    方案里会标注「人工接管（探测判「门禁」）」并附上警告，
+    事后能看出这条是怎么进来的。</p>
+  </div>
+
+  <div class="note b">
+    <div class="t">工具不会验证你填的模型名</div>
+    <p>写错会让 CPA 每次轮到它都失败，消耗重试预算。填之前先在站方后台
+    或用 <code>/v1/models</code> 确认。命令行侧目前没有等价参数，要人工接管请用网页。</p>
+  </div>
 
   <h3>三条红线</h3>
   <div class="grid2">
