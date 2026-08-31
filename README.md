@@ -1208,19 +1208,52 @@ bash upstream-importer/tools/export-logs.sh 200  # 最近 200 个
 | 错误日志（每次失败一个文件） | `logs/cli-proxy-api/error-*.log` | `error-logs-max-files`，默认 50，超了删最旧 |
 | 常规运行日志 | 容器 stdout | Docker json-file 轮转，compose 里是 `10m × 3` |
 
-`logging-to-file: false` 时常规日志**只在 stdout**，被轮转掉就找不回来了。
-想长期保留就改 `config.yaml`：
+### 想留更久：改文件数，别开 logging-to-file
 
 ```yaml
-logging-to-file: true          # 常规日志落到 logs/
-error-logs-max-files: 200      # 从 50 提高
-logs-max-total-size-mb: 2048   # 总量上限跟着提
+error-logs-max-files: 200      # 从 50 提高，这一项真的有用
+logs-max-total-size-mb: 512    # 够用；只有错误日志时撞不到它
+logging-to-file: false         # 保持 false —— 理由见下
+request-log: false             # 保持 false
 ```
 
 改完 `docker compose restart cli-proxy-api`。
 
+**`logging-to-file: true` 会让常规日志挤掉错误日志。** 那个开关把常规运行
+日志也写进同一个 `logs/` 目录，而 `logs-max-total-size-mb` 的清理是**按整个
+目录总大小、从最旧开始删**，不区分类型。常规日志连续写、错误日志偶发，
+两者共用一个配额的结果就是：常规日志的持续增长把错误日志顶出去 ——
+真出故障时回看，只剩最近一小段。`config.yaml` 里那条注释已经点到这个机制
+（「该清理机制作用于整个 logs 目录」）。保持 `false`，常规日志留在容器
+stdout（`docker compose logs` 能取），错误日志独占 `logs/` 配额，互不挤压。
+
 **`request-log: true` 不要开** —— 它记录每个请求与响应，单条可达 10MB+，
 `config.yaml` 自己的注释就写着「硬盘不够大请不要开启」。排障用错误日志够了。
+
+### 能回看多久
+
+按 `config.yaml` 注释里的实测数据推算（单份 70KB–2.1MB，一次故障 10 个文件
+在 75 分钟内被后续错误全部挤出）：
+
+| `error-logs-max-files` | 故障**持续爆发**时可回看 |
+|---|---|
+| 50（默认改后值） | 约 6 小时 |
+| 200 | 约 25 小时 |
+
+这是**下限** —— 那个速率取自故障爆发期。平稳期错误稀少，200 份可能覆盖数天。
+
+两个限制叠加生效，谁先撞到谁生效。只有错误日志时永远是**文件数**先撞：
+最坏情况 200 × 2.1MB ≈ 420MB，连 512MB 都到不了。所以
+`logs-max-total-size-mb` 在这个场景下只是兜底，调大它不会延长保留时间。
+
+**要长期存档，靠的不是调这几个数** —— CPA 的清理机制设计目标是「防止撑爆
+磁盘」，不是「长期保存」。真要留全量就定期归档出去，例如 cron 每天一次：
+
+```cron
+30 4 * * * cd /opt/deploy && bash upstream-importer/tools/export-logs.sh 200 >/dev/null
+```
+
+导出的包已脱敏，可以直接往别处搬。
 
 ### 只想看摘要，不打包
 
