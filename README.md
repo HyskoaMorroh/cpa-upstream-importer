@@ -235,7 +235,8 @@ cpa-upstream-importer/
 ├ tools/
 │  ├ recheck.py       复核**既有**凭据：按各站声明的模型 + CPA 的真实转发头
 │  ├ diag403.py       403 结构性诊断：预算 vs 顶层池、单点、档位落差
-│  └ rehearse.py      整链演练（假 CPA，零外网）
+│  ├ rehearse.py      整链演练（假 CPA，零外网）
+│  └ export-logs.sh  导出 CPA 错误日志，打包前强制脱敏
 ├ deploy/
 │  ├ preflight.sh     部署前自检（只读，不改任何东西）
 │  ├ install.sh       systemd 一键安装（幂等，可重复跑）
@@ -1165,6 +1166,72 @@ codex 段 gpt-5.6-sol 的承载站（按 priority 降序）
 > 不是「这个站可靠」。**单点站（该段只有 1 个 key）提到顶层风险特别高 ——
 > 它一挂整层就空，下面的可用站要等冷却期过完才轮到。
 > 提档到顶层前应确认：① 多次复测稳定 ② 该站在本段有多个 key。
+
+---
+
+## 导出 CPA 错误日志：`tools/export-logs.sh`
+
+排障要把日志发给别人时用这个，**别手动 tar**。原因见下面的警告。
+
+```bash
+cd /opt/deploy                                   # 必须在 config.yaml 旁边
+bash upstream-importer/tools/export-logs.sh      # 最近 50 个错误日志
+bash upstream-importer/tools/export-logs.sh 200  # 最近 200 个
+```
+
+产出 `log-export-<时间戳>.tar.gz`，内含四样：
+
+| 文件 | 内容 |
+|---|---|
+| `error-logs/` | 错误日志原文（已脱敏），每次失败一个文件 |
+| `stdout.log` | 容器 stdout 全量 |
+| `digest.txt` | 摘要表，一行一个错误日志 —— **先看这个** |
+| `context.txt` | 日志相关配置与容器状态（不含密钥） |
+
+> ⚠ **错误日志含明文上游 API Key。** CPA 在 `debug: true` 下把完整请求体
+> 写进错误日志，其中有 `Authorization` 头。手动打包发出去，那些 Key 就跟着走了。
+>
+> 脚本默认脱敏，覆盖 6 种形态：`sk-*`、`Bearer *`、JSON 里的
+> `api_key` / `x-api-key` / `secret_key`、`x-goog-api-key` 头、URL 上的
+> `?key=`。改的是副本，**原始日志一个字节都不动**；脱敏后还会自证一遍，
+> 仍检出凭据形态就拒绝打包并保留目录待人工检查。
+>
+> `--raw` 跳过脱敏，只在「日志完全不出本机」时用。要发给别人、贴 issue、
+> 传网盘，就绝对不要加。
+
+排障信息不受脱敏影响 —— 上游 URL、状态码、错误消息都保留。
+
+### 两类日志不在同一个地方
+
+| 类型 | 位置 | 保留策略 |
+|---|---|---|
+| 错误日志（每次失败一个文件） | `logs/cli-proxy-api/error-*.log` | `error-logs-max-files`，默认 50，超了删最旧 |
+| 常规运行日志 | 容器 stdout | Docker json-file 轮转，compose 里是 `10m × 3` |
+
+`logging-to-file: false` 时常规日志**只在 stdout**，被轮转掉就找不回来了。
+想长期保留就改 `config.yaml`：
+
+```yaml
+logging-to-file: true          # 常规日志落到 logs/
+error-logs-max-files: 200      # 从 50 提高
+logs-max-total-size-mb: 2048   # 总量上限跟着提
+```
+
+改完 `docker compose restart cli-proxy-api`。
+
+**`request-log: true` 不要开** —— 它记录每个请求与响应，单条可达 10MB+，
+`config.yaml` 自己的注释就写着「硬盘不够大请不要开启」。排障用错误日志够了。
+
+### 只想看摘要，不打包
+
+```bash
+cd /opt/deploy
+bash upstream-importer/legacy/logs-digest.sh 50
+```
+
+关键是「尝试」列：`0` 表示 CPA 在选择阶段就返回 503、请求根本没出门
+（成因见 `config.yaml` 的 `transient-error-cooldown-seconds` 注释）；
+`>0` 表示已发到上游，看「错误」列。
 
 ---
 
