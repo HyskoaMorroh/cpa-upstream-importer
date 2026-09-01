@@ -1065,6 +1065,16 @@ class SectionPlan:
     duplicate_note: str = ""
     impacts: list[Impact] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # 原条目的 weight，只在全量重建时用来**原样搬回去**。
+    #
+    # 为什么必须保留（2026-09-01 审计发现）：`weight: 0` 是用户显式表达
+    # 「把这个站逐出调度池」的唯一手段（本模块 232 行把它当强信号读），
+    # 而 CPA 缺这个字段时默认 1。全量重建不带它 = 你手工封禁的站全部复活，
+    # 而且没有任何提示。
+    #
+    # None 表示原条目没写这个字段，渲染时也不写 —— 「没写」与「写了 1」
+    # 在 CPA 侧等价，但保持原样能让 diff 干净。
+    weight: int | None = None
 
     @property
     def hijacked(self) -> list[Impact]:

@@ -143,10 +143,18 @@ def detect_memory_mb() -> tuple[int, str]:
     """可用内存 MB。优先 cgroup 限额，其次 /proc/meminfo 的 MemAvailable。"""
     # cgroup v2。注意 memory.max 是**硬上限**，容器实际能用的还要看
     # 宿主剩余；取两者较小者更稳，但读不到宿主时以限额为准。
+    #
+    # 必须挡住 <= 0 与超大值（2026-09-01 审计发现）：v1 那条路有 `0 < n` 的
+    # 判断，v2 这条原来只判了 != "max"。于是 memory.max = "-1"（某些运行时
+    # 表达「无限制」的方式）会被当成真实限额，算出 memory_mb = -1 —— 而
+    # detect() 里的 `mem > 0` 判断会让 reason 里不带内存那一项，
+    # 显示出来的依据与 memory_source 标的来源自相矛盾。
     v2 = _read("/sys/fs/cgroup/memory.max")
     if v2 and v2 != "max":
         try:
-            return int(v2) // (1024 * 1024), "cgroup v2 memory.max"
+            n = int(v2)
+            if 0 < n < 1024 ** 5:          # 上界同 v1：大于 1 PB 视为无限制
+                return n // (1024 * 1024), "cgroup v2 memory.max"
         except ValueError:
             pass
 

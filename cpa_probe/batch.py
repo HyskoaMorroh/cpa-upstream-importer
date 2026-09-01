@@ -26,6 +26,10 @@ class BatchProber:
         self._prober = prober
         self._max_workers = max_workers
         self._stats = {"success": 0, "partial": 0, "failure": 0}
+        # 抛异常的站：[(站, 原因), ...]。调用方要能说出「哪几个站没跑成」——
+        # results 里少一条而不知道为什么，比直接报错更难查。
+        # 累加都在 as_completed 那个循环里做，那是单线程，不需要锁。
+        self.errors: list[tuple[str, str]] = []
 
     def probe_batch(
         self,
@@ -45,9 +49,12 @@ class BatchProber:
         total = len(rows)
         current = 0
 
-        def probe_one(row: ParsedRow) -> tuple[str, Any]:
+        def probe_one(row: ParsedRow) -> tuple[tuple[str, str], Any]:
             result = self._prober.probe(row)
-            return (row.bare, result)
+            # 键必须含 api_key —— 只用 bare 会让同一个站的多个 Key 互相覆盖。
+            # 实测那份配置里 relay-f 与 relay-l 各有 15 个 Key，用 bare 做键
+            # 时 15 个只剩 1 个，而 _stats 仍报 15 个已完成。
+            return ((row.bare, row.api_key), result)
 
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=self._max_workers,
@@ -78,9 +85,13 @@ class BatchProber:
                             current, total, url, dict(self._stats)
                         )
 
-                except Exception as e:
-                    # 探测失败，记录为 failure
+                except Exception as e:                     # noqa: BLE001
+                    # 单站抛异常不能让整批停下 —— 175 个站里有一个超时就全废
+                    # 不可接受。但**异常本身不能吞掉**：原来这里连 e 都没用，
+                    # 于是「哪个站为什么失败」无从得知，而调用方只看到 results
+                    # 里少了一条。
                     self._stats["failure"] += 1
+                    self.errors.append((row.bare, f"{type(e).__name__}: {e}"))
                     current += 1
                     if progress_callback:
                         progress_callback(
@@ -141,3 +152,49 @@ def extract_existing_entries(cfg: dict) -> list[tuple[str, str, str, str]]:
                     entries.append(("compat", base_url, api_key, "openai-compatibility"))
 
     return entries
+
+
+def existing_weights(cfg: dict) -> dict[tuple[str, str], int]:
+    """既有条目的 weight，按 (host, api_key) 索引。只收显式写了的。
+
+    为什么单独一个函数而不塞进 extract_existing_entries 的返回值：那个函数的
+    四元组已被调用方与测试依赖，改结构要连带改几处；而这里只需要一张查表。
+
+    为什么必须有（2026-09-01 审计发现）：`weight: 0` 是用户显式表达「把这个站
+    逐出调度池」的唯一手段，CPA 缺这个字段时默认 1。全量重建不搬运它 =
+    手工封禁的站全部复活，且没有任何提示。
+
+    键用 host 而非 base_url：同一个站在不同段的 base-url 形态不同
+    （codex/compat 带 /v1），用 base_url 查不到。
+    """
+    from .parse import host_of
+
+    out: dict[tuple[str, str], int] = {}
+    for section in ("gemini-api-key", "codex-api-key", "claude-api-key"):
+        for e in cfg.get(section) or []:
+            if not isinstance(e, dict):
+                continue
+            w = e.get("weight")
+            if not isinstance(w, int):          # 缺失或非整数都当没写
+                continue
+            h = host_of(str(e.get("base-url") or ""))
+            k = str(e.get("api-key") or "")
+            if h and k:
+                out[(h, k)] = w
+
+    # compat 段的 weight 在 api-key-entries 的每一项上，不在 provider 级
+    for prov in cfg.get("openai-compatibility") or []:
+        if not isinstance(prov, dict):
+            continue
+        h = host_of(str(prov.get("base-url") or ""))
+        for ke in prov.get("api-key-entries") or []:
+            if not isinstance(ke, dict):
+                continue
+            w = ke.get("weight")
+            if not isinstance(w, int):
+                continue
+            k = str(ke.get("api-key") or "")
+            if h and k:
+                out[(h, k)] = w
+
+    return out

@@ -46,7 +46,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cpa_probe as cp  # noqa: E402
 from cpa_probe.pipeline import Prober, SEED_MODELS  # noqa: E402
-from cpa_probe.batch import BatchProber, extract_existing_entries  # noqa: E402
+from cpa_probe.batch import (  # noqa: E402
+    BatchProber, existing_weights, extract_existing_entries,
+)
 from cpa_probe.writeback import (  # noqa: E402
     apply_diffs,
     build_diffs,
@@ -448,9 +450,31 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
         # 批量探测
         results_dict = batch_prober.probe_batch(all_rows, progress_callback=progress_cb)
 
-        # 转换为列表（按原顺序）
+        # 转换为列表（按原顺序）。
+        #
+        # **必须滤掉 None**：BatchProber 对抛异常的站不会往 results_dict 里放
+        # 条目，于是 .get() 返回 None。而下游 _api_job 的 snapshot 与
+        # _api_plan 都直接取 res.row —— None 会让整个 /api/job 返回 500。
+        # 触发条件低到「175 个站里有一个网络超时」。
+        #
+        # 滤掉之后要把数量说出来：静默少几个站，用户看到的是「探测完成」但
+        # 方案里莫名少了几条，那比报错更难查。
         with job.lock:
-            job.results = [results_dict.get(row.bare) for row in all_rows]
+            got = [results_dict.get((row.bare, row.api_key)) for row in all_rows]
+            job.results = [r for r in got if r is not None]
+        lost = len(got) - len(job.results)
+        if lost:
+            job.emit("error", {
+                "msg": f"{lost} 个站探测时抛异常，未纳入结果"
+                       f"（其余 {len(job.results)} 个正常）"
+            })
+            # 逐条报原因 —— BatchProber.errors 记了 (站, 异常)。
+            # 只说「少了 3 个」而不说是哪 3 个、为什么，等于让人去猜。
+            for host, why in batch_prober.errors[:20]:
+                job.emit("error", {"msg": f"  {host}：{why}"})
+            if len(batch_prober.errors) > 20:
+                job.emit("error", {
+                    "msg": f"  …另有 {len(batch_prober.errors) - 20} 条同类"})
 
         job.emit("info", {"msg": f"探测完成：{batch_prober._stats['success']} 成功，{batch_prober._stats['partial']} 部分通，{batch_prober._stats['failure']} 失败"})
 
@@ -1015,6 +1039,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         opts = body.get("opts") or {}
+        # **必须写进 opts**：_api_plan 从 job.opts 读这个标志决定走全量重建还是
+        # 增量插入。只用它选执行函数是不够的 —— 那样 run_job_full_redetect 确实
+        # 跑了，但随后 /api/plan 读到 False 就走增量分支，rebuild_config_full
+        # 从不执行。表现是「等了 5 分钟重探，最后只追加了新站」，而且不报错：
+        # diffs 为空、lines_before == lines_after，看起来像「没什么要改的」。
+        opts["full_redetect"] = full_redetect
         if full_redetect and max_workers is not None:
             opts["max_workers"] = max_workers
 
@@ -1075,6 +1105,10 @@ class Handler(BaseHTTPRequestHandler):
             bands: dict = {}
             seen = cp.existing_fingerprints(cfg)
             all_plans = {}  # {(base_url, api_key): ImportPlan}
+            # 既有条目的 weight，按 (host, api_key) 查。`weight: 0` 是「把这个站
+            # 逐出调度池」的唯一表达，而 CPA 缺这个字段时默认 1 —— 不搬运它
+            # 等于让手工封禁的站全部复活。
+            weights = existing_weights(cfg)
 
             for res in job.results:
                 fh = forced.get(res.row.host) or {}
@@ -1082,6 +1116,10 @@ class Handler(BaseHTTPRequestHandler):
                                   probation=probation,
                                   force={str(k): [str(m) for m in (v or [])]
                                          for k, v in fh.items()} if fh else None)
+                w = weights.get((res.row.host, res.row.api_key))
+                if w is not None:
+                    for sp in p.sections.values():
+                        sp.weight = w
                 all_plans[(res.row.bare, res.row.api_key)] = p
 
             # 应用用户覆盖
