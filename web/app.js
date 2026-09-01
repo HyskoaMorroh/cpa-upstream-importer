@@ -792,14 +792,56 @@ function poll() {
     S.pollFails = 0;          // 通了就清零，只关心**连续**失败
     S.cursor = d.event_cursor;
     renderStream(d.events);
-    $('#st_rows').textContent = `${d.done_rows}/${d.total_rows}`;
+
+    // 进度条：用 unit_done/unit_total 而非 done_rows/total_rows ——
+    // 全量重探的单元是「凭据」，与 rows 不是一回事（rows 可能为空）。
+    const done = d.unit_done != null ? d.unit_done : d.done_rows;
+    const total = d.unit_total != null ? d.unit_total : d.total_rows;
+    $('#st_rows').textContent = `${done}/${total}`;
     $('#st_calls').textContent = d.calls;
     $('#st_time').textContent = d.elapsed;
-    $('#prog').style.width =
-      (d.total_rows ? d.done_rows / d.total_rows * 100 : 0) + '%';
+    $('#prog').style.width = (total ? done / total * 100 : 0) + '%';
+
     if (S.reuseSaved > 0) {
-      $('#st_saved').innerHTML =
-        `复用省下 <b>${S.reuseSaved}</b> 轮`;
+      $('#st_saved').innerHTML = `复用省下 <b>${S.reuseSaved}</b> 轮`;
+    }
+
+    // ETA：区间显示，带速率与窗口大小。样本不足时不显示数字。
+    const eta = $('#st_eta');
+    const det = $('#eta_detail');
+    if (d.eta_sec != null && d.eta_lo != null && d.eta_hi != null) {
+      const fmt = (s) => s < 60 ? `${s}s` : `${Math.floor(s/60)}m${s%60}s`;
+      const mid = fmt(Math.round(d.eta_sec));
+      const lo = fmt(Math.round(d.eta_lo));
+      const hi = fmt(Math.round(d.eta_hi));
+      const rate = d.rate_per_min != null ? ` · ${d.rate_per_min}/分` : '';
+      const smp = d.samples != null ? ` · 样本 ${d.samples}` : '';
+      eta.innerHTML = `<b>剩余 ${mid}</b> <span class="hint">(${lo}~${hi}${rate}${smp})</span>`;
+      eta.hidden = false;
+    } else if (d.eta_suppressed) {
+      // 高并发下剩余时间无法可靠外推（后端已判定），只报吞吐率。
+      // 显式说明原因 —— 不然「有速率却没剩余时间」看着像 bug。
+      const rate = d.rate_per_min != null ? `${d.rate_per_min}/分` : '';
+      eta.innerHTML = (rate ? `<b>${rate}</b> ` : '')
+        + `<span class="hint">${esc(d.eta_suppressed)}</span>`;
+      eta.hidden = false;
+    } else if (done > 0 && done < total) {
+      // 样本不足 —— 不给误导性的数字
+      eta.textContent = '估算中…';
+      eta.hidden = false;
+    } else {
+      eta.hidden = true;
+    }
+
+    if (d.in_flight != null && d.in_flight > 0) {
+      let txt = `在飞 ${d.in_flight} 个`;
+      if (d.slowest_host && d.slowest_age != null) {
+        txt += ` · 最慢站 ${esc(d.slowest_host)} 已跑 ${d.slowest_age}s`;
+      }
+      det.textContent = txt;
+      det.style.display = '';
+    } else {
+      det.style.display = 'none';
     }
 
     if (d.state === 'done') {

@@ -137,17 +137,24 @@ claude-api-key:
                     on_event=lambda k, d: events.append((k, d)))
     batch = BatchProber(prober, max_workers=3)
 
-    progress = []
+    # 回调分两类：current=0 是探测**开始**的占位（让调用方记「谁在飞」），
+    # current>0 是探测**完成**的进度。所以每个站会来两次。
+    progress, starts = [], []
     t0 = time.time()
-    results = batch.probe_batch(
-        parsed.valid,
-        progress_callback=lambda c, t, s, st: progress.append((c, t, dict(st))))
+
+    def on_progress(c, t, site, st):
+        (starts if c == 0 else progress).append((c, t, dict(st)))
+        assert "sk-" not in str(site), f"进度回调泄漏了 api_key：{site}"
+
+    results = batch.probe_batch(parsed.valid, progress_callback=on_progress)
     dt = time.time() - t0
 
+    assert len(starts) == 3, f"应有 3 次起始占位，实际 {len(starts)}"
     assert len(progress) == 3, f"应有 3 次进度回调，实际 {len(progress)}"
     assert progress[-1][0] == progress[-1][1] == 3, "最后一次回调应是 3/3"
     print(f"③ 批量探测: {len(results)} 个站, {dt:.1f}s, "
-          f"{len(progress)} 次进度回调, 统计 {progress[-1][2]}")
+          f"{len(starts)} 次起始 + {len(progress)} 次进度回调, "
+          f"统计 {progress[-1][2]}")
 
     # ④ 生成方案
     bands, seen = {}, cp.existing_fingerprints(cfg)

@@ -78,6 +78,72 @@ def test_extract_existing_entries():
     print("[OK] extract_existing_entries: 7 entries extracted")
 
 
+def test_job_eta():
+    """ETA 与进度度量。三条硬约束，每条都对应一次实测教训。"""
+    import random
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import server
+
+    class _Row:
+        host = "x.example.com"
+
+    # ① 样本不足时不给数字。宁可「估算中」，也不给一个必然错的秒数 ——
+    #    先报 2 分钟后来变 8 分钟会让操作员做错决定。
+    job = server.Job("j1", [_Row() for _ in range(20)], {})
+    job.workers = 4
+    for i in range(server.Job._ETA_MIN_SAMPLES - 1):
+        job.unit_done.append(float(i + 1))
+    p = job._progress(20)
+    assert "eta_sec" not in p, f"样本不足却给了 ETA：{p}"
+    assert p["unit_done"] == 4 and p["unit_total"] == 20
+
+    # ② 低并发下给区间，且区间必须包住点值
+    job.unit_done.append(5.0)
+    p = job._progress(20)
+    assert "eta_sec" in p, f"5 个样本应当能估：{p}"
+    assert p["eta_lo"] <= p["eta_sec"] <= p["eta_hi"], (
+        f"点值必须落在区间内：{p['eta_lo']} / {p['eta_sec']} / {p['eta_hi']}")
+    assert p["rate_per_min"] > 0
+    assert p["samples"] == 5
+
+    # ③ 高并发下**不给** ETA，只给吞吐率。
+    #
+    # 2026-09-01 回放验证：并发 30 时区间命中率只有 9%（并发 4 是 74%）。
+    # 剩余墙钟被「在飞最长的那个还需多久」主导，占比可达 100%，而那个值
+    # 在它结束前无法从已完成的样本推出 —— 不是算法问题，是信息不在样本里。
+    job_hi = server.Job("j2", [_Row() for _ in range(20)], {})
+    job_hi.workers = 30
+    job_hi.unit_done.extend([1.0, 2.0, 3.0, 4.0, 5.0])
+    p = job_hi._progress(20)
+    assert "eta_sec" not in p, f"并发 30 不该给 ETA：{p}"
+    assert p.get("eta_suppressed"), "抑制 ETA 时必须说明原因"
+    assert p["rate_per_min"] > 0, "吞吐率是实测量，任何并发下都该给"
+
+    # ④ 在飞跟踪：能指出最慢的那个站与它已跑多久
+    job2 = server.Job("j3", [_Row() for _ in range(3)], {})
+    job2.mark_unit_start("slow.example.com")
+    job2.mark_unit_start("fast.example.com")
+    p = job2._progress(3)
+    assert p["in_flight"] == 2
+    assert p["slowest_host"] == "slow.example.com", (
+        f"最慢站应是最早开始的那个，实得 {p.get('slowest_host')}")
+    assert p["slowest_age"] >= 0
+    job2.mark_unit_done("slow.example.com")
+    p = job2._progress(3)
+    assert p["in_flight"] == 1
+    assert p["slowest_host"] == "fast.example.com"
+
+    # ⑤ snapshot 必须把进度字段一路带到 JSON —— 前端读的是那份
+    snap = job.snapshot()
+    for k in ("unit_done", "unit_total", "in_flight", "eta_sec", "rate_per_min"):
+        assert k in snap, f"snapshot 缺字段 {k}"
+
+    print("[OK] Job ETA: 样本不足不给数字、低并发给区间、"
+          "高并发只给速率、在飞可追踪")
+
+
 def test_batch_prober_progress():
     """测试 BatchProber 进度回调（使用假 Prober）"""
 
@@ -103,10 +169,19 @@ def test_batch_prober_progress():
 
     rows = [FakeRow(f"https://site{i}.com") for i in range(10)]
 
-    # 进度收集
+    # 进度收集。分两类：
+    #   占位调用（current=0）—— 探测**开始**时发，让调用方记「谁在飞」
+    #   进度调用（current>0）—— 探测**完成**时发，带统计
+    # 两者都要脱敏（site 不含 api_key）。
     progress_log = []
+    start_log = []
+    seen_sites = []
     def progress_cb(current, total, site, stats):
-        progress_log.append((current, total, stats.copy()))
+        seen_sites.append(site)
+        if current == 0:
+            start_log.append(site)
+        else:
+            progress_log.append((current, total, stats.copy()))
 
     # 批量探测
     batch_prober = BatchProber(FakeProber(), max_workers=3)
@@ -114,7 +189,9 @@ def test_batch_prober_progress():
 
     # 验证结果
     assert len(results) == 10
-    assert len(progress_log) == 10  # 10次回调
+    # 每个站一次开始 + 一次完成
+    assert len(start_log) == 10, f"应有 10 次起始占位，实得 {len(start_log)}"
+    assert len(progress_log) == 10, f"应有 10 次进度回调，实得 {len(progress_log)}"
     assert progress_log[-1][0] == 10  # 最后一次是 10/10
     assert progress_log[-1][1] == 10
 
@@ -125,7 +202,20 @@ def test_batch_prober_progress():
     assert batch_prober._stats["all_four"] == 0
     assert batch_prober._stats["failure"] == 0
 
-    print(f"[OK] BatchProber: 10 sites probed, {len(progress_log)} callbacks")
+    # 进度回调不得泄漏完整 api_key。
+    #
+    # 2026-09-01 实测泄漏：原来传的是结果字典的键 (bare, api_key)，于是
+    # 完整明文 key 经 server 的 progress 事件进日志、进 /api/job 的 JSON、
+    # 再进导出文件 —— 79 凭据的一份日志里 74 个 key 完整可读。
+    # 项目的安全模型写着「完整 key 只在内存里，不落日志、不进 JSON 响应」。
+    assert len(seen_sites) == 20, f"起始+完成共 20 次，实得 {len(seen_sites)}"
+    for site in seen_sites:
+        assert isinstance(site, str), f"site 应是字符串，实得 {type(site)}"
+        assert "sk-" not in site, f"进度回调泄漏了 api_key：{site}"
+        assert site.startswith("https://site"), f"site 形态不对：{site}"
+
+    print(f"[OK] BatchProber: 10 sites probed, {len(progress_log)} callbacks，"
+          f"起始占位 {len(start_log)} 次，进度回调无 key 泄漏")
 
 
 def test_batch_prober_stats():
@@ -1060,6 +1150,7 @@ if __name__ == "__main__":
     # 失败行以 ✗ 开头。自己 print [OK] 不会被计入总数。
     CASES = [
         ("提取既有站", test_extract_existing_entries),
+        ("ETA 与进度度量", test_job_eta),
         ("站级并发与进度回调", test_batch_prober_progress),
         ("统计分类", test_batch_prober_stats),
         ("单站异常隔离", test_batch_prober_exception_handling),
