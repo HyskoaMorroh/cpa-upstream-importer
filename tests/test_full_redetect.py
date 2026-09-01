@@ -1096,6 +1096,100 @@ openai-compatibility:
     print("[OK] Proxy preserved: 有值的搬回，空串与未写的不凭空添加")
 
 
+def test_rebuild_skips_dedup():
+    """全量重探不判重 —— 否则「全勾选」只能勾中每个 host 的第一个 Key。
+
+    2026-09-02 现场：79 个凭据全量重探，「全勾选」显示「已勾选 26 项」。
+    根因是 build_plan 的去重判定在重探模式下语义反了：
+
+      · 新增导入：输入是新 Key，seen 代表「cfg 里已有的 + 本批已处理的」，
+        撞上就是真重复，该挡。
+      · 全量重探：输入**就是** cfg 里的既有条目，而 seen 是从同一份 cfg
+        读出来的 —— 每一条都必然撞上。
+
+    实测数字：14 个 host / 79 个凭据，只有每个 host 的第一个 Key 逃过判定
+    （它的 prefix/headers 与探测建议不同、五元组恰好没撞上，那是偶然不是
+    设计）。14 × 4 段 = 56 个段进了方案，其余 260 个段 writable=False，
+    勾选框点不动。
+    """
+    import yaml
+    import cpa_probe as cp
+    from cpa_probe.pipeline import CandidateResult, SectionVerdict
+
+    # 同一个站三个 Key —— 现场最常见的形态（gorouter 15 个、tabitoken 14 个）
+    cfg = yaml.safe_load("""
+claude-api-key:
+  - api-key: "sk-A"
+    base-url: "https://a.example.com"
+    prefix: "ANT"
+    priority: 300
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+  - api-key: "sk-B"
+    base-url: "https://a.example.com"
+    prefix: "ANT"
+    priority: 200
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+  - api-key: "sk-C"
+    base-url: "https://a.example.com"
+    prefix: "ANT"
+    priority: 100
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+""")
+
+    def mk(row):
+        res = CandidateResult(row=row)
+        res.sections["claude-api-key"] = SectionVerdict(
+            section="claude-api-key", usable=True,
+            base_url=row.base_for("claude-api-key"),
+            models=["claude-opus-5"], category="可用")
+        return res
+
+    def run(rebuild):
+        bands = {}
+        seen = cp.existing_fingerprints(cfg)
+        pairs = cp.existing_pairs(cfg)
+        out = []
+        for ak in ("sk-A", "sk-B", "sk-C"):
+            row = cp.parse_lines(f"https://a.example.com,{ak}").valid[0]
+            p = cp.build_plan(row, mk(row), cfg, bands=bands, seen=seen,
+                              seen_pairs=pairs, probation=True, rebuild=rebuild)
+            sp = p.sections.get("claude-api-key")
+            out.append(sp)
+        return out
+
+    # ① 原行为（新增导入语义）：三个 Key 全部判重 —— 它们本来就在 cfg 里
+    old = run(rebuild=False)
+    assert all(sp is not None for sp in old)
+    assert all(sp.duplicate for sp in old), (
+        f"新增导入模式下这三个 Key 都该判重，实得 "
+        f"{[sp.duplicate for sp in old]}")
+    assert not any(sp.writable for sp in old), "判重的段不该 writable"
+
+    # ② 重探模式：一个都不判重，三个都能勾
+    new = run(rebuild=True)
+    assert not any(sp.duplicate for sp in new), (
+        f"重探不该判重，实得 {[sp.duplicate for sp in new]}")
+    assert all(sp.writable for sp in new), (
+        f"重探的段都该可勾选，实得 {[sp.writable for sp in new]}")
+    # 探测通过的段仍然默认勾选
+    assert all(sp.recommended for sp in new), (
+        f"实测通过的段该默认勾，实得 {[sp.recommended for sp in new]}")
+    # 每个 Key 的方案指向自己的 api_key，没有串
+    assert [sp.api_key for sp in new] == ["sk-A", "sk-B", "sk-C"]
+
+    # ③ 重探模式下 duplicate_note 也该是空的 —— 界面上不该显示「已存在，跳过」
+    assert all(not sp.duplicate_note for sp in new)
+
+    print("[OK] Rebuild skips dedup: 同站 3 个 Key 全部可勾选"
+          "（原行为下 3 个全判重、一个都勾不上）")
+
+
 def test_rebuild_keeps_weight():
     """weight: 0 必须搬回去 —— 丢了等于让手工封禁的站复活。
 
@@ -1335,6 +1429,7 @@ if __name__ == "__main__":
         ("重建保留其余内容", test_rebuild_preserves_everything_else),
         ("未知字段搬运", test_rebuild_keeps_unknown_fields),
         ("proxy-url 搬运", test_rebuild_keeps_proxy),
+        ("重探不判重", test_rebuild_skips_dedup),
         ("重建保留 weight", test_rebuild_keeps_weight),
         ("批量键含 api_key", test_batch_key_includes_api_key),
         ("批量记录异常站", test_batch_records_errors),
