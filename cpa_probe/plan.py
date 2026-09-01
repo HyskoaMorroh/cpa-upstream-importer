@@ -105,6 +105,48 @@ def dominant_prefix(cfg: dict, section: str) -> str:
     return best if n / len(entries) >= 0.7 else ""
 
 
+def extract_existing_entries(cfg: dict) -> list[tuple[str, str, str, dict]]:
+    """从 config.yaml 提取所有既有站的完整信息（用于全量重探）
+
+    Returns:
+        [(section_short, base_url, api_key, original_entry), ...]
+
+        section_short: "gemini" | "codex" | "claude" | "compat"
+        original_entry: 原始 dict，包含 priority/headers/proxy-url/models 等
+    """
+    entries = []
+
+    section_map = {
+        "gemini-api-key": "gemini",
+        "codex-api-key": "codex",
+        "claude-api-key": "claude",
+    }
+
+    # 前三段：每个条目一个 api-key
+    for section_full, section_short in section_map.items():
+        for e in cfg.get(section_full) or []:
+            if not isinstance(e, dict):
+                continue
+            base_url = str(e.get("base-url") or "")
+            api_key = str(e.get("api-key") or "")
+            if base_url and api_key:
+                entries.append((section_short, base_url, api_key, e))
+
+    # compat 段：provider 级 base-url + api-key-entries 里的多个 key
+    for e in cfg.get("openai-compatibility") or []:
+        if not isinstance(e, dict):
+            continue
+        base_url = str(e.get("base-url") or "")
+        for ke in e.get("api-key-entries") or []:
+            if isinstance(ke, dict):
+                api_key = str(ke.get("api-key") or "")
+                if base_url and api_key:
+                    # compat 段的 original_entry 是 provider 级配置
+                    entries.append(("compat", base_url, api_key, e))
+
+    return entries
+
+
 def existing_pairs(cfg: dict) -> dict[str, set[str]]:
     """现有 config.yaml 里每段已配过的 (key, base) 对。"""
     out: dict[str, set[str]] = {}

@@ -48,6 +48,7 @@ from .plan import (
     dominant_prefix,
     existing_fingerprints,
     existing_pairs,
+    extract_existing_entries,
     entry_all_zero_weight,
     entry_weights,
     host_matches_note,
@@ -61,10 +62,12 @@ from .writeback import (
     backup,
     build_diffs,
     push_to_cpa,
+    rebuild_config_full,
     validate,
     verify_upstream,
     write_local,
 )
+from .batch import BatchProber
 
 __all__ = [
     "SECTIONS",
@@ -101,6 +104,7 @@ __all__ = [
     "dominant_prefix",
     "existing_fingerprints",
     "existing_pairs",
+    "extract_existing_entries",
     "entry_all_zero_weight",
     "entry_weights",
     "host_matches_note",
@@ -114,7 +118,9 @@ __all__ = [
     "build_diffs",
     "apply_diffs",
     "push_to_cpa",
+    "rebuild_config_full",
     "validate",
     "verify_upstream",
     "write_local",
+    "BatchProber",
 ]

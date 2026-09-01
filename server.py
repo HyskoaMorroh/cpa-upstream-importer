@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cpa_probe as cp  # noqa: E402
 from cpa_probe.pipeline import Prober  # noqa: E402
+from cpa_probe.batch import BatchProber, extract_existing_entries  # noqa: E402
 from cpa_probe.writeback import (  # noqa: E402
     apply_diffs,
     build_diffs,
@@ -301,6 +302,97 @@ def run_job(job: Job, cfg_path: str) -> None:
     except Exception:
         job.state = "error"
         job.error = traceback.format_exc(limit=4)
+    finally:
+        job.finished = time.time()
+
+
+def run_job_full_redetect(job: Job, cfg_path: str) -> None:
+    """全量重探模式：重新探测所有既有站 + 新站
+
+    与 run_job 的区别：
+    - 从 config.yaml 提取所有既有站
+    - 使用 BatchProber 进行站级并发
+    - 最后不返回 job.results，而是写回完整 config
+    """
+    job.state = "running"
+    try:
+        # 加载 config
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        import yaml
+        cfg = yaml.safe_load(raw) or {}
+
+        # 提取既有站
+        existing_entries = extract_existing_entries(cfg)
+        job.emit("info", {"msg": f"提取到 {len(existing_entries)} 个既有站"})
+
+        # 合并新站：将既有站转为假的输入行格式
+        fake_lines = []
+        for section_short, base_url, api_key, _orig in existing_entries:
+            # 构造假的行文本（parse_lines 会用）
+            fake_lines.append(f"{base_url},{api_key}")
+
+        # 新站的原始文本
+        for row in job.rows:
+            fake_lines.append(row.raw)
+
+        # 重新解析（统一走 parse_lines，保证 ParsedRow 结构完整）
+        all_text = "\n".join(fake_lines)
+        parsed = cp.parse_lines(all_text)
+        all_rows = [
+            cp.ParsedRow(line_no=i, raw=line)
+            for i, (section, base, key) in enumerate(parsed.valid)
+        ]
+        # 补齐字段
+        for i, (section, base, key) in enumerate(parsed.valid):
+            all_rows[i].bare = base
+            all_rows[i].api_key = key
+
+        job.emit("info", {"msg": f"总计 {len(all_rows)} 个站（既有 {len(existing_entries)} + 新增 {len(job.rows)}）"})
+
+        # 创建 Prober
+        prober = Prober(
+            proxy=_resolve_proxy(str(job.opts.get("proxy") or "")),
+            gap=float(job.opts.get("gap", 3.0)),
+            timeout=int(job.opts.get("timeout", 120)),
+            probe_context=bool(job.opts.get("probe_context", True)),
+            swap_samples=int(job.opts.get("swap_samples", 3)),
+            workers=int(job.opts.get("workers", 4)),
+            on_event=job.emit,
+        )
+
+        # 使用 BatchProber（站级并发）
+        max_workers = int(job.opts.get("max_workers", 30))
+        batch_prober = BatchProber(prober, max_workers=max_workers)
+
+        job.emit("info", {"msg": f"开始批量探测（{max_workers} 站并发）"})
+
+        # 进度回调
+        def progress_cb(current, total, site, stats):
+            job.emit("progress", {
+                "msg": f"探测进度：{current}/{total}",
+                "current": current,
+                "total": total,
+                "site": site,
+                "success": stats["success"],
+                "partial": stats["partial"],
+                "failure": stats["failure"],
+            })
+
+        # 批量探测
+        results_dict = batch_prober.probe_batch(all_rows, progress_callback=progress_cb)
+
+        # 转换为列表（按原顺序）
+        with job.lock:
+            job.results = [results_dict.get(row.bare) for row in all_rows]
+
+        job.emit("info", {"msg": f"探测完成：{batch_prober._stats['success']} 成功，{batch_prober._stats['partial']} 部分通，{batch_prober._stats['failure']} 失败"})
+
+        job.state = "done"
+    except Exception:
+        job.state = "error"
+        job.error = traceback.format_exc(limit=4)
+        job.emit("error", {"msg": job.error})
     finally:
         job.finished = time.time()
 
@@ -713,12 +805,18 @@ class Handler(BaseHTTPRequestHandler):
                 # 非空说明那几个站的「实测不可用」结论没作用到定档上。
                 "unmatched_notes": b.unmatched_notes,
             }
+
+        # 计算既有站总数（用于全量重探提示）
+        existing_entries = cp.extract_existing_entries(cfg)
+        existing_count = len(existing_entries)
+
         self._json(200, {
             "config_path": type(self).cfg_path,
             "lines": raw.count("\n") + 1,
             "bytes": len(raw.encode("utf-8")),
             "sections": bands,
             "section_order": list(cp.SECTIONS),
+            "existing_count": existing_count,
         })
 
     def _api_parse(self, body: dict) -> None:
@@ -729,18 +827,31 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _api_probe(self, body: dict) -> None:
+        full_redetect = body.get("full_redetect", False)
+        max_workers = body.get("max_workers")
+
         res = cp.parse_lines(body.get("text") or "")
-        if not res.valid:
+        if not res.valid and not full_redetect:
             self._json(400, {"error": "没有可用行",
                              "invalid": [row_json(r) for r in res.invalid]})
             return
+
+        opts = body.get("opts") or {}
+        if full_redetect and max_workers is not None:
+            opts["max_workers"] = max_workers
+
         jid = secrets.token_hex(8)
-        job = Job(jid, res.valid, body.get("opts") or {})
+        job = Job(jid, res.valid, opts)
         STORE.add_job(job)
-        threading.Thread(target=run_job, args=(job, type(self).cfg_path),
+
+        # 选择执行函数
+        target_fn = run_job_full_redetect if full_redetect else run_job
+        threading.Thread(target=target_fn, args=(job, type(self).cfg_path),
                          daemon=True).start()
+
         self._json(202, {"job_id": jid, "rows": len(res.valid),
-                         "invalid": [row_json(r) for r in res.invalid]})
+                         "invalid": [row_json(r) for r in res.invalid],
+                         "full_redetect": full_redetect})
 
     def _api_job(self, jid: str, since: int) -> None:
         job = STORE.get_job(jid)
@@ -778,6 +889,74 @@ class Handler(BaseHTTPRequestHandler):
         # 默认试用期：新站进最低可插档，不因探测满分就把已验证的站挡在其后
         probation = not bool(body.get("by_score"))
 
+        # 检测是否全量重探模式
+        is_full_redetect = job.opts.get("full_redetect", False)
+
+        if is_full_redetect:
+            # 全量重探模式：使用 rebuild_config_full
+            bands: dict = {}
+            seen = cp.existing_fingerprints(cfg)
+            all_plans = {}  # {(base_url, api_key): ImportPlan}
+
+            for res in job.results:
+                fh = forced.get(res.row.host) or {}
+                p = cp.build_plan(res.row, res, cfg, bands=bands, seen=seen,
+                                  probation=probation,
+                                  force={str(k): [str(m) for m in (v or [])]
+                                         for k, v in fh.items()} if fh else None)
+                all_plans[(res.row.bare, res.row.api_key)] = p
+
+            # 应用用户覆盖
+            for (base_url, api_key), p in all_plans.items():
+                ov_host = overrides.get(p.host) or {}
+                for sec, sp in list(p.sections.items()):
+                    ov = ov_host.get(sec) or {}
+                    if "priority" in ov:
+                        sp.priority = int(ov["priority"])
+                        sp.priority_reason = "用户手工指定"
+                    if "proxy_url" in ov:
+                        sp.proxy_url = str(ov["proxy_url"] or "")
+                    if "headers" in ov and isinstance(ov["headers"], dict):
+                        sp.headers = {str(k): str(v) for k, v in ov["headers"].items()}
+                    if "models" in ov and isinstance(ov["models"], list):
+                        sp.models = [str(m) for m in ov["models"]]
+                    if "max_context_length" in ov:
+                        v = ov["max_context_length"]
+                        sp.max_context_length = int(v) if v else None
+
+            # 全量重建
+            preview, warnings = cp.rebuild_config_full(cfg, all_plans, raw.splitlines(keepends=True))
+
+            # 生成完整 diff（整个文件）
+            diffs = []
+            ok, msg = validate(preview)
+
+            pid = secrets.token_hex(8)
+            STORE.add_plan(pid, {"plans": list(all_plans.values()), "diffs": diffs,
+                                 "preview": preview, "base_raw": raw,
+                                 "created": time.time(),
+                                 "full_redetect": True})
+
+            self._json(200, {
+                "plan_id": pid,
+                "plans": [plan_json(p) for p in all_plans.values()],
+                "diffs": [{
+                    "section": "全量重建",
+                    "host": f"{len(all_plans)} 个站",
+                    "insert_at": 0,
+                    "lines": preview.splitlines(keepends=True),
+                    "text": f"全量重建整个 config.yaml\n警告：{len(warnings)} 个\n" + "\n".join(warnings) if warnings else "全量重建整个 config.yaml"
+                }],
+                "valid": ok,
+                "validate_msg": msg,
+                "lines_before": raw.count("\n") + 1,
+                "lines_after": preview.count("\n") + 1,
+                "warnings": warnings,
+                "full_redetect": True
+            })
+            return
+
+        # 原有逻辑：增量模式
         bands: dict = {}
         seen = cp.existing_fingerprints(cfg)
         plans = []
