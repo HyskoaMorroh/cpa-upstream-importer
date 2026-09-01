@@ -66,6 +66,33 @@ def _read(root: str, rel: str) -> str:
         return ""
 
 
+def source_commit(root: str) -> str:
+    """源码目录当前的 git commit（短）。读不到返回空串。
+
+    为什么要它：挂进来的是**源码**，而跑着的是**编译产物**。`git pull` 之后
+    源码变了但 CPA 容器没重启时，漂移检测会按新源码判断，而实际转发的仍是旧
+    二进制 —— 那种不一致比不检测更容易误导。
+
+    拿它与 CPA 管理响应头里的 X-CPA-COMMIT 比对就能发现这种情形。
+    不解析 packed-refs / worktree 等复杂情形：读不到就返回空，调用方降级。
+    """
+    head = _read(root, ".git/HEAD").strip()
+    if not head:
+        return ""
+    if head.startswith("ref:"):
+        ref = head[4:].strip()
+        sha = _read(root, os.path.join(".git", *ref.split("/"))).strip()
+        if not sha:
+            # packed-refs 的情形
+            packed = _read(root, ".git/packed-refs")
+            for line in packed.splitlines():
+                if line.endswith(" " + ref):
+                    sha = line.split()[0]
+                    break
+        head = sha
+    return head[:12] if re.fullmatch(r"[0-9a-f]{40}", head) else ""
+
+
 def _const_map(src: str) -> dict[str, str]:
     """解析 Go 的 const 块：`name = "value"`（含对齐空格）。"""
     out: dict[str, str] = {}
@@ -272,20 +299,40 @@ def report(root: str) -> tuple[CpaIdentity, list[Drift]]:
     return ident, compare(ident)
 
 
-def check(*, source_root: str = "", cfg: dict | None = None) -> dict:
+def check(*, source_root: str = "", cfg: dict | None = None,
+          runtime_commit: str = "") -> dict:
     """给服务端调用的统一入口。返回可直接进 JSON 的 dict。
 
     优先读源码（精确，能区分有条件/无条件 beta）；读不到就退回 config.yaml
     的 header-defaults（覆盖面小但容器里一定有）。两条都不成立时返回
     checked=False —— 不假装检查过。
+
+    runtime_commit 是 CPA 管理接口回的 X-CPA-COMMIT。给了就与源码的 git HEAD
+    比对 —— 不一致说明「源码已更新但 CPA 没重启」，此时按源码判断的漂移结论
+    对不上实际转发行为，必须提示出来。
     """
     if source_root:
         ident, drifts = report(source_root)
         if ident.ok:
+            src_commit = source_commit(source_root)
+            stale = bool(src_commit and runtime_commit
+                         and not runtime_commit.startswith(src_commit[:7])
+                         and not src_commit.startswith(runtime_commit[:7]))
+            if stale:
+                drifts.insert(0, Drift(
+                    what="源码与运行中的 CPA 不是同一版本",
+                    ours=f"源码 {src_commit}",
+                    theirs=f"运行中 {runtime_commit}",
+                    severity="warn",
+                    note=("下面的比对是按**源码**做的，而 CPA 实际转发用的是旧"
+                          "二进制。请重新构建并重启 CPA，或忽略下面的结论")))
             return {
                 "checked": True,
                 "source": "CPA 源码",
                 "source_root": source_root,
+                "source_commit": src_commit,
+                "runtime_commit": runtime_commit,
+                "stale_binary": stale,
                 "betas_unconditional": ident.claude_betas_unconditional,
                 "betas_conditional": ident.claude_betas_conditional,
                 "codex_user_agent": ident.codex_user_agent,

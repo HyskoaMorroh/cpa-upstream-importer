@@ -138,9 +138,16 @@ function renderDrift() {
   const warns = (d.drifts || []).filter((x) => x.severity === 'warn');
   const infos = (d.drifts || []).filter((x) => x.severity !== 'warn');
 
+  // 版本标注：源码 commit 与运行中 CPA 的 commit。两者不一致时下面的比对
+  // 是按源码做的，而实际转发用旧二进制 —— 那种情形单独拎出来说。
+  const ver = [];
+  if (d.source_commit) ver.push(`源码 ${esc(d.source_commit)}`);
+  if (d.runtime_commit) ver.push(`运行中 ${esc(d.runtime_commit)}`);
+  const verText = ver.length ? ` · ${ver.join(' / ')}` : '';
+
   if (!d.drifts.length) {
     box.className = 'note g';
-    let t = `<b>画像基线一致</b>（依据：${esc(d.source)}）`;
+    let t = `<b>画像基线一致</b>（依据：${esc(d.source)}${verText}）`;
     if (d.partial) {
       t += `。未覆盖：${esc((d.uncovered || []).join('、'))}`;
     }
@@ -159,7 +166,7 @@ function renderDrift() {
   box.innerHTML =
     `<b>画像基线漂移 ${d.drifts.length} 处</b>`
     + (warns.length ? `（${warns.length} 处需处理）` : '')
-    + `（依据：${esc(d.source)}）`
+    + `（依据：${esc(d.source)}${verText}）`
     + `<div style="margin-top:6px">${rows}</div>`
     + `<div class="hint" style="margin-top:6px">漂移意味着探测发的形态与 CPA `
     + `实际转发的不一致 —— 可能出现「探测通了但 CPA 不通」或反之。</div>`;
