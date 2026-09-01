@@ -981,6 +981,38 @@ def test_cgroup_bad_values():
     print("[OK] cgroup bad values: -1 / 0 / 超大哨兵都降级，正常值仍认")
 
 
+def test_full_redetect_without_new_rows():
+    """不加新账号也能全量重探 —— 「只体检既有站」是独立需求。
+
+    后端 _api_probe 一直支持（`not res.valid and not full_redetect` 才拒绝），
+    但前端按钮的启用条件只看「解析出有效行」，于是这条路点不进去。
+    这一项守后端契约；前端那侧靠 syncProbeBtn 里的 `hasRows || full`。
+    """
+    import io as _io
+    import re as _re
+
+    js = _io.open(os.path.join(ROOT, "web", "app.js"), encoding="utf-8").read()
+
+    # 按钮启用必须同时认「有行」与「勾了全量」
+    m = _re.search(r"function syncProbeBtn\(\)\s*\{(.*?)\n\}", js, _re.S)
+    assert m, "syncProbeBtn 不见了 —— 按钮启用逻辑被改回单一条件？"
+    body = m.group(1)
+    assert "full" in body and "hasRows" in body, body
+    assert _re.search(r"!\(\s*hasRows\s*\|\|\s*full\s*\)", body), (
+        "启用条件不是 hasRows || full —— 空输入时全量重探又点不进去了")
+
+    # 不能有别处把它硬设回 disabled = valid.length === 0
+    assert "disabled = d.valid.length === 0" not in js, (
+        "还有地方按「有效行数」直接禁用按钮，会绕过 syncProbeBtn")
+
+    # 后端：空 text + full_redetect 不该被 400 拒绝
+    srv = _io.open(os.path.join(ROOT, "server.py"), encoding="utf-8").read()
+    assert "if not res.valid and not full_redetect:" in srv, (
+        "后端的拒绝条件变了 —— 空输入 + 全量重探必须放行")
+
+    print("[OK] Full redetect w/o new rows: 前后端都允许空输入 + 全量重探")
+
+
 def test_profile_matches_real_cpa_source():
     """如果本机有 CPA 源码，画像梯必须与它一致（无 warn 级漂移）。
 
@@ -1042,6 +1074,7 @@ if __name__ == "__main__":
         ("批量键含 api_key", test_batch_key_includes_api_key),
         ("批量记录异常站", test_batch_records_errors),
         ("cgroup 异常值降级", test_cgroup_bad_values),
+        ("空输入也能全量重探", test_full_redetect_without_new_rows),
     ]
 
     ok = 0
