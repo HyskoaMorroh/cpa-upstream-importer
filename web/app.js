@@ -95,7 +95,11 @@ const S = {
   parsedValid: 0,       // 上次解析出的有效行数。决定「开始探测」能不能点
 };
 
-const pk = (host, sec) => `${host}\u0000${sec}`;
+// 候选身份键。用**行号**而不是 host —— 一个站常有 15 把 Key
+// （实测 gorouter 15、tabitoken 14），用 host 做键时 S.picks 这个 Set 会把
+// 同站同段的 15 个选择去重成 1 个，DOM 定位也只命中第一行。
+// 2026-09-02 现场：「全勾选」显示已勾 26 项，大量段勾不上。
+const pk = (rid, sec) => `${rid}\u0000${sec}`;
 
 // ── 主题：三套，存 localStorage（这个不含秘密，可持久） ──
 function applyTheme(t) {
@@ -1101,6 +1105,9 @@ function renderResults(results) {
 
 function siteCard(r) {
   const host = r.row.host;
+  // 候选身份 = 输入行号。一个站常有 15 把 Key，用 host 当身份会让同站
+  // 多 Key 的勾选状态、priority 输入、模型清单全部串到第一行上。
+  const rid = String(r.row.line_no);
   const rows = S.ctx.section_order.map((sec) => {
     const v = r.sections[sec];
     if (!v) return '';
@@ -1112,7 +1119,7 @@ function siteCard(r) {
       // 探测失败的段也给勾选框 —— 判定会错，必须有人工出口。
       // 但要求先填模型清单：探测没验成功过任何模型，工具无从推断该注册什么。
       // 勾选框默认不勾，且只有填了模型才可勾（见 bindResultEvents）。
-      const fm = ((S.forced[host] || {})[sec] || []).join(', ');
+      const fm = ((S.forced[rid] || {})[sec] || []).join(', ');
       // 站方 /models 目录报出来的模型 —— 探测跑不通不等于站方没这些模型，
       // 现场就有「CPAMP 面板看得见模型、这里判死路」的形态：目录是站方
       // 声明有什么，探测测的是这把 Key 的分组能用什么，两者本就会不一致。
@@ -1121,32 +1128,32 @@ function siteCard(r) {
       const cut = (v.catalog || []).filter((m) => m && !famOk(sec, m)).length;
       // 首次渲染：没有人工接管记录时按同族规则预勾，省掉一个一个点。
       // 已有记录（用户改过）就完全尊重记录，不覆盖。
-      const rec = (S.forced[host] || {})[sec];
+      const rec = (S.forced[rid] || {})[sec];
       const picked = new Set(rec !== undefined ? rec
         : cat.filter((m) => defOn(sec, m)));
       // 预勾的结果要立刻回写 S.forced，否则「勾选即注册」只是视觉上的 ——
       // 提交时读的是 S.forced，不读 DOM。
       if (rec === undefined && picked.size) {
-        (S.forced[host] = S.forced[host] || {})[sec] = [...picked];
+        (S.forced[rid] = S.forced[rid] || {})[sec] = [...picked];
       }
-      return `<tr class="off" data-host="${esc(host)}" data-sec="${esc(sec)}">
+      return `<tr class="off" data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}">
         <td class="pick"><input type="checkbox" class="sel force"
-          data-host="${esc(host)}" data-sec="${esc(sec)}"
+          data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}"
           title="探测未通过。勾选即接管，模型可从右侧目录选或手填"></td>
         <td class="m"><b>${esc(label)}</b></td>
         <td><span class="pill ${pill}">${esc(v.category || '不可用')}</span></td>
         <td>
           ${cat.length ? `<div class="cats">${cat.map((m) => `
             <label class="catpick"><input type="checkbox" class="cm"
-              data-host="${esc(host)}" data-sec="${esc(sec)}"
+              data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}"
               value="${esc(m)}"${picked.has(m) ? ' checked' : ''}>${esc(m)}</label>`
             ).join('')}</div>
           <div class="mtools">
-            <button type="button" class="mini cmall" data-host="${esc(host)}"
+            <button type="button" class="mini cmall" data-rid="${esc(rid)}" data-host="${esc(host)}"
               data-sec="${esc(sec)}">全选</button>
-            <button type="button" class="mini cminv" data-host="${esc(host)}"
+            <button type="button" class="mini cminv" data-rid="${esc(rid)}" data-host="${esc(host)}"
               data-sec="${esc(sec)}">反选</button>
-            <button type="button" class="mini cmnone" data-host="${esc(host)}"
+            <button type="button" class="mini cmnone" data-rid="${esc(rid)}" data-host="${esc(host)}"
               data-sec="${esc(sec)}">清空</button>
             <span class="hint">目录 ${cat.length} 个，已勾 <b class="cmn">${picked.size}</b>
               ${cut ? ` · 已滤掉 ${cut} 个跨族模型（该段发不出去）` : ''}</span>
@@ -1154,7 +1161,7 @@ function siteCard(r) {
             : (cut ? `<div class="hint">目录里 ${cut} 个模型都不属于本段协议族，
               已全部滤掉 —— 写进去 CPA 每次轮到都会失败</div>` : '')}
           <div class="pedit"><input type="text" class="fm" style="width:100%"
-            data-host="${esc(host)}" data-sec="${esc(sec)}"
+            data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}"
             value="${esc(fm)}"
             placeholder="${cat.length ? '也可手填目录外的模型名，逗号分隔'
               : '站方目录也没报模型：手填模型名，逗号分隔，如 claude-opus-5'}"></div>
@@ -1169,11 +1176,11 @@ function siteCard(r) {
             : ''}</td>
         <td class="prio">
           <div class="pedit"><input type="number" class="pi"
-            data-host="${esc(host)}" data-sec="${esc(sec)}" placeholder="待定"></div>
+            data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}" placeholder="待定"></div>
         </td>
         <td class="rsn"><span class="hint">勾选后计算</span></td>
       </tr>
-      <tr class="wrow" data-host="${esc(host)}" data-sec="${esc(sec)}">
+      <tr class="wrow" data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}">
         <td></td><td colspan="7" class="wbox"></td>
       </tr>`;
     }
@@ -1195,9 +1202,9 @@ function siteCard(r) {
     }
     const backends = Object.keys((v.swap && v.swap.backends) || {});
 
-    return `<tr data-host="${esc(host)}" data-sec="${esc(sec)}">
+    return `<tr data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}">
       <td class="pick"><input type="checkbox" class="sel"
-        data-host="${esc(host)}" data-sec="${esc(sec)}"></td>
+        data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}"></td>
       <td class="m"><b>${esc(label)}</b></td>
       <td><span class="pill p-ok">可用</span></td>
       <td>
@@ -1210,11 +1217,11 @@ function siteCard(r) {
       <td>${flags.join(' ') || '<span class="hint">直连即可</span>'}</td>
       <td class="prio">
         <div class="pedit"><input type="number" class="pi"
-          data-host="${esc(host)}" data-sec="${esc(sec)}" placeholder="待定"></div>
+          data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}" placeholder="待定"></div>
       </td>
       <td class="rsn"><span class="hint">计算中…</span></td>
     </tr>
-    <tr class="wrow" data-host="${esc(host)}" data-sec="${esc(sec)}">
+    <tr class="wrow" data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}">
       <td></td><td colspan="7" class="wbox"></td>
     </tr>`;
   }).join('');
@@ -1330,7 +1337,7 @@ function bindResultEvents() {
     // 目录复选框 —— 与手填框同一份 S.forced，勾选即写入
     const cmi = e.target.closest('.cm');
     if (cmi) {
-      const h = cmi.dataset.host, sc = cmi.dataset.sec;
+      const h = cmi.dataset.rid, sc = cmi.dataset.sec;
       const tr = cmi.closest('tr');
       const chosen = tr
         ? $$('.cm', tr).filter((x) => x.checked).map((x) => x.value) : [];
@@ -1356,7 +1363,7 @@ function bindResultEvents() {
 
     const fmi = e.target.closest('.fm');
     if (fmi) {
-      const h = fmi.dataset.host, sc = fmi.dataset.sec;
+      const h = fmi.dataset.rid, sc = fmi.dataset.sec;
       const list = fmi.value.split(',').map((x) => x.trim()).filter(Boolean);
       S.forced[h] = S.forced[h] || {};
       if (list.length) {
@@ -1373,7 +1380,7 @@ function bindResultEvents() {
     }
     const inp = e.target.closest('.pi');
     if (inp) {
-      const h = inp.dataset.host, s = inp.dataset.sec;
+      const h = inp.dataset.rid, s = inp.dataset.sec;
       S.overrides[h] = S.overrides[h] || {};
       S.overrides[h][s] = Object.assign(S.overrides[h][s] || {},
         { priority: parseInt(inp.value, 10) });
@@ -1388,7 +1395,7 @@ function bindResultEvents() {
       // 而拦截的副作用是操作员点了没反应，只能从提示文字反推为什么。
       // 模型清单的可信度由 model_source 在方案里标注（实测/目录/手填/猜测），
       // 那是「看得见的告知」，比「点不动的勾选框」有用。
-      const key = pk(sel.dataset.host, sel.dataset.sec);
+      const key = pk(sel.dataset.rid, sel.dataset.sec);
       if (sel.checked) S.picks.add(key); else S.picks.delete(key);
       syncPickUI();
       // 勾选后必须重算 —— 后端只为**已勾选**的段生成方案（/api/plan 收
@@ -1473,7 +1480,7 @@ function applyPickPreset(mode) {
         missing.push(`${p.host} ${SECTION_LABEL[sec] || sec}`);
         return;
       }
-      S.picks.add(pk(p.host, sec));
+      S.picks.add(pk(p.line_no, sec));
     });
   });
   syncPickUI();
@@ -1503,7 +1510,7 @@ function schedulePlanRefresh() {
 
 function syncPickUI() {
   $$('#results .sel').forEach((el) => {
-    el.checked = S.picks.has(pk(el.dataset.host, el.dataset.sec));
+    el.checked = S.picks.has(pk(el.dataset.rid, el.dataset.sec));
     const tr = el.closest('tr');
     if (tr) tr.classList.toggle('rec', el.checked);
   });
@@ -1544,7 +1551,7 @@ async function refreshPlan(silent) {
   d.plans.forEach((p) => {
     Object.entries(p.sections).forEach(([sec, sp]) => {
       const tr = document.querySelector(
-        `#results tr[data-host="${cssq(p.host)}"][data-sec="${cssq(sec)}"]:not(.wrow)`);
+        `#results tr[data-rid="${cssq(p.line_no)}"][data-sec="${cssq(sec)}"]:not(.wrow)`);
       if (!tr) return;
       const inp = tr.querySelector('.pi');
       if (inp && !inp.value) inp.value = sp.priority;
@@ -1577,7 +1584,7 @@ async function refreshPlan(silent) {
           <div class="hint">${esc(sp.priority_reason)}</div>`;
       }
       const wrow = document.querySelector(
-        `#results tr.wrow[data-host="${cssq(p.host)}"][data-sec="${cssq(sec)}"]`);
+        `#results tr.wrow[data-rid="${cssq(p.line_no)}"][data-sec="${cssq(sec)}"]`);
       if (wrow) {
         const wb = wrow.querySelector('.wbox');
         const html = (sp.duplicate
@@ -1585,15 +1592,15 @@ async function refreshPlan(silent) {
           + sp.warnings.map((w) =>
             `<div class="warn${/抢走|换模/.test(w) ? ' b' : ''}">${esc(w)}</div>`).join('')
           + impactTable(sp)
-          + headerEditor(p.host, sec, sp);
+          + headerEditor(p.line_no, sec, sp);
         wb.innerHTML = html;
         // headers 编辑器一直在，所以 wrow 不再按 html 空否决定显隐 ——
         // 它现在总有内容。
         wrow.hidden = false;
-        bindHeaderEditor(wb, p.host, sec);
+        bindHeaderEditor(wb, p.line_no, sec);
         // 重渲染会把 <details> 的展开态清掉。刚才在编辑哪一段就把它重新展开 ——
         // 否则每次防抖结算完编辑器都自己收起来，等于没法连续改。
-        if (S.keepOpen === pk(p.host, sec)) {
+        if (S.keepOpen === pk(p.line_no, sec)) {
           const det = wb.querySelector('.hedit');
           if (det) det.open = true;
         }
@@ -1612,8 +1619,8 @@ const cssq = (s) => String(s).replace(/["\\]/g, '\\$&');
 //
 // 最要紧的设计点：**改动后必须标「未验证」**。探测是用原来那套跑通的，改了
 // 就没测过了 —— 界面仍显示「✓ 可用」会让人以为改后的配置也验证过。
-function headerEditor(host, sec, sp) {
-  const ov = ((S.overrides[host] || {})[sec] || {});
+function headerEditor(rid, sec, sp) {
+  const ov = ((S.overrides[rid] || {})[sec] || {});
   const edited = Object.prototype.hasOwnProperty.call(ov, 'headers');
   const cur = edited ? ov.headers : (sp.headers || {});
   const keys = Object.keys(cur);
@@ -1624,7 +1631,7 @@ function headerEditor(host, sec, sp) {
          探测是用改动前那套跑通的。</div>`
     : '';
 
-  return `<details class="hedit" data-host="${esc(host)}" data-sec="${esc(sec)}">
+  return `<details class="hedit" data-rid="${esc(rid)}" data-sec="${esc(sec)}">
     <summary>请求头 <span class="hint">${keys.length} 项${edited ? ' · 已手工改过' : ''}</span></summary>
     <div class="hbody">
       ${warn}
@@ -1662,7 +1669,7 @@ const KNOWN_HEADERS = [
   'authorization', 'x-api-key', 'content-type',
 ];
 
-function bindHeaderEditor(wb, host, sec) {
+function bindHeaderEditor(wb, rid, sec) {
   const det = wb.querySelector('.hedit');
   if (!det) return;
   const rowsBox = det.querySelector('.hrows');
@@ -1699,9 +1706,9 @@ function bindHeaderEditor(wb, host, sec) {
   const stash = () => {
     const h = collect();
     check(h);
-    S.overrides[host] = S.overrides[host] || {};
-    S.overrides[host][sec] = S.overrides[host][sec] || {};
-    S.overrides[host][sec].headers = h;
+    S.overrides[rid] = S.overrides[rid] || {};
+    S.overrides[rid][sec] = S.overrides[rid][sec] || {};
+    S.overrides[rid][sec].headers = h;
     det.querySelector('.hreset').disabled = false;
   };
 
@@ -1713,13 +1720,13 @@ function bindHeaderEditor(wb, host, sec) {
     // 停手 700ms 才重算方案。数字是权衡：太短仍会在连续输入中打断，
     // 太长会让「改了头之后 priority 建议随之变化」这件事显得没反应。
     clearTimeout(timer);
-    timer = setTimeout(() => { S.keepOpen = pk(host, sec); refreshPlan(); }, 700);
+    timer = setTimeout(() => { S.keepOpen = pk(rid, sec); refreshPlan(); }, 700);
   });
   // 失焦立即结算 —— 用户已经改完了，不该再等那 700ms
   det.addEventListener('focusout', () => {
     if (!timer) return;
     clearTimeout(timer); timer = null;
-    S.keepOpen = pk(host, sec);
+    S.keepOpen = pk(rid, sec);
     refreshPlan();
   });
   det.addEventListener('click', (e) => {
@@ -1740,7 +1747,7 @@ function bindHeaderEditor(wb, host, sec) {
       // check / stash），于是抛 ReferenceError：行从 DOM 上消失了，
       // 但 S.overrides 里还留着被删的那个头，看起来删掉了实际没有。
       stash();
-      S.keepOpen = pk(host, sec);
+      S.keepOpen = pk(rid, sec);
       refreshPlan();
       return;
     }
@@ -1748,8 +1755,8 @@ function bindHeaderEditor(wb, host, sec) {
       e.preventDefault();
       // 删掉这个键而不是置空 —— 「没改过」与「改成空」是两件事，
       // 后者应当真的写出一个空 headers。
-      if (S.overrides[host] && S.overrides[host][sec]) {
-        delete S.overrides[host][sec].headers;
+      if (S.overrides[rid] && S.overrides[rid][sec]) {
+        delete S.overrides[rid][sec].headers;
       }
       refreshPlan();
     }
@@ -1834,6 +1841,49 @@ $('#btnreplan').onclick = () => {
 };
 
 // ── 写回 ──
+// 写回收尾的轮询。落盘那一步已经在 /api/apply 里同步完成 —— 这里只等
+// 「重载 + 端到端验证」，并把阶段与验证进度显示出来。
+//
+// 与步骤②的探测轮询同一套思路：断连要重试，不能因为一次网络抖动就让用户
+// 以为写回失败（写盘早就成了）。
+async function pollApply(taskId, first) {
+  const box = $('#applymsg');
+  let fails = 0;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 900));
+    let st;
+    try {
+      st = await api(`/api/apply-status/${encodeURIComponent(taskId)}`);
+      fails = 0;
+    } catch (e) {
+      fails += 1;
+      if (fails >= 20) {
+        box.innerHTML = `<span style="color:var(--bad)">轮询中断（${esc(e.message)}）
+          —— <b>配置已写盘</b>，但重载与验证结果拿不到了。
+          可在 VPS 上 <code>docker restart cli-proxy-api</code> 确认生效。</span>`;
+        return null;
+      }
+      continue;
+    }
+    const pct = st.verify_total
+      ? Math.round(st.verify_done / st.verify_total * 100) : 0;
+    const bar = st.verify_total
+      ? '█'.repeat(Math.round(pct / 5)) + '░'.repeat(20 - Math.round(pct / 5))
+      : '';
+    box.innerHTML = `<span class="spin"></span> ${esc(st.stage || '收尾中')}`
+      + (st.verify_total
+        ? ` <span class="hint">${bar} 验证 ${st.verify_done}/${st.verify_total}
+            (${pct}%)</span>` : '')
+      + ` <span class="hint">· ${st.elapsed}s</span>`;
+    if (st.state === 'error') {
+      box.innerHTML = `<span style="color:var(--bad)">收尾出错 —— <b>配置已写盘</b>，
+        是重载或验证那一步失败：<pre>${esc(st.error || '')}</pre></span>`;
+      return { ...first, ...st };
+    }
+    if (st.state !== 'running') return { ...first, ...st };
+  }
+}
+
 $('#btnapply').onclick = async () => {
   const btn = $('#btnapply');
   btn.disabled = true;
@@ -1859,6 +1909,16 @@ $('#btnapply').onclick = async () => {
     $('#applymsg').innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
     btn.disabled = false;
     return;
+  }
+
+  // 落盘已完成（同步做的），重载与验证在后台跑 —— 轮询到结束。
+  //
+  // 为什么必须异步（2026-09-02 现场 524）：重载 1-3 秒 + 验证单个最长 45 秒，
+  // 79 凭据那种规模累计破 100 秒，Cloudflare 直接切断连接返回 524，前端拿到
+  // 的是 CF 的 HTML 拦截页而不是 JSON。任务其实成功了，用户看到的是失败。
+  if (d.task_id) {
+    d = await pollApply(d.task_id, d);
+    if (!d) { btn.disabled = false; return; }
   }
   $('#applymsg').textContent = '';
 

@@ -228,10 +228,59 @@ class Job:
             }
 
 
+class ApplyTask:
+    """一次写回的后台收尾。落盘已完成，这里只跟踪重载与验证。
+
+    为什么需要它（2026-09-02 解 Cloudflare 524）：重载 1-3 秒、验证单个最长
+    45 秒，79 凭据那种规模累计破 100 秒，CF 直接切断连接返回 524 —— 而任务
+    其实成功了。落盘同步做完给确定回执，剩下的丢后台，前端轮询进度。
+    """
+
+    def __init__(self, task_id: str, base_result: dict):
+        self.id = task_id
+        self.state = "running"          # running | done | error
+        self.result = dict(base_result)  # 落盘阶段的结果，后续逐步补字段
+        self.error = ""
+        self.started = time.time()
+        self.finished = 0.0
+        # 阶段进度。写回没有「79 个单元」那种自然分片，能给准的是**阶段**
+        # 与验证的 已完成/总数 —— 那两个都是实测量。
+        self.stage = "写盘完成"
+        self.verify_total = 0
+        self.verify_done = 0
+        self.lock = threading.Lock()
+
+    def set_stage(self, stage: str) -> None:
+        with self.lock:
+            self.stage = stage
+
+    def set_verify_total(self, n: int) -> None:
+        with self.lock:
+            self.verify_total = n
+
+    def bump_verify(self) -> None:
+        with self.lock:
+            self.verify_done += 1
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "task_id": self.id,
+                "state": self.state,
+                "error": self.error,
+                "stage": self.stage,
+                "verify_total": self.verify_total,
+                "verify_done": self.verify_done,
+                "elapsed": round((self.finished or time.time()) - self.started, 1),
+                **self.result,
+            }
+
+
 class Store:
     def __init__(self) -> None:
         self.jobs: dict[str, Job] = {}
         self.plans: dict[str, dict] = {}
+        self.applies: dict[str, ApplyTask] = {}
         self.lock = threading.Lock()
 
     def add_job(self, job: Job) -> None:
@@ -249,6 +298,14 @@ class Store:
     def get_plan(self, pid: str) -> dict | None:
         with self.lock:
             return self.plans.get(pid)
+
+    def add_apply(self, task: "ApplyTask") -> None:
+        with self.lock:
+            self.applies[task.id] = task
+
+    def get_apply(self, tid: str) -> "ApplyTask | None":
+        with self.lock:
+            return self.applies.get(tid)
 
 
 STORE = Store()
@@ -312,6 +369,9 @@ def verdict_json(v) -> dict:
 def plan_json(p) -> dict:
     return {
         "host": p.host,
+        # 候选身份。前端拿它当勾选键与 DOM 定位键 —— host 不唯一
+        # （一个站常有 15 把 Key），用 host 会让同站多 Key 互相覆盖。
+        "line_no": p.line_no,
         "key_masked": p.masked_key,
         "skipped": p.skipped,
         "any_writable": p.any_writable,
@@ -924,6 +984,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "/api/context":
             self._api_context()
+        elif route.startswith("/api/apply-status/"):
+            self._api_apply_status(route[len("/api/apply-status/"):])
         elif route.startswith("/api/export/"):
             self._api_export(route[len("/api/export/"):])
         elif route.startswith("/api/job/"):
@@ -1338,12 +1400,31 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         raw, cfg = self._load_cfg()
-        overrides = body.get("overrides") or {}     # {host: {section: {...}}}
-        selected = body.get("selected")             # [[host, section], ...] 或 None=全选
-        # 人工接管：{host: {section: [模型, ...]}}。探测判不可用但操作员确知
+        # 三个按候选索引的入参。键是**行号字符串**而不是 host ——
+        # 一个站常有 15 把 Key（实测 gorouter 15、tabitoken 14），用 host
+        # 做键会让同站多 Key 互相覆盖：勾选 Set 去重成一个、DOM 定位只命中
+        # 第一行、priority 覆盖落到错误的条目上。2026-09-02 现场表现为
+        # 「全勾选只勾中 26 项」。
+        #
+        # 兼容旧键：值仍接受 host（老前端缓存或外部脚本），查表时两种都试。
+        overrides = body.get("overrides") or {}     # {line_no: {section: {...}}}
+        selected = body.get("selected")             # [[line_no, section], ...] 或 None
+        # 人工接管：{line_no: {section: [模型, ...]}}。探测判不可用但操作员确知
         # 可用的段，由他显式给模型清单。见 cp.build_plan 的 force 说明 ——
         # 只绕过 usable 判定，去重/定档/影响面/diff 确认一道都不少。
         forced = body.get("forced") or {}
+
+        def _by_row(d: dict, row_or_plan) -> dict:
+            """按候选取它那份配置。先试行号，再回落 host。
+
+            回落是为了兼容旧前端的 {host: ...} 形态 —— 那种情况下同站多 Key
+            会共用一份配置，与旧行为一致，不会更坏。
+            """
+            ln = str(getattr(row_or_plan, "line_no", "") or "")
+            if ln and ln in d:
+                return d[ln] or {}
+            h = getattr(row_or_plan, "host", "")
+            return d.get(h) or {}
         # 默认试用期：新站进最低可插档，不因探测满分就把已验证的站挡在其后
         probation = not bool(body.get("by_score"))
 
@@ -1365,7 +1446,7 @@ class Handler(BaseHTTPRequestHandler):
             proxies = existing_proxies(cfg)
 
             for res in job.results:
-                fh = forced.get(res.row.host) or {}
+                fh = _by_row(forced, res.row)
                 # rebuild=True 关掉去重判定 —— 全量重探的输入**就是** cfg 里的
                 # 既有条目，而 seen 是从同一份 cfg 读出来的，每一条都必然撞上。
                 #
@@ -1392,7 +1473,7 @@ class Handler(BaseHTTPRequestHandler):
 
             # 应用用户覆盖
             for (base_url, api_key), p in all_plans.items():
-                ov_host = overrides.get(p.host) or {}
+                ov_host = _by_row(overrides, p)
                 for sec, sp in list(p.sections.items()):
                     ov = ov_host.get(sec) or {}
                     if "priority" in ov:
@@ -1445,7 +1526,7 @@ class Handler(BaseHTTPRequestHandler):
         seen = cp.existing_fingerprints(cfg)
         plans = []
         for res in job.results:
-            fh = forced.get(res.row.host) or {}
+            fh = _by_row(forced, res.row)
             p = cp.build_plan(res.row, res, cfg, bands=bands, seen=seen,
                               probation=probation,
                               force={str(k): [str(m) for m in (v or [])]
@@ -1454,7 +1535,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # 应用用户覆盖（优先级 / 代理 / 头 / 模型 / 是否写入）
         for p in plans:
-            ov_host = overrides.get(p.host) or {}
+            ov_host = _by_row(overrides, p)
             for sec, sp in list(p.sections.items()):
                 ov = ov_host.get(sec) or {}
                 if "priority" in ov:
@@ -1492,15 +1573,17 @@ class Handler(BaseHTTPRequestHandler):
         # 从 plans 里删掉等于前端再也看不到那些段，「全勾」会退化成
         # 「只勾推荐项」（就是这一轮要修掉的症状）。
         if selected is None:
-            want = {(p.host, sec) for p in plans for sec, sp in p.sections.items()
+            want = {(str(p.line_no), sec)
+                    for p in plans for sec, sp in p.sections.items()
                     if sp.recommended}
         else:
             want = {(str(h), str(s)) for h, s in selected}
 
         for_write = []
         for p in plans:
+            # 行号优先，host 回落 —— 与 _by_row 同一套兼容策略
             keep = {sec: sp for sec, sp in p.sections.items()
-                    if (p.host, sec) in want}
+                    if (str(p.line_no), sec) in want or (p.host, sec) in want}
             if not keep:
                 continue
             shallow = copy.copy(p)
@@ -1530,8 +1613,54 @@ class Handler(BaseHTTPRequestHandler):
             "lines_after": preview.count("\n") + 1,
         })
 
+    def _cpa_password_for(self, body: dict) -> str:
+        """取 CPA 管理密码。请求里显式给的优先，否则复用登录凭据。
+
+        只有用户是**用 CPA 管理密码登录**本服务时后者才成立 —— 用服务自己的
+        token 登录的话我们手上没有管理密码。先排除「这就是本服务 token」，
+        避免为它白跑一次 bcrypt（单次约 100ms，且必然不匹配）。
+        """
+        push = body.get("push") or {}
+        mgmt = (push.get("mgmt_key") or "").strip()
+        if mgmt:
+            return mgmt
+        cred = (body.get("_cred") or "").strip()
+        if cred and not _same_secret(cred, type(self).token)                 and self._check_cpa_password(cred):
+            return cred
+        return ""
+
+    def _api_apply_status(self, tid: str) -> None:
+        """写回收尾的进度。前端轮询它，直到 state 不再是 running。
+
+        落盘已经完成了 —— 这个端点只报「重载与验证进行到哪」。
+        """
+        task = STORE.get_apply(tid)
+        if not task:
+            self._json(404, {"error": f"没有这个写回任务：{tid}"})
+            return
+        self._json(200, task.snapshot())
+
     def _api_apply(self, body: dict) -> None:
-        """真正落盘。必须带 plan_id + confirm=true。"""
+        """真正落盘。必须带 plan_id + confirm=true。
+
+        两段式（2026-09-02 改，为解 Cloudflare 524）
+        ------------------------------------------
+        落盘本身很快（一次 O_TRUNC 写），慢的是后面两步：
+          · PUT 触发 CPA 重载        1-3 秒
+          · 端到端验证 N 个段        单个最长 45 秒，并行但受上限 24 约束
+
+        原来这三步在**同一个 HTTP 请求里同步做完**，于是 79 凭据那种规模会
+        跑到 100 秒以上 —— Cloudflare 在 100 秒切断连接，返回 524，前端拿到
+        的是 CF 的 HTML 拦截页而不是 JSON（现场截图里一堆 <!DOCTYPE html>）。
+        任务其实已经写盘成功，但用户看到的是「写回失败」。
+
+        并发度不是瓶颈：验证早就是并行的。瓶颈在「客户端必须一直等着」。
+        所以改成：落盘同步做完（它是关键路径，必须给确定回执），重载与验证
+        丢到后台线程，立刻返回 task_id，前端轮询 /api/apply-status/{id}。
+
+        这样每个 HTTP 请求都在 1 秒内结束，CF 的 100 秒上限再也碰不到，
+        而进度可见 —— 与步骤②的探测进度同一套显示。
+        """
         pid = body.get("plan_id") or ""
         entry = STORE.get_plan(pid)
         if not entry:
@@ -1574,6 +1703,37 @@ class Handler(BaseHTTPRequestHandler):
                   "validate_msg": msg,
                   "diffs": len(entry["diffs"])}
 
+        # 落盘已完成，是不可逆的关键路径 —— 上面那段同步做完并给出确定回执。
+        # 剩下的重载与验证丢到后台，立刻返回 task_id。见本方法 docstring。
+        task = ApplyTask(secrets.token_hex(8), result)
+        STORE.add_apply(task)
+        cls = type(self)
+        threading.Thread(
+            target=_run_apply_tail,
+            args=(task, entry, body, cls.cfg_path, cls.cpa_url,
+                  self._cpa_password_for(body), self._cpa_client_key()),
+            name=f"apply-tail-{task.id}", daemon=True).start()
+        self._json(200, {**result, "task_id": task.id, "state": "running"})
+        return
+
+
+
+
+def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
+                    cfg_path: str, cfg_cpa_url: str,
+                    mgmt: str, auto_client_key: str) -> None:
+    """写回的后台收尾：触发 CPA 重载 + 端到端验证。
+
+    落盘已在 HTTP 请求里同步完成 —— 这里只做「慢且非关键路径」的两步，
+    进度写进 task 供 /api/apply-status 轮询。见 _api_apply 的 docstring：
+    这两步同步做会让 79 凭据那种规模跑破 Cloudflare 的 100 秒上限。
+
+    所有分支都必须落到 task.state —— 后台线程抛异常没人看得到，
+    前端会永远停在「运行中」。
+    """
+    result = task.result
+    try:
+
         # ── 自动让 CPA 立即生效 ────────────────────────────────────────
         # write_local 就地 O_TRUNC 覆写，inode 不变，所以 cli-proxy-api 容器
         # 能看到新字节，CPA 的 fsnotify 也覆盖这种写入。但那条链没有保证：
@@ -1598,17 +1758,11 @@ class Handler(BaseHTTPRequestHandler):
         # 顺序反过来后：留空走服务名直连（既绕开 CF、也不出公网），
         # 只有用户明确填了别的地址才用他填的。
         cpa_base = ((push.get("base") or "").strip()
-                    or (type(self).cpa_url or "").strip())
-        mgmt = (push.get("mgmt_key") or "").strip()
-        if not mgmt:
-            cred = (body.get("_cred") or "").strip()
-            # 先排除「这就是本服务的 token」，避免为 token 白跑一次 bcrypt
-            # （bcrypt 单次约 100ms，且必然不匹配）。
-            is_own_token = _same_secret(cred, type(self).token)
-            if cred and not is_own_token and self._check_cpa_password(cred):
-                mgmt = cred            # 登录用的就是 CPA 管理密码，直接复用
+                    or (cfg_cpa_url or "").strip())
+        # 管理密码由调用方算好传入（见 _cpa_password_for）
 
         if cpa_base and mgmt:
+            task.set_stage("触发 CPA 重载")
             rok, rmsg = reload_cpa(cpa_base, mgmt, entry["preview"])
             result["reload_ok"] = rok
             result["reload_msg"] = rmsg
@@ -1651,7 +1805,7 @@ class Handler(BaseHTTPRequestHandler):
             client_key = (push.get("client_key") or "").strip()
             key_src = "用户填写"
             if not client_key:
-                client_key = self._cpa_client_key()
+                client_key = auto_client_key
                 key_src = "自动取自 config.yaml 的 api-keys"
             if client_key:
                 # 待验证清单先摊平，再并行打 —— 串行会让这个 HTTP 请求超时。
@@ -1679,12 +1833,15 @@ class Handler(BaseHTTPRequestHandler):
                 skipped_over = todo[MAX_VERIFY:]
                 todo = todo[:MAX_VERIFY]
 
+                task.set_stage("端到端验证")
+                task.set_verify_total(len(todo))
                 verified = [None] * len(todo)
 
                 def _one(i: int, host: str, sec: str, model: str) -> None:
                     vok, vmsg = verify_upstream(
                         cpa_base, client_key, sec, model, timeout=45,
                     )
+                    task.bump_verify()
                     verified[i] = {"host": host, "section": sec,
                                    "model": model, "ok": vok, "msg": vmsg}
 
@@ -1729,8 +1886,15 @@ class Handler(BaseHTTPRequestHandler):
                     "缺这一层意味着：现在只知道 CPA 收下了配置，"
                     "不知道客户端打过来时新上游会不会被换模或拒绝。"
                 )
-        self._json(200, result)
 
+        task.state = "done"
+        task.set_stage("全部完成")
+    except Exception:
+        task.state = "error"
+        task.error = traceback.format_exc(limit=4)
+        task.set_stage("收尾出错")
+    finally:
+        task.finished = time.time()
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="upstream-importer-server")

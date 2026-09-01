@@ -413,9 +413,14 @@ gemini-api-key:
     priorities = [int(m.group(1))
                   for m in re.finditer(r"^\s*priority:\s*(\d+)", rebuilt, re.M)]
 
-    # 验证降序
-    assert priorities == sorted(priorities, reverse=True), f"Not sorted: {priorities}"
-    assert priorities == [900, 500, 100]
+    # 新方案按 priority 降序；原有的 site1.com 没进方案，按 keep_unplanned
+    # 原样保留在后面（2026-09-02 起的行为 —— 未勾选的条目不删）。
+    assert priorities[:3] == [900, 500, 100], f"新方案未降序: {priorities}"
+    assert priorities == [900, 500, 100, 100], (
+        f"原条目应被保留在末尾，实得 {priorities}")
+    assert "site1.com" in rebuilt, "未进方案的原条目被删了"
+    assert any("已原样保留" in w for w in warnings), (
+        f"保留原条目时必须给警告，实得 {warnings}")
 
     print(f"[OK] Priority order: {priorities}")
 
@@ -489,19 +494,35 @@ openai-compatibility:
         assert items, f"{sec} 为空 —— 段名分组 miss 了（缺陷 1 回归）"
 
     # 缺陷 2：前三段不该有 name
+    #
+    # 只检查**本次方案生成的**条目。keep_unplanned（2026-09-02）会把没进方案
+    # 的原条目原样保留 —— 这个 fixture 的 gemini 段有个 seed 条目没有 models，
+    # 那是原文的样子，不是渲染缺陷。按 api-key 认出方案条目。
+    planned_keys = {"AIzaG", "cdxC", "sk-ant-CL"}
     for sec in ("gemini-api-key", "codex-api-key", "claude-api-key"):
         for e in parsed[sec]:
             assert "name" not in e, f"{sec} 不该有 name 字段（缺陷 2 回归）"
             assert "api-key" in e and "base-url" in e
+            if e.get("api-key") not in planned_keys:
+                continue                    # 原样保留的旧条目，不按新格式要求
             assert "models" in e, f"{sec} 缺 models"
             # models 是 [{name, alias}] 结构，不是裸字符串列表
             assert isinstance(e["models"][0], dict), f"{sec} models 结构不对"
             assert "alias" in e["models"][0]
 
+    # keep_unplanned：原有的 seed 条目必须还在
+    assert any(e.get("api-key") == "seed" for e in parsed["gemini-api-key"]),         "未进方案的原条目被删了（keep_unplanned 回归）"
+
     # 缺陷 3：compat 段结构与归并
     compat = parsed["openai-compatibility"]
-    assert len(compat) == 1, f"同站两个 Key 应归并成 1 个 provider，实际 {len(compat)}"
-    prov = compat[0]
+    # 本次方案的那个站归并成 1 个 provider；原有的 seed provider 由
+    # keep_unplanned 原样保留（2026-09-02 起）。所以总数是 2，其中新方案 1 个。
+    mine = [e for e in compat
+            if e.get("base-url") == "https://compat.example.com/v1"]
+    assert len(mine) == 1, (
+        f"同站两个 Key 应归并成 1 个 provider，实际 {len(mine)}")
+    assert any(e.get("name") == "seed" for e in compat),         "未进方案的原 provider 被删了（keep_unplanned 回归）"
+    prov = mine[0]
     assert "name" in prov, "compat 段必须有 name（CPA 的 provider 身份）"
     assert "api-key-entries" in prov, "compat 段必须用 api-key-entries"
     assert "api-key" not in prov, "compat 段不该在 provider 级放 api-key"
@@ -1190,6 +1211,103 @@ claude-api-key:
           "（原行为下 3 个全判重、一个都勾不上）")
 
 
+def test_rebuild_entry_conservation():
+    """条目守恒 + 未勾选不删除。两条都是 2026-09-02 生产事故的回归。
+
+    事故一：条目从 121 变 246
+      全量重探为每个凭据的**四段**都生成方案，整段重写时全写进去。而真实
+      情况是每个凭据只配了自己那几段（79 个凭据里跨四段的只有 9 个）。
+      修法是 owned_sections + only_owned。
+
+    事故二：只勾推荐项 → 未勾的原条目被删
+      整段重写只写进方案的条目，其余消失。而「没进方案」有三种无害原因：
+      用户没勾、段判不可写、探测抛异常。修法是 keep_unplanned。
+    """
+    import yaml
+    from cpa_probe.writeback import (owned_sections, rebuild_config_full,
+                                     validate)
+    from cpa_probe.plan import SectionPlan, ImportPlan
+
+    # 两个站：A 配了 claude+codex 两段，B 只配了 claude
+    orig = """host: "127.0.0.1"
+
+codex-api-key:
+  - api-key: "kA"
+    base-url: "https://a.example.com/v1"
+    priority: 300
+    models:
+      - name: "gpt-5.6-sol"
+        alias: ""
+
+claude-api-key:
+  - api-key: "kA"
+    base-url: "https://a.example.com"
+    priority: 500
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+  - api-key: "kB"
+    base-url: "https://b.example.com"
+    priority: 400
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+"""
+    cfg = yaml.safe_load(orig)
+    lines = orig.splitlines(keepends=True)
+
+    own = owned_sections(cfg)
+    assert own[("a.example.com", "kA")] == {"codex-api-key", "claude-api-key"}
+    assert own[("b.example.com", "kB")] == {"claude-api-key"}
+
+    def plan_for(host, key, secs, prio):
+        p = ImportPlan(host=host, masked_key=key, line_no=1)
+        for sec in secs:
+            bu = f"https://{host}" + ("/v1" if "codex" in sec else "")
+            p.sections[sec] = SectionPlan(
+                section=sec, base_url=bu, api_key=key,
+                models=["gpt-5.6-sol" if "codex" in sec else "claude-opus-5"],
+                priority=prio)
+        return p
+
+    # ① 探测给每个凭据都出了四段方案 —— only_owned 该挡掉没配过的
+    ALL = ("gemini-api-key", "codex-api-key", "claude-api-key",
+           "openai-compatibility")
+    plans = {
+        ("https://a.example.com", "kA"): plan_for("a.example.com", "kA", ALL, 900),
+        ("https://b.example.com", "kB"): plan_for("b.example.com", "kB", ALL, 800),
+    }
+    new, warns = rebuild_config_full(cfg, plans, lines)
+    ok, msg = validate(new)
+    assert ok, msg
+    n2 = yaml.safe_load(new)
+
+    # 条目守恒：原来 3 条，现在还是 3 条
+    tot = sum(len(n2.get(s) or []) for s in ALL)
+    assert tot == 3, f"条目数应守恒为 3，实得 {tot}（各段 " +         str({s: len(n2.get(s) or []) for s in ALL}) + "）"
+    # gemini 与 compat 原本没有 —— 不该凭空多出来
+    assert not n2.get("gemini-api-key"), "凭空写了 gemini 段"
+    assert not n2.get("openai-compatibility"), "凭空写了 compat 段"
+    assert any("原本不在 config.yaml 里" in w for w in warns),         f"跳过未拥有的段时必须给警告，实得 {warns}"
+    # priority 确实更新了
+    assert n2["claude-api-key"][0]["priority"] == 900
+
+    # ② 只有 A 进方案（模拟「只勾推荐项」）—— B 的原条目必须保留
+    plans2 = {("https://a.example.com", "kA"):
+              plan_for("a.example.com", "kA", ("claude-api-key",), 950)}
+    new2, warns2 = rebuild_config_full(cfg, plans2, lines)
+    ok2, msg2 = validate(new2)
+    assert ok2, msg2
+    n3 = yaml.safe_load(new2)
+    keys = {e.get("api-key") for e in n3["claude-api-key"]}
+    assert keys == {"kA", "kB"}, f"未勾选的 kB 被删了，实得 {keys}"
+    # A 的 codex 段没进方案，那一段也要原样保留
+    assert len(n3.get("codex-api-key") or []) == 1, "A 的 codex 原条目被删了"
+    assert any("已原样保留" in w for w in warns2), warns2
+
+    print("[OK] Entry conservation: 121 型条目守恒、未勾选的原条目不删除")
+
+
 def test_rebuild_keeps_weight():
     """weight: 0 必须搬回去 —— 丢了等于让手工封禁的站复活。
 
@@ -1430,6 +1548,7 @@ if __name__ == "__main__":
         ("未知字段搬运", test_rebuild_keeps_unknown_fields),
         ("proxy-url 搬运", test_rebuild_keeps_proxy),
         ("重探不判重", test_rebuild_skips_dedup),
+        ("条目守恒与未勾不删", test_rebuild_entry_conservation),
         ("重建保留 weight", test_rebuild_keeps_weight),
         ("批量键含 api_key", test_batch_key_includes_api_key),
         ("批量记录异常站", test_batch_records_errors),

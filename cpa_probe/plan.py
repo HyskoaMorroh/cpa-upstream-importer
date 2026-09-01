@@ -1172,6 +1172,17 @@ class SectionPlan:
 class ImportPlan:
     host: str
     masked_key: str
+    # 候选的唯一身份 = 输入行号。
+    #
+    # 为什么不能用 host（2026-09-02 现场）：一个站有多把 Key 是常态
+    # （实测 gorouter 15 把、tabitoken 14 把）。前端把 (host, section) 当
+    # 勾选键，Set 去重后 15 个 Key 在同一段上只剩 1 个选择；表格行用
+    # data-host 定位，querySelector 只找到第一行 —— 后 14 行的勾选状态与
+    # priority 回填全落到第一行上。表现就是「全勾选只勾中 26 项」。
+    #
+    # 用行号而不是 api_key：key 是明文，绝不进 DOM 属性与 JSON 响应。
+    # 行号在一次任务内唯一（parse_lines 按输入行编号），够做身份。
+    line_no: int = 0
     sections: dict[str, SectionPlan] = field(default_factory=dict)
     skipped: dict[str, str] = field(default_factory=dict)  # 段 -> 不写入的原因
 
@@ -1293,7 +1304,8 @@ def build_plan(
     existing = seen if seen is not None else existing_fingerprints(cfg)
     pairs = seen_pairs if seen_pairs is not None else existing_pairs(cfg)
 
-    plan = ImportPlan(host=row.host, masked_key=row.masked())
+    plan = ImportPlan(host=row.host, masked_key=row.masked(),
+                      line_no=row.line_no)
 
     force = force or {}
     for section, v in result.sections.items():
