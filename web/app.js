@@ -451,6 +451,23 @@ function renderStream(events) {
       return `<div class="note">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
         + `${pad(e.model, 20)} ${esc(e.status)} 临时错误，${e.wait}s 后重试一次</div>`;
     }
+    // 时段：分组按窗口开放。凭据是好的、不是站点问题 —— 窗口内重测。
+    if (e.kind === 'time-window') {
+      const win = e.window ? `${e.window[0]}~${e.window[1]}` : '未知';
+      return `<div class="note">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `${esc(e.host)} 限时段（${win}）—— 窗口内复测</div>`;
+    }
+    // 画像命中：第几次试到通的、什么档、是否需 body 补丁
+    if (e.kind === 'profile-hit') {
+      const body = e.needs_body ? '+body' : '';
+      return `<div class="s2">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `${esc(e.host)} 画像 ${esc(e.profile)}${body} 通（试 ${e.tried} 档）</div>`;
+    }
+    // 画像梯跑完仍不通 —— 让操作员看到「试了几档都不行」，不是「没试」
+    if (e.kind === 'profile-exhausted') {
+      return `<div class="s4">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `${esc(e.host)} 画像梯跑完仍不通（试 ${e.tried} 档）</div>`;
+    }
     // 200 但正文是错误体 / 换模 —— 模型被拒收，不进写入清单
     if (e.kind === 'model-rejected') {
       const why = e.reason ? esc(e.reason)

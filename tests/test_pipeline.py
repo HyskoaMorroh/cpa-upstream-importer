@@ -356,10 +356,20 @@ def main() -> int:
         eq("补头后可用", sorted(r.usable_sections), sorted(cp.SECTIONS))
         v = r.sections["codex-api-key"]
         eq("最终需要头", bool(v.min_headers), True)
+        # 头名按**小写**比较：HTTP 头名大小写不敏感，而画像表统一用小写
+        # （CPA 上线前会改成真实客户端的大小写，见 claudeWireHeaderCasing）。
+        # 原断言写死了 "User-Agent"/"Originator" 的驼峰形态，那是把「假上游
+        # 恰好这么写」当成了契约 —— 换成小写后测试假失败，而行为完全正确。
         eq("头是 UA 或 Originator",
-           set(v.min_headers) <= {"User-Agent", "Originator"}, True)
+           {k.lower() for k in v.min_headers} <= {"user-agent", "originator"}, True)
         eq("走的是 identity 回退",
            any(a.combo.startswith("id:") and a.ok for a in v.attempts), True)
+        # 画像档名要被记下来 —— 报告与写回都靠它，「需要 originator-only」
+        # 比「需要 1 个头」对人有用得多。
+        eq("记下了画像档名", bool(v.profile_name), True)
+        eq("最省档优先（originator 不含版本号，最抗客户端升级）",
+           v.profile_name, "originator-only")
+        eq("这一档不需要 body 补丁", v.min_body_kind, "")
 
         # ------------------------------------------------------------------
         section("swapper：静默换模")
