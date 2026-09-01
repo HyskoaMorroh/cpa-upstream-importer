@@ -1163,6 +1163,19 @@ class ImportPlan:
         return any(p.writable for p in self.sections.values())
 
 
+# 各段的「标准档」档名。判死的段回落配头时用它。
+#
+# 必须按档名而不是 tier 数字取 —— compat 段的梯子把 cc 族嵌在 openai-sdk
+# 之上，tier 编号整体后移一位，取 tier=2 会拿到 claude-cli 形态的
+# anthropic-beta 写给一个走 /chat/completions 的段（见 _fallback_headers）。
+_STD_PROFILE = {
+    "gemini-api-key": "gemini-cli-full",
+    "codex-api-key": "codex-tui",
+    "claude-api-key": "cc-std",
+    "openai-compatibility": "openai-sdk",
+}
+
+
 def _fallback_headers(section: str, v, cfg: dict | None) -> dict[str, str]:
     """判不可用的段该配哪套请求头。
 
@@ -1174,6 +1187,17 @@ def _fallback_headers(section: str, v, cfg: dict | None) -> dict[str, str]:
     取探测**实际打到的最高档**，因为那是实测走过的最完整形态。没有任何
     id: 尝试记录时（连门票梯都没进就死了，比如 DNS 不通）回落到该段标准档
     —— 不取全量档，设备指纹那类头有站方会拒。
+
+    标准档按**档名**指定，不按 tier 数字（2026-09-01 修正）
+    ------------------------------------------------------
+    原来写 `p.tier == 2`，而 tier 在四段里指的不是同一个东西：compat 段的
+    梯子把整个 cc 族嵌在 openai-sdk 之上（为覆盖「中转站只认 Claude Code」
+    那种情形），编号因此整体后移一位 —— 于是 tier=2 在 gemini/codex/claude
+    段分别是 gemini-cli-full / codex-tui / cc-std（都对），在 compat 段却是
+    **cc-min**：给一个走 /chat/completions 的段写 `anthropic-beta`。
+
+    那是 Anthropic 协议专属头，compat 段发它毫无意义，还可能让本来能过的
+    站因为多了个看不懂的头而拒。族名不会随梯子插档而漂移，所以按名字取。
     """
     from .profiles import ladder as _ladder
 
@@ -1183,7 +1207,12 @@ def _fallback_headers(section: str, v, cfg: dict | None) -> dict[str, str]:
         hit = [p for p in rungs if p.name in tried]
         if hit:
             return dict(max(hit, key=lambda p: p.tier).headers)
-    std = [p for p in rungs if p.tier == 2] or [p for p in rungs if p.tier >= 1]
+    want = _STD_PROFILE.get(section, "")
+    std = [p for p in rungs if p.name == want]
+    if not std:
+        # 档名没命中（梯子改过名）：退到该段 tier 最低的非 baseline 档，
+        # 而不是某个写死的数字 —— 宁可少几个头也不要发错协议的头。
+        std = sorted((p for p in rungs if p.tier >= 1), key=lambda p: p.tier)
     return dict(std[0].headers) if std else {}
 
 
