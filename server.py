@@ -310,6 +310,38 @@ def run_job(job: Job, cfg_path: str) -> None:
         job.finished = time.time()
 
 
+_CPA_COMMIT_CACHE: dict = {"at": 0.0, "commit": ""}
+_CPA_COMMIT_TTL = 300.0
+
+
+def _cpa_runtime_commit(base: str) -> str:
+    """读运行中 CPA 的 commit（管理响应头 X-CPA-COMMIT，handler.go:267-269）。
+
+    用来发现「源码已更新但 CPA 没重启」—— 挂进来的是源码，跑着的是编译产物。
+
+    打的是 /healthz：它不需要管理密钥，而 X-CPA-COMMIT 由管理路由的中间件写
+    在响应头上。拿不到就返回空串，调用方降级为「不比对版本」，不报错 ——
+    这只是个增强信号，不能让它影响 /api/context 的可用性。
+
+    缓存 5 分钟：每次打开网页都发一次外网请求不值得，而 CPA 版本不会秒级变。
+    """
+    if not base:
+        return ""
+    now = time.time()
+    if now - _CPA_COMMIT_CACHE["at"] < _CPA_COMMIT_TTL:
+        return _CPA_COMMIT_CACHE["commit"]
+    commit = ""
+    try:
+        req = urllib.request.Request(base.rstrip("/") + "/healthz",
+                                     method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            commit = (resp.headers.get("X-CPA-COMMIT") or "").strip()
+    except Exception:                                   # noqa: BLE001
+        commit = ""
+    _CPA_COMMIT_CACHE.update(at=now, commit=commit)
+    return commit
+
+
 def run_job_full_redetect(job: Job, cfg_path: str) -> None:
     """全量重探模式：重新探测所有既有站 + 新站
 
@@ -857,7 +889,8 @@ class Handler(BaseHTTPRequestHandler):
         # 优先读 CPA 源码（能区分有条件/无条件 beta），读不到退回 config.yaml
         # 的 header-defaults。两条都不成立时明确报「无法核对」，不假装检查过。
         drift = cp.check_profile_drift(
-            source_root=type(self).cpa_source_root, cfg=cfg)
+            source_root=type(self).cpa_source_root, cfg=cfg,
+            runtime_commit=_cpa_runtime_commit(type(self).cpa_url))
 
         self._json(200, {
             "config_path": type(self).cfg_path,
