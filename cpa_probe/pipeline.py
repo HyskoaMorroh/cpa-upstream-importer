@@ -34,7 +34,8 @@ from typing import Callable
 from .classify import body_excerpt as _body_excerpt
 from .classify import classify as _classify
 from .classify import has_error_envelope as _has_error_envelope
-from . import client, fingerprint, request
+from .classify import time_window as _time_window
+from . import client, fingerprint, profiles, request
 from .parse import SECTIONS, ParsedRow, base_for_section, host_of
 
 # 每段的种子模型。/models 目录拿不到时兜底；拿到目录时用来定验证顺序。
@@ -65,6 +66,28 @@ MAX_MODELS_PER_SECTION = 4
 
 def _encode(body: dict) -> bytes:
     return json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+
+def _body_kind(prof) -> str:
+    """这一档的 body 补丁是什么形态。空串 = 不需要 body。
+
+    只记形态名不记值：求值后的值含随机 UUID，落进报告会让每次输出都不同，
+    没法用来做「上次是什么、这次变了没有」的漂移比较。
+    """
+    if not prof.body_patch:
+        return ""
+    uid = ""
+    md = prof.body_patch.get("metadata")
+    if isinstance(md, dict):
+        uid = str(md.get("user_id") or "")
+    kind = "metadata.user_id"
+    if uid.startswith("{"):
+        kind += "(json)"
+    elif uid.startswith("user_"):
+        kind += "(plain)"
+    if "system" in prof.body_patch:
+        kind += "+system"
+    return kind
 
 
 def _model_specific_dead_end(att) -> bool:
@@ -147,6 +170,15 @@ class SectionVerdict:
     models: list[str] = field(default_factory=list)
     need_proxy: bool = False
     min_headers: dict[str, str] = field(default_factory=dict)
+    # 通过时用的画像档名（profiles.Profile.name）。写回与报告都要它 ——
+    # 「需要 cc-std」比「需要 3 个头」对人有用得多。
+    profile_name: str = ""
+    # 该档的 body 补丁形态（只记有没有、是哪种，不记求值后的值 —— 那含
+    # 随机 UUID，落进报告会让每次输出都不同）。非空表示 headers 表达不了，
+    # claude 段要 fingerprint-profile，其余三段配置层无解。
+    min_body_kind: str = ""
+    # 分组的可调用时段（("09:00","18:00")）。「时段」类才有。
+    time_window: tuple[str, str] | None = None
     swap: dict = field(default_factory=dict)
     max_context_length: int | None = None
     # 上限是在**哪个模型**上实测的。同站不同模型窗口不同（claude-opus-5
@@ -168,12 +200,19 @@ class SectionVerdict:
 
     def summary(self) -> str:
         if not self.usable:
-            return f"{self.category or '不可用'} — {self.action}"
+            base = f"{self.category or '不可用'} — {self.action}"
+            if self.time_window:
+                base += f"（可调用时段 {self.time_window[0]}~{self.time_window[1]}）"
+            return base
         bits = [f"{len(self.models)} 模型"]
         if self.need_proxy:
             bits.append("需代理")
-        if self.min_headers:
+        if self.profile_name:
+            bits.append(f"需画像 {self.profile_name}")
+        elif self.min_headers:
             bits.append("需 " + "+".join(self.min_headers))
+        if self.min_body_kind:
+            bits.append(f"需 {self.min_body_kind}")
         if self.swap_detected:
             bits.append(f"⚠ 换模 {self.swap.get('rate_pct', 0)}%")
         if self.max_context_length:
@@ -206,7 +245,13 @@ class Prober:
         swap_samples: int = 3,
         workers: int = 4,
         on_event: Callable[[str, dict], None] | None = None,
+        cfg_snapshot: dict | None = None,
     ):
+        # 现有 config.yaml 的快照。画像梯从它的 `claude-header-defaults` /
+        # `codex.header-defaults` 派生真实的 UA 版本号与 X-Stainless 值
+        # （profiles.defaults_from_config）。给 None 时回落内置常量 ——
+        # 那些常量是从 CPA 源码抄录的，不是猜的，所以缺配置也能工作。
+        self.cfg_snapshot = cfg_snapshot
         self.proxy = proxy
         self.gap = gap
         self.timeout = timeout
@@ -308,6 +353,7 @@ class Prober:
         *,
         combo: str,
         extra_headers: dict[str, str] | None = None,
+        body_patch: dict | None = None,
         proxy: str | None = None,
         text: str | None = None,
     ) -> Attempt:
@@ -317,6 +363,11 @@ class Prober:
         if text is not None:
             kwargs["text"] = text
         url, headers, body = request.build_request(section, base, model, key, **kwargs)
+        if body_patch:
+            # 画像的 body 补丁（metadata.user_id 等）。浅层 merge 就够 ——
+            # 补丁只碰顶层键，而顶层同名键就该整体替换（metadata 整个替换，
+            # 不是与探测自己的 metadata 合并 —— 探测本来不发 metadata）。
+            body.update(body_patch)
         resp = client.send(
             url,
             headers=headers,
@@ -423,8 +474,12 @@ class Prober:
     #
     # 修法是两层：模型专属死路不进 seen（见 _stage1），这里再把「客户端」
     # 排在「死路」之前 —— 它更接近根因，且处置明确（补标识或人工接管）。
-    _SEVERITY = ("客户端", "死路", "鉴权", "注入", "门禁", "IP封",
-                 "未知", "临时", "限频", "限流", "边缘", "反测活", "余额")
+    # 「WAF」紧跟「客户端」：两者都是形态问题，且 WAF 的处置（试画像）与
+    # 客户端同源，比「死路」更接近根因。
+    # 「时段」排在最后段 —— 它 usable=True，且窗口内自然可用，是最不严重的
+    # 一类失败。若排在前面，一个时段受限的站会盖掉另一个种子的真实故障。
+    _SEVERITY = ("客户端", "WAF", "死路", "鉴权", "注入", "门禁", "IP封",
+                 "未知", "临时", "限频", "限流", "边缘", "反测活", "余额", "时段")
 
     @classmethod
     def _severity_rank(cls, category: str) -> int:
@@ -517,28 +572,29 @@ class Prober:
                     v.models = self._accept(v, model, att)
                     return v
 
-            # 标识类：按 identity_combos 由省到全回退，第一个 200 即最小必需头。
+            # 时段：分组按时间窗口开放。窗口外重试一万次也一样，但凭据是好的 ——
+            # 记下窗口后立即收敛，不浪费请求，也不把它判成不可用。
+            if att.category == "时段":
+                v.time_window = _time_window(att.excerpt)
+                v.category, v.action = att.category, att.action
+                self.on_event("time-window", {
+                    "section": section, "host": host_of(base),
+                    "window": v.time_window,
+                })
+                return v
+
+            # 客户端形态类：按画像梯由省到全回退，第一个 200 即最省可用档。
             #
-            # 「客户端」必须在列 —— 那类站回的可能是 503（实测），而 503 既不在
-            # 原来的类别集里、也不在 401/403 里，于是标识头一次都没试过。
-            # 用户日志里 claude 段全程只有 baseline 与 retry1，五种组合零尝试。
-            if (att.category in ("客户端", "门禁", "IP封", "边缘")
-                    or att.status in ("401", "403")):
-                for name, hdrs in request.identity_combos(section):
-                    if not hdrs:
-                        continue  # 空组合等于基线，已试过
-                    att = self._call(
-                        section, base, row.api_key, model, combo=f"id:{name}",
-                        extra_headers=hdrs,
-                        proxy=self.live_proxy if v.need_proxy else None,
-                    )
-                    v.attempts.append(att)
-                    if att.ok:
-                        v.usable = True
-                        v.min_headers = dict(hdrs)
-                        v.category, v.action = att.category, att.action
-                        v.models = self._accept(v, model, att)
-                        return v
+            # 为什么触发条件这么宽（每一项都是实测踩出来的）：
+            #   客户端 —— 站方明说「只允许某某客户端」，可能回 503（不在 401/403 里）
+            #   WAF    —— 自建拦截页，认的是客户端形态，换 IP 无效
+            #   门禁/IP封/边缘/401/403 —— 都可能实际是形态问题被误分类
+            #   鉴权   —— 401 unauthorized client 会落到这里（实测 agentrouter）
+            # 判错方向的代价不对称：多试几档只是多几次请求，漏试会把可用站判死。
+            if (att.category in ("客户端", "WAF", "门禁", "IP封", "边缘", "鉴权")
+                    or att.status in ("401", "403", "503")):
+                if self._try_profiles(row, section, base, model, v):
+                    return v
 
         # 全部种子都没通。取**最严重**的类别，而不是最后一个种子的结论。
         # 见本方法 docstring：后者会让一个该站不存在的模型判死整段。
@@ -546,6 +602,78 @@ class Prober:
             best = min(seen, key=lambda ca: self._severity_rank(ca[0]))
             v.category, v.action = best
         return v
+
+    def _profile_kwargs(self, v: SectionVerdict, api_key: str) -> dict:
+        """后续请求（模型扫描 / 换模采样 / 上下文二分 / 换 Key 复验）要带的
+        画像参数。**必须与 stage1 通过时那一档完全一致**。
+
+        为什么不能只传 min_headers（这是个实测过的坑的同构形态）
+        ------------------------------------------------------
+        stage1 用画像通过后，后面四处若只带 headers 不带 body 补丁，那些请求
+        对需要 `metadata.user_id` 的站（实测 zzzcoding）会全部失败 ——
+        于是「段可用但注册 0 个模型」，或者换 Key 复验时把好 Key 判成坏 Key。
+        这与 wave-1 修过的「_stage2 绕过 _accept」是同一类缺陷：主路径加了
+        检查，第二条路径没加。所以这里做成唯一入口，四处都走它。
+
+        每次重新 materialize 而不是缓存求值结果：body 里的 session_id 应当
+        每个请求都是新的（真实客户端行为），缓存住会让所有请求共用一个会话 ID。
+        """
+        if v.profile_name:
+            for prof in profiles.ladder(v.section, self.cfg_snapshot):
+                if prof.name == v.profile_name:
+                    hdrs, patch = profiles.materialize(prof, api_key)
+                    return {"extra_headers": hdrs or None,
+                            "body_patch": patch or None}
+        return {"extra_headers": dict(v.min_headers) or None}
+
+    def _try_profiles(self, row: ParsedRow, section: str, base: str,
+                      model: str, v: SectionVerdict) -> bool:
+        """按画像梯升级。第一个通过的档写进 verdict 并返回 True。
+
+        梯子是**嵌套超集**（见 profiles 模块 docstring）：第 k 档失败即前 k 档
+        的并集都不够，不必回头补试。实测依据 —— agentrouter 的门票是
+        user-agent + anthropic-beta + x-app 三项缺一不可，平行尝试会全败而
+        它们的并集本来是通的。
+
+        保守取向：整梯跑完（含 alt 档），不提前放弃。多试几档只多几次请求，
+        而漏试会把一个可用站判死 —— 后者不可逆（用户按报告弃用了那个站）。
+        """
+        tried = 0
+        for prof in profiles.ladder(section, self.cfg_snapshot):
+            if prof.is_baseline:
+                continue                    # 基线已在调用方试过
+            hdrs, patch = profiles.materialize(prof, row.api_key)
+            att = self._call(
+                section, base, row.api_key, model, combo=f"id:{prof.name}",
+                extra_headers=hdrs or None, body_patch=patch or None,
+                proxy=self.live_proxy if v.need_proxy else None,
+            )
+            v.attempts.append(att)
+            tried += 1
+            if not att.ok:
+                continue
+            # 200 也要过 _accept —— 「200 但正文是错误体」是实测过的假阳性
+            # 来源（某站对所有请求都回 200，把真实错误放正文里）。
+            models = self._accept(v, model, att)
+            if not models:
+                continue
+            v.usable = True
+            v.min_headers = dict(hdrs)
+            v.profile_name = prof.name
+            v.min_body_kind = _body_kind(prof)
+            v.category, v.action = att.category, att.action
+            v.models = models
+            self.on_event("profile-hit", {
+                "section": section, "host": host_of(base),
+                "profile": prof.name, "tier": prof.tier,
+                "family": prof.family, "tried": tried,
+                "needs_body": bool(patch),
+            })
+            return True
+        self.on_event("profile-exhausted", {
+            "section": section, "host": host_of(base), "tried": tried,
+        })
+        return False
 
     # ---------- ② 模型发现 ----------
 
@@ -582,8 +710,8 @@ class Prober:
                 break
             att = self._call(
                 v.section, v.base_url, row.api_key, model, combo="model-scan",
-                extra_headers=v.min_headers or None,
                 proxy=self.live_proxy if v.need_proxy else None,
+                **self._profile_kwargs(v, row.api_key),
             )
             v.attempts.append(att)
             # 必须走 _accept，不要在这里自己判 model_matches。
@@ -612,8 +740,8 @@ class Prober:
         for _ in range(self.swap_samples):
             att = self._call(
                 v.section, v.base_url, row.api_key, model, combo="swap-sample",
-                extra_headers=v.min_headers or None,
                 proxy=self.live_proxy if v.need_proxy else None,
+                **self._profile_kwargs(v, row.api_key),
             )
             v.attempts.append(att)
             samples.append(att.as_sample())
@@ -711,9 +839,9 @@ class Prober:
             att = self._call(
                 v.section, v.base_url, row.api_key, model,
                 combo=f"ctx-{chars // 1000}k",
-                extra_headers=v.min_headers or None,
                 proxy=self.live_proxy if v.need_proxy else None,
                 text="x" * chars,
+                **self._profile_kwargs(v, row.api_key),
             )
             v.attempts.append(att)
             if not att.ok:
@@ -812,8 +940,8 @@ class Prober:
         att = self._call(
             section, base, row.api_key, probe_model,
             combo="reuse-verify",
-            extra_headers=shape.min_headers or None,
             proxy=self.live_proxy if shape.need_proxy else None,
+            **self._profile_kwargs(shape, row.api_key),
         )
         v.attempts.append(att)
         v.category, v.action = att.category, att.action
@@ -841,6 +969,9 @@ class Prober:
         v.models = list(shape.models)
         v.need_proxy = shape.need_proxy
         v.min_headers = dict(shape.min_headers)
+        v.profile_name = shape.profile_name
+        v.min_body_kind = shape.min_body_kind
+        v.time_window = shape.time_window
         v.swap = dict(shape.swap)
         v.max_context_length = shape.max_context_length
         v.context_model = shape.context_model

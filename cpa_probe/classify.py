@@ -32,6 +32,18 @@ DISPOSITION = {
     "客户端":  (False, False, "站方只认特定客户端。补 Claude Code / CLI 标识后重试；"
                             "仍不通则用人工接管（探测无法复制该客户端形态）"),
     "IP封":    (False, True,  "按出口 IP 拉黑。加 proxy-url 可能救活"),
+    # 与「IP封」分开是因为处置相反：WAF 认的是客户端形态（UA/TLS/行为），
+    # 换出口 IP 没用。2026-09-01 实测 hybgzs 三段都配了 mihomo 代理，走代理
+    # 仍返回同一个「访问已被拦截」页 —— 若判成「IP封」，处置会写「加
+    # proxy-url 可能救活」，那是把用户往一条已证伪的路上引。
+    "WAF":     (False, False, "站方 WAF 按客户端形态拦截，换出口 IP 无效。"
+                              "先试客户端画像；仍不通则该站不接受编程访问"),
+    # 分组按时间窗口开放。usable=True —— 凭据有效，窗口内自然可用。
+    # 2026-09-01 实测 hybgzs codex 段：403「当前分组本时段不可调用，
+    # 可调用时段为：09:00~18:00」。原来落到「门禁」(usable=False, 处置写
+    # 「配置层无解，需站方开通」)，等于把一个每天能用 9 小时的站判死。
+    "时段":    (True,  False, "分组按时间窗口开放，窗口外一律拒绝。"
+                              "记下窗口，窗口内复测；不要降权也不要弃用"),
     "边缘":    (True,  False, "Cloudflare 概率性拦截，重试即可。不代表不可用"),
     "反测活":  (True,  False, "探测文本触发站方测活拦截。换探测文本重测，非站点问题"),
     "注入":    (False, False, "CPA 自身注入的工具被站方拒绝。关 disable-image-generation"),
@@ -83,9 +95,25 @@ _RULES: list[tuple[str, str, str, set[str] | None]] = [
     ("注入", "image_generation 工具被拒",
      r"image[_ ]generation is not enabled|image_generation", {"403", "400"}),
 
-    # ---- Cloudflare / IP ----
-    ("IP封", "CF 挑战或站方拦截页",
-     r"challenge-platform|cf-mitigated|cdn-cgi|访问已被拦截|安全验证", None),
+    # ---- 时间窗口：必须在「门禁」与状态码兜底之前 ----
+    #
+    # 正文里带出可调用时段，说明拒绝原因是**时间**，与凭据、客户端、IP 都无关。
+    # 窗口写法见实测：「当前分组本时段不可调用，可调用时段为：09:00~18:00」。
+    ("时段", "分组按时段开放",
+     r"本时段不可调用|当前时段不可用|不在可(?:调用|用)时段"
+     r"|可调用时段|not available (?:at|during) this (?:time|hour)"
+     r"|only available (?:from|between)\s*\d{1,2}:\d{2}"
+     r"|outside (?:the )?(?:allowed |service )?(?:time )?window", None),
+
+    # ---- Cloudflare / WAF / IP ----
+    #
+    # 「拦截页」与「CF 挑战」分开判：
+    #   · 站方自建的拦截页（访问已被拦截 / 安全验证）= WAF 按客户端形态拦，
+    #     换 IP 无效（实测带代理仍被拦）。
+    #   · CF 的 challenge-platform / cdn-cgi = 边缘按 IP 声誉挑战，换 IP 有效。
+    ("WAF", "站方自建拦截页", r"访问已被拦截|安全验证|人机验证|访问受限", None),
+    ("IP封", "CF 挑战或边缘拦截",
+     r"challenge-platform|cf-mitigated|cdn-cgi", None),
     ("IP封", "CF Attention Required", r"attention required|just a moment", None),
 
     # ---- 门禁 ----
@@ -197,3 +225,44 @@ def body_excerpt(text: str, limit: int = 400) -> str:
     t = re.sub(r"<[^>]+>", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t[:limit] + ("…" if len(t) > limit else "")
+
+
+# 可调用时段的解析：把正文里的窗口抽成结构化的 (起, 止)，供报告与复测调度用。
+# 只认「HH:MM~HH:MM」「HH:MM-HH:MM」「from HH:MM to HH:MM」三种写法 ——
+# 认不出就返回 None，让调用方如实报告「有时段限制但窗口未知」，而不是猜。
+_WINDOW_RE = re.compile(
+    r"(\d{1,2}):(\d{2})\s*(?:~|-|—|–|to|至|到)\s*(\d{1,2}):(\d{2})")
+
+
+def time_window(body: str) -> tuple[str, str] | None:
+    """从正文里抽出可调用时段。返回 ("09:00", "18:00") 或 None。
+
+    为什么要抽出来：「时段」类的处置是「窗口内复测」，而复测调度需要知道
+    窗口是什么。只报「有时段限制」的话，用户仍得自己去翻正文。
+    """
+    m = _WINDOW_RE.search(body or "")
+    if not m:
+        return None
+    h1, m1, h2, m2 = (int(x) for x in m.groups())
+    if not (0 <= h1 <= 23 and 0 <= h2 <= 23 and 0 <= m1 <= 59 and 0 <= m2 <= 59):
+        return None
+    return (f"{h1:02d}:{m1:02d}", f"{h2:02d}:{m2:02d}")
+
+
+def in_time_window(window: tuple[str, str] | None, now_hhmm: str) -> bool | None:
+    """当前时刻是否在窗口内。window 或 now 无效时返回 None（未知，不猜）。
+
+    跨零点的窗口（22:00~06:00）按「起 > 止」识别 —— 那种窗口在午夜两侧都成立。
+    """
+    if not window:
+        return None
+    try:
+        start, end = window
+        n = tuple(int(x) for x in now_hhmm.split(":", 1))
+        s = tuple(int(x) for x in start.split(":", 1))
+        e = tuple(int(x) for x in end.split(":", 1))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    if s <= e:
+        return s <= n <= e
+    return n >= s or n <= e          # 跨零点

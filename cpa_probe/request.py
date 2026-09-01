@@ -1,13 +1,11 @@
-"""按段构造上游请求。路径规则与 CPA 自身 executor 完全对齐。
+"""按段构造上游请求。路径与鉴权形态与 CPA 自身 executor 完全对齐。
 
 源码依据（CLIProxyAPI-main）：
-  gemini  internal/runtime/executor/gemini_executor.go:176
-          {base}/v1beta/models/{model}:generateContent   key 走 query string
-  codex   internal/runtime/executor/codex_executor_execute.go:76
-          {base}/responses                               base 已含 /v1
-  claude  internal/runtime/executor/claude_executor_execute.go:30
-          {base}/v1/messages?beta=true
-  compat  {base}/chat/completions                        base 已含 /v1
+  gemini  gemini_executor.go:186-190   {base}/v1beta/models/{model}:generateContent
+                                       Key 走 **x-goog-api-key 头**，不是 query string
+  codex   codex_executor_execute.go:76 {base}/responses                base 已含 /v1
+  claude  claude_executor_execute.go:30 {base}/v1/messages?beta=true
+  compat  openai_compat_executor.go:146 {base}/chat/completions        base 已含 /v1
 
 段名一律用 config.yaml 里的原始键名字符串（"gemini-api-key" 等），不另设枚举 ——
 少一层映射，写回时直接就是 YAML 的键。
@@ -15,10 +13,21 @@
 claude 段鉴权头：probe-fix 用 Authorization: Bearer，audit 用 x-api-key。
 Anthropic 官方两种都支持，中转站实现不一。本模块**两个都发** —— 多一个头
 不会让通的站变不通，但少一个可能让通的站判成 401。
+（CPA 自己按 base 分流：api.anthropic.com 用 x-api-key，其余用 Bearer，
+ claude_executor_request.go:758-765。探测两个都发覆盖两种实现。）
 
-探测时 claude 段不带 `?beta=true`。CPA 自己带，但那是它对上游能力的假定；
-探测要问的是「这个站的 /v1/messages 通不通」，多一个 query 参数可能引入
-额外失败面。写入 config.yaml 后由 CPA 按它自己的口径请求。
+「与 CPA 对齐」优先于「减少变量」（2026-09-01 修正两处）
+--------------------------------------------------
+原来这两处为了「少引入失败面」而故意与 CPA 不同，结果都造成了误判：
+
+  · gemini 段把 Key 放 query string。实测 chiangma.com 三种画像全部连接层
+    失败（000），而前端用 x-goog-api-key 头能拉到几百个模型 —— 探测测的
+    不是 CPA 会走的那条路，于是把一个可用站判死。
+  · claude 段不带 `?beta=true`。站方按 query 参数分流时，探测与真实转发
+    结论不一致，两个方向的误判都可能发生。
+
+探测要回答的是「CPA 这样发通不通」，不是「这个端点本身通不通」。形态不一致时，
+探测结论对 config.yaml 就没有指导意义。
 """
 
 from __future__ import annotations
@@ -75,7 +84,13 @@ def build_request(
     headers: dict[str, str] = {"Content-Type": "application/json"}
 
     if section == "gemini-api-key":
-        url = f"{base}/v1beta/models/{model}:generateContent?key={api_key}"
+        # Key 走 **头** 而不是 query string —— CPA 只用 x-goog-api-key
+        # （gemini_executor.go:190/304/424/504/665，全库无 `?key=`）。
+        # 2026-09-01 实测：用 query string 时 chiangma.com 三种画像全部
+        # 连接层失败（000），而前端用头的方式能拉到几百个模型 —— 探测测的
+        # 不是 CPA 真实会走的那条路，于是把一个可用站判死。
+        url = f"{base}/v1beta/models/{model}:generateContent"
+        headers["x-goog-api-key"] = api_key
         body: dict = {"contents": [{"role": "user", "parts": [{"text": text}]}]}
 
     elif section == "codex-api-key":
@@ -84,7 +99,12 @@ def build_request(
         body = {"model": model, "stream": False, "input": text}
 
     elif section == "claude-api-key":
-        url = f"{base}/v1/messages"
+        # 带 `?beta=true` —— CPA 三条 claude 路径全都带
+        # （claude_executor_execute.go:30、_stream.go:32、_tokens.go:128）。
+        # 原来不带的理由是「少一个变量」，但那让探测与真实转发形态不一致：
+        # 站方按 query 参数分流时，探测通了而 CPA 不通（或反之）。
+        # 对齐优先于减少变量 —— 探测要问的是「CPA 这样发通不通」。
+        url = f"{base}/v1/messages?beta=true"
         # 两种鉴权头都发 —— 中转站实现不一，少一个可能误判 401
         headers["Authorization"] = f"Bearer {api_key}"
         headers["x-api-key"] = api_key
@@ -120,7 +140,9 @@ def models_endpoint(section: str, base_url: str, api_key: str) -> tuple[str, dic
     headers = {"Content-Type": "application/json"}
 
     if section == "gemini-api-key":
-        return f"{base}/v1beta/models?key={api_key}", headers
+        # 同 build_request：Key 走头，与 CPA 一致
+        headers["x-goog-api-key"] = api_key
+        return f"{base}/v1beta/models", headers
 
     headers["Authorization"] = f"Bearer {api_key}"
     if section == "claude-api-key":
@@ -132,25 +154,26 @@ def models_endpoint(section: str, base_url: str, api_key: str) -> tuple[str, dic
     return f"{base}/models", headers
 
 
-def identity_combos(section: str) -> list[tuple[str, dict[str, str]]]:
-    """标识头回退序列，由省到全。第一个仍 200 的即「最小必需头」。
+def identity_combos(section: str, cfg: dict | None = None):
+    """**已弃用**，转发给 `profiles.ladder()`。保留只为不破坏外部调用。
 
-    Originator-only 排在 UA-only 之前 —— 它不含版本号，不受 Codex 客户端
-    升级影响。这正是用户 2026-08-29 提的「表头随版本升级而变化」的解法：
-    找出最小必需头，能只写 Originator 就不写 UA。
+    为什么弃用（2026-09-01）
+    ----------------------
+    原实现四段共用一份 codex 形态（User-Agent + Originator）。`Originator`
+    是 codex 独有的头，对 claude / gemini 段毫无意义 —— 于是 claude 段一个
+    对的组合都没有，五种全试也过不去。实测 agentrouter 的门票是
+    user-agent + anthropic-beta + x-app 三项缺一不可，而那三项从不在这个表里。
 
-    2026-08-29 实测：relay-c 七值矩阵全部 200（含垃圾串与空值），
-    说明该站「UA 或 Originator 任一满足即可，值不敏感」。
+    更根本的是返回值只有 headers。`metadata.user_id` 是请求**体**字段，
+    这个签名压根表达不了它 —— 而它是 zzzcoding 的门票之一。
+
+    新表见 cpa_probe/profiles.py：按段分开、按客户端族分组、族内嵌套超集、
+    headers 与 body_patch 同时给。
     """
-    _check(section)
-    cpa_ua = CPA_DEFAULT_UA.get(section)
-    return [
-        ("cpa-现状", {"User-Agent": cpa_ua} if cpa_ua else {}),
-        ("originator-only", {"Originator": ORIGINATOR}),
-        ("ua-only-codex", {"User-Agent": UA_CODEX}),
-        ("ua-only-browser", {"User-Agent": UA_BROWSER}),
-        ("codex-全量", {"User-Agent": UA_CODEX, "Originator": ORIGINATOR}),
-    ]
+    from . import profiles
+
+    return [(p.name, p.headers) for p in profiles.ladder(section, cfg)
+            if not p.body_patch]
 
 
 def parse_models_response(section: str, text: str) -> list[str]:

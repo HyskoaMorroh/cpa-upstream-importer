@@ -106,7 +106,10 @@ def test_classify() -> None:
         # CF 特征词
         ("403", "<html>Attention Required! | Cloudflare</html>", "IP封"),
         ("403", "challenge-platform script", "IP封"),
-        ("403", "访问已被拦截，请完成安全验证", "IP封"),
+        # 「访问已被拦截/安全验证」是站方自建拦截页（WAF 按形态拦），
+        # 不是 CF 边缘拦截。2026-09-01 实测 hybgzs 带代理仍被拦 ——
+        # 若判成「IP封」，处置会写「加代理」，那条路已证伪。
+        ("403", "访问已被拦截，请完成安全验证", "WAF"),
         # 403 空正文 = 概率性边缘拦截，重试即可，不代表站点坏
         ("403", "", "边缘"),
         ("403", "   \n  ", "边缘"),
@@ -597,8 +600,9 @@ def test_request() -> None:
     url, hdr, body = rq.build_request("gemini-api-key", "https://g.com",
                                       "gemini-2.5-pro", "K1")
     eq("gemini 路径", url,
-       "https://g.com/v1beta/models/gemini-2.5-pro:generateContent?key=K1")
-    eq("gemini key 走 query 不走头", "Authorization" in hdr, False)
+       "https://g.com/v1beta/models/gemini-2.5-pro:generateContent")
+    eq("gemini key 走 x-goog-api-key 头", hdr.get("x-goog-api-key"), "K1")
+    eq("gemini 不走 Authorization", "Authorization" in hdr, False)
     eq("gemini body 形状", list(body), ["contents"])
 
     url, hdr, body = rq.build_request("codex-api-key", "https://c.com/v1",
@@ -614,7 +618,7 @@ def test_request() -> None:
 
     url, hdr, body = rq.build_request("claude-api-key", "https://a.com",
                                       "claude-opus-5", "K3")
-    eq("claude 路径", url, "https://a.com/v1/messages")
+    eq("claude 路径", url, "https://a.com/v1/messages?beta=true")
     # 中转站实现不一：只发一种可能让通的站误判 401，所以两种都发
     eq("claude 同时发 Bearer", hdr["Authorization"], "Bearer K3")
     eq("claude 同时发 x-api-key", hdr["x-api-key"], "K3")
@@ -637,15 +641,17 @@ def test_request() -> None:
     section("标识头回退序列")
     combos = rq.identity_combos("codex-api-key")
     names = [n for n, _ in combos]
-    # Originator 不含版本号，不受客户端升级影响 —— 这是用户提的
-    # 「表头随版本升级变化」的解法：优先选最耐用的那个
-    eq("originator-only 排在 ua-only 之前",
-       names.index("originator-only") < names.index("ua-only-codex"), True)
-    eq("首个是 cpa 现状基线", names[0], "cpa-现状")
+    # 新梯子已不叫 ua-only-codex（那是旧 identity_combos 的名字），且
+    # originator-only 本身就已经在 browser-ua 之前了（嵌套超集），这条
+    # 改为验梯子首档是 baseline。
+    eq("首档是 baseline", names[0], "baseline")
+    eq("originator-only 排在 browser-ua 之前",
+       names.index("originator-only") < names.index("browser-ua"), True)
 
     section("列模型端点")
-    u, _ = rq.models_endpoint("gemini-api-key", "https://g.com", "K")
-    eq("gemini 列模型", u, "https://g.com/v1beta/models?key=K")
+    u, h = rq.models_endpoint("gemini-api-key", "https://g.com", "K")
+    eq("gemini 列模型", u, "https://g.com/v1beta/models")
+    eq("gemini 列模型头里带 Key", h.get("x-goog-api-key"), "K")
     u, _ = rq.models_endpoint("codex-api-key", "https://c.com/v1", "K")
     eq("codex 列模型", u, "https://c.com/v1/models")
     u, _ = rq.models_endpoint("claude-api-key", "https://a.com", "K")
