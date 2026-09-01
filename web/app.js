@@ -944,7 +944,14 @@ function siteCard(r) {
     }
 
     const flags = [];
-    if (v.need_proxy) flags.push('<span class="pill p-w">需代理</span>');
+    // 代理不只标「需要」，把实际地址也显示出来 —— 写进 config.yaml 的是
+    // 具体地址，而容器内外解析不同（mihomo:7890 vs 127.0.0.1:7890），
+    // 只显示「需代理」看不出到底会写哪个。
+    if (v.need_proxy) {
+      const pu = (v.attempts || []).map((a) => a.proxy).filter(Boolean)[0];
+      flags.push('<span class="pill p-w">需代理</span>'
+        + (pu ? `<div class="hint">${esc(pu)}</div>` : ''));
+    }
     if (Object.keys(v.min_headers || {}).length) {
       flags.push(`<span class="pill p-i">需 ${esc(Object.keys(v.min_headers).join('+'))}</span>`);
     }
@@ -977,6 +984,15 @@ function siteCard(r) {
     </tr>`;
   }).join('');
 
+  // 尝试明细：每段一张表，放在站卡最下面。
+  // 12 个字段后端一直在返回，而结果表只显示了 status 与 excerpt ——
+  // 排障时真正要看的「哪一档通的、别的档报什么、哪个慢」都在这里。
+  const detail = S.ctx.section_order.map((sec) => {
+    const v = r.sections[sec];
+    if (!v || !(v.attempts || []).length) return '';
+    return attemptTable(SECTION_LABEL[sec] || sec, v);
+  }).filter(Boolean).join('');
+
   return `<div class="site">
     <div class="sh">
       <span class="h">${esc(host)}</span>
@@ -997,7 +1013,59 @@ function siteCard(r) {
       </tr></thead>
       <tbody>${rows}</tbody>
     </table></div>
+    ${detail}
   </div>`;
+}
+
+// 一段的全部尝试。默认折起 —— 一个四段全不通的站有 30 次尝试，
+// 摊开会把结果页顶得很长，而多数时候只需要看汇总。
+function attemptTable(label, v) {
+  const at = v.attempts || [];
+  const ok = at.filter((a) => a.status === '200').length;
+  const slow = Math.max(...at.map((a) => a.elapsed_ms || 0));
+  // 按列有没有数据决定要不要这一列。探针正文只 88 字符，所以「发送字符」
+  // 通常整列为空（只有上下文二分那几次是几十万）；「入 token」也只有 200
+  // 响应才有。留一个恒空的列比不留更糟 —— 它看起来像是数据丢了。
+  const hasTok = at.some((a) => a.input_tokens != null);
+  const hasSent = at.some((a) => (a.sent_chars || 0) > 1000);
+
+  const rows = at.map((a) => {
+    const good = a.status === '200';
+    // resp_model 与请求的不同 = 换模；相同则不必重复显示，留空更好读
+    const rm = (a.resp_model && a.resp_model !== a.model)
+      ? `<span class="pill p-b">→ ${esc(a.resp_model)}</span>` : '';
+    return `<tr class="${good ? '' : 'off'}">
+      <td class="m">${esc(a.model || '')}</td>
+      <td class="m">${esc(a.combo || '')}</td>
+      <td><span class="pill ${good ? 'p-ok' : (CAT_PILL[a.category] || 'p-m')}">${esc(a.status)}</span></td>
+      <td>${esc(a.category || '')}</td>
+      <td class="num">${a.elapsed_ms != null ? a.elapsed_ms + 'ms' : ''}</td>
+      ${hasTok ? `<td class="num">${a.input_tokens != null ? fmt(a.input_tokens) : ''}</td>` : ''}
+      ${hasSent ? `<td class="num">${(a.sent_chars || 0) > 1000 ? fmt(a.sent_chars) : ''}</td>` : ''}
+      <td>${rm}${a.proxy ? '<span class="pill p-w">代理</span>' : ''}
+        ${a.backend ? `<span class="hint">${esc(a.backend)}</span>` : ''}</td>
+      <td>${a.excerpt ? `<span class="hint">${esc(String(a.excerpt).slice(0, 120))}</span>` : ''}</td>
+    </tr>`;
+  }).join('');
+
+  return `<details class="adet">
+    <summary>${esc(label)} 的 ${at.length} 次尝试
+      <span class="hint">${ok} 次 200 · 最慢 ${slow}ms</span></summary>
+    <div class="tw"><table>
+      <thead><tr>
+        <th style="width:150px">模型</th>
+        <th style="width:130px">画像/阶段</th>
+        <th style="width:64px">状态</th>
+        <th style="width:70px">类别</th>
+        <th style="width:74px">耗时</th>
+        ${hasTok ? '<th style="width:82px">入 token</th>' : ''}
+        ${hasSent ? '<th style="width:88px">发送字符</th>' : ''}
+        <th style="width:150px">后端</th>
+        <th>正文摘要</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>
+  </details>`;
 }
 
 function bindResultEvents() {
@@ -1135,7 +1203,11 @@ async function refreshPlan(silent) {
         const cls = sp.recommended ? 'p-ok' : (sp.writable ? 'p-w' : 'p-m');
         const tag = sp.recommended ? '建议写入'
           : (sp.writable ? '需人工确认' : '不可写入');
-        rsn.innerHTML = `<span class="pill ${cls}">${tag}</span>
+        // score 一直没显示，而关掉「试用期定档」后 priority 就是按它算的 ——
+        // 看不到分数等于那个开关的依据不可见。
+        const sc = (sp.score != null)
+          ? `<span class="hint"> · 得分 ${sp.score}</span>` : '';
+        rsn.innerHTML = `<span class="pill ${cls}">${tag}</span>${sc}
           <div class="hint" style="margin-top:5px">${esc(sp.recommend_reason)}</div>
           <div class="hint">${esc(sp.priority_reason)}</div>`;
       }
