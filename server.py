@@ -1534,6 +1534,17 @@ class Handler(BaseHTTPRequestHandler):
                             sp.proxy_url = pu
                 all_plans[(res.row.bare, res.row.api_key)] = p
 
+            # 批量定档：站与站之间不同值、同站所有 Key 同值。
+            #
+            # 必须在这里做而不是 build_plan 里（2026-09-02 现场）：
+            # suggest_priority 每次只看「当前 config 有哪些空档」，79 个凭据
+            # 串行调用它、每个都拿到同一个答案 —— 落盘后 claude 段 74 个条目
+            # 全是 175，站与站之间毫无区分，而 priority 的唯一作用就是区分先后。
+            #
+            # 用户覆盖在这之后应用，所以手工改的 priority 不会被它冲掉。
+            prio_warns = cp.assign_priorities(
+                list(all_plans.values()), cfg, probation=probation)
+
             # 应用用户覆盖
             for (base_url, api_key), p in all_plans.items():
                 ov_host = _by_row(overrides, p)
@@ -1554,6 +1565,7 @@ class Handler(BaseHTTPRequestHandler):
 
             # 全量重建
             preview, warnings = cp.rebuild_config_full(cfg, all_plans, raw.splitlines(keepends=True))
+            warnings = list(prio_warns) + list(warnings)
 
             # 生成完整 diff（整个文件）
             diffs = []
@@ -1595,6 +1607,13 @@ class Handler(BaseHTTPRequestHandler):
                               force={str(k): [str(m) for m in (v or [])]
                                      for k, v in fh.items()} if fh else None)
             plans.append(p)
+
+        # 增量导入也批量定档 —— 同一个 bug 的同一个修法。
+        #
+        # 一次粘贴 15 个站时，build_plan 里的 suggest_priority 同样会给它们
+        # 相同的值（bands 共享且不随本批新增更新）。批量分配保证站与站之间
+        # 不同、同站多 Key 同值，与 config.yaml 既有的规律一致。
+        prio_warns = cp.assign_priorities(plans, cfg, probation=probation)
 
         # 应用用户覆盖（优先级 / 代理 / 头 / 模型 / 是否写入）
         for p in plans:
@@ -1674,6 +1693,9 @@ class Handler(BaseHTTPRequestHandler):
             "validate_msg": msg,
             "lines_before": raw.count("\n") + 1,
             "lines_after": preview.count("\n") + 1,
+            # 定档时的退化提示（空档不够、末尾共用最低档）—— 那会影响
+            # 站与站的先后，必须让人看到而不是只写进日志。
+            "warnings": prio_warns,
         })
 
     def _cpa_password_for(self, body: dict) -> str:
