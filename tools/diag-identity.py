@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """客户端画像排查：哪些站要求特定客户端身份，要的是哪一套。
 
+    # 查一个还没进 config.yaml 的站（决定要不要加它之前用这个）
+    docker exec -i upstream-importer python3 /app/tools/diag-identity.py \
+        --url https://anyrouter.top --key sk-xxx --section claude-api-key
+
     # 容器内跑（VPS 上没有源码，用这条）
     docker exec -i upstream-importer python3 /app/tools/diag-identity.py /data/config.yaml
 
@@ -223,9 +227,6 @@ def collect(cfg: dict) -> dict[str, dict]:
 
 def main() -> int:
     args = sys.argv[1:]
-    path = next((a for a in args if not a.startswith("-")), "")
-    if not path:
-        path = os.path.join(os.path.dirname(ROOT), "config.yaml")
     want_sec = ""
     if "--section" in args:
         i = args.index("--section")
@@ -237,6 +238,65 @@ def main() -> int:
         if i + 1 < len(args):
             timeout = max(5, int(args[i + 1]))
 
+    # --url / --key：不经 config.yaml 直接查一个站。
+    #
+    # 为什么需要这个入口：这个工具原本只从 config.yaml 读站点，而「这个站要
+    # 什么头」恰恰是在**决定是否加进 config.yaml 之前**要回答的问题。
+    # 手工先写进配置再查，等于为了诊断去改生产文件。
+    #
+    # 取值不能用「第一个非 - 开头的参数」那套 —— `--url` 后面漏了值时，
+    # 那种写法会静默回落去读默认 config.yaml 并真发请求（自查发现）。
+    # 这里显式检查下一个参数存在且不是另一个选项。
+    def _opt(flag: str) -> str | None:
+        if flag not in args:
+            return None
+        i = args.index(flag)
+        if i + 1 >= len(args) or args[i + 1].startswith("-"):
+            return ""          # 给了选项但没给值 —— 与「没给选项」区分开
+        return args[i + 1]
+
+    direct_url = _opt("--url")
+    direct_key = _opt("--key")
+
+    if direct_url is not None or direct_key is not None:
+        if not direct_url or not direct_key:
+            print("用法：--url <站点地址> --key <密钥>  （两者都必须有值）")
+            print("例：  --url https://api.example.com --key sk-xxx "
+                  "--section claude-api-key")
+            return 2
+        from cpa_probe.parse import parse_lines
+        res = parse_lines(f"{direct_url},{direct_key}")
+        if not res.valid:
+            why = res.invalid[0].error if res.invalid else "解析失败"
+            print(f"解析不了：{why}")
+            return 2
+        row = res.valid[0]
+        secs = [want_sec] if want_sec else list(SECTIONS)
+        # 每段取该段的第一个种子模型 —— 与 pipeline 的 SEED_MODELS 同源，
+        # 不另猜一套。
+        from cpa_probe.pipeline import SEED_MODELS
+        sites = {
+            row.host: {
+                s: (row.api_key, row.base_for(s), SEED_MODELS[s][0])
+                for s in secs
+            }
+        }
+        return _run(sites, secs, timeout)
+
+    # 位置参数（config.yaml 路径）。放在 --url 分支之后取，避免把
+    # `--section claude-api-key` 的值当成路径。
+    path = ""
+    skip = set()
+    for flag in ("--section", "--timeout", "--url", "--key"):
+        if flag in args:
+            skip.add(args.index(flag) + 1)
+    for i, a in enumerate(args):
+        if i in skip or a.startswith("-"):
+            continue
+        path = a
+        break
+    if not path:
+        path = os.path.join(os.path.dirname(ROOT), "config.yaml")
     if not os.path.isfile(path):
         print(f"找不到 {path}")
         return 2
@@ -249,6 +309,10 @@ def main() -> int:
     cfg = yaml.safe_load(io.open(path, encoding="utf-8").read()) or {}
     sites = collect(cfg)
     secs = [want_sec] if want_sec else list(SECTIONS)
+    return _run(sites, secs, timeout)
+
+
+def _run(sites: dict, secs: list, timeout: int) -> int:
 
     n_req = sum(len(PROFILES.get(s, [])) for h in sites for s in sites[h] if s in secs)
     print(f"站点 {len(sites)} 个 · 段 {', '.join(secs)}")
