@@ -3,8 +3,10 @@
 **需求**：前端勾选框控制，全量重新探测 config.yaml 所有既有站，与新站一起重新生成配置（headers/代理/优先级/前缀全部更新）。
 
 **实测数据**（2026-09-01，真实 config.yaml）：
-- 既有站 175 个（compat 69、claude 63、codex 27、gemini 16）
-- 30 并发下预计耗时 4.7 分钟
+- 既有条目 175 个（compat 69、claude 63、codex 27、gemini 16），**去重后 77 个凭据**
+- 单凭据四段全不通 30 次请求（优化前 57）
+- 总请求数最坏 2,310（优化前 9,975，省 77%）
+- 48 并发下约 0.9 分钟（并发数按 cgroup 实测推荐，4U24G 得 48）
 
 ---
 
@@ -93,7 +95,7 @@ def extract_existing_entries(cfg) -> list[tuple[str, str, str, str]]:
     """提取所有既有站 (section_short, base_url, api_key, yaml_key)"""
 ```
 
-**并发模型**：站级 30 并发 × 段级 4 并发 = 峰值 120 个探测线程。节流仍按 `(host, section)` 分桶，同段之间保持 gap 秒。
+**并发模型**：站级并发（默认值由 `resources.detect()` 读 cgroup 算出，4U24G 得 48）× 段级 4 并发。节流仍按 `(host, section)` 分桶，同段之间保持 gap 秒 —— 并发放大的是不相干部分的吞吐。
 
 ### 2. `cpa_probe/writeback.py`
 
@@ -116,16 +118,44 @@ compat 走 provider + api-key-entries、`extra_keys` 归并同站多 Key、以�
 - `_api_plan`：全量重探模式走 `rebuild_config_full`，返回整文件 diff
 - `_api_context`：返回 `existing_count` 供前端提示
 
-### 4. 前端
+### 4. `cpa_probe/resources.py`（并发数不靠猜）
 
-- `web/index.html`：全量重探勾选框 + 并发数输入框 + 警告提示区
-- `web/app.js`：勾选时拉 `existing_count`、二次确认弹窗、透传 `full_redetect`/`max_workers`
+```python
+def detect(*, floor=4, cap=64) -> Resources:
+    """读 cgroup 算推荐并发。容器里 os.cpu_count() 是宿主机核数，不能用。"""
+```
+
+优先 cgroup v2（`cpu.max` / `memory.max`），其次 v1（`cfs_quota_us` /
+`limit_in_bytes`），再回落 `sched_getaffinity`、最后 `os.cpu_count()`，
+并在返回值里标明来源。推荐值 = min(核数 × 12, 内存一半 ÷ 12MB, 64)，下界 4。
+
+docker 实测五档：0.5核/256M→6、1核/512M→12、2核/1G→24、**4核/24G→48**、
+8核/2G→64（被内存 85 与上界一起压住）。
+
+### 5. 请求数优化（三项，省 77%）
+
+- **按凭据去重**（`run_job_full_redetect`）：按 `(host_of(base_url), api_key)`
+  折叠。175 条目 → 77 凭据。键不能用 `base_url` —— 同一站在不同段形态不同
+  （codex/compat 带 `/v1`）
+- **画像结论按 (站, 段) 复用**（`Prober._profiles_failed`）：整梯全败后同段
+  后续种子跳过。门票是站+段的属性，站方查 headers 与 body 形态不看模型名。
+  假上游实测 57 → 30 次
+- **模型验证补尝试上限**（`MAX_MODEL_ATTEMPTS_PER_SECTION=10`）：原来的
+  `MAX_MODELS_PER_SECTION` 只数成功的，声明 838 个模型的聚合站会被全打一遍
+
+三项都做成 `Prober` 参数，前端可调。
+
+### 6. 前端
+
+- `web/index.html`：全量重探勾选框、并发数输入框 + 「用推荐值」按钮、
+  折叠的「高级：请求预算」区（收模型数 / 尝试上限 / 画像复用开关）
+- `web/app.js`：显示资源探测依据、实时预算估算、透传全部新参数
 
 ---
 
 ## 四、测试
 
-`tests/test_full_redetect.py`（7 项，已挂进 `tests/run.py` 清单）：
+`tests/test_full_redetect.py`（10 项，已挂进 `tests/run.py` 清单）：
 
 1. `extract_existing_entries` 提取 7 个站（2 gemini + 1 codex + 2 claude + 2 compat）
 2. `BatchProber` 10 站并发 + 10 次进度回调
@@ -134,8 +164,12 @@ compat 走 provider + api-key-entries、`extra_keys` 归并同站多 Key、以�
 5. `rebuild_config_full` 保留全局配置与人工注释、priority 正确更新、YAML 有效
 6. `rebuild_config_full` 输出按 priority 降序
 7. 段字段结构与 compat 归并（锁第五节那三个缺陷）
+8. 凭据去重：5 条目 → 2 凭据，且 `/v1` 不影响判定
+9. 探测文本非问候：13 种问候形态、长度下限 40、必须含技术词，并扫 pipeline.py
+   里所有硬编码 `text=`
+10. 画像复用省请求：起假上游真数 HTTP 请求，断言省幅 ≥30%（实测 47%）
 
-**全量测试**：自带样本 861 项、真实 config.yaml 863 项，均 exit 0。
+**全量测试**：自带样本 864 项、真实 config.yaml 866 项，均 exit 0。
 
 `tools/e2e_redetect.py` 走完整条链：起假上游 → 造含既有站的 config → 批量探测
 → `build_plan` → `rebuild_config_full` → `validate` → `write_local` → 读回比对。
@@ -198,7 +232,7 @@ CLIProxyAPI 的 gemini/codex/claude 段没有这个字段，只有 compat 有。
 | 风险 | 缓解 |
 |---|---|
 | 临时 503 被判死 | 探测层已有 503 重试（前序会话修复）；diff 需人工确认 |
-| 30 并发打爆站方 | `_Throttle` 按 `(host, section)` 分桶，同段保持 gap；并发数前端可调 |
+| 高并发打爆站方 | `_Throttle` 按 `(host, section)` 分桶，同段保持 gap；并发数前端可调 |
 | 全量重写出 bug | `write_local` 写前必备份；`validate()` 校验 YAML；863 项测试 + 端到端脚本 |
 | 与 CPAMP 并发写 | `_api_apply` 基线比对，被改过就 409 要求重新生成 |
 | 注释丢失 | 三候选键匹配 + 段级去重，测试覆盖 |
@@ -211,10 +245,14 @@ CLIProxyAPI 的 gemini/codex/claude 段没有这个字段，只有 compat 有。
 ## 七、用法
 
 1. 打开网页，勾选「全量重探模式」
-2. 界面显示 config.yaml 中的既有站数量（当前 175）
-3. 可调站级并发数（默认 30，4U24G VPS 可到 40）
+2. 界面显示既有条目数（当前 175）与推荐并发（读 cgroup 算出，4U24G 得 48）
+3. 需要时展开「高级：请求预算」调三项，旁边有实时估算
 4. 点「开始探测」，二次确认
-5. 实时进度：`探测进度：42/175 · 成功 12 · 部分通 25 · 失败 5`
+5. 实时进度（先报去重结果，再报探测进度）：
+   ```
+   按 (站, Key) 去重：176 个条目 → 78 个凭据，省掉 98 次重复探测
+   探测进度：42/78 · 成功 12 · 部分通 25 · 失败 5
+   ```
 6. 探测完成后生成整文件 diff
 7. 逐项确认后点「确认写回」
 8. 写回前自动备份，写回后推 PUT 触发 CPA 重载

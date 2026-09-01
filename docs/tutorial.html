@@ -890,9 +890,37 @@ footer code{background:none;padding:0}
        <b>由人判断哪些改动该接受</b>。</p>
   </div>
 
+  <h3>先去重：条目数不等于要探几次</h3>
+  <p>config.yaml 的条目是「<b>(凭据, 段)</b>」的组合。很多中转站用同一把 Key
+     提供多种协议，于是同一个 <code>url+key</code> 被写进 2-4 个段。</p>
+  <div class="note b">
+    <div class="t">实测那份生产配置：175 个条目只有 77 个不同凭据</div>
+    <p>9 个凭据跨全四段、11 个跨三段、49 个跨两段。而探测的语义本来就是
+       「拿一个凭据把四段各打一遍」—— 按条目喂它等于同一个凭据重复探 2-4 次，
+       白打 98 次全流程。</p>
+    <p>去重键取 <code>(host, api_key)</code> 而不是 <code>(base_url, api_key)</code>：
+       同一个站在不同段的 base-url 形态不同（codex/compat 带 <code>/v1</code>，
+       另两段不带），用后者会把同一个凭据判成两个。</p>
+  </div>
+
+  <h3>再省画像：门票是站+段的属性，与模型无关</h3>
+  <p>画像梯的调用点在<b>种子模型循环内部</b>：第一个种子全败后，循环走到下一个
+     种子，整梯重跑。而每段有 2-3 个种子 —— claude 段 7 档 × 2、compat 6 档 × 3。</p>
+  <p>但站方查的是 headers 与 body 形态，<b>不看模型名</b>。所以第一个种子试完
+     整梯全败之后，同段的后续种子在问同一个问题。假上游实测（全 403，复现
+     那个「只允许 CC 客户端」的站）：</p>
+  <pre>优化前 57 次   browser-ua 打了 9 次、cc-min/cc-std/cc-full 各 5 次
+优化后 30 次   每档恰好 1 次</pre>
+  <div class="note w">
+    <div class="t">为什么不能把画像梯改成二分</div>
+    <p>梯子是<b>嵌套超集</b>，二分找到的是「某个能通的档」而不是「最省档」。
+       找到 <code>cc-full</code> 就停会多写 5 个无用 header 进 config.yaml，
+       站方改门禁时更容易整体失效 —— 那正好破坏「找最小必需集」这个设计意图。</p>
+  </div>
+
   <h3>并发模型：放大吞吐，不放松限频</h3>
-  <p>单站四段全通、不开上下文约 32 次请求；全不通要走画像梯救援约 60 次。
-     串行跑 175 个站要一个多小时，所以站级并发是必须的。</p>
+  <p>去重加省画像之后，单凭据四段全不通约 30 次请求。77 个凭据串行跑仍要
+     半小时，所以站级并发是必须的。</p>
 
   <figure>
   <svg viewBox="0 0 900 240" role="img"
@@ -904,7 +932,7 @@ footer code{background:none;padding:0}
       </marker>
     </defs>
 
-    <text x="12" y="20" font-size="12.5" font-weight="600">站级并发 30</text>
+    <text x="12" y="20" font-size="12.5" font-weight="600">站级并发（按 cgroup 推荐）</text>
     <g font-size="11.5">
       <rect x="12" y="32" width="150" height="52" rx="6"
             fill="#E4F0F4" stroke="#0F6E8C" stroke-width="1.6"/>
@@ -923,7 +951,7 @@ footer code{background:none;padding:0}
       <text x="392" y="52" font-weight="600">站 Z</text>
       <text x="392" y="70" font-size="11">4 段并发</text>
     </g>
-    <text x="556" y="62" font-size="12" font-weight="600">峰值约 120 线程</text>
+    <text x="556" y="62" font-size="12" font-weight="600">峰值 = 并发 × 4</text>
 
     <line x1="12" y1="104" x2="880" y2="104"
           stroke="currentColor" stroke-width="1" stroke-dasharray="3 3" opacity=".3"/>
@@ -946,16 +974,40 @@ footer code{background:none;padding:0}
     <text x="590" y="180" font-size="11.5">一秒都没少</text>
     <text x="590" y="205" font-size="11.5" font-weight="600">放大的是不相干的部分</text>
   </svg>
-  <figcaption>站级 30 并发 × 段级 4 并发，但节流桶的粒度是 (站, 段)。</figcaption>
+  <figcaption>站级并发 × 段级 4 并发，但节流桶的粒度是 (站, 段)。</figcaption>
   </figure>
 
+  <h3>并发数不是写死的：读 cgroup 算出来</h3>
+  <div class="note w">
+    <div class="t">容器里 os.cpu_count() 返回宿主机核数</div>
+    <p>64 核宿主上跑 <code>--cpus=4</code> 的容器，它仍然报 64 —— 按它算并发
+       会超配 16 倍。所以要读 cgroup：v2 的 <code>cpu.max</code> /
+       <code>memory.max</code>、v1 的 <code>cfs_quota_us</code> /
+       <code>limit_in_bytes</code>。</p>
+  </div>
+  <p>推荐值 = min(核数 × 12, 可用内存一半 ÷ 12MB, 上界 64)。docker 实测五档：</p>
   <table>
-    <thead><tr><th>并发数</th><th>175 站预计耗时</th></tr></thead>
+    <thead><tr><th>容器规格</th><th>推荐并发</th><th>受限于</th></tr></thead>
     <tbody>
-      <tr><td>1（串行）</td><td>~90 分钟</td></tr>
-      <tr><td>10</td><td>~14 分钟</td></tr>
-      <tr><td><b>30（默认）</b></td><td><b>~4.7 分钟</b></td></tr>
-      <tr><td>40</td><td>~3.5 分钟</td></tr>
+      <tr><td><code>--cpus=0.5 --memory=256m</code></td><td>6</td><td>核数</td></tr>
+      <tr><td><code>--cpus=1 --memory=512m</code></td><td>12</td><td>核数</td></tr>
+      <tr><td><code>--cpus=2 --memory=1g</code></td><td>24</td><td>核数</td></tr>
+      <tr><td><code>--cpus=4 --memory=24g</code></td><td><b>48</b></td><td>核数</td></tr>
+      <tr><td><code>--cpus=8 --memory=2g</code></td><td>64</td><td>内存 85 与上界 64</td></tr>
+    </tbody>
+  </table>
+  <p>界面把完整依据摊开显示（<code>4.0 核 × 12 = 48 · 24576MB 的一半 ÷ 12MB
+     = 1024 → 取 48（受限于核数）</code>）—— 一个凭空出现的数字，操作员没法
+     判断该不该改。</p>
+
+  <h3>三项优化叠加的实测收益</h3>
+  <table>
+    <thead><tr><th></th><th>优化前</th><th>优化后</th><th>省</th></tr></thead>
+    <tbody>
+      <tr><td>待探测单元</td><td>175 条目</td><td><b>77 凭据</b></td><td>56%</td></tr>
+      <tr><td>单凭据请求数</td><td>57 次</td><td><b>30 次</b></td><td>47%</td></tr>
+      <tr><td>总请求数（最坏）</td><td>9,975</td><td><b>2,310</b></td><td><b>77%</b></td></tr>
+      <tr><td>48 并发耗时</td><td>3.9 分钟</td><td><b>0.9 分钟</b></td><td>4.3×</td></tr>
     </tbody>
   </table>
 
