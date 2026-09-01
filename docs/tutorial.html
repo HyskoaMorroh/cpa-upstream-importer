@@ -827,7 +827,7 @@ footer code{background:none;padding:0}
 
 <section id="s6-5"><div class="wrap">
   <div class="sech"><span class="no">06.5</span><h2>前缀规整：站级前缀 + 段级别名</h2></div>
-  <p class="sub">62 个 claude 条目都是 ANT、13 个 compat provider 都是 CHMA —— 「指名某站」这个能力事实上不存在。</p>
+  <p class="sub">65 个 claude 条目都是 ANT、13 个 compat provider 都是 CHMA —— 「指名某站」这个能力事实上不存在。</p>
 
   <h3>现状的问题</h3>
   <p><code>rewriteModelForAuth</code>（<code>conductor_models.go:685-698</code>）只判
@@ -892,7 +892,7 @@ footer code{background:none;padding:0}
 
   <h3>段级别名可选</h3>
   <p>补 <code>models[].alias: ANT/&lt;原名&gt;</code> 会让每个模型多一行，
-  config.yaml 明显变长。119 个条目里模型数最多的是 cielo compat 段（64 个模型），
+  config.yaml 明显变长。121 个条目里模型数最多的是 chma compat 段（64 个模型），
   那一个 provider 就多 64 行。</p>
 
   <p>这是保留 <code>ANT/xxx</code> 可用性的必然代价。

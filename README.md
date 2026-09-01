@@ -243,7 +243,7 @@ codex 段梯子（6 档）：
 
 ### 前缀规整（站级前缀 + 段级别名）
 
-**问题**：62 个 claude 条目都是 `ANT`、13 个 compat provider 都是 `CHMA`。
+**问题**：65 个 claude 条目都是 `ANT`、13 个 compat provider 都是 `CHMA`。
 `rewriteModelForAuth` 只判「模型名是否以这个 prefix 开头」—— `ANT/claude-opus-5`
 同时命中全部 12 个 claude 站，落到哪个由 priority + 加权轮询决定。「指名某站」
 这个能力事实上不存在。
@@ -701,7 +701,7 @@ mihomo 有两个地址，取决于**从哪里**访问：
 
 CLI 与服务端都会**自动依次探测这两个**，不用手工选。
 
-这件事有实际后果：`config.yaml` 里 **23 个凭据**配了 `proxy-url`
+这件事有实际后果：`config.yaml` 里 **24 个凭据**配了 `proxy-url`
 （gemini/codex/claude 各 7、compat 2）。**在容器内跑探测比在宿主机跑更准** ——
 那 23 个站的代理路径能真正被验证。
 ---
@@ -881,7 +881,7 @@ https://other.example.org/v1,sk-yyyyyyyyyyyy
 | `codex-api-key` | 带 `/v1` | `{base}/responses` |
 | `openai-compatibility` | 带 `/v1` | `{base}/chat/completions` |
 
-12 个现存站点、206 个条目零例外。
+14 个现存主机、121 个条目零例外。
 
 ---
 
