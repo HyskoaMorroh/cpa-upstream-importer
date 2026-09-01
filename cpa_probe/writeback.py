@@ -74,6 +74,21 @@ class Diff:
         return head + "\n" + "\n".join(self.lines)
 
 
+# 四段的 YAML 顶层键。与 parse.SECTIONS 同源，但这里显式列出而不是 import ——
+# 顺序在这个模块里有语义（渲染与 span 定位都按它走），而 parse 那边只是集合。
+#
+# 注意 compat 段的键名是 `openai-compatibility` 而**不是** `openai-api-key`。
+# 2026-09-01 审计发现的一个缺陷正是把段头正则写成 `openai-api-key` ——
+# 那个键不存在，于是真正的 compat 段匹配不到、被当成全局配置复制一遍，
+# 再生成一次，产出两个同名顶层键（yaml.safe_load 静默取后者，原 provider 消失）。
+_SECTION_KEYS = (
+    "gemini-api-key",
+    "codex-api-key",
+    "claude-api-key",
+    "openai-compatibility",
+)
+
+
 def backup(path: str, *, backup_dir: str | None = None) -> str:
     """写前备份。返回备份路径。
 
@@ -371,6 +386,12 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
     if sp.prefix:
         out.append(f"{field}prefix: {_yaml_str(sp.prefix)}")
     out.append(f"{field}priority: {sp.priority}        {note}")
+    # weight 只在全量重建搬运原值时非 None。**不能丢** —— `weight: 0` 是
+    # 「把这个站逐出调度池」的唯一表达，而 CPA 缺这个字段时默认 1，
+    # 丢掉等于让手工封禁的站全部复活（2026-09-01 审计发现）。
+    if sp.weight is not None:
+        why = "   # 原值搬运（weight: 0 = 已逐出调度池）" if sp.weight == 0 else ""
+        out.append(f"{field}weight: {sp.weight}{why}")
     if sp.proxy_url:
         out.append(f"{field}proxy-url: {_yaml_str(sp.proxy_url)}")
     if sp.headers:
@@ -804,59 +825,43 @@ def rebuild_config_full(
     all_plans: dict[tuple[str, str], ImportPlan],
     original_lines: list[str]
 ) -> tuple[str, list[str]]:
-    """全量重建 config.yaml（用于全量重探模式）
+    """全量重建四段，**原文件的其余部分逐字保留**。
 
-    保留：
-    - 全局配置（host/port/tls/remote-management/...）
-    - 四段的段头位置
-    - 各站的人工注释（通过 name 匹配原始条目）
+    为什么是「替换四段」而不是「重新拼装文件」（2026-09-01 审计发现三个数据
+    销毁缺陷后重写）
+    -----------------------------------------------------------------
+    第一版的做法是：取「第一个段之前的行」当全局配置，然后从 all_plans 生成四段
+    拼在后面。三个后果，且 validate() 全部报成功：
 
-    重建：
-    - 每个站的完整配置块（headers/priority/proxy/models/prefix）
-    - 按 priority 从高到低排序
+      · **排在第一个段之后的全局键全部消失**。实测 `api-keys`（客户端认证凭据）、
+        `remote-management`（含管理密钥）、`quota-exceeded`、`logging-to-file`
+        一起丢 —— 丢 api-keys 的后果是所有客户端立刻断连。
+      · **某段没有可写方案时该段整段消失**，哪怕原文件里有条目。触发条件低到
+        「这一段的站这次全部判重复」。
+      · 段头正则写的是 `openai-api-key`（不存在的键），真正的
+        `openai-compatibility` 匹配不到 —— 它会被当成全局配置复制一遍，
+        然后再生成一次，产出两个同名顶层键。
+
+    现在的做法：拿原文件逐行走，只在四段的 span 内替换内容，其余原样输出。
+    没有可写方案的段**不动它**（保留原条目），而不是删掉。
 
     Args:
-        cfg: 原始 config.yaml 解析结果
+        cfg: 原始 config.yaml 解析结果（用于 compat 段的既有 provider 信息）
         all_plans: {(base_url, api_key): ImportPlan, ...}
-        original_lines: 原始文件的行列表（带 \\n）
+        original_lines: 原始文件的行列表（带换行符）
 
     Returns:
         (new_content, warnings)
-        new_content: 重建后的完整文件内容
-        warnings: 警告列表（如：注释匹配失败）
     """
-    warnings = []
+    warnings: list[str] = []
+    from .parse import host_of as _host_of
 
-    # 1. 提取全局配置（到第一个 *-api-key: 之前）
-    global_lines = []
-    first_section_idx = None
-    for i, line in enumerate(original_lines):
-        if re.match(r'^(gemini|codex|claude|openai)-api-key\s*:', line):
-            first_section_idx = i
-            break
-        global_lines.append(line)
-
-    if first_section_idx is None:
-        # 没有任何段，异常情况
-        warnings.append("原文件未找到任何 *-api-key 段，全局配置可能不完整")
-        first_section_idx = len(original_lines)
-
-    # 2. 提取每个站的人工注释（按 (段, 键) 索引）
+    # 1. 注释索引（按 (段, 键)）
     comments_map = _extract_entry_comments(original_lines)
 
-    # 3. 按段组织所有方案
-    #
-    # 注意 section 的取值：pipeline 与 build_plan 一路用的都是**完整 YAML 段名**
-    # （gemini-api-key / openai-compatibility），不是短名。这里按段名直接分组，
-    # 不做映射 —— 早先写成「短名→完整名」的映射表，结果每一段都 miss、
-    # 全部被判「映射失败」跳过，产出一个四段皆空的文件。
-    sections_data: dict[str, list[SectionPlan]] = {
-        "gemini-api-key": [],
-        "codex-api-key": [],
-        "claude-api-key": [],
-        "openai-compatibility": [],
-    }
-
+    # 2. 按段归集可写方案。section 用的是**完整 YAML 段名** ——
+    #    pipeline 与 build_plan 一路如此，不做短名映射。
+    sections_data: dict[str, list[SectionPlan]] = {s: [] for s in _SECTION_KEYS}
     for (base_url, api_key), plan in all_plans.items():
         for sp in plan.sections.values():
             if not sp.writable:
@@ -867,78 +872,135 @@ def rebuild_config_full(
                 continue
             sections_data[sp.section].append(sp)
 
-    # 4. compat 段按 (host, base_url) 归并 —— 该段一个条目 = 一个上游站，
-    #    多个 Key 挂在它的 api-key-entries 下。不归并会生成 N 个重名 provider，
-    #    而 name 就是 CPA 的 provider 身份（冷却、模型能力、执行路由三处按它
-    #    索引），重名会让同一个 Key 命中两套配置。这与 build_diffs 的做法一致。
-    from .parse import host_of as _host_of
-
+    # 3. compat 段按 (host, base_url) 归并 —— 一个条目 = 一个上游站，多个 Key
+    #    挂在 api-key-entries 下。重名 provider 会让冷却、模型能力、执行路由
+    #    三处对同一个 Key 命中两套配置。与 build_diffs 同一套分组。
     compat_groups: dict[tuple[str, str], list[SectionPlan]] = {}
     for sp in sections_data["openai-compatibility"]:
         compat_groups.setdefault((_host_of(sp.base_url), sp.base_url), []).append(sp)
 
-    # 5. 按 priority 排序（每段内从高到低；compat 按组内首个的 priority）
-    for section_full in ("gemini-api-key", "codex-api-key", "claude-api-key"):
-        sections_data[section_full].sort(key=lambda sp: sp.priority, reverse=True)
-    compat_ordered = sorted(compat_groups.items(),
-                            key=lambda kv: kv[1][0].priority, reverse=True)
+    # 4. 排序：前三段按 priority 降序；compat 按组内最高的 priority
+    #    （用 head 的会让「head 恰好是低档那个」的组被错误定位）
+    for s in ("gemini-api-key", "codex-api-key", "claude-api-key"):
+        sections_data[s].sort(key=lambda sp: sp.priority, reverse=True)
+    compat_ordered = sorted(
+        compat_groups.items(),
+        key=lambda kv: max(x.priority for x in kv[1]), reverse=True)
 
-    # 6. 渲染四段
-    output_lines = global_lines.copy()
     stamp = datetime.datetime.now().strftime("%Y-%m-%d")
 
-    def indents_for(section_full: str) -> tuple[str, str]:
-        span = _section_span(original_lines, section_full)
-        if span:
-            return _detect_indent(original_lines, span[0], span[1])
-        return "  ", "    "
+    def render_section(section: str) -> list[str] | None:
+        """生成该段的条目行。返回 None 表示「这一段不要动」。"""
+        if section == "openai-compatibility":
+            if not compat_ordered:
+                return None
+            span = _section_span(original_lines, section)
+            dash, field = (_detect_indent(original_lines, span[0], span[1])
+                           if span else ("  ", "    "))
+            out: list[str] = []
+            used: set[str] = set()
+            for (host, base), group in compat_ordered:
+                # head 取组内 priority 最高的那个，不是插入顺序的第一个 ——
+                # 组的其余成员只贡献 api-key，所以 head 的选择决定了整组用
+                # 哪一套 headers/priority/models。
+                head = max(group, key=lambda x: x.priority)
+                extra = [g.api_key for g in group if g is not head]
+                for c in _comments_for(comments_map, section, head, used, _host_of):
+                    out.append(c if c.endswith("\n") else c + "\n")
+                for line in render_entry(head, dash, field, stamp,
+                                         extra_keys=extra):
+                    out.append(line + "\n")
+            return out
 
-    def comments_for(section_full: str, sp: SectionPlan,
-                     used: set[str]) -> list[str]:
-        """按多个候选键查该站的人工注释，且同一份注释只挂一次。
-
-        为什么要去重（端到端验证抓到）：同一个站在同一段里可能有多个 Key
-        （前三段每个 Key 各占一条），按 host 匹配会让同一份注释被复制到
-        每一条上。原文件里它只出现一次，重建后变成 N 次。
-        """
-        sec = comments_map.get(section_full, {})
-        for cand in (sp.base_url, _host_of(sp.base_url)):
-            if not cand or cand not in sec:
-                continue
-            if cand in used:
-                return []           # 这份注释已经挂过了
-            used.add(cand)
-            return sec[cand]
-        return []
-
-    for section_full in ("gemini-api-key", "codex-api-key", "claude-api-key"):
-        entries = sections_data[section_full]
+        entries = sections_data.get(section) or []
         if not entries:
-            continue
-        output_lines.append(f"{section_full}:\n")
-        dash, field = indents_for(section_full)
-        used: set[str] = set()
-        for sp in entries:
-            for c in comments_for(section_full, sp, used):
-                output_lines.append(c if c.endswith("\n") else c + "\n")
-            for line in render_entry(sp, dash, field, stamp):
-                output_lines.append(line + "\n")
-        output_lines.append("\n")
-
-    if compat_ordered:
-        output_lines.append("openai-compatibility:\n")
-        dash, field = indents_for("openai-compatibility")
+            return None
+        span = _section_span(original_lines, section)
+        dash, field = (_detect_indent(original_lines, span[0], span[1])
+                       if span else ("  ", "    "))
+        out = []
         used = set()
-        for (host, base), group in compat_ordered:
-            head = group[0]
-            extra = [g.api_key for g in group[1:]]
-            for c in comments_for("openai-compatibility", head, used):
-                output_lines.append(c if c.endswith("\n") else c + "\n")
-            for line in render_entry(head, dash, field, stamp, extra_keys=extra):
-                output_lines.append(line + "\n")
-        output_lines.append("\n")
+        for sp in entries:
+            for c in _comments_for(comments_map, section, sp, used, _host_of):
+                out.append(c if c.endswith("\n") else c + "\n")
+            for line in render_entry(sp, dash, field, stamp):
+                out.append(line + "\n")
+        return out
 
-    return "".join(output_lines), warnings
+    # 5. 逐行走原文件，只替换四段的 span 内容，其余逐字保留。
+    #    span 是 (start, end)：start 是段头那一行，end 是段内最后一个实质行之后。
+    spans: dict[str, tuple[int, int]] = {}
+    for section in _SECTION_KEYS:
+        sp_ = _section_span(original_lines, section)
+        if sp_:
+            spans[section] = sp_
+
+    # 段的出现顺序按原文件，不按我们的偏好 —— 重排顶层键会让 diff 变成整文件改动
+    ordered = sorted(spans.items(), key=lambda kv: kv[1][0])
+
+    out_lines: list[str] = []
+    cursor = 0
+    replaced: list[str] = []
+    for section, (start, end) in ordered:
+        # 段之前的内容（含其他全局键、注释、空行）原样输出
+        out_lines.extend(original_lines[cursor:start])
+        body = render_section(section)
+        if body is None:
+            # 没有可写方案 —— **保留原条目**，不是删掉。
+            # 删掉的后果是「这一段的站这次全部判重复」就把整段清空。
+            out_lines.extend(original_lines[start:end])
+        else:
+            out_lines.append(original_lines[start])      # 段头原样
+            out_lines.extend(body)
+            replaced.append(section)
+        cursor = end
+
+    # 最后一个段之后的所有内容 —— 这里正是第一版丢掉 api-keys 与
+    # remote-management 的地方
+    out_lines.extend(original_lines[cursor:])
+
+    # 原文件里没有的段：在末尾补一个。
+    #
+    # 「保留既有内容」与「新段有处可去」两件都要 —— 只做前者会让「原文件没有
+    # codex 段但这次探到了 codex 可用」的方案静默无处安放，只留一条警告。
+    for section in _SECTION_KEYS:
+        if section in spans:
+            continue
+        body = render_section(section)
+        if body is None:
+            continue
+        if out_lines and out_lines[-1].strip():
+            out_lines.append("\n")
+        out_lines.append(f"{section}:\n")
+        out_lines.extend(body)
+        warnings.append(f"原文件没有 {section} 段，已在末尾新建")
+
+    untouched = [s for s in spans if s not in replaced]
+    if untouched:
+        warnings.append(
+            "以下段本次没有可写方案，原条目已原样保留："
+            + "、".join(untouched))
+
+    return "".join(out_lines), warnings
+
+
+def _comments_for(comments_map: dict, section: str, sp: SectionPlan,
+                  used: set, host_of_fn) -> list[str]:
+    """按多个候选键查该站的人工注释，同一份只挂一次。
+
+    多候选是因为 sp.base_url 是 base_for_section() 的产物（codex/compat 补了
+    /v1），与原文件里写的未必一致。去重是因为前三段每个 Key 各占一条，
+    按 host 匹配会让原文件里只出现一次的注释在重建后出现 N 次。
+    """
+    sec = comments_map.get(section, {})
+    for cand in (sp.base_url, host_of_fn(sp.base_url)):
+        if not cand or cand not in sec:
+            continue
+        if cand in used:
+            return []
+        used.add(cand)
+        return sec[cand]
+    return []
 
 
 def _extract_entry_comments(lines: list[str]) -> dict[str, dict[str, list[str]]]:

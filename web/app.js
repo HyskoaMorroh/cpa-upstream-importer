@@ -44,7 +44,7 @@ const S = {
   reuseSaved: 0,        // 形态复用省下的请求数
   reuseSeen: null,      // 已计数过的 shape-reused 事件键（防重拉重复累加）
   diagYaml: null,       // 诊断结果的 YAML 片段 {段: 文本}。不进 HTML 属性
-  keepOpen: '',         // 重渲染后要重新展开哪个 headers 编辑器（'host sec'）
+  keepOpen: '',         // 重渲染后要重新展开哪个 headers 编辑器（pk(host,sec)）
 };
 
 const pk = (host, sec) => `${host}\u0000${sec}`;
@@ -1228,7 +1228,7 @@ async function refreshPlan(silent) {
         bindHeaderEditor(wb, p.host, sec);
         // 重渲染会把 <details> 的展开态清掉。刚才在编辑哪一段就把它重新展开 ——
         // 否则每次防抖结算完编辑器都自己收起来，等于没法连续改。
-        if (S.keepOpen === `${p.host} ${sec}`) {
+        if (S.keepOpen === pk(p.host, sec)) {
           const det = wb.querySelector('.hedit');
           if (det) det.open = true;
         }
@@ -1348,13 +1348,13 @@ function bindHeaderEditor(wb, host, sec) {
     // 停手 700ms 才重算方案。数字是权衡：太短仍会在连续输入中打断，
     // 太长会让「改了头之后 priority 建议随之变化」这件事显得没反应。
     clearTimeout(timer);
-    timer = setTimeout(() => { S.keepOpen = `${host} ${sec}`; refreshPlan(); }, 700);
+    timer = setTimeout(() => { S.keepOpen = pk(host, sec); refreshPlan(); }, 700);
   });
   // 失焦立即结算 —— 用户已经改完了，不该再等那 700ms
   det.addEventListener('focusout', () => {
     if (!timer) return;
     clearTimeout(timer); timer = null;
-    S.keepOpen = `${host} ${sec}`;
+    S.keepOpen = pk(host, sec);
     refreshPlan();
   });
   det.addEventListener('click', (e) => {
@@ -1371,7 +1371,12 @@ function bindHeaderEditor(wb, host, sec) {
     if (del) {
       e.preventDefault();
       del.closest('.hrow').remove();
-      commit();
+      // 这里原本写的是 commit() —— 那个函数不存在（闭包里只有 collect /
+      // check / stash），于是抛 ReferenceError：行从 DOM 上消失了，
+      // 但 S.overrides 里还留着被删的那个头，看起来删掉了实际没有。
+      stash();
+      S.keepOpen = pk(host, sec);
+      refreshPlan();
       return;
     }
     if (rst) {

@@ -153,7 +153,8 @@ claude-api-key:
     bands, seen = {}, cp.existing_fingerprints(cfg)
     all_plans = {}
     for row in parsed.valid:
-        res = results.get(row.bare)
+        # 结果键含 api_key —— 同站多 Key 不能互相覆盖（见 batch.probe_one）
+        res = results.get((row.bare, row.api_key))
         assert res is not None, f"站 {row.bare} 无结果"
         p = cp.build_plan(row, res, cfg, bands=bands, seen=seen, probation=True)
         all_plans[(row.bare, row.api_key)] = p

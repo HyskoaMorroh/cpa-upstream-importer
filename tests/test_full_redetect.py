@@ -7,6 +7,7 @@
 """
 
 import os
+import re
 import sys
 import time
 
@@ -95,8 +96,9 @@ def test_batch_prober_progress():
 
     # 准备测试数据（用假对象模拟 ParsedRow）
     class FakeRow:
-        def __init__(self, url):
-            self.bare = url  # BatchProber 用 bare 字段
+        def __init__(self, url, key="sk-x"):
+            self.bare = url          # BatchProber 的结果键是 (bare, api_key)
+            self.api_key = key       # 同站多 Key 不能互相覆盖，所以键含 api_key
             self.host = url.split("//")[1].split("/")[0] if "//" in url else url
 
     rows = [FakeRow(f"https://site{i}.com") for i in range(10)]
@@ -145,8 +147,9 @@ def test_batch_prober_stats():
                 return FakeResult(0)
 
     class FakeRow:
-        def __init__(self, url):
+        def __init__(self, url, key="sk-x"):
             self.bare = url
+            self.api_key = key
 
     rows = [FakeRow(f"https://site{i}.com") for i in range(5)]
 
@@ -177,8 +180,9 @@ def test_batch_prober_exception_handling():
             return FakeResult()
 
     class FakeRow:
-        def __init__(self, url):
+        def __init__(self, url, key="sk-x"):
             self.bare = url
+            self.api_key = key
 
     rows = [FakeRow(f"https://site{i}.com") for i in range(3)]
 
@@ -747,6 +751,236 @@ def test_headers_override_reaches_yaml():
     print("[OK] Headers override: 覆盖值走到 YAML，空 headers 不写空键")
 
 
+def test_rebuild_preserves_everything_else():
+    """全量重建**只替换四段**，原文件其余内容逐字保留。
+
+    2026-09-01 审计发现三个数据销毁缺陷，共同特征是 validate() 全部报成功：
+      · 排在第一个段之后的全局键消失（api-keys 是客户端认证凭据，
+        丢了所有客户端立刻断连；remote-management 含管理密钥）
+      · 某段没有可写方案时整段消失，哪怕原文件里有条目
+      · 段头正则写的是不存在的 openai-api-key，真正的 openai-compatibility
+        匹配不到 —— 被当全局配置复制一遍后再生成一次，产出两个同名顶层键
+    """
+    import re
+    import yaml
+    from cpa_probe.writeback import rebuild_config_full, validate
+    from cpa_probe.plan import SectionPlan, ImportPlan
+
+    # compat 段故意排在最前 —— 那是旧正则匹配不到的位置
+    orig = '''host: ""
+port: 8317
+
+openai-compatibility:
+  - name: "oldprov"
+    base-url: "https://o.example.com/v1"
+    api-key-entries:
+      - api-key: "k-old"
+    models:
+      - name: "m"
+        alias: "m"
+
+gemini-api-key:
+  - api-key: "g1"
+    base-url: "g.example.com"
+    weight: 0
+
+claude-api-key:
+  - api-key: "c1"
+    base-url: "c.example.com"
+    priority: 300
+
+api-keys:
+  - "client-key-1"
+
+remote-management:
+  secret-key: "bcrypt-hash-here"
+
+quota-exceeded:
+  switch-project: true
+'''
+    cfg = yaml.safe_load(orig)
+    # 只给 gemini 一个可写方案：claude 与 compat 都没有
+    sp = SectionPlan(section="gemini-api-key", base_url="g.example.com",
+                     api_key="g1", models=["gemini-2.5-flash"], priority=150)
+    p = ImportPlan(host="g.example.com", masked_key="g...1")
+    p.sections["gemini-api-key"] = sp
+
+    new, warns = rebuild_config_full(
+        cfg, {("g.example.com", "g1"): p}, orig.splitlines(keepends=True))
+    got = yaml.safe_load(new)
+
+    # ① 四段之外的键一个都不能少
+    for k in ("host", "port", "api-keys", "remote-management", "quota-exceeded"):
+        assert k in got, f"{k} 丢了 —— 那是第一版销毁全局配置的缺陷"
+    assert got["api-keys"] == ["client-key-1"], got.get("api-keys")
+    assert got["remote-management"]["secret-key"] == "bcrypt-hash-here"
+
+    # ② 没有可写方案的段保留原条目，不是删掉
+    assert len(got.get("claude-api-key") or []) == 1, "claude 段原条目被删了"
+    assert len(got.get("openai-compatibility") or []) == 1, "compat 段原条目被删了"
+
+    # ③ 顶层键不能重复。yaml.safe_load 静默取最后一个，所以只能扫文本
+    for key in ("openai-compatibility", "gemini-api-key"):
+        n = len(re.findall(rf"^{re.escape(key)}\s*:", new, re.M))
+        assert n == 1, f"{key} 出现 {n} 次 —— 重复顶层键会让前一份静默消失"
+
+    # ④ 有方案的段真的更新了
+    prios = [e.get("priority") for e in (got.get("gemini-api-key") or [])]
+    assert 150 in prios, f"gemini 的新 priority 没写进去：{prios}"
+
+    ok, msg = validate(new)
+    assert ok, msg
+    print(f"[OK] Rebuild preserves: 全局键与无方案段全部保留、无重复顶层键"
+          f"（{len(warns)} 条警告）")
+
+
+def test_rebuild_keeps_weight():
+    """weight: 0 必须搬回去 —— 丢了等于让手工封禁的站复活。
+
+    `weight: 0` 是用户显式表达「把这个站逐出调度池」的唯一手段（plan.py 里
+    把它当强信号读），而 CPA 缺这个字段时默认 1。
+    """
+    import yaml
+    from cpa_probe.batch import existing_weights
+    from cpa_probe.writeback import render_entry
+    from cpa_probe.plan import SectionPlan
+
+    cfg = yaml.safe_load('''
+gemini-api-key:
+  - api-key: "g1"
+    base-url: "g.example.com"
+    weight: 0
+  - api-key: "g2"
+    base-url: "g.example.com"
+
+openai-compatibility:
+  - name: "p"
+    base-url: "https://o.example.com/v1"
+    api-key-entries:
+      - api-key: "k1"
+        weight: 0
+      - api-key: "k2"
+    models:
+      - name: "m"
+        alias: "m"
+''')
+    w = existing_weights(cfg)
+    # 只收显式写了的：g2 与 k2 没写，不该出现在表里
+    assert w.get(("g.example.com", "g1")) == 0, w
+    assert ("g.example.com", "g2") not in w, w
+    assert w.get(("o.example.com", "k1")) == 0, w
+    assert ("o.example.com", "k2") not in w, w
+
+    # 渲染时写出来
+    sp = SectionPlan(section="gemini-api-key", base_url="g.example.com",
+                     api_key="g1", models=["m"], priority=500, weight=0)
+    text = "\n".join(render_entry(sp, "  ", "    ", "2026-09-01"))
+    assert re.search(r"^\s+weight:\s*0", text, re.M), text
+
+    # weight=None（原本没写）时不写这个字段
+    sp2 = SectionPlan(section="gemini-api-key", base_url="g.example.com",
+                      api_key="g2", models=["m"], priority=500)
+    assert "weight:" not in "\n".join(render_entry(sp2, "  ", "    ", "x"))
+
+    print("[OK] Weight preserved: weight:0 搬回，未写的不凭空添加")
+
+
+def test_batch_key_includes_api_key():
+    """同一个站的多个 Key 不能互相覆盖。
+
+    结果键原来只用 row.bare（不含 api_key），于是 relay-f 那种 15 个 Key 的站
+    只剩 1 条结果，而 _stats 仍报 15 个已完成。
+    """
+    class FakeProber:
+        def __init__(self, **kw):
+            pass
+
+        def probe(self, row):
+            class R:
+                def __init__(self, k):
+                    self.usable_sections = ["gemini"]
+                    self.key = k
+            return R(row.api_key)
+
+    class FakeRow:
+        def __init__(self, url, key):
+            self.bare = url
+            self.api_key = key
+
+    # 同一个站，5 个不同 Key
+    rows = [FakeRow("https://same.example.com", f"sk-{i}") for i in range(5)]
+    bp = BatchProber(FakeProber(), max_workers=2)
+    res = bp.probe_batch(rows)
+
+    assert len(res) == 5, f"5 个 Key 应有 5 条结果，实际 {len(res)}"
+    keys = {r.key for r in res.values()}
+    assert keys == {f"sk-{i}" for i in range(5)}, keys
+    print(f"[OK] Batch key: 同站 5 个 Key 得 {len(res)} 条结果，无覆盖")
+
+
+def test_batch_records_errors():
+    """单站抛异常时要记下是哪个站、什么原因，不能只把计数加一。"""
+    class FakeProber:
+        def __init__(self, **kw):
+            self.n = 0
+
+        def probe(self, row):
+            self.n += 1
+            if self.n == 2:
+                raise RuntimeError("boom")
+            class R:
+                usable_sections = ["gemini"]
+            return R()
+
+    class FakeRow:
+        def __init__(self, url, key="sk-x"):
+            self.bare = url
+            self.api_key = key
+
+    rows = [FakeRow(f"https://s{i}.example.com") for i in range(3)]
+    bp = BatchProber(FakeProber(), max_workers=1)
+    res = bp.probe_batch(rows)
+
+    assert len(res) == 2, len(res)
+    assert bp._stats["failure"] == 1, bp._stats
+    assert len(bp.errors) == 1, bp.errors
+    host, why = bp.errors[0]
+    assert "s1.example.com" in host, host
+    assert "RuntimeError" in why and "boom" in why, why
+    print(f"[OK] Batch errors: 异常站记为 {host} / {why}")
+
+
+def test_cgroup_bad_values():
+    """cgroup 里的异常值不能被当成真实限额。
+
+    memory.max = "-1" 是某些运行时表达「无限制」的方式。把它当真会算出
+    memory_mb = -1，而 detect() 的 `mem > 0` 判断会让 reason 里不带内存项 ——
+    显示的依据与 memory_source 标的来源自相矛盾。
+    """
+    from cpa_probe import resources as R
+
+    orig = R._read
+    try:
+        for val in ("-1", "0", "9223372036854771712"):
+            R._read = lambda path, v=val: v if path.endswith("memory.max") else ""
+            mb, src = R.detect_memory_mb()
+            assert mb == 0, f"memory.max={val} 得到 mb={mb}，应降级为 0"
+            assert src == "读不到", f"memory.max={val} 的 source 是 {src}"
+    finally:
+        R._read = orig
+
+    # 正常值仍然认
+    try:
+        R._read = lambda path: str(2 * 1024 ** 3) if path.endswith("memory.max") else ""
+        mb, src = R.detect_memory_mb()
+        assert mb == 2048, mb
+        assert "memory.max" in src, src
+    finally:
+        R._read = orig
+
+    print("[OK] cgroup bad values: -1 / 0 / 超大哨兵都降级，正常值仍认")
+
+
 def test_profile_matches_real_cpa_source():
     """如果本机有 CPA 源码，画像梯必须与它一致（无 warn 级漂移）。
 
@@ -803,6 +1037,11 @@ if __name__ == "__main__":
         ("远程模式降级", test_drift_remote_degrade),
         ("旧二进制检测", test_stale_binary_detection),
         ("headers 覆盖写进 YAML", test_headers_override_reaches_yaml),
+        ("重建保留其余内容", test_rebuild_preserves_everything_else),
+        ("重建保留 weight", test_rebuild_keeps_weight),
+        ("批量键含 api_key", test_batch_key_includes_api_key),
+        ("批量记录异常站", test_batch_records_errors),
+        ("cgroup 异常值降级", test_cgroup_bad_values),
     ]
 
     ok = 0
