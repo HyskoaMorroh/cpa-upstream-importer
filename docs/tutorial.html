@@ -145,9 +145,12 @@ footer code{background:none;padding:0}
   <a href="#s2">02 段与形态</a>
   <a href="#s3">03 四阶段探测</a>
   <a href="#s4">04 定性九类</a>
+  <a href="#s4-5">04.5 画像</a>
   <a href="#s5">05 换模检测</a>
   <a href="#s6">06 定档</a>
+  <a href="#s6-5">06.5 前缀</a>
   <a href="#s7">07 写回</a>
+  <a href="#s7-5">07.5 全量重探</a>
   <a href="#s8">08 生效链</a>
   <a href="#s9">09 上手</a>
   <a href="#s10">10 发布</a>
@@ -851,6 +854,150 @@ footer code{background:none;padding:0}
        正则扫描，会把折出来的半行当成真段头 —— 实测能凭空多出一个
        <code>openai-compatibility:</code> 段，下一次写入插进错误位置。</p>
     <p>所以控制字符必须在这一层一次性转义掉，保证一个标量只占一个物理行。</p>
+  </div>
+</div></section>
+
+<section id="s7-5"><div class="wrap">
+  <div class="sech"><span class="no">07.5</span><h2>全量重探：把既有站也一起重新定档</h2></div>
+  <p class="sub">上一章的行级插入不动既有条目一个字节。这一章讲的是相反的选择，
+     以及为什么它需要一个勾选框而不是默认行为。</p>
+
+  <h3>行级插入修不了的那类问题</h3>
+  <p>只探新站是安全的默认值。但有四类问题它碰不到：</p>
+  <div class="grid2">
+    <div class="card"><div class="h">headers 过期</div>
+      <ul><li>站方改了门禁，原来那套标识头不再管用</li>
+      <li>从 config.yaml 看不出来，要看实测响应</li></ul></div>
+    <div class="card"><div class="h">priority 错位</div>
+      <ul><li>多次插档之后，能用的站被压在死站后面</li>
+      <li>数值本身没错，是相对关系错了</li></ul></div>
+    <div class="card"><div class="h">代理已失效</div>
+      <ul><li><code>proxy-url</code> 指的出口不通了</li>
+      <li>每次轮到这条都白等一次超时</li></ul></div>
+    <div class="card"><div class="h">模型清单陈旧</div>
+      <ul><li>站方新开了模型，或下掉了原来声明的</li>
+      <li>写着的模型 CPA 路由过去必然失败</li></ul></div>
+  </div>
+  <p>四类的共同表现都是<b>成功率下降</b>，而共同的诊断手段都是<b>重新打一次</b>。</p>
+
+  <h3>为什么是勾选框，不是默认行为</h3>
+  <div class="note w">
+    <div class="t">重探会把此刻正在维护的站判成不可用</div>
+    <p>探测拿到的是「这一刻站方返回什么」，不等于「这个站正确的配置是什么」。
+       某站此刻余额不足、限流、临时维护，重探都会判它不可用——如果这时直接
+       写回，明天它恢复了但配置已经被改掉。</p>
+    <p>所以决定权在操作员：工具负责把现状探清楚、给出完整 diff，
+       <b>由人判断哪些改动该接受</b>。</p>
+  </div>
+
+  <h3>并发模型：放大吞吐，不放松限频</h3>
+  <p>单站四段全通、不开上下文约 32 次请求；全不通要走画像梯救援约 60 次。
+     串行跑 175 个站要一个多小时，所以站级并发是必须的。</p>
+
+  <figure>
+  <svg viewBox="0 0 900 240" role="img"
+       aria-label="站级并发与段级并发的两层结构，以及按站段分桶的节流">
+    <defs>
+      <marker id="a75" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+
+    <text x="12" y="20" font-size="12.5" font-weight="600">站级并发 30</text>
+    <g font-size="11.5">
+      <rect x="12" y="32" width="150" height="52" rx="6"
+            fill="#E4F0F4" stroke="#0F6E8C" stroke-width="1.6"/>
+      <text x="24" y="52" font-weight="600">站 A</text>
+      <text x="24" y="70" font-size="11">4 段并发</text>
+
+      <rect x="176" y="32" width="150" height="52" rx="6"
+            fill="#E4F0F4" stroke="#0F6E8C" stroke-width="1.6"/>
+      <text x="188" y="52" font-weight="600">站 B</text>
+      <text x="188" y="70" font-size="11">4 段并发</text>
+
+      <text x="344" y="62" font-size="20">…</text>
+
+      <rect x="380" y="32" width="150" height="52" rx="6"
+            fill="#E4F0F4" stroke="#0F6E8C" stroke-width="1.6"/>
+      <text x="392" y="52" font-weight="600">站 Z</text>
+      <text x="392" y="70" font-size="11">4 段并发</text>
+    </g>
+    <text x="556" y="62" font-size="12" font-weight="600">峰值约 120 线程</text>
+
+    <line x1="12" y1="104" x2="880" y2="104"
+          stroke="currentColor" stroke-width="1" stroke-dasharray="3 3" opacity=".3"/>
+
+    <text x="12" y="128" font-size="12.5" font-weight="600">节流按 (站, 段) 分桶</text>
+    <g font-size="11.5">
+      <rect x="12" y="140" width="270" height="34" rx="5"
+            fill="#EAF6EE" stroke="#2F7D52" stroke-width="1.4"/>
+      <text x="24" y="161">站 A · claude 段 ← 保持 gap 秒</text>
+
+      <rect x="296" y="140" width="270" height="34" rx="5"
+            fill="#EAF6EE" stroke="#2F7D52" stroke-width="1.4"/>
+      <text x="308" y="161">站 A · codex 段 ← 另一个桶，不等待</text>
+
+      <rect x="12" y="182" width="270" height="34" rx="5"
+            fill="#EAF6EE" stroke="#2F7D52" stroke-width="1.4"/>
+      <text x="24" y="203">站 B · claude 段 ← 另一个桶，不等待</text>
+    </g>
+    <text x="590" y="163" font-size="11.5">同一端点的间隔</text>
+    <text x="590" y="180" font-size="11.5">一秒都没少</text>
+    <text x="590" y="205" font-size="11.5" font-weight="600">放大的是不相干的部分</text>
+  </svg>
+  <figcaption>站级 30 并发 × 段级 4 并发，但节流桶的粒度是 (站, 段)。</figcaption>
+  </figure>
+
+  <table>
+    <thead><tr><th>并发数</th><th>175 站预计耗时</th></tr></thead>
+    <tbody>
+      <tr><td>1（串行）</td><td>~90 分钟</td></tr>
+      <tr><td>10</td><td>~14 分钟</td></tr>
+      <tr><td><b>30（默认）</b></td><td><b>~4.7 分钟</b></td></tr>
+      <tr><td>40</td><td>~3.5 分钟</td></tr>
+    </tbody>
+  </table>
+
+  <h3>注释保全：两种写法，两种做法</h3>
+  <p>上一章的行级插入保注释靠的是<b>不碰它们</b>。全量重写做不到这一点——
+     所有条目都要重新渲染，注释必须主动挂回去。</p>
+  <div class="grid2">
+    <div class="card"><div class="h">行级插入（增量）</div>
+      <ul><li>只在段尾追加</li>
+      <li>既有的每一行原地不动</li>
+      <li>注释自然保住</li></ul></div>
+    <div class="card"><div class="h">全量重写（重探）</div>
+      <ul><li>条目全部重新渲染</li>
+      <li>按 (段, name/base-url) 给注释建索引</li>
+      <li>渲染条目时按索引挂回去</li></ul></div>
+  </div>
+  <p>全局配置（<code>host</code>/<code>port</code>/<code>tls</code>/<code>remote-management</code>
+     那些）按「第一个 <code>*-api-key</code> 段之前」整段原样保留，不参与重建。</p>
+
+  <div class="note b">
+    <div class="t">文件里的排序与 CPA 的优先级方向相反</div>
+    <p>重建后的条目按 <code>priority</code> <b>降序</b>排列，而 CPA 侧的语义是
+       <b>数值小的优先</b>（<code>scheduler.go:1085</code> 升序排序）。所以文件里
+       排在前面的是数值大的、也就是优先级低的。</p>
+    <p>这个顺序只影响阅读，不影响 CPA 的选择——它按数值排，不按文件位置。</p>
+  </div>
+
+  <h3>写回链一步没少</h3>
+  <p>全量重写用的是同一条写回链：基线比对（被改过就 409）→ YAML 校验 →
+     写前备份 → 就地 O_TRUNC 覆写 → PUT 触发重载 → 端到端验证。</p>
+
+  <div class="note w">
+    <div class="t">与 CPA-Manager-Plus 的并发写</div>
+    <p>CPAMP 走 CPA 的 <code>PUT /config.yaml</code> 做全量重写。本工具的基线比对
+       能挡住「在生成方案之后被改过」，但挡不住同一秒的并发。全量重探要跑几分钟，
+       这期间不要在 CPAMP 里改配置。</p>
+  </div>
+
+  <div class="note w">
+    <div class="t">如实说明：还没对真实站跑过</div>
+    <p>全量重探目前只在假上游和 6 项单元测试上验证过，<b>没有对 175 个真实站跑过
+       一次完整流程</b>。第一次实跑建议看完 diff 再决定是否写回。</p>
   </div>
 </div></section>
 
