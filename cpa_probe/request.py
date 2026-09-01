@@ -20,7 +20,7 @@ Anthropic 官方两种都支持，中转站实现不一。本模块**两个都�
 --------------------------------------------------
 原来这两处为了「少引入失败面」而故意与 CPA 不同，结果都造成了误判：
 
-  · gemini 段把 Key 放 query string。实测 cielo.example 三种画像全部连接层
+  · gemini 段把 Key 放 query string。实测 cielo 三种画像全部连接层
     失败（000），而前端用 x-goog-api-key 头能拉到几百个模型 —— 探测测的
     不是 CPA 会走的那条路，于是把一个可用站判死。
   · claude 段不带 `?beta=true`。站方按 query 参数分流时，探测与真实转发
@@ -86,7 +86,7 @@ def build_request(
     if section == "gemini-api-key":
         # Key 走 **头** 而不是 query string —— CPA 只用 x-goog-api-key
         # （gemini_executor.go:190/304/424/504/665，全库无 `?key=`）。
-        # 2026-09-01 实测：用 query string 时 cielo.example 三种画像全部
+        # 2026-09-01 实测：用 query string 时 cielo 三种画像全部
         # 连接层失败（000），而前端用头的方式能拉到几百个模型 —— 探测测的
         # 不是 CPA 真实会走的那条路，于是把一个可用站判死。
         url = f"{base}/v1beta/models/{model}:generateContent"

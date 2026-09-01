@@ -81,3 +81,6 @@ htmlcov/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 站点代号对照 —— 含真实上游站名，与 cpa-atlas.html 同理
+docs/SITE-CODENAMES.md

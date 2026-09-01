@@ -49,7 +49,7 @@
 
 ```
 ┌─ 单站诊断 ──────────────────────────────── [收起] ─┐
-│  url  [https://alfa.example          ]            │
+│  url  [https://alfa          ]            │
 │  key  [sk-xxxx                        ]            │
 │  段    ○ 全部  ● claude  ○ codex  ○ gemini  ○ compat │
 │        ☐ 同时探模型清单   ☐ 同时探上下文上限         │

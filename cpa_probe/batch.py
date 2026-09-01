@@ -55,7 +55,7 @@ class BatchProber:
         def probe_one(row: ParsedRow) -> tuple[tuple[str, str], Any]:
             result = self._prober.probe(row)
             # 键必须含 api_key —— 只用 bare 会让同一个站的多个 Key 互相覆盖。
-            # 实测那份配置里 relay-f 与 relay-l 各有 15 个 Key，用 bare 做键
+            # 实测那份配置里 foxtrot 与 relay-l 各有 15 个 Key，用 bare 做键
             # 时 15 个只剩 1 个，而 _stats 仍报 15 个已完成。
             return ((row.bare, row.api_key), result)
 

@@ -787,7 +787,7 @@ class Prober:
             })
             return True
         # 整梯全败，但站方可能在正文里明说了缺什么能力 —— 补上再打一次。
-        # 见 betas 模块 docstring（alfa.example：八档正文逐字相同，全是
+        # 见 betas 模块 docstring（alfa：八档正文逐字相同，全是
         # 「请启用 1m 上下文」，说明站方没查客户端身份，只是缺一个 beta）。
         if self._retry_with_betas(row, section, base, model, v, tried):
             return True
