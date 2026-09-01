@@ -1013,7 +1013,7 @@ def rebuild_config_full(
         exact = carry_key(_host_of(sp.base_url), sp.api_key)
         if exact in d:
             # 原文件里有这个凭据的条目 —— 用它自己的，哪怕是空的。
-            # 退到兜底键会把同站另一条的字段染过来（实测 zzzcoding 的
+            # 退到兜底键会把同站另一条的字段染过来（实测 zulu 的
             # fingerprint-profile 从 1 个条目扩散到 3 个）。
             sp.carry_lines = list(d[exact])
             return
@@ -1233,7 +1233,7 @@ def extract_carry_lines(lines: list[str]) -> dict[str, dict[str, list[str]]]:
     索引键有两级（2026-09-02 实测同 host 多条目会互相覆盖后改）：
       · 精确键 `host\\x00api-key` —— 前三段是「一个 Key 一条」，同一个站在
         codex 段能有 3 条，只按 host 索引时后一条会覆盖前一条的 carry 行。
-        实测 anyrouter.top 的 `websockets: true` 只在第一个 Key 上，被后两个
+        实测 alfa.example 的 `websockets: true` 只在第一个 Key 上，被后两个
         无该字段的条目覆盖掉。
       · 兜底键 `host` 与 base-url 原文 —— compat 段是「一个站一条、多 Key 挂
         api-key-entries」，没有 per-key 的 carry；另外新导入的 Key 也没有精确
@@ -1268,7 +1268,7 @@ def extract_carry_lines(lines: list[str]) -> dict[str, dict[str, list[str]]]:
             #
             # 空列表是有意义的信号：「这个凭据在原文件里确实没有额外字段」。
             # 没有它时 attach_carry 会退到兜底键，把同站另一个条目的字段
-            # 染给它 —— 实测 zzzcoding 一个 Key 有 fingerprint-profile，
+            # 染给它 —— 实测 zulu 一个 Key 有 fingerprint-profile，
             # 同站另两个没有，重建后三个都有了（1 → 3）。
             if cur_host and cur_key:
                 d[carry_key(cur_host, cur_key)] = list(buf)

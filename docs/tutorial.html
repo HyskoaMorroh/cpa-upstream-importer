@@ -448,6 +448,46 @@ footer code{background:none;padding:0}
        <b>对齐优先于减少变量</b> —— 探测要问的是「CPA 这样发通不通」。</p>
   </div>
 
+  <h3>段族过滤：56% 的请求原本是白发的</h3>
+  <p>聚合站的 <code>/models</code> 目录把三族模型混在一起报。探测队列原样接收，
+     于是 gemini 段拿 <code>claude-opus-4-6</code> 去打
+     <code>/v1beta/models/claude-opus-4-6:generateContent</code> —— CPA 永远不会
+     这样发：<b>段决定协议路径，模型必须是该协议下的模型</b>。</p>
+  <table>
+    <thead><tr><th style="width:130px">请求</th><th style="width:170px">次数</th>
+      <th style="width:110px">成功率</th><th>500 占比</th></tr></thead>
+    <tbody>
+      <tr><td>跨族</td><td>435 / 773（<b>56%</b>）</td><td>5.5%</td>
+        <td>240 次 = <b>55%</b></td></tr>
+      <tr><td>同族</td><td>338</td><td>24.6%</td><td>0 次</td></tr>
+    </tbody>
+  </table>
+  <p>决定性佐证是最后一列：跨族请求里 240 次返回 500，而同族<b>一次都没有</b>。
+     500 被判「临时」触发重试，79 凭据那轮日志里 666 次 500 的最大头就在这。</p>
+  <div class="note w">
+    <div class="t">这不只是烧配额</div>
+    <p>反复拿协议不匹配的模型名轰炸，正是站方风控盯的形态 —— 比一句「你好」更可疑。
+       <code>SECTION_FAMILY</code> 闸让三个协议段只探本族；<code>compat</code>
+       段不设限，它走 <code>/chat/completions</code>，本身就是万能转发口。
+       过滤在探测队列、目录落盘、方案生成三处各做一次 —— 任一处漏了都会复现。</p>
+  </div>
+
+  <h3>目录优先：先问站方，再动手打</h3>
+  <p>原来的顺序是「拿写死的种子模型撞 → 撞不上判死」，而 <code>/models</code>
+     目录在阶段二，<b>只在阶段一已经成功时才跑</b>。等于从头到尾没问过站方
+     「你到底有什么」。</p>
+  <p>实测后果：45/79 个凭据判 0 段可用，其中 <b>7 个的目录明明拿得到模型</b>
+     （最多 199 个）。而 model-scan 阶段（用目录里的模型）成功 200 共 78 次，
+     模型名如 <code>claude-opus-4-6</code>、<code>gpt-oss-120b</code> ——
+     全都不在种子表里。</p>
+  <div class="note g">
+    <div class="t">GET 目录比推理请求安全</div>
+    <p>多数站不计费、不计入调用统计、不触发风控。参考实现全都只这么做：CPAMP
+       的健康检查只发 GET 目录（全库无 POST 测活），CLIProxyAPI 自己完全不探
+       上游存活。这与「严禁 Hi / 你好 这类简单测活」同向 —— 能不发推理就不发。</p>
+    <p>gemini 段的 <code>/v1beta/models</code> 分页，最多翻 20 页（与 CPAMP 同一上限）。</p>
+  </div>
+
   <h3>仍会误判的四种情形</h3>
   <p>说清边界比声称「不会误判」有用：</p>
   <table>
@@ -1197,17 +1237,87 @@ footer code{background:none;padding:0}
        「挡住它零代价」的强信号读。读得懂，写的时候丢了。</p>
   </div>
 
+  <h3>白名单渲染抹掉了 106 个条目的字段</h3>
+  <p><code>render_entry</code> 是<b>白名单式</b>渲染 —— 只写它认识的 10 个字段。
+     而全量重探用它<b>整段重写</b>。生产配置 121 个条目里 106 条带白名单外的字段，
+     重写后全部静默消失：<code>validate()</code> 报成功、YAML 完全合法、界面显示
+     写入成功，只是行为变了。</p>
+  <table>
+    <thead><tr><th style="width:210px">字段</th><th style="width:90px">条目数</th>
+      <th>丢了会怎样</th></tr></thead>
+    <tbody>
+      <tr><td><code>request-scoped-errors</code></td><td><b>116</b></td>
+        <td>冷却规则没了，欠费 / 被封的 Key 留在轮询池被每个请求重试</td></tr>
+      <tr><td><code>excluded-models</code></td><td><b>39</b></td>
+        <td><code>["*"]</code> = 只用显式列的模型，丢了会把不该用的放出来</td></tr>
+      <tr><td><code>proxy-url</code></td><td><b>24</b></td>
+        <td>必须走代理的站改成直连，下次请求拿 403</td></tr>
+      <tr><td><code>websockets</code></td><td>2</td><td>codex 的 WebSocket 开关</td></tr>
+      <tr><td><code>fingerprint-profile</code></td><td>1</td>
+        <td>让 CPA 自己补设备指纹</td></tr>
+      <tr><td><code>disabled</code></td><td>1</td>
+        <td><b>手工停用的 provider 会复活</b></td></tr>
+    </tbody>
+  </table>
+  <div class="note w">
+    <div class="t">那 116 条 request-scoped-errors 的代价，配置注释自己记着</div>
+    <p>「实测 65 分钟内两个 $-0.11 的 Key 产生 52 次 403 insufficient_user_quota，
+       且把 request-retry(1) × max-retry-credentials(2) 的尝试预算吃光，导致
+       <b>59 个请求直接向客户端返回 500</b>，而健康凭证根本没轮到。」</p>
+    <p>这段话是当初为了从 <code>action: continue</code> 改成
+       <code>continue-and-cooldown</code> 写下的。整段重写把规则抹掉，等于退回
+       到那个状态 —— 而且没有任何提示。</p>
+  </div>
+  <p><code>extract_carry_lines()</code> 按<b>原文行</b>搬运，不解析成值再序列化
+     —— 这些字段结构任意深（<code>request-scoped-errors</code> 是对象数组），
+     重新序列化要处理缩进、引号风格、键序，而原文行拿来就用、逐字保真、diff 干净。</p>
+  <div class="note">
+    <div class="t">实现踩的三个坑，都靠拿真实配置对账才暴露</div>
+    <p>· <b>嵌套 dash 误触发条目边界</b> ——
+       <code>request-scoped-errors</code> 底下的 <code>- status: 403</code> 也是
+       dash 行。按「有没有 dash」判断会在每个嵌套项上清空缓冲，106 个待搬条目
+       只搬出 <b>39</b> 个。改成按该段条目级缩进判断。</p>
+    <p>· <b>行尾注释挡住 base-url 解析</b> —— 配置里有
+       <code>base-url: "https://x.com" # 注意不带 /v1</code>，值带注释时
+       <code>host_of</code> 解析不出主机名，<b>28 个</b>条目索引不到。新增
+       <code>_scalar_value()</code> 剥行尾注释，且只在引号闭合之后才认
+       <code>#</code> —— 值本身可以含井号。</p>
+    <p>· <b>同 host 不同 Key 互相染色</b> —— 某站三个 Key 里只有一个有
+       <code>fingerprint-profile</code>，按 host 索引会让另两个也拿到（1 → 3）。
+       改成 <code>host&#92;x00api-key</code> 精确键，且<b>空 carry 也要记</b> ——
+       那是「这个凭据确实没有额外字段」的有效信号，缺了它就会退到兜底键。</p>
+  </div>
+
+  <h3>写后验证抢在 reloadClients 之前</h3>
+  <p>真正让新上游可被选中的是 <code>reloadClients()</code>，它挂在 fsnotify
+     那一路，前面有 <b>150ms debounce</b>（<code>watcher.go:87</code>）。而
+     <code>PUT /config.yaml</code> 只更新管理 handler 的 <code>h.cfg</code>
+     （<code>config_basic.go:162-168</code>）。</p>
+  <p>所以 PUT 返回 200 时凭据池<b>还没重建</b> —— 立刻打业务端点会打在旧池子上，
+     刚写进去的站被报成「验证失败」，而它其实是好的。验证前等 1.2 秒
+     （debounce + LoadConfig 与重建的余量）。误报一个可用站的代价是用户把它删掉，
+     而这一步只花固定 1.2 秒。</p>
+
   <h3>一条方法论</h3>
-  <p>这批缺陷是<b>在 869 项测试全绿的情况下</b>被专门审计找出来的。原因是那些
-     测试的构造数据按我自己的理解写的，跟真实产出不一样 ——
-     <b>测试只能证明代码符合我的意图，不能证明我的意图对</b>。</p>
-  <p>补的 5 项新测试都锁在「实测复现过的破坏」上：全局键要在、无方案段要保留、
-     顶层键不能重复、<code>weight: 0</code> 要搬运、cgroup 异常值要降级。</p>
+  <p>这几批缺陷都是<b>在测试全绿的情况下</b>被专门审计找出来的（第一批 869 项时，
+     第二批 934 项时）。原因是那些测试的构造数据按我自己的理解写的，跟真实产出
+     不一样 —— <b>测试只能证明代码符合我的意图，不能证明我的意图对</b>。</p>
+  <p>第二批更进一步：<b>拿生产 config.yaml 逐字段对账</b>，把重建前后的 15 个
+     字段计数与每个条目的每个字段值全部比一遍。这一步立刻暴露了三个坑，
+     而它们在假上游的构造数据里都不出现 —— 因为构造数据是「我以为配置长这样」，
+     真实配置是「配置实际长这样」。</p>
+  <p>新测试一律锁在「实测复现过的破坏」上：全局键要在、无方案段要保留、顶层键
+     不能重复、<code>weight: 0</code> 与 <code>proxy-url</code> 要搬运、
+     未知字段要逐字保真、同 host 不同 Key 不能互相染色、cgroup 异常值要降级。</p>
 
   <div class="note w">
-    <div class="t">如实说明：还没对真实站跑过</div>
-    <p>全量重探目前只在假上游、单元测试和端到端演练上验证过，<b>没有对这 79 个
-       真实站跑过一次完整流程</b>。第一次实跑建议看完 diff 再决定是否写回。</p>
+    <div class="t">如实说明：验证到哪一步</div>
+    <p><b>已验证</b>：假上游套件、单元测试（936 项，含真实 config.yaml 用例）、
+       端到端演练、以及拿生产 config.yaml 做的重建对账（121 条目 / 79 凭据，
+       字段计数与值零差异）。</p>
+    <p><b>未验证</b>：没有对这 79 个真实站跑过一次<b>完整的写回流程</b> ——
+       对账用的是「重建产物与原文比对」，没真的落盘到生产。第一次实跑建议看完
+       diff 再决定是否写回，备份是唯一的回滚手段。</p>
   </div>
 </div></section>
 
