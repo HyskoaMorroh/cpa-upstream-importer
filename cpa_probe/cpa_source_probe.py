@@ -31,12 +31,30 @@ from __future__ import annotations
 import io
 import os
 import re
+import time
 from dataclasses import dataclass, field
 
 
 # CPA 源码里这几个文件是身份头的权威来源。路径相对仓库根。
 _CLAUDE_REQ = "internal/runtime/executor/claude_executor_request.go"
 _CODEX_REQ = "internal/runtime/executor/codex_executor_request.go"
+
+# 远程模式：直接从 GitHub 拉这两个文件。
+#
+# 为什么值得单独有这条路：本地源码模式要么 git clone（宿主机加一条 cron、
+# 容器加一个挂载），要么手工下 zip（没有 .git，版本比对失效）。而实际部署
+# 常常只有 docker-compose.yml + config.yaml + .env + nginx.conf 这几个文件 ——
+# 为了一个只读检查去铺一套源码同步，成本不成比例。
+#
+# 只拉两个文件（合计约 110KB），不 clone 整仓。
+_RAW_BASE = "https://raw.githubusercontent.com/router-for-me/CLIProxyAPI"
+_GH_API = "https://api.github.com/repos/router-for-me/CLIProxyAPI"
+
+# 远程结果缓存。GitHub 对未认证请求限 60 次/小时，而这个检查在每次打开
+# 网页时都会跑 —— 不缓存会很快撞限额，撞了之后检查静默失效。
+# 6 小时：CPA 不会一天改几次身份头。
+_REMOTE_TTL = 6 * 3600
+_remote_cache: dict = {"at": 0.0, "ident": None, "ref": ""}
 
 
 @dataclass
@@ -117,6 +135,109 @@ def _slice_items(src: str, var: str, consts: dict[str, str]) -> list[str]:
         elif line in consts:
             items.append(consts[line])
     return items
+
+
+def _http_get(url: str, *, timeout: int = 15,
+              proxy: str | None = None) -> tuple[int, str]:
+    """GET 一个文本资源。返回 (状态码, 正文)。失败返回 (0, 错误说明)。"""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={
+        # GitHub 对无 UA 的请求会 403
+        "User-Agent": "cpa-upstream-importer/drift-check",
+        "Accept": "application/vnd.github.raw, text/plain, */*",
+    })
+    try:
+        if proxy:
+            op = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        else:
+            op = urllib.request.build_opener()
+        with op.open(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.reason or f"HTTP {e.code}"
+    except Exception as e:                              # noqa: BLE001
+        return 0, f"{type(e).__name__}: {e}"
+
+
+def extract_remote(*, ref: str = "main", timeout: int = 15,
+                   proxy: str | None = None,
+                   use_cache: bool = True) -> CpaIdentity:
+    """从 GitHub 直接拉那两个 Go 文件并提取常量。
+
+    只拉两个文件（约 110KB），不 clone。适合「VPS 上只有 compose + config +
+    env + nginx 四个文件」这种部署 —— 不需要源码目录、不需要 git、不需要
+    额外挂载。
+
+    缓存 6 小时：GitHub 未认证请求限 60 次/小时，而这个检查每次打开网页都跑。
+    """
+    now = time.time()
+    if (use_cache and _remote_cache["ident"] is not None
+            and _remote_cache["ref"] == ref
+            and now - _remote_cache["at"] < _REMOTE_TTL):
+        return _remote_cache["ident"]
+
+    out = CpaIdentity(source_root=f"github:{ref}")
+
+    st, claude_src = _http_get(f"{_RAW_BASE}/{ref}/{_CLAUDE_REQ}",
+                               timeout=timeout, proxy=proxy)
+    if st != 200:
+        out.errors.append(f"拉不到 {_CLAUDE_REQ}：{claude_src}")
+        return out
+
+    consts = _const_map(claude_src)
+    seq: list[str] = []
+    if "claudeCodeBeta" in consts:
+        seq.append(consts["claudeCodeBeta"])
+    seq.extend(_slice_items(claude_src, "claudeCodeCLIConstantBetas", consts))
+    if "claudeMidConvSystemBeta" in consts:
+        seq.append(consts["claudeMidConvSystemBeta"])
+    if "claudeEffortBeta" in consts:
+        seq.append(consts["claudeEffortBeta"])
+    out.claude_betas_unconditional = seq
+
+    for name in ("claudeOAuthBeta", "claudeContext1MBeta",
+                 "claudeAdvisorToolBeta", "claudeAdvancedToolUseBeta",
+                 "claudeFallbackCreditBeta", "claudeExtendedCacheTTLBeta",
+                 "claudeCacheDiagnosisBeta", "claudeStructuredOutputsBeta",
+                 "claudeServerSideFallbackBeta"):
+        if name in consts:
+            out.claude_betas_conditional[name] = consts[name]
+
+    st2, codex_src = _http_get(f"{_RAW_BASE}/{ref}/{_CODEX_REQ}",
+                               timeout=timeout, proxy=proxy)
+    if st2 == 200:
+        cc = _const_map(codex_src)
+        for k, v in cc.items():
+            lk = k.lower()
+            if "useragent" in lk and not out.codex_user_agent:
+                out.codex_user_agent = v
+            elif "originator" in lk and not out.codex_originator:
+                out.codex_originator = v
+    else:
+        # codex 拉不到不算致命 —— claude 段的 beta 清单是主要目标
+        out.errors.append(f"（非致命）拉不到 {_CODEX_REQ}：{codex_src}")
+
+    if use_cache and out.claude_betas_unconditional:
+        _remote_cache.update(at=now, ident=out, ref=ref)
+    return out
+
+
+def remote_commit(*, ref: str = "main", timeout: int = 10,
+                  proxy: str | None = None) -> str:
+    """拉 GitHub 上该 ref 的最新 commit（短）。拿不到返回空串。
+
+    与本地 .git/HEAD 的作用相同：拿它跟运行中 CPA 的 X-CPA-COMMIT 比，
+    发现「上游已更新但你的 CPA 还是旧版」。
+    """
+    st, body = _http_get(f"{_GH_API}/commits/{ref}", timeout=timeout,
+                         proxy=proxy)
+    if st != 200:
+        return ""
+    m = re.search(r'"sha"\s*:\s*"([0-9a-f]{40})"', body)
+    return m.group(1)[:12] if m else ""
 
 
 def extract(root: str) -> CpaIdentity:
@@ -299,71 +420,122 @@ def report(root: str) -> tuple[CpaIdentity, list[Drift]]:
     return ident, compare(ident)
 
 
+def _drift_json(drifts: list[Drift]) -> list[dict]:
+    return [{"what": d.what, "ours": d.ours, "theirs": d.theirs,
+             "severity": d.severity, "note": d.note} for d in drifts]
+
+
+def _stale_drift(src_commit: str, runtime_commit: str) -> Drift | None:
+    """源码与运行中二进制不是同一版本时的警告。两侧任一缺失就不判。"""
+    if not (src_commit and runtime_commit):
+        return None
+    if (runtime_commit.startswith(src_commit[:7])
+            or src_commit.startswith(runtime_commit[:7])):
+        return None
+    return Drift(
+        what="源码与运行中的 CPA 不是同一版本",
+        ours=f"源码 {src_commit}", theirs=f"运行中 {runtime_commit}",
+        severity="warn",
+        note=("下面的比对是按**源码**做的，而 CPA 实际转发用的是旧二进制。"
+              "请重新构建并重启 CPA，或忽略下面的结论"))
+
+
 def check(*, source_root: str = "", cfg: dict | None = None,
-          runtime_commit: str = "") -> dict:
+          runtime_commit: str = "", allow_remote: bool = False,
+          remote_ref: str = "main", proxy: str | None = None) -> dict:
     """给服务端调用的统一入口。返回可直接进 JSON 的 dict。
 
-    优先读源码（精确，能区分有条件/无条件 beta）；读不到就退回 config.yaml
-    的 header-defaults（覆盖面小但容器里一定有）。两条都不成立时返回
-    checked=False —— 不假装检查过。
+    三条路径，按精度降序尝试：
 
-    runtime_commit 是 CPA 管理接口回的 X-CPA-COMMIT。给了就与源码的 git HEAD
-    比对 —— 不一致说明「源码已更新但 CPA 没重启」，此时按源码判断的漂移结论
-    对不上实际转发行为，必须提示出来。
+      1. **本地源码**（source_root）—— 最精确：能区分有条件/无条件 beta，
+         能读 .git 拿 commit。需要宿主机 clone + 容器挂载。
+      2. **远程拉取**（allow_remote）—— 只拉两个 Go 文件（约 110KB），
+         不需要源码目录、不需要 git、不需要额外挂载。适合「VPS 上只有
+         compose + config + env + nginx 四个文件」这种部署。缓存 6 小时。
+      3. **config.yaml 的 header-defaults** —— 覆盖面小得多（管不到 beta
+         清单），但容器里一定有。
+
+    三条都不成立时返回 checked=False 并说明原因 —— 不假装检查过。
+
+    runtime_commit 是 CPA 管理接口回的 X-CPA-COMMIT。给了就与源码 commit 比，
+    不一致说明「源码已更新但 CPA 没重启」，此时按源码判断的结论对不上实际
+    转发行为，必须提示出来。
     """
+    # ── 路径 1：本地源码 ──
     if source_root:
         ident, drifts = report(source_root)
         if ident.ok:
             src_commit = source_commit(source_root)
-            stale = bool(src_commit and runtime_commit
-                         and not runtime_commit.startswith(src_commit[:7])
-                         and not src_commit.startswith(runtime_commit[:7]))
+            stale = _stale_drift(src_commit, runtime_commit)
             if stale:
-                drifts.insert(0, Drift(
-                    what="源码与运行中的 CPA 不是同一版本",
-                    ours=f"源码 {src_commit}",
-                    theirs=f"运行中 {runtime_commit}",
-                    severity="warn",
-                    note=("下面的比对是按**源码**做的，而 CPA 实际转发用的是旧"
-                          "二进制。请重新构建并重启 CPA，或忽略下面的结论")))
+                drifts.insert(0, stale)
             return {
                 "checked": True,
-                "source": "CPA 源码",
+                "source": "CPA 源码（本地）",
                 "source_root": source_root,
                 "source_commit": src_commit,
                 "runtime_commit": runtime_commit,
-                "stale_binary": stale,
+                "stale_binary": bool(stale),
                 "betas_unconditional": ident.claude_betas_unconditional,
                 "betas_conditional": ident.claude_betas_conditional,
                 "codex_user_agent": ident.codex_user_agent,
                 "codex_originator": ident.codex_originator,
-                "drifts": [
-                    {"what": d.what, "ours": d.ours, "theirs": d.theirs,
-                     "severity": d.severity, "note": d.note}
-                    for d in drifts
-                ],
+                "drifts": _drift_json(drifts),
             }
 
+    # ── 路径 2：远程拉取 ──
+    if allow_remote:
+        ident = extract_remote(ref=remote_ref, proxy=proxy)
+        if ident.claude_betas_unconditional:
+            drifts = compare(ident)
+            src_commit = remote_commit(ref=remote_ref, proxy=proxy)
+            stale = _stale_drift(src_commit, runtime_commit)
+            if stale:
+                stale.note = ("下面的比对是按 GitHub 上的**最新源码**做的，而你"
+                              "运行的 CPA 是旧版本。要么升级 CPA，要么把 "
+                              "CPA_SOURCE_REF 指到你实际用的那个 tag")
+                drifts.insert(0, stale)
+            out = {
+                "checked": True,
+                "source": f"GitHub {remote_ref}（只拉 2 个文件）",
+                "source_commit": src_commit,
+                "runtime_commit": runtime_commit,
+                "stale_binary": bool(stale),
+                "betas_unconditional": ident.claude_betas_unconditional,
+                "betas_conditional": ident.claude_betas_conditional,
+                "codex_user_agent": ident.codex_user_agent,
+                "codex_originator": ident.codex_originator,
+                "drifts": _drift_json(drifts),
+            }
+            # codex 文件拉不到属非致命，但要让人看见
+            soft = [e for e in ident.errors if e.startswith("（非致命）")]
+            if soft:
+                out["soft_errors"] = soft
+            return out
+        # 远程失败不静默 —— 拿不到就落到路径 3，但把原因带出去
+        remote_why = "；".join(ident.errors) or "未知原因"
+    else:
+        remote_why = ""
+
+    # ── 路径 3：config.yaml 的 header-defaults ──
     drifts = compare_config(cfg)
     if cfg and isinstance(cfg.get("claude-header-defaults"), dict):
-        return {
+        out = {
             "checked": True,
             "source": "config.yaml 的 claude-header-defaults",
             "partial": True,
             "uncovered": ["anthropic-beta 清单（只有源码里有）"],
-            "drifts": [
-                {"what": d.what, "ours": d.ours, "theirs": d.theirs,
-                 "severity": d.severity, "note": d.note}
-                for d in drifts
-            ],
+            "drifts": _drift_json(drifts),
         }
+        if remote_why:
+            out["remote_failed"] = remote_why
+        return out
 
-    return {
-        "checked": False,
-        "why": ("读不到 CPA 源码，config.yaml 里也没有 claude-header-defaults。"
-                "画像梯用的是内置常量（从 CPA 源码抄录），无法核对是否已过期"),
-        "drifts": [],
-    }
+    why = ("读不到 CPA 源码，config.yaml 里也没有 claude-header-defaults。"
+           "画像梯用的是内置常量（从 CPA 源码抄录），无法核对是否已过期")
+    if remote_why:
+        why = f"远程拉取失败（{remote_why}）；且 " + why
+    return {"checked": False, "why": why, "drifts": []}
 
 
 def _main(argv: list[str]) -> int:
