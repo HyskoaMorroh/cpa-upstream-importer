@@ -228,3 +228,47 @@ def existing_weights(cfg: dict) -> dict[tuple[str, str], int]:
                 out[(h, k)] = w
 
     return out
+
+
+def existing_proxies(cfg: dict) -> dict[tuple[str, str], str]:
+    """既有条目的 proxy-url，按 (host, api_key) 索引。只收非空值。
+
+    为什么必须搬运（2026-09-02 拿生产 config.yaml 逐字段对账发现）：
+    `proxy_url` 只在探测**当场判定需要代理**（IP封/边缘救回）时才有值，
+    而重探时那个站可能这次直连就通了 —— 于是方案里 proxy_url 为空，
+    整段重写把原有的 26 条 `proxy-url: http://mihomo:7890` 全部抹掉。
+
+    后果不可见：YAML 合法、validate 报成功，但那些必须走代理的站下次
+    请求直连、拿 403，而配置里已经没有任何痕迹说明它本来有代理。
+
+    与 weight 同一套键 (host, api_key) —— base-url 在不同段形态不同。
+    """
+    from .parse import host_of
+
+    out: dict[tuple[str, str], str] = {}
+    for section in ("gemini-api-key", "codex-api-key", "claude-api-key"):
+        for e in cfg.get(section) or []:
+            if not isinstance(e, dict):
+                continue
+            pu = str(e.get("proxy-url") or "").strip()
+            if not pu:
+                continue
+            h = host_of(str(e.get("base-url") or ""))
+            k = str(e.get("api-key") or "")
+            if h and k:
+                out[(h, k)] = pu
+
+    # compat 段的 proxy-url 在 api-key-entries 的每一项上，不在 provider 级
+    for prov in cfg.get("openai-compatibility") or []:
+        if not isinstance(prov, dict):
+            continue
+        h = host_of(str(prov.get("base-url") or ""))
+        for ke in prov.get("api-key-entries") or []:
+            if not isinstance(ke, dict):
+                continue
+            pu = str(ke.get("proxy-url") or "").strip()
+            k = str(ke.get("api-key") or "")
+            if pu and h and k:
+                out[(h, k)] = pu
+
+    return out

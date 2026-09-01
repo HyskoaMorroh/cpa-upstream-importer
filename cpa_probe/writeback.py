@@ -384,7 +384,16 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
         rows: list[str] = []
         for m in sp.models:
             rows.append(f"{indent}- name: {_yaml_str(m)}")
-            rows.append(f"{indent}  alias: {_yaml_str(m)}")
+            # alias 写空串，与现有 459 个条目一致（生产 config.yaml 里
+            # 100% 是 `alias: ""`）。
+            #
+            # 为什么不写成与 name 相同（2026-09-02 核对 CPA 源码）：
+            # buildConfiguredModelInfo（service_models.go:678-682）在
+            # alias 为空时自动回落成 name，所以 `alias: ""` 与
+            # `alias: <name>` 的**运行时效果完全相同**；而写死值会让
+            # 全量重建把 459 行原本是 `""` 的行全改掉 —— diff 里 459 处
+            # 无意义改动，掩盖真正要看的 priority 变化。
+            rows.append(f'{indent}  alias: ""')
             if sp.max_context_length and m == sp.context_model:
                 rows.append(f"{indent}  max-context-length: {sp.max_context_length}"
                             f"   # 实测值")
@@ -416,6 +425,8 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
             out.append(f"{field}headers:")
             for k, v in sp.headers.items():
                 out.append(f"{field}  {k}: {_yaml_str(v)}")
+        for ln in sp.carry_lines:
+            out.append(ln.rstrip("\n"))
         out.append(f"{field}models:")
         out.extend(model_lines(f"{field}  "))
         return out
@@ -439,6 +450,11 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
         out.append(f"{field}headers:")
         for k, v in sp.headers.items():
             out.append(f"{field}  {k}: {_yaml_str(v)}")
+    # 原条目里 render_entry 不认识的字段，按原文行搬运。
+    # 放在 models 之前 —— YAML 映射无序，但放这里让 diff 与原文的键序一致。
+    # 已经 rstrip 过换行，写出时由调用方统一补。
+    for ln in sp.carry_lines:
+        out.append(ln.rstrip("\n"))
     out.append(f"{field}models:")
     out.extend(model_lines(f"{field}  "))
     return out
@@ -984,6 +1000,29 @@ def rebuild_config_full(
     # 1. 注释索引（按 (段, 键)）
     comments_map = _extract_entry_comments(original_lines)
 
+    # 1b. 原条目里 render_entry 不认识的字段（request-scoped-errors /
+    #     excluded-models / websockets / fingerprint-profile / disabled…）。
+    #     整段重写会把它们抹掉，所以按原文行搬回去 —— 见 extract_carry_lines。
+    carry_map = extract_carry_lines(original_lines)
+
+    def attach_carry(sp: SectionPlan) -> None:
+        """给方案补上该条目原有的 carry 行。已经有了就不动（用户覆盖优先）。"""
+        if sp.carry_lines:
+            return
+        d = carry_map.get(sp.section) or {}
+        exact = carry_key(_host_of(sp.base_url), sp.api_key)
+        if exact in d:
+            # 原文件里有这个凭据的条目 —— 用它自己的，哪怕是空的。
+            # 退到兜底键会把同站另一条的字段染过来（实测 zzzcoding 的
+            # fingerprint-profile 从 1 个条目扩散到 3 个）。
+            sp.carry_lines = list(d[exact])
+            return
+        # 新导入的 Key：原文件没有它的条目，拿同站的规则当默认
+        h = _host_of(sp.base_url)
+        got = d.get(h) or d.get(sp.base_url)
+        if got:
+            sp.carry_lines = list(got)
+
     # 2. 按段归集可写方案。section 用的是**完整 YAML 段名** ——
     #    pipeline 与 build_plan 一路如此，不做短名映射。
     sections_data: dict[str, list[SectionPlan]] = {s: [] for s in _SECTION_KEYS}
@@ -1030,6 +1069,7 @@ def rebuild_config_full(
                 # 哪一套 headers/priority/models。
                 head = max(group, key=lambda x: x.priority)
                 extra = [g.api_key for g in group if g is not head]
+                attach_carry(head)
                 for c in _comments_for(comments_map, section, head, used, _host_of):
                     out.append(c if c.endswith("\n") else c + "\n")
                 for line in render_entry(head, dash, field, stamp,
@@ -1046,6 +1086,7 @@ def rebuild_config_full(
         out = []
         used = set()
         for sp in entries:
+            attach_carry(sp)
             for c in _comments_for(comments_map, section, sp, used, _host_of):
                 out.append(c if c.endswith("\n") else c + "\n")
             for line in render_entry(sp, dash, field, stamp):
@@ -1126,6 +1167,200 @@ def _comments_for(comments_map: dict, section: str, sp: SectionPlan,
         used.add(cand)
         return sec[cand]
     return []
+
+
+# render_entry 自己会写的字段。搬运原字段时要跳过它们 —— 否则同一个键会
+# 出现两次（YAML 里后者覆盖前者，值可能是旧的）。
+_RENDERED_KEYS = frozenset({
+    "api-key", "base-url", "prefix", "priority", "weight", "proxy-url",
+    "headers", "models", "name", "api-key-entries",
+})
+
+
+def carry_key(host: str, api_key: str) -> str:
+    """carry 行的精确索引键。用 NUL 分隔 —— host 与 key 都可能含任何可打印字符。"""
+    return f"{host}\x00{api_key}"
+
+
+def _scalar_value(tail: str) -> str:
+    """取 `键: 值 # 注释` 里的值部分，剥掉行尾注释。
+
+    为什么必须剥（2026-09-02 实测）：生产 config.yaml 里有
+    `base-url: "https://api.example.com" # 注意不带 /v1` 这种写法。
+    不剥注释时值带着 ` # 注意不带 /v1`，host_of 解析不出主机名，
+    整条目的 carry 索引键就少一个 —— 28 个条目因此搬不到。
+
+    只在引号闭合之后才认 `#`：值本身可以含井号（`prefix: "a#b"`）。
+    """
+    t = tail.strip()
+    if not t:
+        return ""
+    if t[0] in "\"'":
+        q = t[0]
+        i = 1
+        while i < len(t):
+            if t[i] == "\\":
+                i += 2
+                continue
+            if t[i] == q:
+                return t[1:i]
+            i += 1
+        return t[1:]                       # 引号没闭合，原样给回
+    # 裸标量：第一个 ` #` 之前
+    cut = t.find(" #")
+    return (t[:cut] if cut >= 0 else t).strip()
+
+
+def extract_carry_lines(lines: list[str]) -> dict[str, dict[str, list[str]]]:
+    """提取每个条目里 render_entry **不认识**的字段，按 (段, 站名) 索引原文行。
+
+    为什么必须有（2026-09-02 拿生产 config.yaml 核对发现）
+    -------------------------------------------------
+    render_entry 是白名单式渲染，只写它知道的 10 个字段；而全量重探用它
+    **整段重写**。生产配置 108 个条目里 106 条带白名单外的字段，重写后
+    全部静默消失 —— validate() 报成功，YAML 也合法，只是行为变了：
+
+        request-scoped-errors  105 条   冷却规则，丢了坏站不再被剔除
+        excluded-models         39 条   `["*"]` = 只用显式列的模型
+        websockets               2 条   codex 的 WebSocket 开关
+        fingerprint-profile      1 条   让 CPA 自己补设备指纹
+        disabled                 1 条   手工停用的 provider 会复活
+
+    存**原文行**而不是解析后的值：这些字段结构任意深（request-scoped-errors
+    是对象数组），重新序列化要处理缩进、引号风格、键序；而原文行拿来就能用、
+    逐字保真、diff 也干净。
+
+    索引键有两级（2026-09-02 实测同 host 多条目会互相覆盖后改）：
+      · 精确键 `host\\x00api-key` —— 前三段是「一个 Key 一条」，同一个站在
+        codex 段能有 3 条，只按 host 索引时后一条会覆盖前一条的 carry 行。
+        实测 anyrouter.top 的 `websockets: true` 只在第一个 Key 上，被后两个
+        无该字段的条目覆盖掉。
+      · 兜底键 `host` 与 base-url 原文 —— compat 段是「一个站一条、多 Key 挂
+        api-key-entries」，没有 per-key 的 carry；另外新导入的 Key 也没有精确
+        匹配的原条目，用 host 拿同站的规则是合理的默认。
+
+    值都用 `base_for_section` 之前的原文 host：sp.base_url 经过加工
+    （codex/compat 补 /v1），与原文里的写法对不上，只有 host 稳定。
+    """
+    from .parse import host_of
+
+    out: dict[str, dict[str, list[str]]] = {}
+    section = None
+    # 当前条目：收集到的 carry 行 + 它的候选键
+    buf: list[str] = []
+    keys: list[str] = []
+    # 当前条目的 host 与 api-key —— 用来建精确键 host\x00api-key
+    cur_host: str = ""
+    cur_key: str = ""
+    # 正在跳过某个多行字段（如 models: 下面的整块）时的缩进阈值
+    skip_indent: int | None = None
+    # 本段条目级 dash 的缩进。**必须按它判断新条目**，不能只看「有没有 dash」——
+    # request-scoped-errors 底下的 `- status: 403` 也是 dash 行，按后者判断会在
+    # 每个嵌套列表项上误触发 flush()，把刚收集的 carry 行连同索引键一起清空。
+    # 2026-09-02 实测：前三段 106 个待搬条目只搬出 39 个，就是这个原因。
+    item_indent: int | None = None
+
+    def flush() -> None:
+        nonlocal buf, keys, cur_host, cur_key
+        if section and (cur_host or keys):
+            d = out.setdefault(section, {})
+            # 精确键**总是**写，哪怕 buf 是空的。
+            #
+            # 空列表是有意义的信号：「这个凭据在原文件里确实没有额外字段」。
+            # 没有它时 attach_carry 会退到兜底键，把同站另一个条目的字段
+            # 染给它 —— 实测 zzzcoding 一个 Key 有 fingerprint-profile，
+            # 同站另两个没有，重建后三个都有了（1 → 3）。
+            if cur_host and cur_key:
+                d[carry_key(cur_host, cur_key)] = list(buf)
+            # 兜底键只在有内容且尚未写过时写 —— 它服务的是「新导入的 Key，
+            # 原文件里没有对应条目」，那时拿同站规则是合理的默认。
+            if buf:
+                for k in keys:
+                    d.setdefault(k, list(buf))
+        buf, keys = [], []
+        cur_host, cur_key = "", ""
+
+    def indent_of(ln: str) -> int:
+        return len(ln) - len(ln.lstrip())
+
+    for line in lines:
+        m = re.match(r"^(gemini-api-key|codex-api-key|claude-api-key"
+                     r"|openai-compatibility)\s*:", line)
+        if m:
+            flush()
+            section = m.group(1)
+            skip_indent = None
+            item_indent = None
+            continue
+        if section is None:
+            continue
+
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        # 离开本段（顶层键）
+        if re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]*\s*:", line):
+            flush()
+            section = None
+            skip_indent = None
+            item_indent = None
+            continue
+
+        ind = indent_of(line)
+
+        # 正在跳过某个白名单字段的子块（models: / headers: / api-key-entries:）
+        if skip_indent is not None:
+            if ind > skip_indent:
+                continue
+            skip_indent = None
+
+        # 新条目起点：**该段条目级缩进**上的 dash 行。第一个 dash 定基准。
+        # 用缩进而不是「是不是 dash」—— 见 item_indent 的说明。
+        dash_here = bool(re.match(r"^\s*-\s+\S", line))
+        if dash_here and item_indent is None:
+            item_indent = ind
+        is_item = dash_here and ind == item_indent
+        if is_item:
+            flush()
+            # 条目首行的字段与后续字段行对齐（dash 缩进 + "- " 宽度）
+            ind += 2
+
+        # 取字段名。条目首行形如 `  - api-key: x`，字段名在 `- ` 之后
+        fm = re.match(r"^\s*(?:-\s+)?([a-zA-Z_][a-zA-Z0-9_-]*)\s*:", line)
+        if not fm:
+            # 不是 `键:` 形态（列表项的值行等），归入当前 carry 块
+            if buf:
+                buf.append(line)
+            continue
+        field_name = fm.group(1)
+        inline_value = _scalar_value(line.split(":", 1)[1])
+
+        if field_name in _RENDERED_KEYS:
+            # 记键：name 与 host_of(base-url) 都要
+            val = inline_value
+            if field_name == "name" and val:
+                keys.append(val)
+            elif field_name == "base-url" and val:
+                h = host_of(val)
+                if h:
+                    keys.append(h)
+                    cur_host = h
+                keys.append(val)
+            elif field_name == "api-key" and val:
+                cur_key = val
+            # 只有「值在后续行」的字段才需要整块跳过（models: / headers: /
+            # api-key-entries:）。行内就有值的（api-key: "x"）不能设 —— 那会
+            # 把同一条目里紧随其后的字段全部吞掉。
+            if not inline_value:
+                skip_indent = ind
+            continue
+
+        # 白名单外的字段 —— 连同它的子块一起搬
+        buf.append(line)
+
+    flush()
+    return out
 
 
 def _extract_entry_comments(lines: list[str]) -> dict[str, dict[str, list[str]]]:

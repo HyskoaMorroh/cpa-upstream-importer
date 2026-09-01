@@ -929,6 +929,173 @@ quota-exceeded:
           f"（{len(warns)} 条警告）")
 
 
+def test_rebuild_keeps_unknown_fields():
+    """render_entry 不认识的字段必须原文搬回。
+
+    2026-09-02 拿生产 config.yaml 逐字段对账发现的数据销毁缺陷：
+    render_entry 是白名单式渲染（只写它知道的 10 个字段），而全量重探用它
+    **整段重写**。生产配置 121 个条目里 106 条带白名单外的字段，重写后全部
+    静默消失 —— YAML 合法、validate 报成功，只是行为变了：
+
+        request-scoped-errors  116 条  冷却规则，丢了坏站不再被剔除
+        excluded-models         39 条  `["*"]` = 只用显式列的模型
+        websockets               2 条  codex 的 WebSocket 开关
+        fingerprint-profile      1 条  让 CPA 自己补设备指纹
+        disabled                 1 条  手工停用的 provider 会复活
+    """
+    import yaml
+    from cpa_probe.writeback import (carry_key, extract_carry_lines,
+                                     rebuild_config_full, validate)
+    from cpa_probe.plan import SectionPlan, ImportPlan
+
+    orig = """host: "127.0.0.1"
+api-keys:
+  - "sk-client"
+
+claude-api-key:
+  # 这站限过模型
+  - api-key: "sk-A"
+    base-url: "https://a.example.com" # 注意不带 /v1
+    priority: 300
+    request-scoped-errors:
+      - status: 403
+        match:
+          - "has been banned"
+        action: continue-and-cooldown
+    excluded-models: ["*"]
+    fingerprint-profile: "claude-code-cli"
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+  - api-key: "sk-B"
+    base-url: "https://a.example.com"
+    priority: 200
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+
+codex-api-key:
+  - api-key: "cdx-A"
+    base-url: "https://a.example.com/v1"
+    priority: 100
+    websockets: true
+    models:
+      - name: "gpt-5.6-sol"
+        alias: ""
+"""
+    cfg = yaml.safe_load(orig)
+    lines = orig.splitlines(True)
+
+    # ① 提取：行尾注释不能挡住 base-url 解析（`# 注意不带 /v1` 曾让 28 条漏抓）
+    carry = extract_carry_lines(lines)
+    ca = carry["claude-api-key"]
+    got_a = ca.get(carry_key("a.example.com", "sk-A")) or []
+    txt_a = "".join(got_a)
+    for f in ("request-scoped-errors", "excluded-models", "fingerprint-profile"):
+        assert f in txt_a, f"sk-A 没搬到 {f}：{txt_a[:200]}"
+    # 嵌套结构要整块搬（match 下面的列表项）
+    assert "has been banned" in txt_a, "嵌套列表项没搬全"
+
+    # ② 同 host 不同 Key 不能互相染色。sk-B 原本没有这些字段，
+    #    退到兜底键会把 sk-A 的字段抄给它。
+    got_b = ca.get(carry_key("a.example.com", "sk-B"))
+    assert got_b == [], f"sk-B 应当是空的 carry，实得 {got_b}"
+
+    # ③ codex 段的 websockets 在 headers 之后 —— 缩进状态机要能出得来
+    cc = carry["codex-api-key"]
+    txt_c = "".join(cc.get(carry_key("a.example.com", "cdx-A")) or [])
+    assert "websockets" in txt_c, f"codex 没搬到 websockets：{txt_c!r}"
+
+    # ④ 整链：全量重建后字段计数必须与原文一致
+    plans = {}
+    for sec, ak, bu, pri in (("claude-api-key", "sk-A", "https://a.example.com", 290),
+                             ("claude-api-key", "sk-B", "https://a.example.com", 190),
+                             ("codex-api-key", "cdx-A", "https://a.example.com/v1", 90)):
+        pl = ImportPlan(host="a.example.com", masked_key=ak)
+        pl.sections[sec] = SectionPlan(
+            section=sec, base_url=bu, api_key=ak,
+            models=["claude-opus-5" if "claude" in sec else "gpt-5.6-sol"],
+            priority=pri)
+        plans[(bu, ak)] = pl
+
+    new, warns = rebuild_config_full(cfg, plans, lines)
+    ok, msg = validate(new)
+    assert ok, f"重建结果非法：{msg}"
+    n2 = yaml.safe_load(new)
+
+    def count(c, f):
+        return sum(1 for s in ("claude-api-key", "codex-api-key")
+                   for e in (c.get(s) or []) if isinstance(e, dict) and f in e)
+
+    for f in ("request-scoped-errors", "excluded-models",
+              "fingerprint-profile", "websockets"):
+        a, b = count(cfg, f), count(n2, f)
+        assert a == b, f"{f}：原 {a} 条 → 新 {b} 条"
+
+    # ⑤ 值也要一致，不只是键在
+    a_new = next(e for e in n2["claude-api-key"] if e["api-key"] == "sk-A")
+    a_old = next(e for e in cfg["claude-api-key"] if e["api-key"] == "sk-A")
+    assert a_new["request-scoped-errors"] == a_old["request-scoped-errors"]
+    assert a_new["excluded-models"] == a_old["excluded-models"]
+    # sk-B 不该被染上 sk-A 的字段
+    b_new = next(e for e in n2["claude-api-key"] if e["api-key"] == "sk-B")
+    assert "fingerprint-profile" not in b_new, "同 host 另一个 Key 被染色了"
+    # priority 是这次要改的，确实改了
+    assert a_new["priority"] == 290
+
+    # ⑥ 全局键仍在
+    assert "api-keys" in n2 and n2["api-keys"] == ["sk-client"]
+
+    print("[OK] Unknown fields carried: request-scoped-errors / excluded-models"
+          " / websockets / fingerprint-profile 逐字保真，同站不同 Key 不染色")
+
+
+def test_rebuild_keeps_proxy():
+    """proxy-url 必须搬回。
+
+    2026-09-02 对账发现：`proxy_url` 只在探测**当场判定需要代理**时才有值，
+    重探时那个站可能这次直连就通 —— 方案里 proxy_url 为空，整段重写把原有
+    的 24 条 mihomo 代理全抹掉。后果不可见：YAML 合法，但那些必须走代理的站
+    下次直连拿 403，配置里已无任何痕迹。
+    """
+    import yaml
+    from cpa_probe.batch import existing_proxies
+
+    cfg = yaml.safe_load("""
+gemini-api-key:
+  - api-key: "g1"
+    base-url: "g.example.com"
+    proxy-url: "http://mihomo:7890"
+  - api-key: "g2"
+    base-url: "g.example.com"
+  - api-key: "g3"
+    base-url: "g.example.com"
+    proxy-url: ""
+
+openai-compatibility:
+  - name: "p"
+    base-url: "https://o.example.com/v1"
+    api-key-entries:
+      - api-key: "k1"
+        proxy-url: "http://mihomo:7890"
+      - api-key: "k2"
+    models:
+      - name: "m"
+        alias: ""
+""")
+    P = existing_proxies(cfg)
+    assert P.get(("g.example.com", "g1")) == "http://mihomo:7890", P
+    # 没写的与空串都不该进表 —— 空串与「没这个键」语义相同（都不走代理），
+    # 收进来会让重建凭空写出 `proxy-url: ""`
+    assert ("g.example.com", "g2") not in P, P
+    assert ("g.example.com", "g3") not in P, P
+    # compat 段的 proxy-url 在 api-key-entries 上，不在 provider 级
+    assert P.get(("o.example.com", "k1")) == "http://mihomo:7890", P
+    assert ("o.example.com", "k2") not in P, P
+
+    print("[OK] Proxy preserved: 有值的搬回，空串与未写的不凭空添加")
+
+
 def test_rebuild_keeps_weight():
     """weight: 0 必须搬回去 —— 丢了等于让手工封禁的站复活。
 
@@ -1166,6 +1333,8 @@ if __name__ == "__main__":
         ("旧二进制检测", test_stale_binary_detection),
         ("headers 覆盖写进 YAML", test_headers_override_reaches_yaml),
         ("重建保留其余内容", test_rebuild_preserves_everything_else),
+        ("未知字段搬运", test_rebuild_keeps_unknown_fields),
+        ("proxy-url 搬运", test_rebuild_keeps_proxy),
         ("重建保留 weight", test_rebuild_keeps_weight),
         ("批量键含 api_key", test_batch_key_includes_api_key),
         ("批量记录异常站", test_batch_records_errors),
