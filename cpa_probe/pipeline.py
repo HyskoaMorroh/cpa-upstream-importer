@@ -61,6 +61,60 @@ MODEL_PREFIX_WHITELIST = ("gemini", "gpt", "claude")
 # 而 `openai-xxx`、`omni-xxx` 不该命中，单纯 startswith("o") 会误收。
 _OPENAI_REASONING_RE = re.compile(r"^o\d+(?:[.\-]|$)")
 
+def model_family(name: str) -> str:
+    """模型属于哪一族。返回 "gemini" / "gpt" / "claude" / ""（认不出）。
+
+    只看名字，不看它挂在哪个段 —— 判据就是名字本身。
+    """
+    n = (name or "").strip().lower()
+    if "/" in n:
+        n = n.split("/")[-1]
+    if n.startswith("gemini"):
+        return "gemini"
+    if n.startswith("claude"):
+        return "claude"
+    if n.startswith("gpt") or _OPENAI_REASONING_RE.match(n):
+        return "gpt"
+    return ""
+
+
+# 每段只能探本族的模型。
+#
+# 为什么必须按段过滤（2026-09-01 从 79 凭据实跑日志量化）
+# ----------------------------------------------------
+# 聚合站的 /models 目录把三族混在一起报（一个站同时声明 claude-opus-5、
+# gpt-5.6-sol、gemini-2.5-pro）。`_probe_order` 原来把整份目录倒进队列，
+# 只过 `model_allowed`（三族全放行），于是：
+#
+#     gemini 段拿 claude-opus-4-6 去打 /v1beta/models/claude-opus-4-6:generateContent
+#     codex  段拿 claude-opus-5   去打 /responses
+#
+# CPA 永远不会这样发 —— 段决定协议路径，模型必须是该协议下的模型。
+# 实测这类请求占协议段总请求的 **56%**（435/773），成功率 5.5%，而同族
+# 是 24.6%（4.5 倍差）。更要紧的是跨族请求里 **240 次返回 500**（占跨族
+# 55%，同族一次都没有），而 500 被 classify 判「临时」→ 触发重试 → 又一次
+# 500，日志里 666 次 500 的最大头就是这么来的。
+#
+# 除了白烧配额，反复拿协议不匹配的模型名轰炸正是站方风控盯的形态 ——
+# 用户明确要求过不许用容易触发封号的探测手段。
+#
+# compat 段不设限：它走 /chat/completions，本身就是「什么模型都能转」的
+# 万能口，三族都合法（日志里 compat 段跨族请求的成功率与同族持平）。
+SECTION_FAMILY: dict[str, str] = {
+    "gemini-api-key": "gemini",
+    "codex-api-key": "gpt",
+    "claude-api-key": "claude",
+}
+
+
+def model_fits_section(section: str, name: str) -> bool:
+    """这个模型能不能在这个段上探。compat 段一律 True。"""
+    want = SECTION_FAMILY.get(section)
+    if not want:
+        return True
+    return model_family(name) == want
+
+
 # 每段最多验几个模型。聚合站声明几百个（relay-m 曾 838 个），
 # 全验会触发反测活且极贵。
 MAX_MODELS_PER_SECTION = 4
@@ -76,6 +130,43 @@ MAX_MODELS_PER_SECTION = 4
 # 取 10：够拿到 4 个可信模型（种子 2-3 个 + 目录里前几个通常就够），
 # 又把最坏情形从「目录长度」压到常数。
 MAX_MODEL_ATTEMPTS_PER_SECTION = 10
+
+# 什么情况下值得换出口 IP 再试一次（2026-09-01 按 79 凭据实跑日志定的）
+#
+# 为什么不是「不通就试代理」：那轮日志里 56 个 (站, 段) 组合，35 个不通。
+# 全试要多发 70-105 次请求，而其中一多半的失败原因与出口 IP 毫无关系 ——
+# 余额要充值、鉴权是 Key 不对、死路是分组没这个渠道、客户端要的是请求画像。
+# 那些请求发出去注定是同一个错，只是把账单和封号风险抬高。
+#
+# 分两级的理由：代理请求本身也可能超时（日志里 43 次代理尝试有 3 次拿 000），
+# 所以只有「拦的就是 IP」这一类值得抢在其余处置之前；原因不明的那些放到
+# 最后补一次，前提是别的路都走完了。
+_PROXY_FIRST = frozenset({
+    "IP封",     # CF 挑战 / 边缘按 IP 声誉拦 —— 换 IP 是对症处置
+    "边缘",     # 403 空正文，CF 概率性拦截
+})
+_PROXY_SECOND = frozenset({
+    "未知",     # 定不了性，换条链路是最便宜的一次排除
+    "临时",     # 5xx。站方过载与中间链路故障从正文分不出来
+})
+
+# 明确**不**试代理的类别，连同理由。这个表不参与判断（判断只看上面两个
+# 集合），存在的意义是让「为什么不试」可追溯 —— 否则下一个人只会看到
+# 一个不含它们的白名单，无从判断是有意省略还是漏了。
+_PROXY_POINTLESS = {
+    "WAF": "认客户端形态而非 IP。实测某站三段都配了 mihomo，仍返回同一个拦截页",
+    "余额": "充值即自愈，与出口 IP 无关",
+    "鉴权": "401 是凭据本身的问题",
+    "死路": "分组里没有这个渠道，换 IP 不会变出来",
+    "客户端": "要的是请求画像（UA / beta 头），不是 IP",
+    "时段": "等窗口，换 IP 不改变站方的时间判断",
+    "限流": "429，CPA 自带冷却轮换",
+    "限频": "探测节奏问题，加大 gap 而非换 IP",
+    "反测活": "探测文本触发的，换文本而非换 IP",
+    "换模": "站方确实回了响应，只是换了模型",
+    "注入": "CPA 自注入的工具被拒，关开关而非换 IP",
+    "门禁": "站方后台开关",
+}
 
 
 def _encode(body: dict) -> bytes:
@@ -659,8 +750,17 @@ class Prober:
                     v.models = self._accept(v, model, att)
                     return v
 
-            # IP封 / 边缘：代理是最高优先级处置
-            if att.category in ("IP封", "边缘") and self.live_proxy:
+            # 换出口 IP 值不值得试一次 —— 按类别分级，不是「不通就试」。
+            #
+            # 2026-09-01 用 79 凭据的实跑日志量化过（见 _PROXY_FIRST/_SECOND
+            # 的说明）：全试要多发 70-105 次请求，而其中一多半类别的失败原因
+            # 与出口 IP 无关，那些请求注定白花。所以分两级：
+            #   第一级 IP封/边缘  —— 拦的就是 IP，代理是首选处置，立刻试
+            #   第二级 未知/临时  —— 原因不明或疑似链路问题，其余处置都用尽后补一次
+            # 已证伪的不试：WAF（认客户端形态，实测带代理仍同一拦截页）、
+            # 余额（充值自愈）、鉴权（401 凭据）、死路（分组无渠道）、
+            # 客户端（要画像不要 IP）、时段（等窗口）。
+            if att.category in _PROXY_FIRST and self.live_proxy:
                 att = self._call(
                     section, base, row.api_key, model,
                     combo="via-proxy", proxy=self.live_proxy,
@@ -702,6 +802,38 @@ class Prober:
         if seen:
             best = min(seen, key=lambda ca: self._severity_rank(ca[0]))
             v.category, v.action = best
+
+        # 第二级代理：原因不明（未知）或疑似链路问题（临时）的段，在**所有**
+        # 其余处置都用尽之后补一次换 IP。
+        #
+        # 为什么放在这里而不是与第一级同处：这两类不是「拦的就是 IP」，代理只是
+        # 一个便宜的排除法。放在处置链前面会插在画像梯之前，把本该由画像解决的
+        # 站先浪费两次代理请求；放在收敛之后则只在真的无路可走时才花这一次。
+        #
+        # 只用第一个种子模型试一次 —— 若换链路真能通，一次就看得出来；
+        # 通了也不直接判 usable，而是**重走一遍接受判定**（_accept 会查换模、
+        # 空正文错误体这些假阳性），否则等于给代理路径开了个免检后门。
+        if (not v.usable and v.category in _PROXY_SECOND and self.live_proxy
+                and probe_models):
+            was = v.category
+            model = probe_models[0]
+            att = self._call(section, base, row.api_key, model,
+                             combo="via-proxy-last", proxy=self.live_proxy,
+                             **self._profile_kwargs(v, row.api_key))
+            v.attempts.append(att)
+            if att.ok:
+                # 走 _accept 而不是直接置 models —— 它查换模与「200 包错误体」
+                # 这两种假阳性。拒收时返回空列表，段仍不可写，不会静默进配置。
+                accepted = self._accept(v, model, att)
+                if accepted:
+                    v.usable = True
+                    v.need_proxy = True
+                    v.category, v.action = att.category, att.action
+                    v.models = accepted
+                    self.on_event("proxy-rescued", {
+                        "section": section, "host": host_of(base),
+                        "model": model, "was": was,
+                    })
         return v
 
     def _profile_kwargs(self, v: SectionVerdict, api_key: str) -> dict:
@@ -925,7 +1057,14 @@ class Prober:
             if not token:
                 break
 
-        catalog = [m for m in seen if model_allowed(m)]
+        # 两道闸：白名单（三族之外一律不要）+ 段族（本段只留本族）。
+        #
+        # 段族这道尤其影响界面：`v.catalog` 会成为方案里「可信模型」的候选
+        # 清单，操作员在上面勾选要注册哪些。不过滤的话 gemini 段会列出
+        # claude-opus-5 / gpt-oss-120b —— 勾上就写进 gemini-api-key，
+        # 而 CPA 拿它去打 :generateContent 每次必失败。
+        catalog = [m for m in seen
+                   if model_allowed(m) and model_fits_section(section, m)]
         # 载荷保持 {section, count} 两字段 —— 前端与 test_pipeline 的
         # 「catalog 载荷字段」断言按这个约定写。host 由 candidate-start
         # 给出，这里重复只会让事件流变胖；白名单滤掉多少不进载荷，避免
@@ -947,6 +1086,11 @@ class Prober:
         # 目录里与种子同名的排到最前 —— 既在目录里、又是已知好用的模型
         preferred = [m for m in SEED_MODELS[section] if m in catalog]
         for m in preferred + catalog + SEED_MODELS[section]:
+            # 段族闸：三个协议段只探本族。聚合站目录三族混报，不过这道闸
+            # 会让 gemini 段拿 claude 模型去打 :generateContent —— CPA 永远
+            # 不会那样发，56% 的请求白烧且 55% 回 500。见 SECTION_FAMILY。
+            if not model_fits_section(section, m):
+                continue
             if m not in order and m not in skip and model_allowed(m):
                 order.append(m)
         return order

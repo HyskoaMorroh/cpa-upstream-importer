@@ -62,6 +62,10 @@ _HOST_NOISE = ("www", "api", "app", "sub", "ai", "gw", "proxy", "openai",
                "chat", "relay", "hub", "cdn", "new")
 
 # 公共后缀（含二级）。剥到只剩「站名」那一段。
+#
+# 后面几个（cloudns / do / gg / hxi）不是笔误：动态 DNS 服务商与国别顶级域
+# 也会出现在中转站域名里，不剥掉就会把服务商名字当成站名，prefix 跟着错。
+# 这是**运行时数据**，删任何一项都会让对应站的词干算错。
 _TLD_TAIL = ("com", "cn", "net", "org", "io", "co", "cc", "me", "top",
              "xyz", "dev", "app", "icu", "space", "site", "online", "pro",
              "cloud", "cloudns", "do", "hxi", "gg", "ai")
@@ -74,8 +78,8 @@ def stem(host: str) -> str:
 
     api.7x9zk.com          -> 7x9zk       数字开头，candidate() 要前置 N
     sub.42labs.space       -> 42labs      子域名不是站名
-    api.mysite.cloudns.org -> mysite      cloudns 是动态 DNS 服务商，不是站名
-    somesite.hxi.me        -> somesite    无 api. 前缀，词干就在最左
+    api.mysite.dyndns-x.example -> mysite   动态 DNS 服务商的后缀不是站名
+    somesite.short-d.example    -> somesite 无 api. 前缀，词干就在最左
     ai.foobar.com          -> foobar      ai 是噪声词
     """
     h = host_of(host) or str(host or "").strip().lower()
