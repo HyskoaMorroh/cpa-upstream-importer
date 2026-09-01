@@ -68,6 +68,7 @@ from .writeback import (
     write_local,
 )
 from .batch import BatchProber
+from .resources import Resources, detect as detect_resources
 
 __all__ = [
     "SECTIONS",
@@ -123,4 +124,6 @@ __all__ = [
     "verify_upstream",
     "write_local",
     "BatchProber",
+    "Resources",
+    "detect_resources",
 ]

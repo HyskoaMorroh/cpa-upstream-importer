@@ -260,6 +260,10 @@ def run_job(job: Job, cfg_path: str) -> None:
             probe_context=bool(job.opts.get("probe_context", True)),
             swap_samples=int(job.opts.get("swap_samples", 3)),
             workers=int(job.opts.get("workers", 4)),
+            max_models=int(job.opts.get("max_models", 4)),
+            max_model_attempts=int(job.opts.get("max_model_attempts", 10)),
+            reuse_profile_verdict=bool(
+                job.opts.get("reuse_profile_verdict", True)),
             on_event=job.emit,
         )
 
@@ -324,31 +328,57 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
 
         # 提取既有站
         existing_entries = extract_existing_entries(cfg)
-        job.emit("info", {"msg": f"提取到 {len(existing_entries)} 个既有站"})
+        job.emit("info", {"msg": f"提取到 {len(existing_entries)} 个既有条目"})
 
-        # 合并新站：将既有站转为假的输入行格式
-        fake_lines = []
-        for section_short, base_url, api_key, _orig in existing_entries:
-            # 构造假的行文本（parse_lines 会用）
-            fake_lines.append(f"{base_url},{api_key}")
+        # 按凭据去重 —— **这一步省掉的量比并发还多**。
+        #
+        # config.yaml 的条目是「(凭据, 段)」的组合：同一个 url+key 常被写进
+        # 2-4 个段（gemini / codex / claude / compat），因为很多中转站用同一把
+        # Key 提供多种协议。实测这份配置 175 个条目其实只有 77 个不同凭据，
+        # 9 个跨全四段、11 个跨三段、49 个跨两段。
+        #
+        # 而 Prober.probe() 的语义本来就是「拿一个凭据把四段各打一遍」——
+        # 按条目喂它等于同一个凭据重复探 2-4 次，那份配置会白打 98 次全流程。
+        #
+        # 去重键取 (host, api_key) 而不是 (base_url, api_key)：同一个站在
+        # 不同段的 base-url 形态不同（codex/compat 带 /v1，另两段不带），
+        # 用 base_url 会把同一个凭据判成两个。host_of 已经小写化并剥掉协议。
+        seen_cred: set[tuple[str, str]] = set()
+        lines: list[str] = []
+        dup = 0
+        for _sec, base_url, api_key, _orig in existing_entries:
+            ck = (cp.host_of(base_url), api_key)
+            if ck in seen_cred:
+                dup += 1
+                continue
+            seen_cred.add(ck)
+            lines.append(f"{base_url},{api_key}")
 
-        # 新站的原始文本
+        # 新站：原始文本，同样参与去重（用户可能粘贴了已在配置里的站）
         for row in job.rows:
-            fake_lines.append(row.raw)
+            ck = (cp.host_of(row.bare), row.api_key)
+            if ck in seen_cred:
+                dup += 1
+                continue
+            seen_cred.add(ck)
+            lines.append(row.raw)
 
-        # 重新解析（统一走 parse_lines，保证 ParsedRow 结构完整）
-        all_text = "\n".join(fake_lines)
-        parsed = cp.parse_lines(all_text)
-        all_rows = [
-            cp.ParsedRow(line_no=i, raw=line)
-            for i, (section, base, key) in enumerate(parsed.valid)
-        ]
-        # 补齐字段
-        for i, (section, base, key) in enumerate(parsed.valid):
-            all_rows[i].bare = base
-            all_rows[i].api_key = key
+        if dup:
+            job.emit("info", {
+                "msg": f"按 (站, Key) 去重：{len(existing_entries) + len(job.rows)} "
+                       f"个条目 → {len(lines)} 个凭据，省掉 {dup} 次重复探测"
+            })
 
-        job.emit("info", {"msg": f"总计 {len(all_rows)} 个站（既有 {len(existing_entries)} + 新增 {len(job.rows)}）"})
+        # 统一走 parse_lines，保证 ParsedRow 的 bare 按段规范化过
+        parsed = cp.parse_lines("\n".join(lines))
+        all_rows = list(parsed.valid)
+        if parsed.invalid:
+            job.emit("info", {"msg": f"{len(parsed.invalid)} 行解析失败，已跳过"})
+
+        job.emit("info", {
+            "msg": f"待探测 {len(all_rows)} 个凭据"
+                   f"（每个凭据四段各探一遍，段级并发）"
+        })
 
         # 创建 Prober
         prober = Prober(
@@ -358,6 +388,10 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
             probe_context=bool(job.opts.get("probe_context", True)),
             swap_samples=int(job.opts.get("swap_samples", 3)),
             workers=int(job.opts.get("workers", 4)),
+            max_models=int(job.opts.get("max_models", 4)),
+            max_model_attempts=int(job.opts.get("max_model_attempts", 10)),
+            reuse_profile_verdict=bool(
+                job.opts.get("reuse_profile_verdict", True)),
             on_event=job.emit,
         )
 
@@ -810,6 +844,11 @@ class Handler(BaseHTTPRequestHandler):
         existing_entries = cp.extract_existing_entries(cfg)
         existing_count = len(existing_entries)
 
+        # 运行环境与推荐并发数。前端要显示「为什么是这个数」，所以连
+        # 依据（cpus/memory/来源/reason）一起给，不只给一个数字。
+        # 容器里 os.cpu_count() 是宿主机核数，必须读 cgroup —— 见 resources 模块。
+        res = cp.detect_resources()
+
         self._json(200, {
             "config_path": type(self).cfg_path,
             "lines": raw.count("\n") + 1,
@@ -817,6 +856,7 @@ class Handler(BaseHTTPRequestHandler):
             "sections": bands,
             "section_order": list(cp.SECTIONS),
             "existing_count": existing_count,
+            "resources": res.as_dict(),
         })
 
     def _api_parse(self, body: dict) -> None:
