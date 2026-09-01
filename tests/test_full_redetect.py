@@ -715,6 +715,38 @@ def test_stale_binary_detection():
     print("[OK] Stale binary: 版本不一致告警，缺失一侧时不误判")
 
 
+def test_headers_override_reaches_yaml():
+    """overrides.headers 必须一路走到写出的 YAML 行。
+
+    后端早就认这个键，但前端一直没有入口 —— 现在加了编辑器，这条链得有测试
+    守着：任何一环把它丢掉（build_plan 不接、render_entry 不写），
+    表现都是「界面上改了，写进去的还是旧的」，而那个很难当场发现。
+    """
+    from cpa_probe.plan import SectionPlan, ImportPlan
+    from cpa_probe.writeback import render_entry
+
+    sp = SectionPlan(
+        section="claude-api-key",
+        base_url="h.example.com", api_key="sk-x",
+        models=["claude-opus-5"], priority=500,
+        headers={"x-my-custom": "v1", "anthropic-beta": "only-this"},
+    )
+    lines = render_entry(sp, "  ", "    ", "2026-09-01")
+    text = "\n".join(lines)
+
+    assert "headers:" in text, text
+    assert 'x-my-custom: "v1"' in text, text
+    assert 'anthropic-beta: "only-this"' in text, text
+
+    # 空 headers 不该写出一个空的 headers: 键 —— 那是合法 YAML 但语义是
+    # 「显式给了空映射」，与「没有这个字段」不同
+    sp2 = SectionPlan(section="claude-api-key", base_url="h.example.com",
+                      api_key="sk-x", models=["m"], priority=1, headers={})
+    assert "headers:" not in "\n".join(render_entry(sp2, "  ", "    ", "x"))
+
+    print("[OK] Headers override: 覆盖值走到 YAML，空 headers 不写空键")
+
+
 def test_profile_matches_real_cpa_source():
     """如果本机有 CPA 源码，画像梯必须与它一致（无 warn 级漂移）。
 
@@ -770,6 +802,7 @@ if __name__ == "__main__":
         ("画像梯对齐真实 CPA 源码", test_profile_matches_real_cpa_source),
         ("远程模式降级", test_drift_remote_degrade),
         ("旧二进制检测", test_stale_binary_detection),
+        ("headers 覆盖写进 YAML", test_headers_override_reaches_yaml),
     ]
 
     ok = 0

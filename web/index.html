@@ -206,6 +206,26 @@ textarea::placeholder{color:var(--ink-3)}
   font-family:var(--f-mono);font-size:12px;line-height:1.65;
   white-space:pre;overflow-x:auto;
 }
+/* headers 手工编辑：塞在结果表每段的展开行里，默认折起 —— 多数时候不需要改，
+   摊开会让本来就宽的结果表更难看。 */
+.hedit{margin-top:10px;font-size:13px}
+.hedit>summary{
+  cursor:pointer;user-select:none;color:var(--ink-2);
+  padding:4px 0;font-weight:600;
+}
+.hedit>summary:hover{color:var(--ink)}
+.hbody{padding:8px 0 4px}
+.hrows{display:flex;flex-direction:column;gap:6px}
+.hrow{display:flex;gap:8px;align-items:center}
+.hrow>input{
+  font:inherit;font-size:12.5px;padding:5px 8px;
+  background:var(--bg-2);color:var(--ink);
+  border:1px solid var(--line);border-radius:6px;
+}
+.hrow>input:focus{outline:2px solid var(--accent-2);outline-offset:1px}
+.hrow>.hk{flex:0 0 210px;font-family:var(--f-mono)}
+.hrow>.hv{flex:1 1 auto;min-width:120px;font-family:var(--f-mono)}
+.hrow>.hdel{flex:0 0 auto;padding:2px 8px;line-height:1.4}
 /* 高级设置：默认折起。这几项能显著改变请求量，摊开会让主面板显得可怕，
    但藏进另一个页面又会让人找不到 —— details 是这两者之间唯一不需要 JS 的解。 */
 .adv{margin:14px 0 4px;border:1px solid var(--line);border-radius:9px;

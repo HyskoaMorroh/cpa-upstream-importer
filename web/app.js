@@ -44,6 +44,7 @@ const S = {
   reuseSaved: 0,        // 形态复用省下的请求数
   reuseSeen: null,      // 已计数过的 shape-reused 事件键（防重拉重复累加）
   diagYaml: null,       // 诊断结果的 YAML 片段 {段: 文本}。不进 HTML 属性
+  keepOpen: '',         // 重渲染后要重新展开哪个 headers 编辑器（'host sec'）
 };
 
 const pk = (host, sec) => `${host}\u0000${sec}`;
@@ -1146,9 +1147,19 @@ async function refreshPlan(silent) {
           ? `<div class="warn b">已存在：${esc(sp.duplicate_note)}</div>` : '')
           + sp.warnings.map((w) =>
             `<div class="warn${/抢走|换模/.test(w) ? ' b' : ''}">${esc(w)}</div>`).join('')
-          + impactTable(sp);
+          + impactTable(sp)
+          + headerEditor(p.host, sec, sp);
         wb.innerHTML = html;
-        wrow.hidden = !html;
+        // headers 编辑器一直在，所以 wrow 不再按 html 空否决定显隐 ——
+        // 它现在总有内容。
+        wrow.hidden = false;
+        bindHeaderEditor(wb, p.host, sec);
+        // 重渲染会把 <details> 的展开态清掉。刚才在编辑哪一段就把它重新展开 ——
+        // 否则每次防抖结算完编辑器都自己收起来，等于没法连续改。
+        if (S.keepOpen === `${p.host} ${sec}`) {
+          const det = wb.querySelector('.hedit');
+          if (det) det.open = true;
+        }
       }
     });
   });
@@ -1156,6 +1167,152 @@ async function refreshPlan(silent) {
   return d;
 }
 const cssq = (s) => String(s).replace(/["\\]/g, '\\$&');
+
+// ── headers 手工编辑 ──
+// 后端 _api_plan 早就认 overrides.headers，但前端一直只能整段接受探测结果。
+// 两种情形都真实存在：探测判门禁但你从别处知道正确的头；探测给出的头多了一项
+// （漂移检测就抓到过无条件发 oauth-2025-04-20 那一处）。
+//
+// 最要紧的设计点：**改动后必须标「未验证」**。探测是用原来那套跑通的，改了
+// 就没测过了 —— 界面仍显示「✓ 可用」会让人以为改后的配置也验证过。
+function headerEditor(host, sec, sp) {
+  const ov = ((S.overrides[host] || {})[sec] || {});
+  const edited = Object.prototype.hasOwnProperty.call(ov, 'headers');
+  const cur = edited ? ov.headers : (sp.headers || {});
+  const keys = Object.keys(cur);
+
+  const rows = keys.map((k, i) => hdrRow(k, cur[k], i)).join('');
+  const warn = edited
+    ? `<div class="warn b">headers 已手工改过 —— 这一段的「已验证」不再成立。
+         探测是用改动前那套跑通的。</div>`
+    : '';
+
+  return `<details class="hedit" data-host="${esc(host)}" data-sec="${esc(sec)}">
+    <summary>请求头 <span class="hint">${keys.length} 项${edited ? ' · 已手工改过' : ''}</span></summary>
+    <div class="hbody">
+      ${warn}
+      <div class="hrows">${rows}</div>
+      <div class="row" style="margin-top:8px">
+        <button class="mini hadd">+ 加一行</button>
+        <button class="mini hreset"${edited ? '' : ' disabled'}>恢复探测值</button>
+        <span class="hint hmsg"></span>
+      </div>
+      <div class="hint" style="margin-top:6px">留空的行提交时丢弃。头名大小写不敏感，
+        但**值**的形态必须精确 —— 站方按值匹配。</div>
+    </div>
+  </details>`;
+}
+
+function hdrRow(k, v, i) {
+  return `<div class="hrow">
+    <input type="text" class="hk" value="${esc(k)}" placeholder="header 名"
+      aria-label="第 ${i + 1} 个 header 名">
+    <input type="text" class="hv" value="${esc(v)}" placeholder="值"
+      aria-label="第 ${i + 1} 个 header 值">
+    <button class="mini hdel" title="删掉这一行">×</button>
+  </div>`;
+}
+
+// 已知的头名。用于「拼错了」的提示 —— 只警告不阻止：这张表不可能穷尽
+// 所有站方要的头，挡住合法冷门头比放过一个手滑更糟。
+const KNOWN_HEADERS = [
+  'user-agent', 'anthropic-beta', 'anthropic-version', 'x-app',
+  'anthropic-dangerous-direct-browser-access', 'originator',
+  'x-stainless-lang', 'x-stainless-runtime', 'x-stainless-retry-count',
+  'x-stainless-timeout', 'x-stainless-runtime-version',
+  'x-stainless-package-version', 'x-stainless-os', 'x-stainless-arch',
+  'x-claude-code-session-id', 'x-goog-api-client', 'accept', 'accept-encoding',
+  'authorization', 'x-api-key', 'content-type',
+];
+
+function bindHeaderEditor(wb, host, sec) {
+  const det = wb.querySelector('.hedit');
+  if (!det) return;
+  const rowsBox = det.querySelector('.hrows');
+  const msg = det.querySelector('.hmsg');
+
+  const collect = () => {
+    const out = {};
+    [].slice.call(rowsBox.querySelectorAll('.hrow')).forEach((r) => {
+      const k = r.querySelector('.hk').value.trim();
+      const v = r.querySelector('.hv').value.trim();
+      // 空 key 或空 value 一律丢弃 —— 与 CPAMP 的 buildHeaderObject 同口径，
+      // 两边行为不同会让人在一处试通、另一处失败时找不到原因。
+      if (k && v) out[k] = v;
+    });
+    return out;
+  };
+
+  const check = (h) => {
+    const bad = Object.keys(h).filter(
+      (k) => !KNOWN_HEADERS.includes(k.toLowerCase()));
+    const under = Object.keys(h).filter((k) => k.includes('_'));
+    const bits = [];
+    if (under.length) {
+      bits.push(`${under.join('、')} 含下划线 —— HTTP 头一般用连字符，`
+        + `确认不是 anthropic_beta 这类手滑`);
+    }
+    if (bad.length) bits.push(`未见过的头名：${bad.join('、')}`);
+    msg.textContent = bits.length ? `⚠ ${bits.join('；')}` : '';
+    msg.style.color = bits.length ? 'var(--warn)' : '';
+  };
+
+  // 写进 S.overrides 但**不**立刻 refreshPlan —— 那会重渲染整个 .wbox，
+  // 把正在输入的框连焦点带光标一起换掉。边打字边跳焦点是不能用的。
+  const stash = () => {
+    const h = collect();
+    check(h);
+    S.overrides[host] = S.overrides[host] || {};
+    S.overrides[host][sec] = S.overrides[host][sec] || {};
+    S.overrides[host][sec].headers = h;
+    det.querySelector('.hreset').disabled = false;
+  };
+
+  let timer = null;
+  det.addEventListener('input', (e) => {
+    if (!e.target.classList.contains('hk')
+        && !e.target.classList.contains('hv')) return;
+    stash();
+    // 停手 700ms 才重算方案。数字是权衡：太短仍会在连续输入中打断，
+    // 太长会让「改了头之后 priority 建议随之变化」这件事显得没反应。
+    clearTimeout(timer);
+    timer = setTimeout(() => { S.keepOpen = `${host} ${sec}`; refreshPlan(); }, 700);
+  });
+  // 失焦立即结算 —— 用户已经改完了，不该再等那 700ms
+  det.addEventListener('focusout', () => {
+    if (!timer) return;
+    clearTimeout(timer); timer = null;
+    S.keepOpen = `${host} ${sec}`;
+    refreshPlan();
+  });
+  det.addEventListener('click', (e) => {
+    const add = e.target.closest('.hadd');
+    const del = e.target.closest('.hdel');
+    const rst = e.target.closest('.hreset');
+    if (add) {
+      e.preventDefault();
+      rowsBox.insertAdjacentHTML('beforeend',
+        hdrRow('', '', rowsBox.children.length));
+      rowsBox.lastElementChild.querySelector('.hk').focus();
+      return;
+    }
+    if (del) {
+      e.preventDefault();
+      del.closest('.hrow').remove();
+      commit();
+      return;
+    }
+    if (rst) {
+      e.preventDefault();
+      // 删掉这个键而不是置空 —— 「没改过」与「改成空」是两件事，
+      // 后者应当真的写出一个空 headers。
+      if (S.overrides[host] && S.overrides[host][sec]) {
+        delete S.overrides[host][sec].headers;
+      }
+      refreshPlan();
+    }
+  });
+}
 
 // 逐模型影响面。抢顶层与挡下层是两件事，都要能看见。
 function impactTable(sp) {
