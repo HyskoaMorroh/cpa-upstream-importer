@@ -670,6 +670,51 @@ const (
           f"未核对与部分核对都有明确标记")
 
 
+def test_drift_remote_degrade():
+    """远程模式拉不到时必须落到 config.yaml 路径，并带出失败原因。
+
+    不能静默降级 —— 那会让人以为「已按源码核对过」，而实际只比了 UA 与
+    X-Stainless 几项。这一项不发真实网络请求（用不存在的 ref 让它必然失败）。
+    """
+    from cpa_probe import cpa_source_probe as csp
+    from cpa_probe import profiles as _pf
+
+    r = csp.check(allow_remote=True, remote_ref="no-such-ref-xyz-9999",
+                  cfg={"claude-header-defaults":
+                       {"os": _pf._CC_OS_DEFAULT + "-NEW"}})
+    assert r["checked"] is True, r
+    assert r.get("partial") is True, "退到 config 路径必须标 partial"
+    assert r.get("remote_failed"), "远程失败的原因必须带出去，不能静默"
+    assert r["uncovered"], "必须写明哪些没覆盖到"
+
+    # 连 config 也没有时，checked 必须是 False
+    r2 = csp.check(allow_remote=True, remote_ref="no-such-ref-xyz-9999",
+                   cfg=None)
+    assert r2["checked"] is False, r2
+    assert "远程拉取失败" in r2["why"], r2["why"]
+
+    print("[OK] Remote degrade: 拉取失败时降级到 config 路径并带出原因")
+
+
+def test_stale_binary_detection():
+    """源码 commit 与运行中 CPA 的 commit 不一致时要警告。"""
+    from cpa_probe import cpa_source_probe as csp
+
+    # 两侧都有且不同 → 出警告
+    d = csp._stale_drift("aaaaaaaaaaaa", "bbbbbbbbbbbb")
+    assert d is not None and d.severity == "warn", d
+
+    # 前缀相同（短 sha vs 长 sha）→ 不警告
+    assert csp._stale_drift("abc1234def56", "abc1234") is None
+    assert csp._stale_drift("abc1234", "abc1234def56") is None
+
+    # 任一缺失 → 不判（不能因为拿不到就报不一致）
+    assert csp._stale_drift("", "abc1234") is None
+    assert csp._stale_drift("abc1234", "") is None
+
+    print("[OK] Stale binary: 版本不一致告警，缺失一侧时不误判")
+
+
 def test_profile_matches_real_cpa_source():
     """如果本机有 CPA 源码，画像梯必须与它一致（无 warn 级漂移）。
 
@@ -723,6 +768,8 @@ if __name__ == "__main__":
         ("画像结论复用省请求", test_profile_verdict_reuse_saves_calls),
         ("画像漂移检测", test_profile_drift_detection),
         ("画像梯对齐真实 CPA 源码", test_profile_matches_real_cpa_source),
+        ("远程模式降级", test_drift_remote_degrade),
+        ("旧二进制检测", test_stale_binary_detection),
     ]
 
     ok = 0

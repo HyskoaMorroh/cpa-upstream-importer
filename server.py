@@ -490,6 +490,14 @@ class Handler(BaseHTTPRequestHandler):
     # CLIProxyAPI 源码根。给了就能精确核对画像梯是否随 CPA 升级而过期
     # （见 cpa_source_probe）。容器里默认没有 —— 只挂了 config.yaml。
     cpa_source_root = ""
+    # 允许从 GitHub 直接拉那两个 Go 文件做漂移检测（只读、约 110KB、缓存 6h）。
+    # 适合「VPS 上只有 compose + config + env + nginx 四个文件」的部署 ——
+    # 不需要源码目录、不需要 git。默认开：它只出网读公开源码，不传任何本地数据。
+    cpa_source_remote = True
+    cpa_source_ref = "main"
+    # 拉 GitHub 用的代理。国内 VPS 直连 raw.githubusercontent 常不通，
+    # 而这台机器上通常已经有 mihomo —— 复用它。
+    drift_proxy = ""
     token = ""
     # 容器里 config.yaml 是单文件挂载，同目录不可写 —— 备份要落到另一个卷
     backup_dir = ""
@@ -890,7 +898,10 @@ class Handler(BaseHTTPRequestHandler):
         # 的 header-defaults。两条都不成立时明确报「无法核对」，不假装检查过。
         drift = cp.check_profile_drift(
             source_root=type(self).cpa_source_root, cfg=cfg,
-            runtime_commit=_cpa_runtime_commit(type(self).cpa_url))
+            runtime_commit=_cpa_runtime_commit(type(self).cpa_url),
+            allow_remote=type(self).cpa_source_remote,
+            remote_ref=type(self).cpa_source_ref,
+            proxy=type(self).drift_proxy or None)
 
         self._json(200, {
             "config_path": type(self).cfg_path,
@@ -1319,6 +1330,15 @@ def main() -> None:
                     help="CLIProxyAPI 源码根目录。给了才能精确核对画像梯是否"
                          "随 CPA 升级过期；不给则退回读 config.yaml 的 "
                          "claude-header-defaults（覆盖面小）")
+    ap.add_argument("--no-drift-remote", action="store_true",
+                    help="禁止从 GitHub 拉 CPA 源码做漂移检测。默认允许 —— "
+                         "只读公开源码、不传任何本地数据、缓存 6 小时")
+    ap.add_argument("--drift-ref", default=os.environ.get("CPA_SOURCE_REF", "main"),
+                    help="拉哪个 ref 的源码。你运行的 CPA 不是最新版时，"
+                         "指到对应 tag（如 v7.2.0）才能得到有意义的比对")
+    ap.add_argument("--drift-proxy", default=os.environ.get("DRIFT_PROXY", ""),
+                    help="拉 GitHub 用的代理（如 http://mihomo:7890）。"
+                         "国内 VPS 直连 raw.githubusercontent 常不通")
     ap.add_argument("--no-cpa-key", action="store_true",
                     help="不接受 CPA 管理密钥登录，只认本服务的 token")
     args = ap.parse_args()
@@ -1336,6 +1356,9 @@ def main() -> None:
     Handler.accept_cpa_key = not args.no_cpa_key
     Handler.cpa_url = args.cpa_url
     Handler.cpa_source_root = args.cpa_source
+    Handler.cpa_source_remote = not args.no_drift_remote
+    Handler.cpa_source_ref = args.drift_ref
+    Handler.drift_proxy = args.drift_proxy
 
     cpa_hash = Handler._cpa_mgmt_hash()
     try:
