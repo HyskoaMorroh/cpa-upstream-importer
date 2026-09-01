@@ -842,6 +842,103 @@ https://other.example.org/v1,sk-yyyyyyyyyyyy
 
 ---
 
+## 先诊断一个站：它到底要什么 header
+
+批量导入之前常有个更具体的问题：**这个站为什么 401？它的门票是什么？**
+
+页面顶部「单站诊断」折叠区回答这个。填 url + key、选段、点开始，它按画像梯
+由省到全试，第一个通过的档就是最小必需集：
+
+```
+      baseline         t0 403  客户端  37ms   站方不查客户端身份
+      cc-min           t1 403  客户端  13ms   只查 UA 形态与 claude-code beta
+  ✓   cc-std           t2 200         31ms   另查 x-app / anthropic-version
+
+最小必需画像：cc-std（试了 3 档）
+下面这段可直接粘进 config.yaml 的该段条目里：
+
+  - api-key: "<你的 key>"
+    base-url: "https://api.example.com"
+    headers:
+      user-agent: "claude-cli/2.1.220 (external, cli)"
+      anthropic-beta: "claude-code-20250219,interleaved-thinking-2025-05-14,…"
+      x-app: "cli"
+      anthropic-version: "2023-06-01"
+      anthropic-dangerous-direct-browser-access: "true"
+
+[复制 YAML]  [填进上面的输入框]
+```
+
+**它与批量导入是两个不同的意图**，所以不共用流水线：诊断只回答一个问题，
+不建任务、不生成方案、不写回。想导入就点「填进上面的输入框」走正常流程 ——
+诊断与写回之间必须有人工确认这一跳。
+
+默认只查 claude 段（3–8 次请求）。选「全部四段」约 25 次。
+
+它用的是 `profiles.ladder()`，与实际探测**同一套画像梯** —— 诊断结论必须与
+真正导入时的行为一致，所以没有另写一份表。
+
+三种结论的处置完全不同，界面分开说：
+
+| 结论 | 意味着 |
+|---|---|
+| 命中某档且需要 headers | 给你 YAML，直接粘 |
+| baseline 就通 | `headers` 留空即可，不需要任何头 |
+| 整梯全败 | **不一定是拒绝你** —— 可能余额、限时段、或只认浏览器。看每档的正文摘要判断 |
+
+命中的档如果还需要请求体字段（`needs_body`），界面会单独提示：headers 表达不了
+它，claude 段可在条目里设 `fingerprint-profile: claude-code-cli` 让 CPA 自己补，
+其余三段配置层无解。
+
+命令行等价物（VPS 上没开网页时用）：
+
+```bash
+docker exec -i upstream-importer python3 /app/tools/diag-identity.py \
+  --url https://api.example.com --key sk-xxx --section claude-api-key
+```
+
+---
+
+## 改探测给出的 headers
+
+探测判出的 headers 不是不可改的。结果表每段有个「请求头」折叠区，可以逐项编辑、
+加行、删行。两种情形会用到：
+
+- 探测判「门禁」，但你从别处知道正确的头
+- 探测给出的头多了一项（漂移检测抓到过无条件发 `oauth-2025-04-20` 那一处）
+
+**改动后那一段会标「已手工改过」，并明说「已验证」不再成立** —— 探测是用改动前
+那套跑通的，改了就没测过了。这一点必须显眼：界面仍显示「✓ 可用」而实际配置已
+不同，是最容易误导的情形。
+
+「恢复探测值」一键回退。留空的行提交时丢弃（与 CPAMP 的 `buildHeaderObject`
+同口径 —— 两边行为不同会让人在一处试通、另一处失败时找不到原因）。
+
+头名会做**警告级**校验：含下划线（`anthropic_beta` 这类手滑）或没见过的头名会
+提示，但**不阻止提交** —— 那张已知表不可能穷尽所有站方要的头，挡住合法冷门头
+比放过一个手滑更糟。
+
+---
+
+## 每次尝试都能看
+
+结果表下方每段有「N 次尝试」折叠区，列出这一段打的每一次请求：
+
+```
+claude 的 3 次尝试          1 次 200 · 最慢 37ms
+
+  模型            画像/阶段    状态  类别    耗时   入 token  后端        正文摘要
+  claude-opus-5   baseline    403   客户端  37ms                        {"error":{"message":"only…
+  claude-opus-5   cc-min      403   客户端  13ms                        {"error":{"message":"only…
+  claude-opus-5   cc-std      200          31ms   37        anthropic
+```
+
+排障时要看的「哪一档通的、别的档报什么、哪个慢」都在这里。`resp_model` 只在与
+请求的模型不同时显示（那是换模）；「发送字符」列只在上下文二分那几次有值
+（几十万字符），整段没有时该列不出现 —— 一个恒空的列看起来像数据丢了。
+
+---
+
 ## 探测做什么
 
 ```
