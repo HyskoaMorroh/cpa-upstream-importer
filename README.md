@@ -200,17 +200,83 @@ amd64/arm64 跳过编译工具链的安装。
 
 ---
 
+## 核心机制
+
+### 画像系统（2026-09-01）
+
+**问题**：中转站按客户端身份门禁。探测发 `x-api-key`+`content-type` 被拒 503，
+真实 Claude Code 发完整 CC 头集能通 —— 同一站、同一 Key，成败取决于下游客户端。
+
+**解法**：25 档画像梯 × 4 段，按客户端族分组（cc / codex / gemini-cli / openai-sdk / browser），
+族内嵌套超集（后档 = 前档 + 新项）。baseline 失败后逐档升级，第一个通的即最小必需画像。
+
+```
+claude 段梯子（8 档）：
+  baseline → cc-min → cc-std → cc-full → 
+  [cc-body-json / cc-body-plain / cc-body-system] → browser-ua
+
+codex 段梯子（6 档）：
+  baseline → originator-only → [codex-tui / codex-vscode] → codex-full → browser-ua
+```
+
+**headers + body_patch 双层**：`metadata.user_id` 是请求体字段，旧 `identity_combos`
+只返回 headers 表达不了。新 `Profile` 同时给 headers 与 body 补丁，按 Key 求值
+模板变量（`{key_hash}` / `{uuid1..3}`）—— 静态 user_id 会让所有 Key 共用一个假身份。
+
+**实测依据**：
+- agentrouter claude 段：baseline 401 → cc-std（user-agent + anthropic-beta + x-app）200
+- zzzcoding claude 段：cc-min 503 → cc-std 502（门禁通过，站方自己上游挂了）
+- agentrouter codex 段：baseline 401 → originator-only 200
+
+画像写进 **config.yaml 条目 headers**（四段通用、与下游客户端无关、优先级最高）。
+`fingerprint-profile` 只在站方要请求体字段时用（目前 13 站里只有 zzzcoding 一个）。
+
+### 新增两类：时段与 WAF
+
+**时段类（usable=True）**：分组按窗口开放。实测 hybgzs codex 段 `09:00~18:00`
+—— 窗口外打凭据有效但站方拒绝，报 403 + 提示「限时段」；窗口内可用。
+
+**WAF 类（usable=False）**：站方 WAF 按形态拦。实测 hybgzs 三段带代理仍被拦
+`访问已被拦截` —— 换 IP 无效，不是封 IP，是请求形态问题。
+
+时段类立即收敛（不重试），导入时标注窗口并提示手工复测。
+
+### 前缀规整（站级前缀 + 段级别名）
+
+**问题**：62 个 claude 条目都是 `ANT`、13 个 compat provider 都是 `CHMA`。
+`rewriteModelForAuth` 只判「模型名是否以这个 prefix 开头」—— `ANT/claude-opus-5`
+同时命中全部 12 个 claude 站，落到哪个由 priority + 加权轮询决定。「指名某站」
+这个能力事实上不存在。
+
+**解法**：14 站各自独占前缀（从域名生成，agentrouter → `AGR`、kktoken → `KKT`），
+保留原名轮询，用 `models[].alias` 补段级兼容名。
+
+```
+你想要的                        用哪个名字                  效果
+让 CPA 自动挑最好的站          claude-opus-5（原名）       按 priority 轮询全部 12 站
+指名 agentrouter               AGR/claude-opus-5           只落 agentrouter 那 7 条
+指名 kktoken                   KKT/claude-opus-5           只落 kktoken 那 5 条
+兼容旧客户端（用 ANT/...）     ANT/claude-opus-5（别名）   同原名轮询
+```
+
+三个名字同一条链路、同一套 headers、同一个成功率。段级别名可选（`--keep-section-prefix`），
+默认补上，config 变长但不破坏现有客户端。站级前缀自动分配、幂等、沿用你手工定的值。
+
+---
+
 ## 目录
 
 ```
 cpa-upstream-importer/
-├ cpa_probe/          共享判定库（9 模块，无第三方依赖，PyYAML 可选）
+├ cpa_probe/          共享判定库（11 模块，无第三方依赖，PyYAML 可选）
 │  ├ parse.py         解析 url,key；按段规范化 base-url
-│  ├ classify.py      响应定性：余额/封号/限流/门禁/IP封/反测活/死路/临时/注入
-│  ├ request.py       按段构造请求，路径与 CPA executor 对齐
+│  ├ classify.py      响应定性：余额/封号/限流/门禁/IP封/反测活/死路/临时/注入/时段/WAF
+│  ├ request.py       按段构造请求，路径与 CPA executor 对齐（gemini 用 x-goog-api-key 头 / claude 带 ?beta=true）
 │  ├ client.py        统一 HTTP 传输（原三脚本用了三种底层）
 │  ├ fingerprint.py   后端 id 指纹、静默换模判定、截断校验
-│  ├ pipeline.py      四阶段探测编排 · 段/候选并行 · single-flight 形态复用
+│  ├ profiles.py      25 档画像梯 × 4 段，按客户端族分组，族内嵌套超集，headers + body_patch 双层
+│  ├ prefixes.py      站级前缀自动分配（从域名生成、幂等、尊重手工值）、段级别名补充
+│  ├ pipeline.py      四阶段探测编排 · 段/候选并行 · single-flight 形态复用 · 画像升级
 │  ├ plan.py          去重、priority 定档（读 weight:0 与实测注释）、影响面
 │  └ writeback.py     行级 YAML 编辑（保注释）、备份、diff、重载 CPA + 读回校验
 ├ server.py           HTTP 服务（标准库，VPS 免装依赖）
