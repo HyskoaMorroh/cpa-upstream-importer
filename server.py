@@ -338,6 +338,16 @@ def verdict_json(v) -> dict:
         "catalog": list(getattr(v, "catalog", None) or []),
         "need_proxy": v.need_proxy,
         "min_headers": v.min_headers,
+        # 请求指纹：通过时用的画像档名，以及该档是否需要请求体补丁。
+        # 界面要显示它 —— 「需要 cc-std」比「需要 3 个头」对人有用得多，
+        # 而 min_body_kind 非空意味着 headers 表达不了，claude 段得设
+        # fingerprint-profile 让 CPA 自己补（其余三段配置层无解）。
+        #
+        # 2026-09-02 补：这两个字段一直在 SectionVerdict 上，但没进 JSON ——
+        # 于是界面上「请求指纹」这一列永远是空的。
+        "profile_name": v.profile_name,
+        "min_body_kind": v.min_body_kind,
+        "time_window": list(v.time_window) if v.time_window else None,
         "swap": v.swap,
         "swap_detected": v.swap_detected,
         "max_context_length": v.max_context_length,
@@ -386,6 +396,12 @@ def plan_json(p) -> dict:
                 "priority": sp.priority,
                 "priority_reason": sp.priority_reason,
                 "proxy_url": sp.proxy_url,
+                # 前缀与 weight 也要给 —— 它们会落进 config.yaml，
+                # 而界面上「本项目所有参数都应同时具备」（2026-09-02）。
+                # prefix 决定 `ANT/claude-opus-5` 这类命名空间别名能不能
+                # 命中；weight: 0 决定这个条目是否参与调度。
+                "prefix": sp.prefix,
+                "weight": sp.weight,
                 "headers": sp.headers,
                 "max_context_length": sp.max_context_length,
                 "context_model": sp.context_model,
@@ -1240,11 +1256,58 @@ class Handler(BaseHTTPRequestHandler):
                 "calls": len(rungs),
             }
 
+        # ── 完整参数：走与全量检测**同一条链路** ──────────────────────
+        #
+        # 为什么必须（2026-09-02 用户指出）：这个端点原来只回答「要什么头」，
+        # 而写进 config.yaml 需要的是全套 —— 代理、请求指纹、priority、前缀、
+        # 模型清单、上下文上限、影响面。逐字段比对发现相对 verdict_json 缺 20
+        # 个字段、相对 plan_json 缺 22 个。
+        #
+        # 根因不是「忘了加」，是它自己组装返回值 —— 四条途径各有一份字段清单
+        # （verdict_json / plan_json / 这里的字典字面量 / CLI 的 print），
+        # 加字段要改四处，漏一处就是缺失。
+        #
+        # 修法：诊断也跑 prober.probe() + build_plan()，然后复用同一套序列化。
+        # 诊断与全量的差别只应在「探几个候选」与「要不要写回」，不该在
+        # 「能得出什么结论」。
+        full = bool(body.get("full", True))
+        verdicts: dict = {}
+        plan_out = None
+        if full:
+            # probe() 跑完整四阶段：目录 → 段归属 → 模型验证 → 换模 → 上限。
+            # 上下文二分默认仍关（那是百万字符的大 body，诊断场景不值得），
+            # 但换模采样打开 —— 它只要 3 次额外请求，而「照常计费却返回另一个
+            # 模型」是必须让人看见的结论。
+            fp = Prober(
+                proxy=_resolve_proxy(str(body.get("proxy") or "")),
+                gap=float(body.get("gap", 0.5)),
+                timeout=int(body.get("timeout", 60)),
+                probe_context=bool(body.get("probe_context", False)),
+                swap_samples=int(body.get("swap_samples", 3)),
+                workers=len(secs),
+                cfg_snapshot=cfg,
+            )
+            result = fp.probe(row)
+            verdicts = {sec: verdict_json(v)
+                        for sec, v in result.sections.items()}
+            # 定档与影响面：与写回路径同一个 build_plan，参数完全一致。
+            # rebuild=False —— 诊断的语义是「这个站能不能导入」，撞已有条目
+            # 时该如实报 duplicate，那正是操作员要知道的。
+            pl = cp.build_plan(row, result, cfg, bands={},
+                               seen=cp.existing_fingerprints(cfg),
+                               probation=bool(body.get("probation", True)))
+            plan_out = plan_json(pl)
+
         self._json(200, {
             "host": row.host,
             "key_masked": row.masked(),
+            "line_no": row.line_no,
             "sections": out,
             "total_calls": sum(v["calls"] for v in out.values()),
+            # 与 /api/probe 完全同构 —— 前端可以复用同一套渲染
+            "verdicts": verdicts,
+            "plan": plan_out,
+            "full": full,
         })
 
     def _api_probe(self, body: dict) -> None:
