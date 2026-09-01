@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import copy
 import io
 import os
 import sys
@@ -741,12 +742,22 @@ def test_real_config(path: str) -> None:
     }
 
     plan = cp.build_plan(row, res, cfg, bands=bands)
-    eq("不可用段被跳过", "gemini-api-key" in plan.skipped, True)
-    eq("可写段 3 个", len([1 for p in plan.sections.values() if p.writable]), 3)
+    # 判死段现在**进方案**（有种子模型兜底、六项参数算全），只是不建议写。
+    # 断言从「被跳过」改成「不建议写」—— 那才是这条用例真正要保的：
+    # 判死的段不会在用户没勾的情况下落进 config.yaml。
+    eq("不可用段进了方案", "gemini-api-key" in plan.sections, True)
+    eq("不可用段可勾选", plan.sections["gemini-api-key"].writable, True)
+    eq("不可用段不建议写", plan.sections["gemini-api-key"].recommended, False)
+    eq("建议写的段 3 个",
+       len([1 for p in plan.sections.values() if p.recommended]), 3)
     eq("无劫持顶层警告",
        [w for p in plan.sections.values() for w in p.warnings if "抢走" in w], [])
 
-    diffs = build_diffs(raw, plan and [plan])
+    # build_diffs 按 writable 筛，而判死段现在也 writable —— 生产路径靠
+    # /api/plan 先剪一遍（selected=None 退到 recommended）。这里模拟那一步。
+    only_rec = copy.copy(plan)
+    only_rec.sections = {k: v for k, v in plan.sections.items() if v.recommended}
+    diffs = build_diffs(raw, [only_rec])
     eq("生成 3 处插入", len(diffs), 3)
     out = apply_diffs(raw, diffs)
     ok, msg = validate(out)

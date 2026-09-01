@@ -32,7 +32,7 @@ from .parse import ParsedRow, base_for_section, host_of
 # pipeline 不导入 plan，这个方向无环。只取白名单判定与每段模型上限，
 # 目录读回来的名字必须过同一道白名单 —— 不然中转站目录里的
 # embedding / whisper / tts 之类会被注册成对话模型。
-from .pipeline import MAX_MODELS_PER_SECTION, model_allowed
+from .pipeline import MAX_MODELS_PER_SECTION, SEED_MODELS, model_allowed
 
 # 只有 gemini 段在配置层去重（静默丢弃）
 _DEDUP_SECTIONS = {"gemini-api-key"}
@@ -1068,6 +1068,8 @@ class SectionPlan:
     # 模型清单从哪来，可信度递减：
     #   probed  —— 推理请求实测通过，返回的 model 字段与请求一致
     #   catalog —— 只是目录 GET 读到的，站方声称有，未经推理验证
+    #   seed    —— 本工具写死的猜测（SEED_MODELS）。目录也关了、探测也没通、
+    #              操作员也没填时的兜底。可信度最低，但是个确定值
     #   manual  —— 操作员手填，工具没验证过
     # 必须一路带到界面：「验证过」和「站方声称有」不能长一个样。CPAMP 的
     # 「模型」列就是显示 config.yaml 里写了几个（rowData.ts:78），并排放在
@@ -1130,6 +1132,10 @@ class SectionPlan:
                     " —— 参数已按试用期算全，确知可用再勾")
         if self.model_source == "manual":
             return f"手填 {len(self.models)} 个模型，工具未验证 —— 参数已算全"
+        if self.model_source == "seed":
+            return ("推理未通过且目录读不到，模型是默认猜测"
+                    f"（{len(self.models)} 个）—— 参数已按试用期算全，"
+                    "但清单大概率要改")
         if any("换模" in w for w in self.warnings):
             return "检测到静默换模 —— 计费却拿不到要的模型，默认不勾"
         if self.hijacked:
@@ -1236,9 +1242,18 @@ def build_plan(
         # 测活的唯一手段（它连推理都不发），可信度足够当候选。三者全空才跳过 ——
         # 那时连注册哪些模型都不知道，compat 段的 models 还是必填字段
         # （config_types.go:670 无 omitempty）。
-        if not v.usable and not forced_models and not v.catalog:
-            plan.skipped[section] = f"{v.category or '不可用'} — {v.action or '不写入'}"
-            continue
+        # 三者全空时**不再跳过**：退到该段的种子模型。
+        #
+        # 为什么改（2026-09-01 用户实测）：79 个凭据全量重探后「全勾」只勾中
+        # 4 项。原因就是这一条 —— 目录关闭 + 判死的段直接缺席方案，界面上连
+        # 勾选框都没有，操作员想接管也无从下手。而中转站关 /models 是常态。
+        #
+        # 种子模型是本工具写死的猜测（SEED_MODELS），可信度最低，所以：
+        #   · model_source 记成 "seed"，界面上与 probed/catalog 明确区分
+        #   · recommended 恒为 False，绝不替操作员做决定
+        #   · 带警告说明它没有任何实测依据
+        # 但它是**确定的值**，不是「待定」—— 用户的硬要求是写进 config.yaml
+        # 的参数不能有未定项，缺席比填错更难排查。
 
         base = base_for_section(row.bare, section)
         proxy = "http://mihomo:7890" if v.need_proxy else ""
@@ -1278,10 +1293,14 @@ def build_plan(
             models, model_source = forced_models, "manual"
         elif v.usable:
             models, model_source = list(v.models), "probed"
-        else:
+        elif v.catalog:
             # 判死但目录能读到 —— 取目录里通过白名单的名字。
             models = [m for m in v.catalog if model_allowed(m)][:MAX_MODELS_PER_SECTION]
             model_source = "catalog"
+        else:
+            # 目录也关了 —— 用种子。最低可信度，但保证这一段有确定清单。
+            models = list(SEED_MODELS.get(section, ()))[:MAX_MODELS_PER_SECTION]
+            model_source = "seed"
 
         score = score_verdict(v)
         pri, reason = suggest_priority(band, score, models=models,
@@ -1342,6 +1361,16 @@ def build_plan(
                 f"{', '.join(models)}。"
                 "站方目录只说明「声称有」，不等于这把 Key 的分组能用 —— "
                 "很多站禁止推理测活却确实可用，确知可用再勾")
+        elif model_source == "seed":
+            sp.priority_reason = (
+                f"未验证（探测判「{v.category or '不可用'}」，"
+                f"目录也读不到，用种子模型）· {reason}")
+            sp.warnings.append(
+                f"探测未通过（{v.category or '不可用'} — {v.action or ''}），"
+                f"且站方 /models 目录读不到 —— 模型清单是本工具的默认猜测："
+                f"{', '.join(models)}。"
+                "这批名字没有任何实测依据，写进去很可能是死条目。"
+                "确知该站卖什么模型的话，用右侧输入框改成真实清单")
 
         sp.impacts = compute_impact(band, sp.models, pri)
 

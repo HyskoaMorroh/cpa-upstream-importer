@@ -438,9 +438,9 @@ def main() -> int:
         att = next(d for k, d in events if k == "attempt")
         eq("attempt 载荷字段",
            sorted(att), sorted(["section", "model", "combo", "status",
-                                "category", "elapsed_ms"]))
+                                "category", "elapsed_ms", "host"]))
         cat = next(d for k, d in events if k == "catalog")
-        eq("catalog 载荷字段", sorted(cat), ["count", "section"])
+        eq("catalog 载荷字段", sorted(cat), ["count", "host", "section"])
         done = next(d for k, d in events if k == "candidate-done")
         eq("candidate-done 载荷字段", sorted(done), ["calls", "host", "usable"])
         eq("start 载荷不含明文 key",
