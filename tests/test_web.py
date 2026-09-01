@@ -277,11 +277,24 @@ def main() -> int:
     truthy("前端把 forced 传给后端", "forced: S.forced" in js)
     truthy("后端读 forced", '"forced"' in srv)
     truthy("后端把 force 转给 build_plan", "force=" in srv)
-    truthy("没填模型时拦住勾选",
-           "classList.contains('force')" in js,
-           "空清单到后端会被当成未接管而跳过，勾了也不会写入")
-    truthy("模型清空时同步取消勾选", "S.picks.delete(pk(h, sc))" in js)
+    # 2026-09-01 反转：原来这里断言「没填模型就拦住勾选」，前提是
+    # 「空清单到后端会被跳过」。那个前提已经不成立 —— build_plan 现在给
+    # 判死段用种子模型兜底（严禁 priority 等参数未定），所以每段都有确定
+    # 清单，勾选不该再被拦。现在要保的是**给候选可选**，而不是逼人手打。
+    truthy("目录候选给成可勾清单", 'class="cm"' in js,
+           "站方 /models 报得出模型时不该逼操作员手打")
+    truthy("标注模型来源", "model_source" in js,
+           "实测通过 / 目录声明 / 手填 / 种子兜底，可信度差一截")
+    truthy("种子兜底的段有区分标记", "'seed'" in js)
     truthy("重来时清空 forced", "S.forced = {}" in js)
+
+    section("⑧ 收尾时的缺口必须说清")
+    # 现场报障：`71/79 (90%)` 就切到第三步，看着像「没跑完就往下走」。
+    # 实际是 8 个候选探测抛异常、进不了结果集（server.py 的 lost 分支
+    # 已逐条报了原因）。缺陷在前端只显示比值，不说差额是**失败**还是**未跑**。
+    truthy("算出缺口", "d.total_rows - d.done_rows" in js)
+    truthy("缺口有独立配色", "'partial'" in js)
+    truthy("说清不是没跑完", "不是「还没跑完」" in js)
 
     section("⑧ 过程可见性：新增事件前端都要认")
     # 后端新发的事件如果前端不认，就在日志里静默丢失 ——

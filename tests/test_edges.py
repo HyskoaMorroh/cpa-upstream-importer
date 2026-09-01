@@ -25,6 +25,7 @@ compat 重名 provider、撞已有站、同 Key 重复导入，三者都在真�
 from __future__ import annotations
 
 import collections
+import copy
 import io
 import os
 import sys
@@ -138,8 +139,16 @@ def _dead_section_params() -> None:
            bool(any("目录" in w or "未跑通" in w for w in sp.warnings)), True)
 
     # 无目录、无手填 —— 这段该缺席，不能凭空编模型名
-    eq("既无目录也无手填的段不进方案",
-       "gemini-api-key" in plan.sections, False)
+    # 既无目录也无手填 —— 现在用种子模型兜底进方案（严禁参数未定，
+    # 所以宁可给种子也不留空档），但标注来源为 seed 且不建议写。
+    sp_seed = plan.sections.get("gemini-api-key")
+    eq("无目录无手填的段也进方案", bool(sp_seed is not None), True)
+    if sp_seed:
+        eq("标注来源是种子", sp_seed.model_source, "seed")
+        eq("种子段可勾选", sp_seed.writable, True)
+        eq("种子段不建议写", sp_seed.recommended, False)
+        eq("种子段 priority 是确定整数",
+           bool(isinstance(sp_seed.priority, int)), True)
 
     # 手填接管：同一个段补上模型名就该进来
     plan2 = cp.build_plan(row, res, cfg, bands={},
@@ -160,15 +169,30 @@ class Harness:
         self.n_provider = len(cfg.get("openai-compatibility") or [])
         self.n_claude = len(cfg.get("claude-api-key") or [])
 
-    def run(self, text: str, **kw):
-        """跑一批输入，返回 (合并后的 cfg, plans, diffs, 增量)。"""
+    def run(self, text: str, *, pick=None, **kw):
+        """跑一批输入，返回 (合并后的 cfg, plans, diffs, 增量)。
+
+        `pick` 复刻服务端 /api/plan 的选择集：None = 默认（只写系统建议的段），
+        "all" = 用户点了「全勾」。判死段现在也进方案且 writable，所以
+        **必须**在这里剪一遍，否则测的就不是生产路径 —— server.py 的
+        selected=None 分支正是退到 recommended。
+        """
         rows = cp.parse_lines(text).valid
         bands: dict = {}
         seen = cp.existing_fingerprints(self.cfg)
         pairs = cp.existing_pairs(self.cfg)
         plans = [cp.build_plan(r, make_result(r, **kw), self.cfg, bands=bands,
                                seen=seen, seen_pairs=pairs) for r in rows]
-        diffs = build_diffs(self.raw, plans)
+        for_write = []
+        for pl in plans:
+            keep = {sec: sp for sec, sp in pl.sections.items()
+                    if pick == "all" or sp.recommended}
+            if not keep:
+                continue
+            shallow = copy.copy(pl)
+            shallow.sections = keep
+            for_write.append(shallow)
+        diffs = build_diffs(self.raw, for_write)
         out = apply_diffs(self.raw, diffs)
         ok, msg = validate(out)
         new = yaml.safe_load(out)

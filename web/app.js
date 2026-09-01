@@ -25,6 +25,18 @@ const CAT_PILL = {
   '鉴权': 'p-b', '注入': 'p-i', '未知': 'p-m',
 };
 
+// 模型清单的来源 → 可信度标记。四者差一截，界面不能显示成一样：
+//   probed  实测发过请求跑通
+//   catalog 站方 /models 目录声明（真实转发可能仍失败）
+//   manual  操作员手填
+//   seed    本工具的种子猜测兜底（最不可信，但严禁 priority 未定，所以宁可给）
+const SRC_TAG = {
+  probed: { t: '实测', c: 'p-ok' },
+  catalog: { t: '目录', c: 'p-w' },
+  manual: { t: '手填', c: 'p-b' },
+  seed: { t: '猜测', c: 'p-m' },
+};
+
 const THEMES = ['midnight', 'parchment', 'neon'];
 
 const S = {
@@ -761,8 +773,26 @@ function poll() {
       // （哪个段在哪个 combo 上通的、403 出现几次）。只是不再假装在跑。
       $('#spin').hidden = true;
       $('#p2h').textContent = '② 探测完成';
+      // done_rows 可能小于 total_rows —— 抛异常的候选进不了结果集
+      // （server.py 的 lost 分支会逐条报原因）。原来这里只显示
+      // 「71/79 (90%)」就切到第三步，看着像「没跑完就往下走」。
+      // 差额必须当场说清是**失败**而不是**未跑**，否则用户只能猜。
+      const missed = d.total_rows - d.done_rows;
       $('#p2tag').textContent =
         `${d.calls} 次请求 · ${d.elapsed}s · 日志保留在下方可回看`;
+      if (missed > 0) {
+        $('#p2tag').textContent += ` · ${missed} 个候选探测时抛异常`;
+        $('#prog').classList.add('partial');
+        $('#st_rows').innerHTML =
+          `${d.done_rows}/${d.total_rows}`
+          + ` <span class="pill p-w">缺 ${missed}</span>`;
+        $('#p2').insertAdjacentHTML('beforeend',
+          `<div class="note w"><b>${missed} 个候选没有结果。</b>`
+          + `它们探测时抛了异常，不在下面的结果表里 —— 上方日志的`
+          + `红色 error 行逐条记了是哪个站、什么原因。`
+          + `这不是「还没跑完」，重跑只会得到同样的结果，`
+          + `除非先解决那些异常。</div>`);
+      }
       S.results = d.results;
       // renderResults 必须包起来。它抛异常时（某个字段形状没料到）原来会
       // 变成 unhandled rejection —— 转圈已停但第 3 步不出现，页面看着像
@@ -791,6 +821,22 @@ function poll() {
 
 const pad = (s, n) => esc(String(s == null ? '' : s).padEnd(n));
 
+// 站名短标。79 个站并发探测，事件是一条交织的流 —— 不带归属时某站的
+// 「可用段 []」会落在别站的尝试行之间，看起来像那个站没跑完就进了下一步。
+// 现场就是这么误判的（2026-09-01：声明 4 次请求的块里有 38 行 attempt，
+// 那些行属于别的站）。
+//
+// 取主机名的辨识段而不是整串：整串会把每行推宽 20+ 字符，而并发流里
+// 需要的是「同不同站」的快速区分，不是完整地址。
+function tag(host) {
+  if (!host) return '        ';
+  const parts = String(host).split('.');
+  // api.foo.com -> foo；sub.foo.co.uk -> foo
+  let stem = parts.length >= 3 ? parts[parts.length - 3] : parts[0];
+  if (stem === 'api' || stem === 'www') stem = parts[parts.length - 2] || stem;
+  return pad(stem.slice(0, 8), 8);
+}
+
 function renderStream(events) {
   if (!events.length) return;
   const box = $('#stream');
@@ -817,70 +863,71 @@ function renderStream(events) {
         S.reuseSeen.add(rk);
         S.reuseSaved += 1;
       }
-      return `<div class="note">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+      return `<div class="note">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
         + `复用主机形态${e.verified ? (e.ok ? '（凭证已验）' : `（凭证不通：${esc(e.reason || '')}）`)
           : `（${esc(e.reason || '')}）`}</div>`;
     }
     if (e.kind === 'shape-reuse-abort') {
-      return `<div class="s4">  ${pad(SECTION_LABEL[e.section], 8)} `
+      return `<div class="s4">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
         + `${esc(e.reason || '')}</div>`;
     }
     // 站方负载上限（503/502/504）会重试一次。要让这一步可见 —— 否则
     // 用户只看到同一个模型出现两次、不知道为什么，也不知道等了 2 秒。
     if (e.kind === 'transient-retry') {
-      return `<div class="note">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+      return `<div class="note">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
         + `${pad(e.model, 20)} ${esc(e.status)} 临时错误，${e.wait}s 后重试一次</div>`;
     }
     // 时段：分组按窗口开放。凭据是好的、不是站点问题 —— 窗口内重测。
     if (e.kind === 'time-window') {
       const win = e.window ? `${e.window[0]}~${e.window[1]}` : '未知';
-      return `<div class="note">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
-        + `${esc(e.host)} 限时段（${win}）—— 窗口内复测</div>`;
+      return `<div class="note">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `限时段（${win}）—— 窗口内复测</div>`;
     }
     // 画像命中：第几次试到通的、什么档、是否需 body 补丁
     if (e.kind === 'profile-hit') {
       const body = e.needs_body ? '+body' : '';
-      return `<div class="s2">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
-        + `${esc(e.host)} 画像 ${esc(e.profile)}${body} 通（试 ${e.tried} 档）</div>`;
+      return `<div class="s2">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `画像 ${esc(e.profile)}${body} 通（试 ${e.tried} 档）</div>`;
     }
     // 画像梯跑完仍不通 —— 让操作员看到「试了几档都不行」，不是「没试」
     if (e.kind === 'profile-exhausted') {
-      return `<div class="s4">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
-        + `${esc(e.host)} 画像梯跑完仍不通（试 ${e.tried} 档）</div>`;
+      return `<div class="s4">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `画像梯跑完仍不通（试 ${e.tried} 档）</div>`;
     }
     // 整梯全败后，正文点名要 beta 就补上重试。显示补了什么 —— 这一步会改
     // 落地的 anthropic-beta，操作员必须看得到凭什么改的。
     if (e.kind === 'beta-retry') {
-      return `<div class="note">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
-        + `${esc(e.host)} 正文点名缺 ${esc((e.added || []).join(','))}，`
+      return `<div class="note">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `正文点名缺 ${esc((e.added || []).join(','))}，`
         + `补进 ${esc(e.profile)} 重试</div>`;
     }
     if (e.kind === 'beta-hit') {
-      return `<div class="s2">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
-        + `${esc(e.host)} 补 beta 后通（${esc(e.profile)}）</div>`;
+      return `<div class="s2">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `补 beta 后通（${esc(e.profile)}）</div>`;
     }
     // 同段整梯已试过全败，后续种子跳过。**必须显示** —— 否则日志里看起来
     // 像是这个种子没被处理，而实际是刻意省掉的重复请求。
     if (e.kind === 'profile-skipped') {
-      return `<div class="note">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+      return `<div class="note">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
         + `${pad(e.model, 20)} 跳过画像梯（${esc(e.why || '同段已试过')}）</div>`;
     }
     // 模型验证撞到尝试上限。显示剩余数，让操作员知道「不是全验了」
     if (e.kind === 'model-scan-capped') {
-      return `<div class="note">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
-        + `${esc(e.host)} 模型验证达上限：试 ${e.attempted} 次收 ${e.accepted} 个，`
+      return `<div class="note">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `模型验证达上限：试 ${e.attempted} 次收 ${e.accepted} 个，`
         + `余 ${e.remaining} 个未验</div>`;
     }
     // 200 但正文是错误体 / 换模 —— 模型被拒收，不进写入清单
     if (e.kind === 'model-rejected') {
       const why = e.reason ? esc(e.reason)
         : `请求 ${esc(e.requested)} 却回 ${esc(String(e.actual))}`;
-      return `<div class="s4">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+      return `<div class="s4">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
         + `${pad(e.requested, 20)} 模型不收：${why}</div>`;
     }
     if (e.kind === 'attempt') {
       const c = e.status === '200' ? 's2' : (e.status[0] === '4' ? 's4' : 's5');
-      return `<div class="${c}">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+      return `<div class="${c}">${esc(tag(e.host))} `
+        + `${pad(SECTION_LABEL[e.section] || e.section, 8)} `
         + `${pad(e.model, 20)} ${pad(e.combo, 18)} ${pad(e.status, 5)} `
         + `${esc(e.category)}</div>`;
     }
@@ -891,32 +938,32 @@ function renderStream(events) {
     // 目录问不到不是失败 —— 很多站关掉了 /models，照样能推理。
     // 这时探测退回种子模型，日志里要说清「为什么用的是种子」。
     if (e.kind === 'catalog-miss') {
-      return `<div class="s4">  ${pad(SECTION_LABEL[e.section], 8)} `
+      return `<div class="s4">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
         + `/models 目录不可读（${esc(e.status)}），改用种子模型试探</div>`;
     }
     if (e.kind === 'swap') {
-      return `<div class="s4">  ${pad(SECTION_LABEL[e.section], 8)} `
+      return `<div class="s4">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
         + `静默换模 ${e.rate_pct}%（${esc(e.model)}）</div>`;
     }
     if (e.kind === 'context') {
-      return `<div class="s2">  ${pad(SECTION_LABEL[e.section], 8)} `
+      return `<div class="s2">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
         + `上下文上限 ${fmt(e.limit)}${e.untrusted ? '（由截断反推）' : ''}</div>`;
     }
     if (e.kind === 'context-declared') {
       // 上游在超限错误里**明说**了上限 —— 省掉整轮二分（最多 5 次百万字符
       // 请求）。这件事值得显示：它解释了为什么这个段没跑满二分轮次。
-      return `<div class="s2">  ${pad(SECTION_LABEL[e.section], 8)} `
+      return `<div class="s2">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
         + `上游自报上限 ${fmt(e.limit)} —— 免掉二分（${esc(e.model)}）</div>`;
     }
     if (e.kind === 'section-error') {
       // 某段探测抛异常。另外三段照常跑完，但这一段的失败必须可见 ——
       // 不显示的话它会表现成「这个段莫名不可用」。
-      return `<div class="s5">  ${pad(SECTION_LABEL[e.section], 8)} `
+      return `<div class="s5">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
         + `探测异常：${esc(e.error)}</div>`;
     }
     if (e.kind === 'section-done') {
       // 逐段收尾。并行下四段完成先后是乱的，这行让顺序可追溯。
-      return `<div class="${e.usable ? 's2' : 's4'}">  `
+      return `<div class="${e.usable ? 's2' : 's4'}">${esc(tag(e.host))} `
         + `${pad(SECTION_LABEL[e.section], 8)} `
         + `${e.usable ? '✓' : '✗'} ${esc(e.summary || '')}</div>`;
     }
@@ -1208,27 +1255,12 @@ function bindResultEvents() {
     }
     const sel = e.target.closest('.sel');
     if (sel) {
-      // 探测未通过的段：没填模型就不让勾 —— 空清单到后端会被当成
-      // 未接管而跳过，勾了也不会写入。在这里拦住并说清原因。
-      // 探测未通过的段：拦的条件从「必须手填」放宽成「必须有模型可注册」。
-      // 站方目录报出的模型算数 —— 有目录就直接勾得上，不必手打一遍。
-      // 真的一个模型都没有才拦：空清单到后端会被跳过，勾了也不会写入。
-      if (sel.classList.contains('force') && sel.checked) {
-        const h2 = sel.dataset.host, s2 = sel.dataset.sec;
-        const fl = (S.forced[h2] || {})[s2] || [];
-        const row = sel.closest('tr');
-        const fromCat = row
-          ? $$('.cm', row).filter((x) => x.checked).length : 0;
-        if (!fl.length && !fromCat) {
-          sel.checked = false;
-          const box2 = row && row.querySelector('.fm');
-          if (box2) box2.focus();
-          $('#pickstat').textContent = row && $$('.cm', row).length
-            ? '该段没选模型 —— 从上方目录勾几个，或手填模型名'
-            : '该段探测未通过且站方目录未报模型 —— 请手填模型名（逗号分隔）';
-          return;
-        }
-      }
+      // 勾选不再有任何前置条件 —— 勾了就是勾了。
+      //
+      // 这里曾拦「没模型不让勾」。后端补了种子兜底后空清单不可能出现，
+      // 而拦截的副作用是操作员点了没反应，只能从提示文字反推为什么。
+      // 模型清单的可信度由 model_source 在方案里标注（实测/目录/手填/猜测），
+      // 那是「看得见的告知」，比「点不动的勾选框」有用。
       const key = pk(sel.dataset.host, sel.dataset.sec);
       if (sel.checked) S.picks.add(key); else S.picks.delete(key);
       syncPickUI();
@@ -1264,8 +1296,10 @@ function applyPickPreset(mode) {
       if (sp.duplicate) return;
       if (mode === 'rec' && !sp.recommended) return;
       if (mode === 'none') return;
+      // 不再按「有没有模型」拦 —— 后端现在给每段都算出确定清单
+      // （实测 > 目录 > 手填 > 种子猜测），空清单已不可能出现。
+      // 真出现了就是后端的缺陷，如实报出来而不是静默少勾。
       if (!(sp.models || []).length) {
-        // 站方目录也没报模型 —— 勾了后端也会跳过，如实告诉操作员
         missing.push(`${p.host} ${SECTION_LABEL[sec] || sec}`);
         return;
       }
@@ -1275,7 +1309,7 @@ function applyPickPreset(mode) {
   syncPickUI();
   if (mode === 'all' && missing.length) {
     $('#pickstat').textContent = `已勾选 ${S.picks.size} 项写入 · `
-      + `${missing.length} 段无模型可注册（站方目录未报，需手填）`;
+      + `${missing.length} 段异常无模型（后端缺陷，请报）`;
   }
 }
 
@@ -1326,6 +1360,21 @@ async function refreshPlan(silent) {
       if (!tr) return;
       const inp = tr.querySelector('.pi');
       if (inp && !inp.value) inp.value = sp.priority;
+      // 模型清单的来源 —— 判死段现在也有确定清单，但那清单可能只是种子
+      // 猜测。不标出来的话，「猜的」和「实测跑通的」在界面上没有区别。
+      const ml = tr.querySelector('.mlist');
+      if (ml && sp.model_source) {
+        const st = SRC_TAG[sp.model_source];
+        if (st && !ml.querySelector('.srctag')) {
+          ml.insertAdjacentHTML('afterbegin',
+            `<span class="pill ${st.c} srctag">${st.t}</span> `);
+        }
+        if (sp.model_source === 'seed') {
+          ml.insertAdjacentHTML('beforeend',
+            '<div class="hint">种子兜底：站方目录也没报模型，'
+            + '这几个名字是本工具猜的，勾选前请确认</div>');
+        }
+      }
       const rsn = tr.querySelector('.rsn');
       if (rsn) {
         const cls = sp.recommended ? 'p-ok' : (sp.writable ? 'p-w' : 'p-m');

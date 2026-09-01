@@ -347,6 +347,8 @@ tr.rec:hover td{background:color-mix(in srgb,var(--ok-bg) 60%,transparent)}
      margin:15px 0}
 .bar i{display:block;height:100%;border-radius:4px;transition:width .35s ease;
        background:linear-gradient(90deg,var(--accent),var(--accent-2))}
+/* 有候选抛异常没进结果集时 —— 满格的绿色会让人以为全都跑通了 */
+.bar i.partial{background:linear-gradient(90deg,var(--warn),var(--accent-2))}
 .stat{display:flex;gap:26px;font-size:13.5px;color:var(--ink-3);
       margin-bottom:6px;flex-wrap:wrap}
 .stat b{color:var(--ink);font-family:ui-monospace,monospace;

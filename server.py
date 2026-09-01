@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import copy
 import hmac
 import io
 import json
@@ -1221,21 +1222,44 @@ class Handler(BaseHTTPRequestHandler):
                     v = ov["max_context_length"]
                     sp.max_context_length = int(v) if v else None
 
-        # 选择集过滤
-        if selected is not None:
+        # 选择集过滤。
+        #
+        # selected=None（前端首次拉取，为了读 recommended）不能等于「全写」：
+        # 判死段现在也是 writable 了（有种子模型兜底、参数算全），而
+        # build_diffs 按 writable 筛 —— 不设默认判据的话首次 /api/plan
+        # 就会把 IP封 / 死路的段一起排进 diff。
+        #
+        # 默认判据取 recommended：那才是「工具建议写」的集合。判死段照旧
+        # 出现在 plans 里（界面要显示它们的完整参数、勾选框要能勾），
+        # 只是不进 diff。
+        # 关键：剪的是**送进 build_diffs 的副本**，不是 plans 本身。
+        # plans 要原样回给界面 —— 判死段的完整参数、勾选框都靠它渲染，
+        # 从 plans 里删掉等于前端再也看不到那些段，「全勾」会退化成
+        # 「只勾推荐项」（就是这一轮要修掉的症状）。
+        if selected is None:
+            want = {(p.host, sec) for p in plans for sec, sp in p.sections.items()
+                    if sp.recommended}
+        else:
             want = {(str(h), str(s)) for h, s in selected}
-            for p in plans:
-                for sec in list(p.sections):
-                    if (p.host, sec) not in want:
-                        p.skipped[sec] = "用户未选择"
-                        del p.sections[sec]
 
-        diffs = build_diffs(raw, plans)
+        for_write = []
+        for p in plans:
+            keep = {sec: sp for sec, sp in p.sections.items()
+                    if (p.host, sec) in want}
+            if not keep:
+                continue
+            shallow = copy.copy(p)
+            shallow.sections = keep
+            for_write.append(shallow)
+
+        diffs = build_diffs(raw, for_write)
         preview = apply_diffs(raw, diffs)
         ok, msg = validate(preview)
 
         pid = secrets.token_hex(8)
-        STORE.add_plan(pid, {"plans": plans, "diffs": diffs,
+        # 存 for_write 而不是 plans：apply 后的写后验证按 entry["plans"]
+        # 挑目标，存全量就会去验根本没写进去的段（判死段现在也 writable）。
+        STORE.add_plan(pid, {"plans": for_write, "diffs": diffs,
                              "preview": preview, "base_raw": raw,
                              "created": time.time()})
 

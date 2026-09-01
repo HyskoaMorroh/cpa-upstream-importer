@@ -472,6 +472,9 @@ class Prober:
             "attempt",
             {
                 "section": section,
+                # host 必须带 —— 79 个站并发，日志是交织的流。不带归属时
+                # 「某站的行」和「别站的行」混在一起，看着像这个站没跑完。
+                "host": host_of(base),
                 "model": model,
                 "combo": combo,
                 "status": resp.status,
@@ -515,6 +518,7 @@ class Prober:
         if att.error_envelope:
             self.on_event("model-rejected", {
                 "section": v.section,
+                "host": host_of(v.base_url),
                 "requested": model,
                 "actual": None,
                 "reason": "200 但正文是错误体",
@@ -524,6 +528,7 @@ class Prober:
             return [model]
         self.on_event("model-rejected", {
             "section": v.section,
+            "host": host_of(v.base_url),
             "requested": model,
             "actual": att.resp_model,
             "backend": att.backend,
@@ -613,7 +618,7 @@ class Prober:
             while (att.category == "临时" and tries < self._TRANSIENT_RETRIES):
                 tries += 1
                 self.on_event("transient-retry", {
-                    "section": section, "model": model,
+                    "section": section, "host": host_of(base), "model": model,
                     "status": att.status, "wait": self._TRANSIENT_WAIT,
                 })
                 time.sleep(self._TRANSIENT_WAIT)
@@ -907,7 +912,8 @@ class Prober:
                 if page == 0:
                     # 与 catalog 事件同一套载荷约定：不重复 host。
                     self.on_event("catalog-miss", {
-                        "section": section, "status": resp.status,
+                        "section": section, "host": host_of(base),
+                        "status": resp.status,
                     })
                     return []
                 break            # 翻页中断：已拿到的仍然算
@@ -924,7 +930,8 @@ class Prober:
         # 「catalog 载荷字段」断言按这个约定写。host 由 candidate-start
         # 给出，这里重复只会让事件流变胖；白名单滤掉多少不进载荷，避免
         # 把上游的模型名规模也一起吐出去。
-        self.on_event("catalog", {"section": section, "count": len(catalog)})
+        self.on_event("catalog", {"section": section, "host": host_of(base),
+                                  "count": len(catalog)})
         return catalog
 
     def _probe_order(self, section: str, catalog: list[str],
@@ -1010,7 +1017,8 @@ class Prober:
             samples.append(att.as_sample())
         v.swap = fingerprint.swap_rate(samples)
         if v.swap.get("swap"):
-            self.on_event("swap", {"section": v.section, "model": model,
+            self.on_event("swap", {"section": v.section,
+                                   "host": host_of(v.base_url), "model": model,
                                    "rate_pct": v.swap.get("rate_pct")})
 
     # ---------- ④b 上下文上限 ----------
@@ -1352,17 +1360,20 @@ class Prober:
                         v.category, v.action = "死路", f"探测异常：{e}"
                         done[sec] = v
                         self.on_event("section-error",
-                                      {"section": sec, "error": str(e)})
+                                      {"section": sec, "host": row.host,
+                                       "error": str(e)})
             for sec in SECTIONS:
                 v = done[sec]
                 res.sections[sec] = v
-                self.on_event("section-done", {"section": sec, "usable": v.usable,
+                self.on_event("section-done", {"section": sec, "host": row.host,
+                                               "usable": v.usable,
                                                "summary": v.summary()})
         else:
             for section in SECTIONS:
                 v = self._probe_one_section(row, section)
                 res.sections[section] = v
-                self.on_event("section-done", {"section": section, "usable": v.usable,
+                self.on_event("section-done", {"section": section, "host": row.host,
+                                               "usable": v.usable,
                                                "summary": v.summary()})
 
         self.on_event("candidate-done", {"host": row.host,
