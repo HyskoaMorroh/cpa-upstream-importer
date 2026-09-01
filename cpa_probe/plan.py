@@ -1243,6 +1243,7 @@ def build_plan(
     seen_pairs: dict[str, set[str]] | None = None,
     probation: bool = True,
     force: dict[str, list[str]] | None = None,
+    rebuild: bool = False,
 ) -> ImportPlan:
     """把一个候选的探测结果变成写入方案。
 
@@ -1269,6 +1270,24 @@ def build_plan(
     force 只绕过 usable 判定，**不绕过**去重、定档、影响面计算与 diff 确认 ——
     那几道是防止写坏 config.yaml 的，与「这个站能不能用」是两件事。
     模型清单必须由操作员显式给出：探测没验成功过任何模型，工具无从推断。
+
+    rebuild：全量重探模式。**关掉去重判定**。
+    --------------------------------------
+    两种模式的输入语义完全相反：
+
+      · 新增导入（rebuild=False）：输入是新 Key，`seen` 代表「config.yaml
+        里已有的 + 本批已处理的」，撞上就是真重复，该挡。
+      · 全量重探（rebuild=True）：输入**就是** config.yaml 里的既有条目，
+        而 `seen` 是从同一份 cfg 读出来的 —— 每一条都必然撞上。
+
+    2026-09-02 实测后果：79 个凭据全量重探，「全勾选」只勾中 26 项。
+    14 个 host 里每个 host 只有第一个 Key 逃过判定（它的 prefix/headers 与
+    探测建议不同、五元组恰好没撞上，那是偶然不是设计），其余全部 duplicate
+    → writable=False → 全勾选跳过。14 × 4 段 = 56 个段有方案，其余 260 个
+    段连勾选框都点不动。
+
+    重探要判的不是「有没有重复」，而是「这次的方案与原条目有没有变化」——
+    那个由 diff 预览呈现，不需要在这里拦。
     """
     bands = bands or {}
     existing = seen if seen is not None else existing_fingerprints(cfg)
@@ -1374,7 +1393,11 @@ def build_plan(
             model_source=model_source,
         )
 
-        if fp in existing.get(section, set()):
+        # 全量重探不判重：输入就是既有条目，撞上是必然而非异常。
+        # 见 docstring 里 rebuild 那一节。
+        if rebuild:
+            pass
+        elif fp in existing.get(section, set()):
             sp.duplicate = True
             sp.duplicate_note = (
                 "gemini 段：CPA 会静默丢弃，写进去等于没写"

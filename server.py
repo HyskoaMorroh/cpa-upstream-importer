@@ -1366,8 +1366,15 @@ class Handler(BaseHTTPRequestHandler):
 
             for res in job.results:
                 fh = forced.get(res.row.host) or {}
+                # rebuild=True 关掉去重判定 —— 全量重探的输入**就是** cfg 里的
+                # 既有条目，而 seen 是从同一份 cfg 读出来的，每一条都必然撞上。
+                #
+                # 2026-09-02 实测：不传这个参数时 79 个凭据只有 26 项可勾选。
+                # 14 个 host 里每个只有第一个 Key 逃过（它的 prefix/headers 与
+                # 探测建议不同、五元组恰好没撞），其余 260 个段全判 duplicate
+                # → writable=False → 「全勾选」跳过，勾选框点不动。
                 p = cp.build_plan(res.row, res, cfg, bands=bands, seen=seen,
-                                  probation=probation,
+                                  probation=probation, rebuild=True,
                                   force={str(k): [str(m) for m in (v or [])]
                                          for k, v in fh.items()} if fh else None)
                 w = weights.get((res.row.host, res.row.api_key))
