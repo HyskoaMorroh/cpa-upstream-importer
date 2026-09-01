@@ -42,6 +42,7 @@ const S = {
   forced: {},
   picks: null,          // Set("host\u0000section")，null = 尚未初始化
   reuseSaved: 0,        // 形态复用省下的请求数
+  reuseSeen: null,      // 已计数过的 shape-reused 事件键（防重拉重复累加）
 };
 
 const pk = (host, sec) => `${host}\u0000${sec}`;
@@ -495,7 +496,8 @@ $('#btnprobe').onclick = async () => {
     return;
   }
 
-  S.jobId = d.job_id; S.cursor = 0; S.picks = null; S.reuseSaved = 0;
+  S.jobId = d.job_id; S.cursor = 0; S.picks = null;
+  S.reuseSaved = 0; S.reuseSeen = null;
   $('#p1').hidden = true; $('#pparse').hidden = true; $('#p2').hidden = false;
   $('#stream').innerHTML = ''; $('#spin').hidden = false;
   $('#st_saved').textContent = '';
@@ -629,7 +631,15 @@ function renderStream(events) {
         : `<div class="s4">  代理预检不通，本轮跳过全部 via-proxy —— ${esc(e.detail)}</div>`;
     }
     if (e.kind === 'shape-reused') {
-      S.reuseSaved += 1;
+      // 计数按事件序号去重 —— 轮询中断后 showResume 会把 cursor 归零重拉
+      // 全部日志（app.js 的 showResume），累加式计数会把已经数过的再数一遍。
+      // 事件在 job.events 里的下标是稳定的，拿它做幂等键。
+      if (!S.reuseSeen) S.reuseSeen = new Set();
+      const rk = `${e.t}|${e.section}|${e.host || ''}`;
+      if (!S.reuseSeen.has(rk)) {
+        S.reuseSeen.add(rk);
+        S.reuseSaved += 1;
+      }
       return `<div class="note">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
         + `复用主机形态${e.verified ? (e.ok ? '（凭证已验）' : `（凭证不通：${esc(e.reason || '')}）`)
           : `（${esc(e.reason || '')}）`}</div>`;
@@ -690,10 +700,6 @@ function renderStream(events) {
       return `<div>  ${pad(SECTION_LABEL[e.section], 8)} /models 目录 ${e.count} 个`
         + `（已按 gemini/gpt/claude 过滤）</div>`;
     }
-    if (e.kind === 'model-rejected') {
-      return `<div class="s4">  ${pad(SECTION_LABEL[e.section], 8)} `
-        + `拒收：请求 ${esc(e.requested)} 却回 ${esc(e.actual)}（${esc(e.backend)}）</div>`;
-    }
     if (e.kind === 'swap') {
       return `<div class="s4">  ${pad(SECTION_LABEL[e.section], 8)} `
         + `静默换模 ${e.rate_pct}%（${esc(e.model)}）</div>`;
@@ -719,6 +725,27 @@ function renderStream(events) {
       return `<div class="${e.usable ? 's2' : 's4'}">  `
         + `${pad(SECTION_LABEL[e.section], 8)} `
         + `${e.usable ? '✓' : '✗'} ${esc(e.summary || '')}</div>`;
+    }
+    // ── 全量重探路径的三种事件（run_job_full_redetect 发的）──
+    // 漏了这三个分支它们会落到兜底，显示成 `[info] {"msg":"…"}` 的原始 JSON。
+    // 而全量重探恰恰是最需要可读进度的场景（跑几分钟、几十个站）。
+    if (e.kind === 'info') {
+      return `<div class="s2">${esc(e.msg || '')}</div>`;
+    }
+    if (e.kind === 'progress') {
+      const pct = e.total ? Math.round((e.current / e.total) * 100) : 0;
+      const bar = '█'.repeat(Math.round(pct / 4))
+        + '░'.repeat(25 - Math.round(pct / 4));
+      const stat = [];
+      if (e.success != null) stat.push(`成功 ${e.success}`);
+      if (e.partial != null) stat.push(`部分通 ${e.partial}`);
+      if (e.failure != null) stat.push(`失败 ${e.failure}`);
+      return `<div class="s2">${bar} ${e.current}/${e.total} (${pct}%)`
+        + (stat.length ? ` · ${stat.join(' · ')}` : '')
+        + (e.site ? ` · 刚完成 ${esc(e.site)}` : '') + `</div>`;
+    }
+    if (e.kind === 'error') {
+      return `<div class="s5">✗ ${esc(e.msg || '')}</div>`;
     }
     // 兜底：未认识的事件类型也要留痕，不能静默丢弃 ——
     // 静默丢弃会让「后端加了新事件、前端忘了处理」这种失配无从发现。
@@ -1161,7 +1188,8 @@ $('#btnapply').onclick = async () => {
 
 $('#btnrestart').onclick = () => {
   S.jobId = null; S.planId = null; S.plans = null;
-  S.overrides = {}; S.forced = {}; S.cursor = 0; S.picks = null; S.reuseSaved = 0;
+  S.overrides = {}; S.forced = {}; S.cursor = 0; S.picks = null;
+  S.reuseSaved = 0; S.reuseSeen = null;
   $('#input').value = '';
   ['#pdone', '#p4', '#p3', '#p2', '#pparse'].forEach((s) => { $(s).hidden = true; });
   $('#p1').hidden = false;

@@ -95,10 +95,17 @@ def main() -> int:
 
     # ── ② 事件类型契约 ─────────────────────────────────────────────
     section("② 后端发出的事件，前端都要认")
-    # 后端：self.on_event("xxx", ...) / job.emit("xxx", ...)
-    emitted = set(re.findall(r'on_event\(\s*"([a-z-]+)"',
-                             io.open(os.path.join(ROOT, "cpa_probe", "pipeline.py"),
-                                     encoding="utf-8").read()))
+    # 两个来源都要扫（2026-09-01 补）：
+    #   pipeline.py  self.on_event("xxx", ...)   —— 探测流程
+    #   server.py    job.emit("xxx", ...)        —— 任务编排（全量重探那条路）
+    # 原来只扫前者，于是 run_job_full_redetect 发的 info/progress/error 三种
+    # 从未被这项检查覆盖，前端漏了分支也不报错 —— 它们落到兜底分支，
+    # 在日志里显示成 `[info] {"msg":"…"}` 的原始 JSON。而全量重探恰恰是最
+    # 需要可读进度的场景。
+    pipe_src = io.open(os.path.join(ROOT, "cpa_probe", "pipeline.py"),
+                       encoding="utf-8").read()
+    emitted = set(re.findall(r'on_event\(\s*"([a-z-]+)"', pipe_src))
+    emitted |= set(re.findall(r'\.emit\(\s*"([a-z-]+)"', srv))
     # 前端：e.kind === 'xxx'
     handled = set(re.findall(r"e\.kind === '([a-z-]+)'", js))
     # attempt 走的是兜底分支（不在 if 链里显式判），单独放行
