@@ -630,7 +630,65 @@ function renderDiag(d) {
       + rungs + concl + `</div>`;
   }).join('');
 
-  $('#diagout').innerHTML = blocks;
+  // 完整参数表：与全量检测同一套字段。
+  //
+  // 为什么必须有（2026-09-02 用户指出）：诊断原来只显示「要什么头」，而写进
+  // config.yaml 需要全套 —— 代理、指纹、priority、前缀、模型、上限、影响面。
+  // 后端已改成走同一条链路（prober.probe + build_plan），这里把它渲染出来。
+  let planHtml = '';
+  if (d.plan && d.plan.sections && Object.keys(d.plan.sections).length) {
+    const rows = Object.entries(d.plan.sections).map(([sec, sp]) => {
+      const v = (d.verdicts || {})[sec] || {};
+      const st = SRC_TAG[sp.model_source] || { t: sp.model_source, c: 'p-m' };
+      const tag = sp.recommended ? '<span class="pill p-ok">建议写入</span>'
+        : (sp.writable ? '<span class="pill p-w">需人工确认</span>'
+                       : '<span class="pill p-m">不可写入</span>');
+      return `<tr>
+        <td class="m"><b>${esc(SECTION_LABEL[sec] || sec)}</b></td>
+        <td><span class="pill ${v.usable ? 'p-ok' : (CAT_PILL[v.category] || 'p-m')}">${
+          esc(v.usable ? '可用' : (v.category || '不可用'))}</span></td>
+        <td class="m">${sp.priority}
+          <div class="hint">${esc(sp.priority_reason || '')}</div></td>
+        <td class="m">${esc(sp.prefix || '—')}
+          ${sp.weight === 0
+            ? '<div class="warn b">weight: 0 —— 不参与调度</div>'
+            : (sp.weight != null ? `<div class="hint">weight ${sp.weight}</div>` : '')}</td>
+        <td><span class="pill ${st.c}">${st.t}</span>
+          <div class="mlist">${esc((sp.models || []).join(', ')) || '—'}</div></td>
+        <td class="m">${sp.proxy_url ? esc(sp.proxy_url)
+          : (v.need_proxy ? '<span class="pill p-w">需代理</span>' : '直连')}</td>
+        <td class="m">${esc(Object.keys(sp.headers || {}).join(', ')) || '—'}</td>
+        <td class="m">${v.profile_name ? esc(v.profile_name)
+          : (v.min_body_kind ? 'fingerprint-profile' : '—')}</td>
+        <td class="num">${sp.max_context_length ? fmt(sp.max_context_length) : '—'}
+          ${sp.context_model ? `<div class="hint">@${esc(sp.context_model)}</div>` : ''}</td>
+        <td>${tag}
+          <div class="hint">${esc(sp.recommend_reason || '')}</div>
+          ${(sp.warnings || []).map((w) =>
+            `<div class="warn">${esc(w)}</div>`).join('')}
+          ${sp.duplicate ? `<div class="warn b">${esc(sp.duplicate_note)}</div>` : ''}</td>
+      </tr>`;
+    }).join('');
+    planHtml = `
+      <div class="note" style="margin-top:18px">
+        <b>完整参数（与全量检测同一套判定）</b>
+        —— 这些就是写进 <code>config.yaml</code> 的值。
+        <span class="hint">诊断跑的是完整四阶段：目录发现 → 段归属 → 模型验证
+        → 换模采样。上下文二分默认关（那是百万字符的大 body），
+        传 <code>probe_context: true</code> 可打开。</span>
+      </div>
+      <div class="tw"><table>
+        <thead><tr>
+          <th style="width:80px">段</th><th style="width:92px">判定</th>
+          <th style="width:150px">priority</th><th style="width:66px">前缀</th>
+          <th style="width:190px">模型</th><th style="width:120px">代理</th>
+          <th style="width:150px">headers</th><th style="width:120px">请求指纹</th>
+          <th style="width:110px">上下文上限</th><th>系统建议</th>
+        </tr></thead>
+        <tbody>${rows}</tbody></table></div>`;
+  }
+
+  $('#diagout').innerHTML = blocks + planHtml;
 
   // YAML 通过 S.diagYaml 传递，不进 HTML 属性 —— 多行文本在属性里会被
   // 转义破坏（换行变实体、引号提前闭合）。
@@ -1555,6 +1613,19 @@ async function refreshPlan(silent) {
       if (!tr) return;
       const inp = tr.querySelector('.pi');
       if (inp && !inp.value) inp.value = sp.priority;
+      // weight: 0 必须显眼 —— 它是「这个站被逐出调度池」的唯一表达，而
+      // 全量重探会如实把原值搬回来。CPAMP 面板上表现为「启用」开关是关的，
+      // 而这里若不显示，用户会以为写回后它就参与调度了（2026-09-02 现场问题：
+      // 「一些网站全量写入后是关闭状态是怎么回事」）。
+      if (sp.weight === 0) {
+        const pc = tr.querySelector('.prio');
+        if (pc && !pc.querySelector('.w0')) {
+          pc.insertAdjacentHTML('beforeend',
+            '<div class="warn b w0">weight: 0 —— 原配置已把它逐出调度池，'
+            + '写回后仍不参与轮询（CPAMP 面板显示为「未启用」）。'
+            + '要解封请手工删掉这一行</div>');
+        }
+      }
       // 模型清单的来源 —— 判死段现在也有确定清单，但那清单可能只是种子
       // 猜测。不标出来的话，「猜的」和「实测跑通的」在界面上没有区别。
       const ml = tr.querySelector('.mlist');

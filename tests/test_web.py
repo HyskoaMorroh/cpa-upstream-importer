@@ -294,6 +294,29 @@ def main() -> int:
     truthy("种子兜底的段有区分标记", "'seed'" in js)
     truthy("重来时清空 forced", "S.forced = {}" in js)
 
+    section("⑧ 三条途径的字段必须齐平")
+    # 2026-09-02 用户指出：单站诊断只出 header，其余参数（代理、指纹、
+    # priority、前缀、模型、上限、影响面）全缺。根因是四条途径各自组装返回值。
+    # 现在诊断也走 prober.probe + build_plan，复用同一套序列化。
+    truthy("诊断走完整探测", "fp.probe(row)" in srv,
+           "只跑画像梯只能得出 header，其余参数全缺")
+    truthy("诊断走 build_plan", "plan_out = plan_json(pl)" in srv,
+           "priority / 前缀 / 影响面 都由 build_plan 算")
+    truthy("诊断回 verdicts", '"verdicts": verdicts' in srv)
+    truthy("前端渲染完整参数表", "完整参数（与全量检测同一套判定）" in js)
+    for f in ("profile_name", "min_body_kind"):
+        truthy(f"verdict_json 带 {f}", f'"{f}": v.' in srv,
+               "界面上「请求指纹」那一列靠它")
+    # time_window 要转成 list（tuple 不能直接进 JSON）
+    truthy("verdict_json 带 time_window",
+           '"time_window": list(v.time_window)' in srv,
+           "限时段的站要标出窗口，否则看着像不可用")
+    for f in ("prefix", "weight"):
+        truthy(f"plan_json 带 {f}", f'"{f}": sp.{f}' in srv,
+               "它会落进 config.yaml")
+    truthy("weight:0 在结果表里有警示", "逐出调度池" in js,
+           "写回后 CPAMP 显示未启用，界面必须提前说清")
+
     section("⑧ 收尾时的缺口必须说清")
     # 现场报障：`71/79 (90%)` 就切到第三步，看着像「没跑完就往下走」。
     # 实际是 8 个候选探测抛异常、进不了结果集（server.py 的 lost 分支
