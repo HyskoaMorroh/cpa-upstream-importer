@@ -278,8 +278,42 @@ async function doParse() {
     ? `${d.valid.length} 行可探测 · ${hosts.length} 个主机` : '没有有效行';
 }
 
+// ── 全量重探勾选框交互 ──
+$('#o_full_redetect').addEventListener('change', (e) => {
+  const checked = e.target.checked;
+  $('#o_max_workers_row').hidden = !checked;
+  $('#full_redetect_warning').hidden = !checked;
+
+  if (checked) {
+    // 获取既有站数量
+    api('/api/context').then(ctx => {
+      const existingCount = ctx.existing_count || 0;
+      S.existingCount = existingCount;
+      $('#existing_count_text').textContent = existingCount > 0
+        ? `config.yaml 中有 ${existingCount} 个既有站。`
+        : '未检测到既有站（config.yaml 可能为空）。';
+    }).catch(() => {
+      $('#existing_count_text').textContent = '无法读取既有站数量。';
+    });
+  }
+});
+
 // ── 探测 ──
 $('#btnprobe').onclick = async () => {
+  const fullRedetect = $('#o_full_redetect').checked;
+
+  // 全量重探确认
+  if (fullRedetect) {
+    const existingCount = S.existingCount || 0;
+    const confirmMsg = existingCount > 0
+      ? `即将重新探测所有 ${existingCount} 个既有站，\n与新站一起重新生成配置（headers/代理/优先级/前缀全部更新）。\n\n预计耗时 5-8 分钟，是否继续？`
+      : `全量重探模式已开启，但未检测到既有站。\n\n是否仅探测新站？`;
+
+    if (!confirm(confirmMsg)) {
+      return;
+    }
+  }
+
   const body = {
     text: $('#input').value,
     opts: {
@@ -294,6 +328,8 @@ $('#btnprobe').onclick = async () => {
       workers: $('#o_fast').checked ? 4 : 1,
       candidate_workers: $('#o_fast').checked ? 4 : 1,
     },
+    full_redetect: fullRedetect,
+    max_workers: fullRedetect ? parseInt($('#o_max_workers').value, 10) || 30 : undefined,
   };
   let d;
   try { d = await api('/api/probe', { method: 'POST', body }); }

@@ -449,11 +449,24 @@ https://其他站.com,sk-yyyyyyyyyyyyyyyy
     <label class="opt">换模采样 <input type="number" id="o_swap" value="3" min="0" max="12"> 次</label>
     <label class="opt"><input type="checkbox" id="o_fast" checked> 并行探测
       <span class="hint">四段同时 + 多站同时，快 4–8 倍</span></label>
+    <label class="opt" style="border-top: 2px solid var(--border); padding-top: 12px; margin-top: 12px;">
+      <input type="checkbox" id="o_full_redetect"> <strong>全量重探模式</strong>
+      <span class="hint">重新探测 config.yaml 中所有既有站，与新站一起重新生成配置（headers/代理/优先级/前缀全部更新）。预计耗时 5-8 分钟。</span>
+    </label>
+    <label class="opt" id="o_max_workers_row" style="margin-left: 24px;" hidden>
+      站级并发数 <input type="number" id="o_max_workers" value="30" min="1" max="50" step="1">
+      <span class="hint">同时探测的站数量（4U24G VPS 推荐 30-40）</span>
+    </label>
   </div>
   <div class="note w" id="costnote">
     <b>上下文探测会计费。</b>每个可用段额外 4–6 次大 body 请求（最大约 110 万字符）。
     它是唯一能修掉「<code>Context window is full</code>」那条 400 的探测 ——
     真实上限写进 <code>max-context-length</code> 后，客户端才在正确的点自动压缩。
+  </div>
+  <div class="note w" id="full_redetect_warning" hidden>
+    <b>⚠️ 全量重探将重新探测所有既有站。</b>
+    <span id="existing_count_text">正在读取既有站数量...</span>
+    此操作会生成完整的 diff 预览，您可以在写回前逐项确认。
   </div>
   <div class="row">
     <button class="go ghost" id="btnparse">解析（零请求）</button>
