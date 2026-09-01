@@ -118,9 +118,11 @@ def test_batch_prober_progress():
     assert progress_log[-1][0] == 10  # 最后一次是 10/10
     assert progress_log[-1][1] == 10
 
-    # 验证统计：所有站都是 partial（2段通）
-    assert batch_prober._stats["partial"] == 10
-    assert batch_prober._stats["success"] == 0
+    # 验证统计：所有站 2 段通 —— 新口径下「至少一段可用」就算 success，
+    # 四段全通才进 all_four。旧口径要求四段全通才算 success，实测 79 个
+    # 凭据里只有 1 个满足，界面长期显示「成功 0」。
+    assert batch_prober._stats["success"] == 10
+    assert batch_prober._stats["all_four"] == 0
     assert batch_prober._stats["failure"] == 0
 
     print(f"[OK] BatchProber: 10 sites probed, {len(progress_log)} callbacks")
@@ -156,9 +158,12 @@ def test_batch_prober_stats():
     batch_prober = BatchProber(FakeProber(), max_workers=2)
     results = batch_prober.probe_batch(rows)
 
-    assert batch_prober._stats["success"] == 1
-    assert batch_prober._stats["partial"] == 2
+    # 1 站四段全通 + 2 站两段通 = 3 个「至少一段可用」；其中 1 个四段全通。
+    assert batch_prober._stats["success"] == 3
+    assert batch_prober._stats["all_four"] == 1
     assert batch_prober._stats["failure"] == 2
+    # partial 保留为兼容键，恒 0：外部还在读它，删掉会静默变 KeyError
+    assert batch_prober._stats["partial"] == 0
 
     print(f"[OK] BatchProber stats: {batch_prober._stats}")
 
@@ -189,8 +194,8 @@ def test_batch_prober_exception_handling():
     batch_prober = BatchProber(FakeProber(), max_workers=1)
     results = batch_prober.probe_batch(rows)
 
-    # 异常站被计入 failure
-    assert batch_prober._stats["partial"] == 2  # 第1、3站
+    # 异常站被计入 failure，其余两站各 1 段通 = success
+    assert batch_prober._stats["success"] == 2   # 第1、3站
     assert batch_prober._stats["failure"] == 1   # 第2站（异常）
     assert len(results) == 2  # 只有成功的2个结果
 

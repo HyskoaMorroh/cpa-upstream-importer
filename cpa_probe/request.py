@@ -209,3 +209,25 @@ def parse_models_response(section: str, text: str) -> list[str]:
                 if isinstance(v, str) and v:
                     out.append(v)
     return sorted(set(out))
+
+
+def next_page_token(text: str) -> str:
+    """Gemini 列模型的翻页游标。没有就返回空串。
+
+    为什么需要（2026-09-01，对齐 CPAMP）：`/v1beta/models` 分页返回，
+    默认页长有限。CPAMP 的 healthCheck.ts:279-364 会一直翻到
+    `nextPageToken` 为空（上限 20 页）；本工具原来只读第一页，于是
+    gemini 段的目录被截断，后面的模型根本没机会被验。
+
+    其余三段（OpenAI / Codex / Claude 形态）不分页，调用方只对 gemini 用。
+    """
+    import json
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    tok = data.get("nextPageToken") or data.get("next_page_token") or ""
+    return tok if isinstance(tok, str) else ""

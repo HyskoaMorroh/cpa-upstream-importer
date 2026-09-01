@@ -25,7 +25,10 @@ class BatchProber:
         """
         self._prober = prober
         self._max_workers = max_workers
-        self._stats = {"success": 0, "partial": 0, "failure": 0}
+        # success = 至少一段可用；all_four = 四段全通（success 的子集）。
+        # partial 保留但恒为 0：外部调用方（server.py / web）还在读这个键，
+        # 直接删会静默变成 KeyError 或 undefined。见 probe_batch 里的口径说明。
+        self._stats = {"success": 0, "all_four": 0, "partial": 0, "failure": 0}
         # 抛异常的站：[(站, 原因), ...]。调用方要能说出「哪几个站没跑成」——
         # results 里少一条而不知道为什么，比直接报错更难查。
         # 累加都在 as_completed 那个循环里做，那是单线程，不需要锁。
@@ -69,11 +72,23 @@ class BatchProber:
                     results[url] = result
 
                     # 更新统计
+                    #
+                    # 口径（2026-09-01 修正）：`success` = **至少一段可用**，
+                    # 因为「这个凭据能不能用」才是操作员要的答案。
+                    #
+                    # 原来 success 要求四段全通，实测 79 个凭据里只有 1 个
+                    # 满足 —— 中转站按类型卖，一个站同时卖满 gemini+codex+
+                    # claude+compat 本就罕见。结果界面长期显示「成功 0」，
+                    # 而下方日志明明在刷 200，操作员据此以为程序没在跑。
+                    # 34 个真正可用的凭据里 33 个被划进了「部分通」。
+                    #
+                    # 四段全通仍然值得单独看，改用 `all_four` 记，不再占用
+                    # 「成功」这个词。
                     usable_count = len(result.usable_sections)
-                    if usable_count == 4:
+                    if usable_count > 0:
                         self._stats["success"] += 1
-                    elif usable_count > 0:
-                        self._stats["partial"] += 1
+                        if usable_count == 4:
+                            self._stats["all_four"] += 1
                     else:
                         self._stats["failure"] += 1
 

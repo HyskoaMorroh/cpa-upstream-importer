@@ -6,7 +6,7 @@
 'use strict';
 
 const $ = (s) => document.querySelector(s);
-const $$ = (s) => [].slice.call(document.querySelectorAll(s));
+const $$ = (s, root) => [].slice.call((root || document).querySelectorAll(s));
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
   (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmt = (n) => (n == null ? '—' : Number(n).toLocaleString('en-US'));
@@ -848,6 +848,17 @@ function renderStream(events) {
       return `<div class="s4">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
         + `${esc(e.host)} 画像梯跑完仍不通（试 ${e.tried} 档）</div>`;
     }
+    // 整梯全败后，正文点名要 beta 就补上重试。显示补了什么 —— 这一步会改
+    // 落地的 anthropic-beta，操作员必须看得到凭什么改的。
+    if (e.kind === 'beta-retry') {
+      return `<div class="note">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `${esc(e.host)} 正文点名缺 ${esc((e.added || []).join(','))}，`
+        + `补进 ${esc(e.profile)} 重试</div>`;
+    }
+    if (e.kind === 'beta-hit') {
+      return `<div class="s2">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `${esc(e.host)} 补 beta 后通（${esc(e.profile)}）</div>`;
+    }
     // 同段整梯已试过全败，后续种子跳过。**必须显示** —— 否则日志里看起来
     // 像是这个种子没被处理，而实际是刻意省掉的重复请求。
     if (e.kind === 'profile-skipped') {
@@ -876,6 +887,12 @@ function renderStream(events) {
     if (e.kind === 'catalog') {
       return `<div>  ${pad(SECTION_LABEL[e.section], 8)} /models 目录 ${e.count} 个`
         + `（已按 gemini/gpt/claude 过滤）</div>`;
+    }
+    // 目录问不到不是失败 —— 很多站关掉了 /models，照样能推理。
+    // 这时探测退回种子模型，日志里要说清「为什么用的是种子」。
+    if (e.kind === 'catalog-miss') {
+      return `<div class="s4">  ${pad(SECTION_LABEL[e.section], 8)} `
+        + `/models 目录不可读（${esc(e.status)}），改用种子模型试探</div>`;
     }
     if (e.kind === 'swap') {
       return `<div class="s4">  ${pad(SECTION_LABEL[e.section], 8)} `
@@ -914,9 +931,14 @@ function renderStream(events) {
       const bar = '█'.repeat(Math.round(pct / 4))
         + '░'.repeat(25 - Math.round(pct / 4));
       const stat = [];
-      if (e.success != null) stat.push(`成功 ${e.success}`);
-      if (e.partial != null) stat.push(`部分通 ${e.partial}`);
-      if (e.failure != null) stat.push(`失败 ${e.failure}`);
+      // 「可用」= 至少一段通。原来这里显示的 success 要求四段全通，
+      // 79 个凭据里只有 1 个满足，于是长期显示「成功 0」而下方日志在刷
+      // 200 —— 看起来像卡住了。四段全通改成括注。
+      if (e.success != null) {
+        stat.push(`可用 ${e.success}`
+          + (e.all_four ? `（全通 ${e.all_four}）` : ''));
+      }
+      if (e.failure != null) stat.push(`全灭 ${e.failure}`);
       return `<div class="s2">${bar} ${e.current}/${e.total} (${pct}%)`
         + (stat.length ? ` · ${stat.join(' · ')}` : '')
         + (e.site ? ` · 刚完成 ${esc(e.site)}` : '') + `</div>`;
@@ -960,24 +982,47 @@ function siteCard(r) {
       // 但要求先填模型清单：探测没验成功过任何模型，工具无从推断该注册什么。
       // 勾选框默认不勾，且只有填了模型才可勾（见 bindResultEvents）。
       const fm = ((S.forced[host] || {})[sec] || []).join(', ');
+      // 站方 /models 目录报出来的模型 —— 探测跑不通不等于站方没这些模型，
+      // 现场就有「CPAMP 面板看得见模型、这里判死路」的形态：目录是站方
+      // 声明有什么，探测测的是这把 Key 的分组能用什么，两者本就会不一致。
+      const cat = (v.catalog || []).filter((m) => m);
+      const picked = new Set(((S.forced[host] || {})[sec] || []));
       return `<tr class="off" data-host="${esc(host)}" data-sec="${esc(sec)}">
         <td class="pick"><input type="checkbox" class="sel force"
           data-host="${esc(host)}" data-sec="${esc(sec)}"
-          title="探测未通过。要接管请先在右侧填模型名"></td>
+          title="探测未通过。勾选即接管，模型可从右侧目录选或手填"></td>
         <td class="m"><b>${esc(label)}</b></td>
         <td><span class="pill ${pill}">${esc(v.category || '不可用')}</span></td>
-        <td>${esc(v.action || '不写入')}
-          ${last && last.excerpt
-            ? `<div class="mlist">${esc(last.status)} · ${esc(last.excerpt.slice(0, 150))}</div>`
-            : ''}</td>
-        <td colspan="4">
+        <td>
+          ${cat.length ? `<div class="cats">${cat.map((m) => `
+            <label class="catpick"><input type="checkbox" class="cm"
+              data-host="${esc(host)}" data-sec="${esc(sec)}"
+              value="${esc(m)}"${picked.has(m) ? ' checked' : ''}>${esc(m)}</label>`
+            ).join('')}</div>
+          <div class="hint">站方目录报出 ${cat.length} 个模型，勾选即注册</div>`
+            : ''}
           <div class="pedit"><input type="text" class="fm" style="width:100%"
             data-host="${esc(host)}" data-sec="${esc(sec)}"
             value="${esc(fm)}"
-            placeholder="不给测活的站：手填模型名，逗号分隔，如 claude-opus-5"></div>
-          <div class="hint">填了才能勾选。工具不会验证这些模型 ——
-            写错会让 CPA 每次轮到它都失败</div>
+            placeholder="${cat.length ? '也可手填目录外的模型名，逗号分隔'
+              : '站方目录也没报模型：手填模型名，逗号分隔，如 claude-opus-5'}"></div>
+          <div class="hint">工具不会验证这些模型 —— 写错会让 CPA 每次轮到它都失败</div>
         </td>
+        <td class="num">${v.max_context_length ? fmt(v.max_context_length) : '—'}
+          ${v.context_model ? `<div class="hint">@${esc(v.context_model)}</div>` : ''}</td>
+        <td>${esc(v.action || '不写入')}
+          ${v.need_proxy ? '<div><span class="pill p-w">需代理</span></div>' : ''}
+          ${last && last.excerpt
+            ? `<div class="mlist">${esc(last.status)} · ${esc(last.excerpt.slice(0, 90))}</div>`
+            : ''}</td>
+        <td class="prio">
+          <div class="pedit"><input type="number" class="pi"
+            data-host="${esc(host)}" data-sec="${esc(sec)}" placeholder="待定"></div>
+        </td>
+        <td class="rsn"><span class="hint">勾选后计算</span></td>
+      </tr>
+      <tr class="wrow" data-host="${esc(host)}" data-sec="${esc(sec)}">
+        <td></td><td colspan="7" class="wbox"></td>
       </tr>`;
     }
 
@@ -1110,6 +1155,31 @@ function bindResultEvents() {
   const box = $('#results');
   box.addEventListener('change', (e) => {
     // 人工接管的模型清单
+    // 目录复选框 —— 与手填框同一份 S.forced，勾选即写入
+    const cmi = e.target.closest('.cm');
+    if (cmi) {
+      const h = cmi.dataset.host, sc = cmi.dataset.sec;
+      const tr = cmi.closest('tr');
+      const chosen = tr
+        ? $$('.cm', tr).filter((x) => x.checked).map((x) => x.value) : [];
+      // 手填框里目录外的模型要留着 —— 两个入口写同一个段，不能互相清空
+      const box3 = tr && tr.querySelector('.fm');
+      const known = new Set($$('.cm', tr).map((x) => x.value));
+      const extra = box3
+        ? box3.value.split(',').map((x) => x.trim())
+            .filter((x) => x && !known.has(x)) : [];
+      const list = chosen.concat(extra);
+      S.forced[h] = S.forced[h] || {};
+      if (list.length) {
+        S.forced[h][sc] = list;
+      } else {
+        delete S.forced[h][sc];
+      }
+      refreshPlan(true);
+      syncPickUI();
+      return;
+    }
+
     const fmi = e.target.closest('.fm');
     if (fmi) {
       const h = fmi.dataset.host, sc = fmi.dataset.sec;
@@ -1140,15 +1210,22 @@ function bindResultEvents() {
     if (sel) {
       // 探测未通过的段：没填模型就不让勾 —— 空清单到后端会被当成
       // 未接管而跳过，勾了也不会写入。在这里拦住并说清原因。
+      // 探测未通过的段：拦的条件从「必须手填」放宽成「必须有模型可注册」。
+      // 站方目录报出的模型算数 —— 有目录就直接勾得上，不必手打一遍。
+      // 真的一个模型都没有才拦：空清单到后端会被跳过，勾了也不会写入。
       if (sel.classList.contains('force') && sel.checked) {
-        const fl = (S.forced[sel.dataset.host] || {})[sel.dataset.sec] || [];
-        if (!fl.length) {
+        const h2 = sel.dataset.host, s2 = sel.dataset.sec;
+        const fl = (S.forced[h2] || {})[s2] || [];
+        const row = sel.closest('tr');
+        const fromCat = row
+          ? $$('.cm', row).filter((x) => x.checked).length : 0;
+        if (!fl.length && !fromCat) {
           sel.checked = false;
-          const row = sel.closest('tr');
           const box2 = row && row.querySelector('.fm');
           if (box2) box2.focus();
-          $('#pickstat').textContent =
-            '该段探测未通过 —— 要接管请先填模型名（逗号分隔）';
+          $('#pickstat').textContent = row && $$('.cm', row).length
+            ? '该段没选模型 —— 从上方目录勾几个，或手填模型名'
+            : '该段探测未通过且站方目录未报模型 —— 请手填模型名（逗号分隔）';
           return;
         }
       }
@@ -1177,16 +1254,29 @@ function bindResultEvents() {
 
 function applyPickPreset(mode) {
   if (!S.plans) return;
+  // 「全勾」就是全勾 —— 不看判定状态。很多站不给测活却能用，按判定筛
+  // 等于把可用站扔掉。唯一不勾的是 duplicate（撞已有 Key，写进去是重复条目）。
+  // 「只勾推荐项」保持按 recommended 筛，那才是让工具替你判断的入口。
   S.picks = new Set();
+  const missing = [];
   S.plans.forEach((p) => {
     Object.entries(p.sections).forEach(([sec, sp]) => {
-      if (!sp.writable) return;
-      if (mode === 'all' || (mode === 'rec' && sp.recommended)) {
-        S.picks.add(pk(p.host, sec));
+      if (sp.duplicate) return;
+      if (mode === 'rec' && !sp.recommended) return;
+      if (mode === 'none') return;
+      if (!(sp.models || []).length) {
+        // 站方目录也没报模型 —— 勾了后端也会跳过，如实告诉操作员
+        missing.push(`${p.host} ${SECTION_LABEL[sec] || sec}`);
+        return;
       }
+      S.picks.add(pk(p.host, sec));
     });
   });
   syncPickUI();
+  if (mode === 'all' && missing.length) {
+    $('#pickstat').textContent = `已勾选 ${S.picks.size} 项写入 · `
+      + `${missing.length} 段无模型可注册（站方目录未报，需手填）`;
+  }
 }
 
 function syncPickUI() {
