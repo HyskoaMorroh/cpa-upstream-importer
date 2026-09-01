@@ -64,9 +64,17 @@ _CC_UA_TEMPLATE = "claude-cli/{version} (external, cli)"
 # 与请求体相关的条件项（advisor / advanced-tool-use / effort / fast-mode 等）不带 ——
 # 探测请求里没有 tools、没有 speed，真实客户端那时也不会发它们。
 _CC_BETAS_MIN = "claude-code-20250219"
+# 与 CPA 的 claudeCodeCLIBetas **无条件**发送的那部分对齐
+# （claude_executor_request.go:107-150）。用 cpa_source_probe 自动比对，
+# 差异会被报成漂移。
+#
+# 为什么去掉了 oauth-2025-04-20（2026-09-01 漂移检测抓到）
+# ----------------------------------------------------
+# CPA 只在 `oauthToken == true` 时才追加它（同文件 110-112）。而我们是拿
+# **api-key** 探测的，不满足那个条件 —— 无条件发它等于声称走 oauth 却带着
+# api-key，按项检查 beta 的站会看到一个自相矛盾的请求。
 _CC_BETAS_STD = ",".join([
     "claude-code-20250219",
-    "oauth-2025-04-20",
     "interleaved-thinking-2025-05-14",
     "redact-thinking-2026-02-12",
     "thinking-token-count-2026-05-13",

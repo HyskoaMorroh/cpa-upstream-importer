@@ -69,6 +69,7 @@ from .writeback import (
 )
 from .batch import BatchProber
 from .resources import Resources, detect as detect_resources
+from .cpa_source_probe import check as check_profile_drift
 
 __all__ = [
     "SECTIONS",
@@ -126,4 +127,5 @@ __all__ = [
     "BatchProber",
     "Resources",
     "detect_resources",
+    "check_profile_drift",
 ]

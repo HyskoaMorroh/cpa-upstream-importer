@@ -1204,6 +1204,112 @@ gemini           → POST /v1beta/models/{model}:generateContent
 
 ---
 
+## 画像梯能不能跟着 CPA 自动更新
+
+**部分能，而不能的那部分不是实现难度问题，是信息本身不存在。** 这个区分很重要，
+否则会误以为「等 CPA 升级自动刷新」就万事大吉。
+
+### 两类内容
+
+**① 头的「值」—— 能自动跟随**
+
+UA 版本号、X-Stainless 族、anthropic-beta 各项的具体值，在 CPA 源码里是
+`const` 块与 `[]string` 切片，形态稳定可解析：
+
+```go
+// internal/runtime/executor/claude_executor_request.go:40-52
+claudeCodeBeta          = "claude-code-20250219"
+claudeMidConvSystemBeta = "mid-conversation-system-2026-04-07"
+claudeEffortBeta        = "effort-2025-11-24"
+
+// :61-67
+var claudeCodeCLIConstantBetas = []string{
+	"interleaved-thinking-2025-05-14",
+	claudeRedactThinkingBeta,
+	"thinking-token-count-2026-05-13",
+	...
+}
+```
+
+**② 档次划分（几档、每档含哪些头）—— 不能自动生成**
+
+CPA 源码里**没有**这个信息。它只知道自己转发时发什么，从不问「少发几个行不行」。
+
+而画像梯的全部意义正是问这个：config.yaml 里的 `headers` 越少越稳——站方改门禁
+时，写了 12 个头的条目比写了 3 个的更容易整体失效。
+
+举个具体的：`cc-min` = UA + anthropic-beta 这个分档，依据是实测发现
+**agentrouter 的门票恰好是那三项缺一不可**。CPA 源码里读不出这句话。
+
+所以档次划分是「实测出来的站方行为」，不是 CPA 的数据。
+
+### 已经做了什么
+
+| 层 | 状态 | 说明 |
+|---|---|---|
+| 头的值从 CPA 派生 | ✅ | `profiles.defaults_from_config()` 读 `claude-header-defaults` / `codex.header-defaults` |
+| beta 清单与 CPA 源码比对 | ✅ | `cpa_probe/cpa_source_probe.py` 解析 Go 常量表 |
+| 漂移在界面显示 | ✅ | `/api/context` 返回 `profile_drift`，前端渲染 |
+| 档次划分 | ❌ 手工维护 | 信息上不成立，见上 |
+
+### 漂移检测抓到的第一个缺陷
+
+上线这个检测当天就抓到一处真实问题：画像梯**无条件**发 `oauth-2025-04-20`，
+而 CPA 只在 `oauthToken == true` 时才发它（`claude_executor_request.go:110-112`）。
+
+我们是拿 **api-key** 探测的，不满足那个条件——无条件发它等于声称走 oauth 却
+带着 api-key，按项检查 beta 的站会看到一个自相矛盾的请求。已修。
+
+这类错误人工比对很难发现：那个清单有 8-17 项，而「哪几项是有条件的」要读函数体
+才知道。
+
+### 怎么开启
+
+**精确模式**（读 CPA 源码，能区分有条件/无条件 beta）：
+
+```bash
+# .env
+CPA_SOURCE=/opt/deploy/CLIProxyAPI
+CPA_SOURCE_ROOT=/cpa-source
+```
+
+命令行直接跑：
+
+```bash
+python3 -m cpa_probe.cpa_source_probe /path/to/CLIProxyAPI
+```
+
+输出形如：
+
+```
+claude 无条件 beta（8 项）：
+    claude-code-20250219
+    interleaved-thinking-2025-05-14
+    ...
+claude 有条件 beta（9 项，探测时不发）：
+    oauth-2025-04-20                       claudeOAuthBeta
+    context-1m-2025-08-07                  claudeContext1MBeta
+    ...
+✓ 画像梯与 CPA 源码一致，无漂移
+```
+
+**退化模式**（读不到源码时自动走这条）：拿 config.yaml 的
+`claude-header-defaults` 比对内置回落常量。覆盖面小得多——只有 UA 版本与
+X-Stainless 族，**管不到 beta 清单**。界面会明确标注「未覆盖：anthropic-beta
+清单（只有源码里有）」，不假装全都比过了。
+
+两条都不成立时报 `checked: false` 并说明原因，而不是显示「一致」。
+
+### CI 里的守卫
+
+`tests/test_full_redetect.py` 有一项 `test_profile_matches_real_cpa_source`：
+本机有 CPA 源码时，断言画像梯与它无 warn 级漂移；源码不在则跳过。
+
+所以你更新 CPA 源码后跑一遍测试，漂移会直接让测试失败，而不是等某个站突然
+401 才发现。
+
+---
+
 ## 全量重探：把既有站也一起重新定档
 
 默认行为是**只探新站**——粘贴的站探测完插进去，config.yaml 里已有的 175 个
