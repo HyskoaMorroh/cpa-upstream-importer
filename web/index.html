@@ -160,6 +160,52 @@ textarea::placeholder{color:var(--ink-3)}
 }
 .opts{display:flex;flex-wrap:wrap;gap:11px 24px;margin:20px 0 6px;font-size:13.5px}
 .opt{display:flex;align-items:center;gap:8px;color:var(--ink-2)}
+/* 单站诊断面板。默认折起 —— 主流程是批量导入，这个是排障入口。 */
+.diag{padding:0}
+.diag>summary{
+  padding:16px 22px;cursor:pointer;user-select:none;
+  display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;
+}
+.diag>summary::marker,.diag>summary::-webkit-details-marker{color:var(--ink-3)}
+.diag>summary:hover .dh{color:var(--accent-2)}
+.diag .dh{font-size:16px;font-weight:650;color:var(--ink)}
+.diag[open]>summary{border-bottom:1px solid var(--line)}
+.dbody{padding:18px 22px 22px}
+.drow{display:flex;gap:16px;flex-wrap:wrap;margin:14px 0 4px}
+.dfield{display:flex;flex-direction:column;gap:5px;flex:1 1 260px}
+.dfield>span{font-size:12.5px;color:var(--ink-2)}
+.dfield>input{
+  font:inherit;font-size:13.5px;padding:8px 11px;
+  background:var(--bg-2);color:var(--ink);
+  border:1px solid var(--line);border-radius:7px;
+}
+.dfield>input:focus{outline:2px solid var(--accent-2);outline-offset:1px}
+#d_section{
+  font:inherit;font-size:13px;padding:4px 8px;
+  background:var(--bg-2);color:var(--ink);
+  border:1px solid var(--line);border-radius:6px;cursor:pointer;
+}
+/* 画像梯结果：每档一行，命中那行高亮 */
+.rung{
+  display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;
+  padding:5px 10px;border-radius:6px;font-family:var(--f-mono);font-size:12.5px;
+  border-left:3px solid transparent;
+}
+.rung.hit{background:var(--ok-bg);border-left-color:var(--ok)}
+.rung.miss{color:var(--ink-3)}
+.rung .rn{min-width:132px;font-weight:600}
+.rung .rs{min-width:44px}
+.rung .rw{color:var(--ink-3);font-size:11.5px}
+.hdrbox{
+  margin-top:10px;padding:12px 14px;border-radius:8px;
+  background:var(--bg-2);border:1px solid var(--line);
+}
+.hdrbox pre{
+  margin:8px 0 0;padding:10px 12px;border-radius:6px;
+  background:var(--card);border:1px solid var(--line-2);
+  font-family:var(--f-mono);font-size:12px;line-height:1.65;
+  white-space:pre;overflow-x:auto;
+}
 /* 高级设置：默认折起。这几项能显著改变请求量，摊开会让主面板显得可怕，
    但藏进另一个页面又会让人找不到 —— details 是这两者之间唯一不需要 JS 的解。 */
 .adv{margin:14px 0 4px;border:1px solid var(--line);border-radius:9px;
@@ -444,6 +490,48 @@ footer code{color:var(--ink-2)}
 </div>
 
 <!-- ── 步骤 1 ── -->
+<!-- ── 单站诊断：决定要不要导入之前的动作，所以排在步骤①之前 ── -->
+<details class="panel diag" id="pdiag">
+  <summary>
+    <span class="dh">单站诊断</span>
+    <span class="hint">这个站要什么 header？只读，不生成方案、不写回</span>
+  </summary>
+  <div class="dbody">
+    <p class="psub">想知道某个站的门票是什么、为什么 401，用这个。它按画像梯
+       由省到全试，<b>第一个通过的档就是最小必需集</b> —— 那正是该写进
+       <code>config.yaml</code> 的 <code>headers</code>。</p>
+    <div class="drow">
+      <label class="dfield">
+        <span>站点地址</span>
+        <input type="text" id="d_url" spellcheck="false"
+               placeholder="https://api.example.com" aria-label="诊断站点地址">
+      </label>
+      <label class="dfield">
+        <span>密钥</span>
+        <input type="password" id="d_key" spellcheck="false"
+               placeholder="sk-..." aria-label="诊断密钥">
+      </label>
+    </div>
+    <div class="opts">
+      <label class="opt">段
+        <select id="d_section" aria-label="诊断哪个段">
+          <option value="claude-api-key" selected>claude</option>
+          <option value="codex-api-key">codex</option>
+          <option value="gemini-api-key">gemini</option>
+          <option value="openai-compatibility">compat</option>
+          <option value="">全部四段（约 25 次请求）</option>
+        </select>
+        <span class="hint">单段 3–8 次请求</span>
+      </label>
+      <label class="opt"><input type="checkbox" id="d_proxy"> 走代理
+        <span class="hint">站方按出口 IP 限制时用</span></label>
+      <button class="go" id="btndiag">开始诊断</button>
+      <span class="hint" id="diagmsg"></span>
+    </div>
+    <div id="diagout"></div>
+  </div>
+</details>
+
 <div class="panel" id="p1">
   <div class="ph"><h2>① 投喂上游账号</h2>
     <span class="tag">每行一组 url,key</span></div>
