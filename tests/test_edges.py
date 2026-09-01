@@ -162,6 +162,60 @@ def _dead_section_params() -> None:
         eq("手填段 headers 非空", bool(bool(sp2.headers)), True)
 
 
+def _fallback_headers_per_protocol() -> None:
+    """判死的段回落配头时，不能拿到别的协议的专属头。
+
+    2026-09-01 抓到：_fallback_headers 原来按 `p.tier == 2` 取标准档，而
+    tier 在四段里指的不是同一个东西 —— compat 段的梯子把整个 cc 族嵌在
+    openai-sdk 之上（覆盖「中转站只认 Claude Code」那种情形），编号整体
+    后移一位。于是 tier=2 在 gemini/codex/claude 段分别是 gemini-cli-full
+    / codex-tui / cc-std（都对），在 compat 段却是 **cc-min**：给一个走
+    /chat/completions 的段写 `anthropic-beta`。
+
+    这个错不会让测试红 —— headers 非空、priority 是整数、YAML 合法，
+    全部断言都过，只是写进 config.yaml 的门票是错协议的。所以这里按
+    「协议专属头不许跨段出现」来断言，而不是断言取到了哪个档名：
+    梯子以后怎么插档都不影响这条判据。
+    """
+    row = cp.parse_lines("https://all-dead.example.com,sk-dead-2").valid[0]
+    res = CandidateResult(row=row)
+    cats = {"claude-api-key": "WAF", "gemini-api-key": "IP封",
+            "codex-api-key": "死路", "openai-compatibility": "门禁"}
+    res.sections = {
+        sec: SectionVerdict(section=sec, usable=False,
+                            base_url=row.base_for(sec),
+                            category=cat, action="站方拒绝")
+        for sec, cat in cats.items()
+    }
+    cfg = {sec: [] for sec in cats}
+    plan = cp.build_plan(row, res, cfg, bands={},
+                         seen=cp.existing_fingerprints(cfg), probation=True)
+
+    eq("四段全判死也全进方案", len(plan.sections), 4)
+
+    # 每段只许带本段协议的专属头
+    forbidden = {
+        "gemini-api-key": ("anthropic-", "originator"),
+        "codex-api-key": ("anthropic-", "x-goog-"),
+        "claude-api-key": ("originator", "x-goog-"),
+        "openai-compatibility": ("anthropic-", "originator", "x-goog-"),
+    }
+    for sec, bad_prefixes in forbidden.items():
+        sp = plan.sections.get(sec)
+        eq(f"{sec} 判死也有 headers", bool(sp and sp.headers), True)
+        if not sp:
+            continue
+        leaked = [k for k in sp.headers
+                  if any(k.lower().startswith(b) for b in bad_prefixes)]
+        eq(f"{sec} 不带别段协议头", leaked, [])
+
+    # compat 段的门票必须是 OpenAI SDK 形态而不是 claude-cli
+    sp = plan.sections.get("openai-compatibility")
+    if sp:
+        eq("compat 段回落到 openai-sdk 档",
+           bool(any(k.lower().startswith("x-stainless") for k in sp.headers)), True)
+
+
 class Harness:
     def __init__(self, raw: str, cfg: dict):
         self.raw = raw
@@ -499,6 +553,7 @@ def main() -> int:
 
     section("判不可用的段：勾选后参数不许留「未定」")
     _dead_section_params()
+    _fallback_headers_per_protocol()
 
     print("\n" + "=" * 62)
     if _fail:
