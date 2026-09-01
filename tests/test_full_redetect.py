@@ -413,6 +413,171 @@ openai-compatibility:
           f"{len(prov['api-key-entries'])} 个 Key、{len(warns)} 条警告")
 
 
+def test_credential_dedup():
+    """同一凭据被写进多个段时，探测只做一次。
+
+    config.yaml 的条目是「(凭据, 段)」的组合：很多中转站用同一把 Key 提供
+    多种协议，于是同一个 url+key 被写进 2-4 个段。而 Prober.probe() 的语义
+    本来就是「拿一个凭据把四段各打一遍」—— 按条目喂它等于重复探测。
+
+    实测那份生产配置：175 个条目只有 77 个不同凭据，按条目探会白打 98 次。
+    """
+    import yaml
+    cfg = yaml.safe_load("""
+gemini-api-key:
+  - api-key: "sk-SAME"
+    base-url: "multi.example.com"
+  - api-key: "sk-ONLY-GEMINI"
+    base-url: "single.example.com"
+
+codex-api-key:
+  - api-key: "sk-SAME"
+    base-url: "multi.example.com/v1"
+
+claude-api-key:
+  - api-key: "sk-SAME"
+    base-url: "multi.example.com"
+
+openai-compatibility:
+  - name: "multi"
+    base-url: "multi.example.com/v1"
+    api-key-entries:
+      - api-key: "sk-SAME"
+    models:
+      - name: "m"
+        alias: "m"
+""")
+    entries = extract_existing_entries(cfg)
+    assert len(entries) == 5, f"应有 5 个条目，实际 {len(entries)}"
+
+    # 按 (host, key) 去重 —— 与 run_job_full_redetect 同一套键
+    from cpa_probe.parse import host_of
+    creds = {(host_of(base), key) for _s, base, key, _o in entries}
+
+    # sk-SAME 跨四段但 host 相同，应折成 1 个；加上 single 那个 = 2
+    assert len(creds) == 2, f"去重后应有 2 个凭据，实际 {len(creds)}：{creds}"
+
+    # 关键：base-url 带不带 /v1 不能影响去重判定
+    hosts = {h for h, _k in creds}
+    assert hosts == {"multi.example.com", "single.example.com"}, hosts
+
+    print(f"[OK] Credential dedup: 5 条目 → {len(creds)} 凭据（省 3 次全流程探测）")
+
+
+def test_probe_text_not_trivial():
+    """探测文本不能是简单问候 —— 那是站方反测活规则最先拦的形态。
+
+    2026-08-29 实测修正过一次（原来用 "hi"）。这一项防止它被改回去：
+    简单问候的特征是短、无技术内容、疑似测活，站方按这个封号。
+    """
+    from cpa_probe import request as req
+
+    text = req.PROBE_TEXT.lower().strip()
+
+    banned = ["hi", "hello", "hey", "你好", "您好", "test", "ping",
+              "你是什么模型", "what model are you", "who are you",
+              "介绍一下你自己", "1", "?", "。"]
+    for b in banned:
+        assert text != b, f"PROBE_TEXT 不能是 {b!r}"
+        assert not text.startswith(b + " "), f"PROBE_TEXT 不能以 {b!r} 开头"
+
+    # 长度下限：太短的一律像测活
+    assert len(text) >= 40, f"PROBE_TEXT 太短（{len(text)} 字符），像测活"
+
+    # 必须有技术内容 —— 至少命中一个技术词
+    tech = ["hash", "tree", "map", "tcp", "http", "algorithm", "function",
+            "database", "index", "cache", "sort", "queue", "thread"]
+    assert any(t in text for t in tech), f"PROBE_TEXT 缺技术内容：{text!r}"
+
+    # pipeline 里那条反测活重试用的备用文本也要过同一道
+    import io as _io
+    src = _io.open(os.path.join(ROOT, "cpa_probe", "pipeline.py"),
+                   encoding="utf-8").read()
+    import re as _re
+    for m in _re.finditer(r'text="([^"]{1,120})"', src):
+        t = m.group(1)
+        if set(t) == {"x"}:          # 上下文二分的填充，不是给站方读的
+            continue
+        low = t.lower()
+        assert len(t) >= 20, f"pipeline 里的探测文本太短：{t!r}"
+        assert any(x in low for x in tech), f"pipeline 里的文本缺技术内容：{t!r}"
+
+    print(f"[OK] Probe text: {len(text)} 字符、含技术内容、非问候")
+
+
+def test_profile_verdict_reuse_saves_calls():
+    """同段整梯全败后，后续种子跳过画像梯 —— 用真实请求数验证。
+
+    门票是站+段的属性（站方查 headers 与 body 形态，不看模型名），所以第一个
+    种子试完整梯全败之后，同段的后续种子不必重问。
+
+    实测（假上游全 403）：57 次 → 30 次，省 47%。
+    """
+    import json
+    import socket
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from cpa_probe.pipeline import Prober
+    from cpa_probe.parse import parse_lines
+
+    calls = {"n": 0}
+    lock = threading.Lock()
+
+    class AllGate(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, payload):
+            raw = json.dumps(payload).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def _count_and_deny(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            with lock:
+                calls["n"] += 1
+            self._send(403, {"error": {"message": "only allows CC clients",
+                                      "type": "permission_error"}})
+
+        do_GET = _count_and_deny
+        do_POST = _count_and_deny
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    srv = ThreadingHTTPServer(("127.0.0.1", port), AllGate)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    try:
+        row = parse_lines(f"http://127.0.0.1:{port},sk-test").valid[0]
+
+        calls["n"] = 0
+        Prober(gap=0.0, probe_context=False, swap_samples=0, workers=4,
+               reuse_profile_verdict=True).probe(row)
+        with_reuse = calls["n"]
+
+        calls["n"] = 0
+        Prober(gap=0.0, probe_context=False, swap_samples=0, workers=4,
+               reuse_profile_verdict=False).probe(row)
+        without = calls["n"]
+    finally:
+        srv.shutdown()
+
+    assert with_reuse < without, (
+        f"开复用应更省，实际 开={with_reuse} 关={without}")
+    saved_pct = (1 - with_reuse / without) * 100
+    assert saved_pct >= 30, f"省得太少（{saved_pct:.0f}%），复用可能没生效"
+
+    print(f"[OK] Profile reuse: {without} → {with_reuse} 次请求"
+          f"（省 {saved_pct:.0f}%）")
+
+
 if __name__ == "__main__":
     # 与其余套件同一套汇报约定：run.py 按「全部通过 · N 项」这行统计，
     # 失败行以 ✗ 开头。自己 print [OK] 不会被计入总数。
@@ -424,6 +589,9 @@ if __name__ == "__main__":
         ("全量重建保注释", test_rebuild_config_preserves_comments),
         ("priority 降序", test_rebuild_config_priority_order),
         ("段字段结构与 compat 归并", test_rebuild_config_section_structure),
+        ("凭据去重", test_credential_dedup),
+        ("探测文本非问候", test_probe_text_not_trivial),
+        ("画像结论复用省请求", test_profile_verdict_reuse_saves_calls),
     ]
 
     ok = 0

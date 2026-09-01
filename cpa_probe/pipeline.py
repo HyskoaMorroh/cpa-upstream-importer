@@ -63,6 +63,18 @@ _OPENAI_REASONING_RE = re.compile(r"^o\d+(?:[.\-]|$)")
 # 全验会触发反测活且极贵。
 MAX_MODELS_PER_SECTION = 4
 
+# 每段最多**尝试**几次模型验证。
+#
+# 为什么不能只有 MAX_MODELS_PER_SECTION（2026-09-01 量化发现）：
+# 那个是「已接受几个」的上限，而失败的尝试不增加计数。一个声明 838 个模型
+# 的聚合站，如果它的模型全都验不过（分组不含、限时段、要门票），循环会把
+# 白名单过滤后剩下的**全部**打一遍才结束 —— 上面那句注释说的「全验会触发
+# 反测活且极贵」正是这个情形，但原来的 break 条件兑现不了它。
+#
+# 取 10：够拿到 4 个可信模型（种子 2-3 个 + 目录里前几个通常就够），
+# 又把最坏情形从「目录长度」压到常数。
+MAX_MODEL_ATTEMPTS_PER_SECTION = 10
+
 
 def _encode(body: dict) -> bytes:
     return json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -244,6 +256,9 @@ class Prober:
         probe_context: bool = True,
         swap_samples: int = 3,
         workers: int = 4,
+        max_models: int = MAX_MODELS_PER_SECTION,
+        max_model_attempts: int = MAX_MODEL_ATTEMPTS_PER_SECTION,
+        reuse_profile_verdict: bool = True,
         on_event: Callable[[str, dict], None] | None = None,
         cfg_snapshot: dict | None = None,
     ):
@@ -257,6 +272,14 @@ class Prober:
         self.timeout = timeout
         self.probe_context = probe_context
         self.swap_samples = swap_samples
+        # 每段收几个模型、最多试几次。做成参数是因为这两个数的取舍与
+        # 具体站群有关：聚合站多时该压低尝试数，站少而模型杂时该放宽。
+        self.max_models = max(1, int(max_models))
+        self.max_model_attempts = max(self.max_models, int(max_model_attempts))
+        # 同段整梯全败后，后续种子是否跳过画像梯。默认开 —— 门票是站+段的
+        # 属性，与模型无关（见 _profiles_failed）。留开关是为了万一遇到
+        # 「同一段不同模型走不同门禁」的站，能一键回到旧行为自证。
+        self.reuse_profile_verdict = reuse_profile_verdict
         # 四段并行度。1 = 完全串行（老行为，出问题时的退路）。
         # 上限就是 4 —— 段数固定，再高没有意义。
         self.workers = max(1, min(int(workers), len(SECTIONS)))
@@ -270,6 +293,17 @@ class Prober:
         # (host, section) -> 门闩。表示「已有线程在学这个段的形态」。
         # 同主机多 Key 并发时防止重复做那 12 次昂贵探测。见 _probe_one_section。
         self._inflight: dict[tuple[str, str], threading.Event] = {}
+        # (host, section) -> 整梯跑完全败。**门票是站+段的属性，与用哪个种子
+        # 模型问它无关** —— 站方查的是 headers 与 body 形态，不看模型名。
+        #
+        # 为什么值得单独记（2026-09-01 量化）：_try_profiles 的调用点在
+        # _stage1 的种子循环内部，返回 False 后循环走到下一个种子，整梯重跑。
+        # 而每段有 2-3 个种子，claude 段 7 档 × 2 = 14 次、compat 6 档 × 3 = 18 次。
+        # 四段全不通的站现状 48 次画像请求，其中 27 次是重复问同一个问题。
+        #
+        # 只缓存**失败**：成功的形态已经由 _shape 记着，而且成功时 _stage1
+        # 直接 return，不会走到下一个种子。
+        self._profiles_failed: set[tuple[str, str]] = set()
         self._lock = threading.RLock()
         self._proxy_state: bool | None = None   # None=未检 True/False=预检结果
         # 代理预检专用锁。不复用 _lock —— 预检要占最多 4 秒，
@@ -637,7 +671,22 @@ class Prober:
 
         保守取向：整梯跑完（含 alt 档），不提前放弃。多试几档只多几次请求，
         而漏试会把一个可用站判死 —— 后者不可逆（用户按报告弃用了那个站）。
+
+        但「整梯跑完」只需要做**一次**：门票是站+段的属性（站方查 headers 与
+        body 形态，不看模型名），所以第一个种子试完整梯全败之后，同段的后续
+        种子直接跳过，不重问同一个问题。省的量见 _profiles_failed 的说明。
         """
+        pkey = (host_of(base), section)
+        if self.reuse_profile_verdict:
+            with self._lock:
+                already_failed = pkey in self._profiles_failed
+            if already_failed:
+                self.on_event("profile-skipped", {
+                    "section": section, "host": host_of(base), "model": model,
+                    "why": "同段整梯已试过且全败，门票与模型无关",
+                })
+                return False
+
         tried = 0
         for prof in profiles.ladder(section, self.cfg_snapshot):
             if prof.is_baseline:
@@ -670,6 +719,8 @@ class Prober:
                 "needs_body": bool(patch),
             })
             return True
+        with self._lock:
+            self._profiles_failed.add(pkey)
         self.on_event("profile-exhausted", {
             "section": section, "host": host_of(base), "tried": tried,
         })
@@ -705,9 +756,20 @@ class Prober:
             if m not in order and m not in found and model_allowed(m):
                 order.append(m)
 
+        attempted = 0
         for model in order:
-            if len(found) >= MAX_MODELS_PER_SECTION:
+            if len(found) >= self.max_models:
                 break
+            # 尝试次数也要有上限 —— found 只数成功的，而目录可能有几百项
+            # 且全部验不过。见 MAX_MODEL_ATTEMPTS_PER_SECTION 的说明。
+            if attempted >= self.max_model_attempts:
+                self.on_event("model-scan-capped", {
+                    "section": v.section, "host": host_of(v.base_url),
+                    "attempted": attempted, "accepted": len(found),
+                    "remaining": len(order) - attempted,
+                })
+                break
+            attempted += 1
             att = self._call(
                 v.section, v.base_url, row.api_key, model, combo="model-scan",
                 proxy=self.live_proxy if v.need_proxy else None,

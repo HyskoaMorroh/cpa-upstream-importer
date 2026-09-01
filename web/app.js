@@ -113,7 +113,103 @@ async function boot() {
   $('#cfgmeta').textContent =
     `${S.ctx.lines.toLocaleString()} 行 · ${entries} 条目`;
   renderBands();
+  applyResources();
+  updateBudget();
 }
+
+// ── 运行环境与推荐并发 ──
+// 容器里 os.cpu_count() 是宿主机核数，所以推荐值由后端读 cgroup 算出（见
+// cpa_probe/resources.py）。这里只负责显示依据 —— 一个凭空出现的数字用户
+// 没法判断该不该改，所以把「4 核 × 12 = 48」这句原样摊开。
+function applyResources() {
+  const r = S.ctx && S.ctx.resources;
+  const hint = $('#o_workers_hint');
+  if (!r) { if (hint) hint.textContent = '读不到运行环境，用默认值 30'; return; }
+
+  S.recWorkers = r.recommended_workers;
+  const inp = $('#o_max_workers');
+  if (inp) inp.value = r.recommended_workers;
+
+  const mem = r.memory_mb ? `${(r.memory_mb / 1024).toFixed(1)}G` : '未知';
+  const where = r.in_container ? '容器' : '宿主机';
+  if (hint) {
+    hint.textContent =
+      `推荐 ${r.recommended_workers}（${where} ${r.cpus} 核 / ${mem}）· ${r.reason}`;
+  }
+  const box = $('#o_workers_notes');
+  if (box && r.notes && r.notes.length) {
+    box.innerHTML = r.notes.map((n) => `<div>· ${esc(n)}</div>`).join('');
+    box.hidden = false;
+  }
+}
+
+$('#o_workers_auto').onclick = () => {
+  if (S.recWorkers) {
+    $('#o_max_workers').value = S.recWorkers;
+    updateBudget();
+  }
+};
+
+// ── 请求预算估算 ──
+// 每段画像档数写死在这里是有意的：它来自 profiles.py 的梯子长度，而那个
+// 不会随配置变。估的是**最坏情形**（四段全不通、走完整梯），因为用户要判断
+// 的正是「最坏要花多少」。
+const LADDER_LEN = { gemini: 3, codex: 5, claude: 7, compat: 6 };
+const SEEDS = { gemini: 2, codex: 2, claude: 2, compat: 3 };
+
+function updateBudget() {
+  const el = $('#budget_text');
+  if (!el) return;
+
+  const reuse = $('#o_reuse_verdict').checked;
+  const attempts = parseInt($('#o_max_attempts').value, 10) || 10;
+  const ctx = $('#o_ctx').checked;
+  const swap = parseInt($('#o_swap').value, 10) || 0;
+
+  // 最坏：四段全不通。baseline 每段每种子 1 次 + 画像梯
+  let worst = 0;
+  let best = 0;
+  for (const k of Object.keys(LADDER_LEN)) {
+    const seeds = SEEDS[k];
+    worst += seeds;                                   // baseline
+    worst += LADDER_LEN[k] * (reuse ? 1 : seeds);     // 画像梯
+    best += 1;                                        // 首个种子就通
+  }
+  // 通的段还要验模型 + 换模采样 + 上下文二分
+  const perOkSection = attempts + (swap > 1 ? swap : 0) + (ctx ? 6 : 0);
+  best += perOkSection * 4;
+
+  const sites = (S.ctx && S.ctx.existing_count) || 0;
+  const full = $('#o_full_redetect').checked;
+  const n = full ? sites + 1 : 1;
+  const workers = parseInt($('#o_max_workers').value, 10) || 1;
+  const gap = parseFloat($('#o_gap').value) || 0;
+
+  // 耗时：每站的请求在四段间并行，同段内串行且受 gap 约束。
+  // 粗估单站墙钟 = (单段最坏请求数) × (响应 1.5s + gap)
+  const perSection = Math.ceil(worst / 4);
+  const perSite = perSection * (1.5 + gap);
+  const mins = (n / Math.max(1, workers)) * perSite / 60;
+
+  let txt = `：单站全不通约 ${worst} 次请求`
+    + `，全通约 ${best} 次`;
+  if (full && sites) {
+    txt += ` · ${n} 个站 × ${workers} 并发 ≈ ${mins.toFixed(1)} 分钟`;
+  }
+  if (!reuse) {
+    const saved = Object.keys(LADDER_LEN)
+      .reduce((a, k) => a + LADDER_LEN[k] * (SEEDS[k] - 1), 0);
+    txt += ` · 关掉画像复用多花 ${saved} 次/站`;
+  }
+  el.textContent = txt;
+}
+
+['#o_max_models', '#o_max_attempts', '#o_reuse_verdict', '#o_ctx',
+ '#o_swap', '#o_gap', '#o_max_workers', '#o_full_redetect'].forEach((sel) => {
+  const el = $(sel);
+  if (el) el.addEventListener('change', updateBudget);
+  if (el && el.type === 'number') el.addEventListener('input', updateBudget);
+});
 
 $('#toksave').onclick = () => {
   const v = $('#tokin').value.trim();
@@ -327,6 +423,11 @@ $('#btnprobe').onclick = async () => {
       // 之间仍严格保持 gap 秒。
       workers: $('#o_fast').checked ? 4 : 1,
       candidate_workers: $('#o_fast').checked ? 4 : 1,
+      // 请求预算（高级设置）。做成参数而不是常量，是因为取舍与站群有关：
+      // 聚合站多时该压低尝试数，站少而模型杂时该放宽。
+      max_models: parseInt($('#o_max_models').value, 10) || 4,
+      max_model_attempts: parseInt($('#o_max_attempts').value, 10) || 10,
+      reuse_profile_verdict: $('#o_reuse_verdict').checked,
     },
     full_redetect: fullRedetect,
     max_workers: fullRedetect ? parseInt($('#o_max_workers').value, 10) || 30 : undefined,
@@ -503,6 +604,18 @@ function renderStream(events) {
     if (e.kind === 'profile-exhausted') {
       return `<div class="s4">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
         + `${esc(e.host)} 画像梯跑完仍不通（试 ${e.tried} 档）</div>`;
+    }
+    // 同段整梯已试过全败，后续种子跳过。**必须显示** —— 否则日志里看起来
+    // 像是这个种子没被处理，而实际是刻意省掉的重复请求。
+    if (e.kind === 'profile-skipped') {
+      return `<div class="note">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `${pad(e.model, 20)} 跳过画像梯（${esc(e.why || '同段已试过')}）</div>`;
+    }
+    // 模型验证撞到尝试上限。显示剩余数，让操作员知道「不是全验了」
+    if (e.kind === 'model-scan-capped') {
+      return `<div class="note">  ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `${esc(e.host)} 模型验证达上限：试 ${e.attempted} 次收 ${e.accepted} 个，`
+        + `余 ${e.remaining} 个未验</div>`;
     }
     // 200 但正文是错误体 / 换模 —— 模型被拒收，不进写入清单
     if (e.kind === 'model-rejected') {
