@@ -118,8 +118,14 @@ def main() -> int:
     # ── ③ 响应字段契约 ─────────────────────────────────────────────
     section("③ 前端依赖的响应字段，后端真的会给")
     # 前端读 d.xxx（轮询响应）
+    # 进度字段也在其中：unit_done/unit_total 是进度条的分母分子，
+    # eta_* 与 rate_per_min 决定「剩余多久」那一块，slowest_* 决定
+    # 「卡在谁身上」。前端读了后端不给 = 界面永久空白，而不会报错。
     for f in ("state", "events", "event_cursor", "calls", "elapsed",
-              "done_rows", "total_rows", "results", "error"):
+              "done_rows", "total_rows", "results", "error",
+              "unit_done", "unit_total", "in_flight",
+              "eta_sec", "eta_lo", "eta_hi", "eta_suppressed",
+              "rate_per_min", "samples", "slowest_host", "slowest_age"):
         in_js = f"d.{f}" in js
         in_srv = f'"{f}"' in srv
         if in_js:

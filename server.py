@@ -84,6 +84,17 @@ class Job:
         self.finished = 0.0
         self.calls = 0
         self.lock = threading.Lock()
+        # 每个工作单元完成的时刻（相对 started 的秒数）。
+        self.unit_done: list[float] = []
+        # 在飞单元：{站名: 起始时刻}。用来回答「现在卡在谁身上」——
+        # 这是操作员真正需要的信息，见 _progress 的说明。
+        self.unit_flight: dict[str, float] = {}
+        # 工作单元总数。普通探测=行数；全量重探=去重后的凭据数，由那条
+        # 路径在算出来之后回填（它开始时还不知道会有多少个凭据）。
+        self.unit_total: int = len(rows)
+        # 实际并发度。**决定 ETA 给不给**，见 _ETA_MAX_WORKERS 的说明。
+        # 两条路径的默认值差 7.5 倍（普通 4 / 全量重探 30），各自回填。
+        self.workers: int = 1
 
     def emit(self, kind: str, data: dict) -> None:
         with self.lock:
@@ -92,9 +103,118 @@ class Job:
             if kind == "attempt":
                 self.calls += 1
 
+    def mark_unit_start(self, name: str) -> None:
+        """一个工作单元开始。name 必须是**脱敏**的站名，不能带 api_key。"""
+        with self.lock:
+            self.unit_flight[name] = time.time() - self.started
+
+    def mark_unit_done(self, name: str | None = None, n: int = 1) -> None:
+        """记 n 个工作单元完成。两条探测路径都要调，否则那条路没有进度。"""
+        now = time.time() - self.started
+        with self.lock:
+            self.unit_done.extend([now] * n)
+            if name is not None:
+                self.unit_flight.pop(name, None)
+
+    # ETA 的最小样本数。少于这个数不给任何秒数 —— 宁可显示「估算中」，
+    # 也不给一个必然错的数字：先报 2 分钟后来变 8 分钟会让人做错决定。
+    _ETA_MIN_SAMPLES = 5
+
+    # 并发度上限。超过它就**不给 ETA**，只给吞吐率与在飞跟踪。
+    #
+    # 为什么必须按并发闸（2026-09-01 跨 12 种子 × 11 档并发回放）：
+    #     并发   平均误差   区间命中
+    #      1       67%       94%
+    #      4       55%       74%     ← 普通探测默认，可用
+    #      8       70%       51%
+    #     30       92%        9%     ← 全量重探默认，完全不可用
+    #
+    # 高并发下剩余墙钟被「在飞最长的那个还需多久」主导（并发 30、进度
+    # 40/79 时占比 100%），而那个值在它结束前无法从已完成的数据推出 ——
+    # 不是算法不够好，是信息本身不在样本里。
+    #
+    # 取 4：命中率 74% 是「三次里对两次多」，勉强够用来安排下一件事；
+    # 6 档降到 60%、8 档 51%，那种数字给了等于误导。
+    _ETA_MAX_WORKERS = 4
+
+    # 区间的分位。下界取 p25、上界取 p99。
+    #
+    # 为什么上界要到 p99 而不是 p90（2026-09-01 跨 12 组随机种子 × 3 档
+    # 离散度回放验证）：单凭据代价是重尾分布（实测 p50=6 次请求、p90=42、
+    # max=293，49 倍差）。区间命中率 p90 只有 31%，p95 是 68%，p99 才到
+    # 91%-97%。一个 3 次里错 2 次的区间不如不给。
+    _ETA_Q_LO = 0.25
+    _ETA_Q_HI = 0.99
+
+    def _progress(self, total: int) -> dict:
+        """进度度量：ETA 区间、吞吐率、在飞站跟踪。
+
+        点值用**全量累计均值**而不是最近窗口的吞吐（2026-09-01 回放验证）
+        --------------------------------------------------------------
+        直觉上「最近窗口」更能反映当下速度，实测反过来：
+
+            估计器        离散度σ    平均误差   区间命中
+            最近窗口       0.8/1.4/2.0   35/81/199%   81/65/51%
+            累计均值+分位   0.8/1.4/2.0   30/67/157%   97/94/91%
+
+        原因是各单元完成顺序与代价无关（随机顺序），此时累计均值是总体均值
+        的无偏估计；而窗口平均会被恰好落在窗口里的一个慢站整体带偏，越到
+        后期波动越大 —— 表现出来就是 ETA 在几次轮询之间大幅跳动。
+
+        区间用经验分位而不是 ±标准差：代价是重尾分布（p50=6 次请求、
+        p90=42、max=293），标准差被极值撑爆，反而给不出有效上界。
+        """
+        done = list(self.unit_done)
+        flight = dict(self.unit_flight)
+        now = time.time() - self.started
+        out: dict = {"unit_done": len(done), "unit_total": total,
+                     "in_flight": len(flight)}
+
+        # 在飞最久的那个 —— 判断「是不是卡住了」只需要这一个数字。
+        if flight:
+            name, t0 = min(flight.items(), key=lambda kv: kv[1])
+            out["slowest_host"] = name
+            out["slowest_age"] = round(now - t0, 1)
+
+        n = len(done)
+        remain = total - n
+        if n < self._ETA_MIN_SAMPLES or remain <= 0 or total <= 0:
+            return out
+
+        # 相邻完成时刻之差 = 每个单元占用的墙钟。第一个用绝对时刻（从
+        # 任务起点算），否则会漏掉启动阶段。
+        gaps = sorted([done[0]] + [done[i] - done[i - 1] for i in range(1, n)])
+        if not gaps or gaps[-1] <= 0:
+            return out
+
+        def q(p: float) -> float:
+            return gaps[min(int(len(gaps) * p), len(gaps) - 1)]
+
+        mean = sum(gaps) / len(gaps)
+        # 吞吐率与样本数任何并发下都给 —— 它们是实测量，不是外推。
+        out["rate_per_min"] = round(60.0 / mean, 1) if mean > 0 else None
+        out["samples"] = n
+
+        # ETA 只在低并发下给。高并发时剩余时间被在飞的慢单元主导，
+        # 外推出来的数字命中率不到 10%（见 _ETA_MAX_WORKERS）。
+        if self.workers > self._ETA_MAX_WORKERS:
+            out["eta_suppressed"] = f"并发 {self.workers} 过高，剩余时间无法可靠外推"
+            return out
+
+        out.update({
+            "eta_sec": round(remain * mean, 1),
+            "eta_lo": round(remain * q(self._ETA_Q_LO), 1),
+            "eta_hi": round(remain * q(self._ETA_Q_HI), 1),
+        })
+        return out
+
     def snapshot(self, since: int = 0) -> dict:
+        # _progress 自己要拿锁，所以先在锁外算好再合并 —— 在 with 里调它
+        # 会死锁（threading.Lock 不可重入）。
+        prog = self._progress(self.unit_total or len(self.rows))
         with self.lock:
             return {
+                **prog,
                 "id": self.id,
                 "state": self.state,
                 "error": self.error,
@@ -287,16 +407,23 @@ def run_job(job: Job, cfg_path: str) -> None:
         hosts = {r.host for r in job.rows}
         cand_workers = max(1, min(len(hosts),
                                   int(job.opts.get("candidate_workers", 4))))
+        # ETA 的并发闸要知道真实并发度，不是配置值 —— 站数少于配置时
+        # 实际并发就是站数。
+        with job.lock:
+            job.workers = cand_workers
 
         # 结果按输入行序回填，不用 append —— 并行下完成先后是乱的，
         # 而前端结果表与 build_diffs 的插入顺序都依赖原始行序。
         slots: list = [None] * len(job.rows)
 
         def one(i: int, row) -> None:
+            job.mark_unit_start(row.host)
             slots[i] = prober.probe(row)
             with job.lock:
                 # done_rows 是进度显示用的，只数已完成的，与顺序无关
                 job.results = [x for x in slots if x is not None]
+            # 锁外调 —— mark_unit_done 自己要拿同一把锁，在锁内调会死锁
+            job.mark_unit_done(row.host)
 
         if cand_workers > 1 and len(job.rows) > 1:
             with concurrent.futures.ThreadPoolExecutor(
@@ -439,11 +566,25 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
         # 使用 BatchProber（站级并发）
         max_workers = int(job.opts.get("max_workers", 30))
         batch_prober = BatchProber(prober, max_workers=max_workers)
+        with job.lock:
+            job.workers = max(1, min(len(all_rows), max_workers))
 
         job.emit("info", {"msg": f"开始批量探测（{max_workers} 站并发）"})
 
-        # 进度回调
+        # 工作单元总数在这里才确定（去重后的凭据数），回填。
+        # 普通路径的 unit_total 在 __init__ 里就是 len(rows)，这条路不是。
+        with job.lock:
+            job.unit_total = len(all_rows)
+
+        # 进度回调 —— site 是站名（已脱敏，不含 api_key）
         def progress_cb(current, total, site, stats):
+            # current=0 是占位调用，只记起始不记完成
+            if current == 0:
+                job.mark_unit_start(site)
+                return
+            # 先记完成再发事件 —— snapshot 读的是 unit_done，顺序反了
+            # 会让本次事件对应的进度晚一轮才反映出来。
+            job.mark_unit_done(site)
             job.emit("progress", {
                 "msg": f"探测进度：{current}/{total}",
                 "current": current,

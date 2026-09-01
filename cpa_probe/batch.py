@@ -43,7 +43,9 @@ class BatchProber:
 
         Args:
             rows: 站点列表（ParsedRow）
-            progress_callback: 进度回调 (current, total, site_url, stats)
+            progress_callback: 进度回调 (current, total, site_bare, stats)
+                site_bare 是**脱敏**的站裸地址。绝不要往这里传含 api_key
+                的值 —— 它会一路进日志、JSON 响应和导出文件。
 
         Returns:
             {url: CandidateResult} 映射
@@ -53,6 +55,10 @@ class BatchProber:
         current = 0
 
         def probe_one(row: ParsedRow) -> tuple[tuple[str, str], Any]:
+            # 探测前先调一次 callback 占位，触发 Job.mark_unit_start 记录起始。
+            # current=0 是占位符，真实进度在 as_completed 循环里给。
+            if progress_callback:
+                progress_callback(0, 0, row.bare, {})
             result = self._prober.probe(row)
             # 键必须含 api_key —— 只用 bare 会让同一个站的多个 Key 互相覆盖。
             # 实测那份配置里 foxtrot 与 relay-l 各有 15 个 Key，用 bare 做键
@@ -95,9 +101,18 @@ class BatchProber:
                     current += 1
 
                     # 回调
+                    #
+                    # 传 `row.bare`（站的裸地址）而**不是** `url` ——
+                    # 后者是结果字典的键 `(bare, api_key)`，含**完整明文 key**。
+                    #
+                    # 2026-09-01 实测泄漏：这个值经 server.py 的 progress 事件
+                    # 进日志、进 /api/job 的 JSON、再进导出文件。一份 79 凭据的
+                    # 日志里有 74 个完整 key 明文可读，而项目的安全模型写着
+                    # 「完整 key 只在内存里，不落日志、不进 JSON 响应」。
+                    # 站名足够定位「刚完成哪个」，key 在这里没有任何用途。
                     if progress_callback:
                         progress_callback(
-                            current, total, url, dict(self._stats)
+                            current, total, row.bare, dict(self._stats)
                         )
 
                 except Exception as e:                     # noqa: BLE001
