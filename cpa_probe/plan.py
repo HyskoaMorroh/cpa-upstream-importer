@@ -1516,3 +1516,126 @@ def build_plan(
         plan.sections[section] = sp
 
     return plan
+
+
+# ---------------- 批量定档 ----------------
+
+
+def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
+                      probation: bool = True) -> list[str]:
+    """给一批方案统一定档：**站与站之间不同值，同站所有 Key 同值**。
+
+    为什么必须批量做（2026-09-02 现场）
+    ---------------------------------
+    `suggest_priority` 每次只看「当前 config.yaml 有哪些空档」，79 个凭据串行
+    调用它，每个都问同一个问题、拿到同一个答案 —— 落盘后 claude 段 74 个条目
+    全是 175，gemini 段 76 个全是 225。站与站之间毫无区分，而 priority 的**唯一
+    作用**就是区分先后。
+
+    为什么同站同值（用户 2026-09-02 确认的 A 方案）
+    -------------------------------------------
+    原始 config.yaml 就是这个规律，三段无一例外：
+
+        kktoken     5 个 Key   priority 1000
+        tabitoken  14 个 Key   priority  990
+        gorouter   15 个 Key   priority  985
+
+    这与 CPA 的调度语义一致：`priority` 决定「哪一层先被尝试」，同层内部按
+    `weight` 轮询（selector.go:539-549 只取最高那一桶）。同站多 Key 指向同一个
+    上游、能力相同，本该在同一层；给它们不同值会让第 2 把 Key 只在第 1 把不可用
+    时才被尝试 —— 把「多 Key 轮询」变成「主备切换」，白费配额。
+
+    分配办法
+    -------
+    按段独立处理。站按「探测质量」降序排（组内最高分，同分按主机名保证稳定），
+    然后从可用空档里由高到低取值，一个站一个值。
+
+    空档不够时退化为「在最低现有档之下等距铺开」—— 那时无论如何都要挤在一起，
+    但至少各站仍互不相同。
+
+    返回 warnings（哪些段空档不够、退化了）。
+    """
+    warns: list[str] = []
+
+    # 1. 按段 → 站 归集。站的身份用 host —— 同站不同段的 base-url 形态不同。
+    per_section: dict[str, dict[str, list[SectionPlan]]] = {}
+    for plan in plans:
+        for sec, sp in plan.sections.items():
+            if not sp.writable:
+                continue
+            host = host_of(sp.base_url)
+            per_section.setdefault(sec, {}).setdefault(host, []).append(sp)
+
+    for section, by_host in per_section.items():
+        band = build_band(cfg, section)
+
+        # 2. 站级排序：组内最高分降序。同分按主机名 —— 必须稳定，否则同一批
+        #    输入两次运行给出不同档位，diff 变得无法复核。
+        ranked = sorted(
+            by_host.items(),
+            key=lambda kv: (-max(x.score for x in kv[1]), kv[0]),
+        )
+
+        # 3. 候选档位：从空档里取。每个空档能放几个站取决于宽度 ——
+        #    (lo, hi) 之间能放 hi-lo-1 个整数，但贴着边界不安全（现有站就在
+        #    lo 与 hi 上），所以留 1 点余量、按等距取。
+        slots: list[int] = []
+        for lo, hi in band.gaps():                 # 已降序
+            width = hi - lo
+            if width <= 2:
+                continue                            # 只够放 1 个且贴边，跳过
+            room = width - 1                        # 可用整数个数
+            take = min(room, len(ranked))           # 不必超过站数
+            if take <= 0:
+                continue
+            step = room // (take + 1) or 1
+            for i in range(1, take + 1):
+                v = hi - step * i
+                if lo < v < hi:
+                    slots.append(v)
+            if len(slots) >= len(ranked):
+                break
+        slots = sorted(set(slots), reverse=True)
+
+        # 4. 空档不够 —— 在最低现有档之下等距铺开。
+        if len(slots) < len(ranked):
+            floor_v = min(band.tiers) if band.tiers else 100
+            need = len(ranked) - len(slots)
+            # 步长取 5：与现有配置的档位间距同量级（实测 990/985 差 5），
+            # 且留出手工微调的空间。下界钳 1 —— priority 0 与负数在 CPA 里
+            # 语义未定义。
+            extra = []
+            v = floor_v - 5
+            while len(extra) < need and v >= 1:
+                extra.append(v)
+                v -= 5
+            slots.extend(extra)
+            if len(slots) < len(ranked):
+                warns.append(
+                    f"段 {section}：{len(ranked)} 个站只排得下 {len(slots)} 个"
+                    f"互不相同的档位（现有档位谱太密），末尾几个会共用最低档")
+            else:
+                warns.append(
+                    f"段 {section}：可插空档不足，{need} 个站排在最低现有档"
+                    f"{floor_v} 之下（每 5 点一档）")
+
+        # 5. 落值。同站所有 Key 拿同一个值。
+        for idx, (host, sps) in enumerate(ranked):
+            v = slots[idx] if idx < len(slots) else max(slots[-1] if slots else 1, 1)
+            v = max(int(v), 1)
+            best = max(x.score for x in sps)
+            for sp in sps:
+                sp.priority = v
+                sp.priority_reason = (
+                    f"批量定档：{section} 段第 {idx + 1}/{len(ranked)} 站"
+                    f"（组内最高分 {best}，同站 {len(sps)} 个 Key 共用此档）"
+                )
+                # 影响面要按新值重算 —— 旧值算出来的 impacts 会误导。
+                sp.impacts = compute_impact(band, sp.models, v)
+                if sp.hijacked:
+                    names = ", ".join(i.model for i in sp.hijacked[:4])
+                    sp.warnings.append(
+                        f"会抢走 {len(sp.hijacked)} 个模型的顶层（{names}）——"
+                        "层级隔离下现有顶层站将完全不被尝试")
+
+    return warns

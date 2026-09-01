@@ -40,6 +40,7 @@ from .plan import (
     Impact,
     ImportPlan,
     SectionPlan,
+    assign_priorities,
     build_band,
     build_plan,
     compute_impact,
@@ -58,6 +59,7 @@ from .plan import (
 )
 from .writeback import (
     Diff,
+    owned_sections,
     apply_diffs,
     backup,
     build_diffs,
