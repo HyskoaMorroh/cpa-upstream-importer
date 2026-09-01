@@ -213,14 +213,14 @@ claude-api-key:
 
     # 构造新方案（priority 改变）
     sp_gemini = SectionPlan(
-        section="gemini",
+        section="gemini-api-key",
         base_url="old.example.com",
         api_key="AIzaOLD",
         models=["gemini-2.5-flash"],
         priority=150,  # 改了
     )
     sp_claude = SectionPlan(
-        section="claude",
+        section="claude-api-key",
         base_url="claude-old.example.com",
         api_key="sk-ant-OLD",
         models=["claude-opus-5"],
@@ -249,13 +249,11 @@ claude-api-key:
     assert "relay-a 403 banned" in rebuilt
     assert "relay-b 实测 503" in rebuilt
 
-    # 验证 priority 更新
-    assert "priority: 150" in rebuilt
-    assert "priority: 250" in rebuilt
-
-    # 验证旧 priority 消失
-    assert "priority: 200" not in rebuilt
-    assert "priority: 300" not in rebuilt
+    # 验证 priority 更新（用正则取值，因为 render_entry 会在行尾附定档理由）
+    import re
+    prios = {int(m.group(1))
+             for m in re.finditer(r"^\s*priority:\s*(\d+)", rebuilt, re.M)}
+    assert prios == {150, 250}, f"priority 应为 {{150, 250}}，实际 {prios}"
 
     # 验证 YAML 有效
     parsed = yaml.safe_load(rebuilt)
@@ -291,7 +289,7 @@ gemini-api-key:
         ("site-mid.com", "key-mid", 500),
     ]):
         sp = SectionPlan(
-            section="gemini",
+            section="gemini-api-key",
             base_url=url,
             api_key=key,
             models=["gemini-2.5-flash"],
@@ -303,13 +301,11 @@ gemini-api-key:
 
     rebuilt, warnings = rebuild_config_full(cfg, plans, original_lines)
 
-    # 提取 priority 出现顺序
-    lines = rebuilt.splitlines()
-    priorities = []
-    for line in lines:
-        if "priority:" in line:
-            prio = int(line.split("priority:")[1].strip())
-            priorities.append(prio)
+    # 提取 priority 出现顺序。render_entry 会在同一行尾部附定档理由注释
+    # （priority: 900        # 2026-09-01 批量导入 · …），所以要先切掉 #。
+    import re
+    priorities = [int(m.group(1))
+                  for m in re.finditer(r"^\s*priority:\s*(\d+)", rebuilt, re.M)]
 
     # 验证降序
     assert priorities == sorted(priorities, reverse=True), f"Not sorted: {priorities}"
@@ -318,11 +314,128 @@ gemini-api-key:
     print(f"[OK] Priority order: {priorities}")
 
 
+def test_rebuild_config_section_structure():
+    """重建产出的字段结构必须与 CLIProxyAPI 的期望一致。
+
+    这一项锁的是端到端验证抓到的三个缺陷（单元测试的构造数据当时绕过了它们）：
+
+      1. 段名用短名（gemini）而非完整段名（gemini-api-key）时，分组全部
+         miss，产出一个四段皆空的文件 —— YAML 合法、validate() 通过、
+         静默地把 175 个站清空
+      2. 前三段被写了 `name` 字段 —— CLIProxyAPI 的 gemini/codex/claude 段
+         没有这个字段，只有 compat 有
+      3. compat 段被按前三段的扁平结构渲染 —— 它要的是
+         name + models[{name,alias}] + api-key-entries[{api-key}]
+    """
+    from cpa_probe.writeback import rebuild_config_full
+    from cpa_probe.plan import SectionPlan, ImportPlan
+    import yaml
+
+    original = """host: "127.0.0.1"
+
+gemini-api-key:
+  - api-key: "seed"
+    base-url: "seed.example.com"
+    priority: 1
+
+openai-compatibility:
+  - name: "seed"
+    base-url: "https://seed.example.com/v1"
+    api-key-entries:
+      - api-key: "seed"
+    models:
+      - name: "m"
+        alias: "m"
+"""
+    cfg = yaml.safe_load(original)
+    lines = original.splitlines(keepends=True)
+
+    plans = {}
+
+    # 前三段各一个站
+    for sec, url, key in (
+        ("gemini-api-key", "g.example.com", "AIzaG"),
+        ("codex-api-key", "https://c.example.com/v1", "cdxC"),
+        ("claude-api-key", "cl.example.com", "sk-ant-CL"),
+    ):
+        sp = SectionPlan(section=sec, base_url=url, api_key=key,
+                         models=["m1"], priority=500)
+        p = ImportPlan(host=url, masked_key="x")
+        p.sections[sec] = sp
+        plans[(url, key)] = p
+
+    # compat 段：同一个站两个 Key，必须归并成一个 provider
+    for key in ("sk-A", "sk-B"):
+        sp = SectionPlan(section="openai-compatibility",
+                         base_url="https://compat.example.com/v1",
+                         api_key=key, models=["m1"], priority=400)
+        p = ImportPlan(host="compat.example.com", masked_key="x")
+        p.sections["openai-compatibility"] = sp
+        plans[("https://compat.example.com/v1", key)] = p
+
+    rebuilt, warns = rebuild_config_full(cfg, plans, lines)
+    parsed = yaml.safe_load(rebuilt)
+
+    # 缺陷 1：四段不能是空的
+    for sec in ("gemini-api-key", "codex-api-key", "claude-api-key",
+                "openai-compatibility"):
+        items = parsed.get(sec) or []
+        assert items, f"{sec} 为空 —— 段名分组 miss 了（缺陷 1 回归）"
+
+    # 缺陷 2：前三段不该有 name
+    for sec in ("gemini-api-key", "codex-api-key", "claude-api-key"):
+        for e in parsed[sec]:
+            assert "name" not in e, f"{sec} 不该有 name 字段（缺陷 2 回归）"
+            assert "api-key" in e and "base-url" in e
+            assert "models" in e, f"{sec} 缺 models"
+            # models 是 [{name, alias}] 结构，不是裸字符串列表
+            assert isinstance(e["models"][0], dict), f"{sec} models 结构不对"
+            assert "alias" in e["models"][0]
+
+    # 缺陷 3：compat 段结构与归并
+    compat = parsed["openai-compatibility"]
+    assert len(compat) == 1, f"同站两个 Key 应归并成 1 个 provider，实际 {len(compat)}"
+    prov = compat[0]
+    assert "name" in prov, "compat 段必须有 name（CPA 的 provider 身份）"
+    assert "api-key-entries" in prov, "compat 段必须用 api-key-entries"
+    assert "api-key" not in prov, "compat 段不该在 provider 级放 api-key"
+    keys = [e["api-key"] for e in prov["api-key-entries"]]
+    assert set(keys) == {"sk-A", "sk-B"}, f"两个 Key 都要在，实际 {keys}"
+
+    print(f"[OK] Section structure: 前三段无 name、compat 归并 "
+          f"{len(prov['api-key-entries'])} 个 Key、{len(warns)} 条警告")
+
+
 if __name__ == "__main__":
-    test_extract_existing_entries()
-    test_batch_prober_progress()
-    test_batch_prober_stats()
-    test_batch_prober_exception_handling()
-    test_rebuild_config_preserves_comments()
-    test_rebuild_config_priority_order()
-    print("\n[OK] 全量重探功能测试通过")
+    # 与其余套件同一套汇报约定：run.py 按「全部通过 · N 项」这行统计，
+    # 失败行以 ✗ 开头。自己 print [OK] 不会被计入总数。
+    import sys
+
+    CASES = [
+        ("提取既有站", test_extract_existing_entries),
+        ("站级并发与进度回调", test_batch_prober_progress),
+        ("统计分类", test_batch_prober_stats),
+        ("单站异常隔离", test_batch_prober_exception_handling),
+        ("全量重建保注释", test_rebuild_config_preserves_comments),
+        ("priority 降序", test_rebuild_config_priority_order),
+        ("段字段结构与 compat 归并", test_rebuild_config_section_structure),
+    ]
+
+    ok = 0
+    bad: list[str] = []
+    for name, fn in CASES:
+        try:
+            fn()
+            ok += 1
+        except AssertionError as e:
+            bad.append(f"{name}: {e}")
+        except Exception as e:
+            bad.append(f"{name}: {type(e).__name__}: {e}")
+
+    print()
+    if bad:
+        for b in bad:
+            print(f"  ✗  {b}")
+        print(f"失败 {len(bad)} 项 · 通过 {ok} 项")
+        sys.exit(1)
+    print(f"全部通过 · {ok} 项")

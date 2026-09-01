@@ -27,7 +27,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # test_pipeline 排后面：它起假上游、真发 HTTP，比纯逻辑慢。
 SUITES = ["test_probe.py", "test_server.py", "test_pipeline.py",
           "test_edges.py", "test_reload.py", "test_speed.py", "test_web.py",
-          "test_tiering.py"]
+          "test_tiering.py", "test_full_redetect.py"]
 
 
 def _force_utf8_stdout() -> None:
