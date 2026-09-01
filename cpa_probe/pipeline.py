@@ -690,7 +690,7 @@ class Prober:
             #   客户端 —— 站方明说「只允许某某客户端」，可能回 503（不在 401/403 里）
             #   WAF    —— 自建拦截页，认的是客户端形态，换 IP 无效
             #   门禁/IP封/边缘/401/403 —— 都可能实际是形态问题被误分类
-            #   鉴权   —— 401 unauthorized client 会落到这里（实测 agentrouter）
+            #   鉴权   —— 401 unauthorized client 会落到这里（实测 golf）
             # 判错方向的代价不对称：多试几档只是多几次请求，漏试会把可用站判死。
             if (att.category in ("客户端", "WAF", "门禁", "IP封", "边缘", "鉴权")
                     or att.status in ("401", "403", "503")):
@@ -711,7 +711,7 @@ class Prober:
         为什么不能只传 min_headers（这是个实测过的坑的同构形态）
         ------------------------------------------------------
         stage1 用画像通过后，后面四处若只带 headers 不带 body 补丁，那些请求
-        对需要 `metadata.user_id` 的站（实测 zzzcoding）会全部失败 ——
+        对需要 `metadata.user_id` 的站（实测 zulu）会全部失败 ——
         于是「段可用但注册 0 个模型」，或者换 Key 复验时把好 Key 判成坏 Key。
         这与 wave-1 修过的「_stage2 绕过 _accept」是同一类缺陷：主路径加了
         检查，第二条路径没加。所以这里做成唯一入口，四处都走它。
@@ -732,7 +732,7 @@ class Prober:
         """按画像梯升级。第一个通过的档写进 verdict 并返回 True。
 
         梯子是**嵌套超集**（见 profiles 模块 docstring）：第 k 档失败即前 k 档
-        的并集都不够，不必回头补试。实测依据 —— agentrouter 的门票是
+        的并集都不够，不必回头补试。实测依据 —— golf 的门票是
         user-agent + anthropic-beta + x-app 三项缺一不可，平行尝试会全败而
         它们的并集本来是通的。
 
@@ -787,7 +787,7 @@ class Prober:
             })
             return True
         # 整梯全败，但站方可能在正文里明说了缺什么能力 —— 补上再打一次。
-        # 见 betas 模块 docstring（anyrouter.top：八档正文逐字相同，全是
+        # 见 betas 模块 docstring（alfa：八档正文逐字相同，全是
         # 「请启用 1m 上下文」，说明站方没查客户端身份，只是缺一个 beta）。
         if self._retry_with_betas(row, section, base, model, v, tried):
             return True

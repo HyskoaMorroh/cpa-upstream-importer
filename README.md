@@ -97,7 +97,7 @@ python3 tools/recheck.py /path/to/config.yaml --top-only   # 复核既有凭据
 1. **占位符字母按原名字母序分配**。`test_probe.py` 有断言把运行时
    `sorted()` 的结果和源码里的字面量比对，字母乱分配会让两边排序不一致 ——
    测试失败，而原因跟被测逻辑毫无关系。
-2. **短名 == 域名首标签**（`relay-f` / `relay-f.example`）。
+2. **短名 == 域名首标签**（`foxtrot` / `relay-f.example`）。
    `host_matches_note` 的无别名表兜底靠这个性质。
 3. **但有一对故意不共享子串**（`jdw` / `relay-h.example`）。
    `test_tiering.py` 那条「必须靠别名表才认得」的断言靠它。
@@ -224,19 +224,19 @@ codex 段梯子（6 档）：
 模板变量（`{key_hash}` / `{uuid1..3}`）—— 静态 user_id 会让所有 Key 共用一个假身份。
 
 **实测依据**：
-- agentrouter claude 段：baseline 401 → cc-std（user-agent + anthropic-beta + x-app）200
-- zzzcoding claude 段：cc-min 503 → cc-std 502（门禁通过，站方自己上游挂了）
-- agentrouter codex 段：baseline 401 → originator-only 200
+- golf claude 段：baseline 401 → cc-std（user-agent + anthropic-beta + x-app）200
+- zulu claude 段：cc-min 503 → cc-std 502（门禁通过，站方自己上游挂了）
+- golf codex 段：baseline 401 → originator-only 200
 
 画像写进 **config.yaml 条目 headers**（四段通用、与下游客户端无关、优先级最高）。
-`fingerprint-profile` 只在站方要请求体字段时用（目前 13 站里只有 zzzcoding 一个）。
+`fingerprint-profile` 只在站方要请求体字段时用（目前 13 站里只有 zulu 一个）。
 
 ### 新增两类：时段与 WAF
 
-**时段类（usable=True）**：分组按窗口开放。实测 hybgzs codex 段 `09:00~18:00`
+**时段类（usable=True）**：分组按窗口开放。实测 hotel codex 段 `09:00~18:00`
 —— 窗口外打凭据有效但站方拒绝，报 403 + 提示「限时段」；窗口内可用。
 
-**WAF 类（usable=False）**：站方 WAF 按形态拦。实测 hybgzs 三段带代理仍被拦
+**WAF 类（usable=False）**：站方 WAF 按形态拦。实测 hotel 三段带代理仍被拦
 `访问已被拦截` —— 换 IP 无效，不是封 IP，是请求形态问题。
 
 时段类立即收敛（不重试），导入时标注窗口并提示手工复测。
@@ -248,14 +248,14 @@ codex 段梯子（6 档）：
 同时命中全部 12 个 claude 站，落到哪个由 priority + 加权轮询决定。「指名某站」
 这个能力事实上不存在。
 
-**解法**：14 站各自独占前缀（从域名生成，agentrouter → `AGR`、kktoken → `KKT`），
-保留原名轮询，用 `models[].alias` 补段级兼容名。
+**解法**：14 站各自独占前缀（从域名生成，`api.alpharelay.com` → `ALP`、
+`betagate.cc` → `BET`），保留原名轮询，用 `models[].alias` 补段级兼容名。
 
 ```
 你想要的                        用哪个名字                  效果
 让 CPA 自动挑最好的站          claude-opus-5（原名）       按 priority 轮询全部 12 站
-指名 agentrouter               AGR/claude-opus-5           只落 agentrouter 那 7 条
-指名 kktoken                   KKT/claude-opus-5           只落 kktoken 那 5 条
+指名 alpharelay                ALP/claude-opus-5           只落 alpharelay 那 7 条
+指名 betagate                  BET/claude-opus-5           只落 betagate 那 5 条
 兼容旧客户端（用 ANT/...）     ANT/claude-opus-5（别名）   同原名轮询
 ```
 
@@ -1246,7 +1246,7 @@ priority 那一层参与轮询，其余全是死重量。实测你的部署曾�
 （先探测、再逐个提档、观察成功率），并**强制提示提档前要现测** ——
 `priority` 只反映「当初定的档」，不反映「现在还能不能用」。
 
-> 这条提示是踩过坑加的：codex 段的 `relay-c`(800) 落差只有 100，
+> 这条提示是踩过坑加的：codex 段的 `cielo`(800) 落差只有 100，
 > 看着像「稍差一点的备选」，实测却返回 **200 但正文是 `CF_APP_WAF` 拦截页**
 > —— 状态码骗过了判定。光看 priority 落差会给出把必然失败的站提到顶层
 > 这种危险建议。
@@ -1448,7 +1448,7 @@ CPA 源码里**没有**这个信息。它只知道自己转发时发什么，从
 时，写了 12 个头的条目比写了 3 个的更容易整体失效。
 
 举个具体的：`cc-min` = UA + anthropic-beta 这个分档，依据是实测发现
-**agentrouter 的门票恰好是那三项缺一不可**。CPA 源码里读不出这句话。
+**golf 的门票恰好是那三项缺一不可**。CPA 源码里读不出这句话。
 
 所以档次划分是「实测出来的站方行为」，不是 CPA 的数据。
 
@@ -1732,7 +1732,7 @@ config.yaml，没有 models 字段，只能用种子模型猜）；本工具复�
 
 **③ 请求头必须与 CPA 实际转发时一致**
 
-不带任何头直连测 `relay-c` 的 codex 段，21 个组合全部 **401
+不带任何头直连测 `cielo` 的 codex 段，21 个组合全部 **401
 unauthorized client** —— 而 CPAMP 面板显示它 **100% 成功率**。
 逐头对照实测：
 
@@ -1787,7 +1787,7 @@ codex 段 gpt-5.6-sol 的承载站（按 priority 降序）
 ```
 
 层级隔离下 900 那层要全部进冷却才降到 800 —— **一个单 key 的坏站挡住了
-7 个可用 key**。CPAMP 面板上 relay-c 显示 100% 成功率而客户端仍报错，
+7 个可用 key**。CPAMP 面板上 cielo 显示 100% 成功率而客户端仍报错，
 成因就是这个。
 
 > **提档的教训**：我当天下午基于「实测 200、3.59 秒」把 relay-m 从 180
@@ -1914,7 +1914,7 @@ bash upstream-importer/legacy/logs-digest.sh 50
 所以哪怕 187 个条目都配了 `request-scoped-errors`、规则也对，预算不够就照样透传：
 **claude 顶层曾有 35 个凭据，而预算只有 `1 × 4 = 4`** —— 只试 4 个就放弃，另外 31 个从没试过。
 
-实测抽样印证：同一站内凭据状态不一致（`relay-h` 3 个里 1 个 200、1 个 403 门禁、1 个超时）。
+实测抽样印证：同一站内凭据状态不一致（`hotel` 3 个里 1 个 200、1 个 403 门禁、1 个超时）。
 轮询撞上坏的就透传。
 
 ### 但直接加大预算会踩另一个坑
@@ -1946,7 +1946,7 @@ max-retry-credentials: 9      # 4 → 9，覆盖顶层池（每站 3 个 × 3 �
 max-retry-interval: 30        # 0 → 30，愿意等 30 秒跨过短冷却窗口
 ```
 
-claude 顶层 26 个多余的 key 降到 **990** —— 仍高于 950 的 `relay-a`
+claude 顶层 26 个多余的 key 降到 **990** —— 仍高于 950 的 `alfa`
 （实测超时 90 秒），所以那个坏站仍轮不到。
 
 `max-retry-interval` 这一改**推翻了**注释里 2026-08-27 那条「30 秒会被客户端读超时
@@ -1981,7 +1981,7 @@ python3 tools/diag403.py /opt/deploy/config.yaml
 
 ### gemini 段仍无解
 
-顶层 `relay-g` 实测 8 次全 403（含经代理），该段其余站逐站实测全部 503/401/404。
+顶层 `golf` 实测 8 次全 403（含经代理），该段其余站逐站实测全部 503/401/404。
 **无论怎么调档都会失败** —— 需要补新上游，或该站方恢复。
 
 ---
@@ -2040,7 +2040,7 @@ config.yaml  models[].max-context-length
   → Codex 客户端 /models 响应 → 客户端据此定自动压缩阈值
 ```
 
-**这就是那条 400 的正解。** 客户端按 `[1M]` 算窗口、到 967k 才压缩，而 relay-h 真实只吃
+**这就是那条 400 的正解。** 客户端按 `[1M]` 算窗口、到 967k 才压缩，而 hotel 真实只吃
 995,988 —— 只剩 3% 余量；且 400 不在 `isCredentialRetryRoundStatus` 白名单
 （`conductor_selection.go:1038` 只含 403/408/429/500/502/503/504），命中即终止本轮，
 其余上游一次都不试。写入真实上限后客户端在正确的点压缩，不必改客户端设置。

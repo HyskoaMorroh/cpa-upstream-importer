@@ -3,7 +3,7 @@
 
     # 查一个还没进 config.yaml 的站（决定要不要加它之前用这个）
     docker exec -i upstream-importer python3 /app/tools/diag-identity.py \
-        --url https://anyrouter.top --key sk-xxx --section claude-api-key
+        --url https://alfa --key sk-xxx --section claude-api-key
 
     # 容器内跑（VPS 上没有源码，用这条）
     docker exec -i upstream-importer python3 /app/tools/diag-identity.py /data/config.yaml

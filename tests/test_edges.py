@@ -390,7 +390,7 @@ def main() -> int:
 
         # ------------------------------------------------------------ ⑪
         section("⑪ 已存在的 Key 再导一次 · 两层判重")
-        # 这一项锁住的坑：现有条目常带 prefix / headers（relay-f 的 claude
+        # 这一项锁住的坑：现有条目常带 prefix / headers（foxtrot 的 claude
         # 条目有 prefix: ANT 和一个 UA），探测方案不带那些，五元组指纹撞不上，
         # 只查五元组会把同一个凭据在同一个站重复写入。
         ekey = (existing_prov.get("api-key-entries") or [{}])[0].get("api-key", "")

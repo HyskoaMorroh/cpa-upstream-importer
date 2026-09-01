@@ -8,7 +8,7 @@ r"""客户端画像梯：站方要什么形态的客户端，就给它什么形�
 
 梯子为什么必须**嵌套**
 --------------------
-实测教训（2026-09-01 agentrouter）：门票是 user-agent + anthropic-beta + x-app
+实测教训（2026-09-01 golf）：门票是 user-agent + anthropic-beta + x-app
 三项**缺一不可**。如果梯子是「试 A、试 B、试 C」的平行结构，三项各试一遍全都
 失败，而它们的并集本来是通的 —— 探测会把一个可用站判死。
 
@@ -161,7 +161,7 @@ def _cc_headers(defaults: dict, *, betas: str, std: bool = False,
         "anthropic-beta": betas,
     }
     if std or full:
-        # x-app 是实测的门票之一（agentrouter：缺它 401，有它 200）。
+        # x-app 是实测的门票之一（golf：缺它 401，有它 200）。
         # 从 std 档起就带上 —— 它比 X-Stainless 族更常被检查。
         # 用显式参数而不是拿 betas 与常量比身份：那种写法在 betas 被
         # 拼接或从配置读入后就静默失效，而失效方向是「少发门票头」。
@@ -194,7 +194,7 @@ def _claude_ladder(d: dict) -> list[Profile]:
                 why="只查 UA 形态与 claude-code beta"),
         Profile("cc-std", 2,
                 headers=_cc_headers(d, betas=_CC_BETAS_STD, std=True),
-                why="另查 x-app / anthropic-version（实测 agentrouter 属此档）"),
+                why="另查 x-app / anthropic-version（实测 golf 属此档）"),
         Profile("cc-full", 3,
                 headers=_cc_headers(d, betas=_CC_BETAS_FULL, std=True, full=True),
                 why="另查 X-Stainless SDK 指纹族与会话头"),
@@ -280,7 +280,7 @@ def _compat_ladder(d: dict) -> list[Profile]:
     （openai_compat_executor.go:155）。
 
     为什么要带 claude 形态的档：同一个站的 compat 段与 claude 段可能共用一个
-    分组，被同一套门禁拦。实测 agentrouter 的 compat 段正是 cc-std 档救活的
+    分组，被同一套门禁拦。实测 golf 的 compat 段正是 cc-std 档救活的
     （7 个 Key 从全部 401 变成 5 通过 + 2 欠费）。
 
     body 档也带上：compat 段发的是 /chat/completions，metadata.user_id 不是
@@ -297,7 +297,7 @@ def _compat_ladder(d: dict) -> list[Profile]:
                 why="与 claude 段共用门禁的站，最省档"),
         Profile("cc-std", 3,
                 headers=_cc_headers(d, betas=_CC_BETAS_STD, std=True),
-                why="与 claude 段共用门禁（实测 agentrouter compat 属此档）"),
+                why="与 claude 段共用门禁（实测 golf compat 属此档）"),
         Profile("cc-full", 4,
                 headers=_cc_headers(d, betas=_CC_BETAS_FULL, std=True, full=True),
                 why="共用门禁且查 SDK 指纹族"),

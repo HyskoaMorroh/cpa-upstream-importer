@@ -16,7 +16,7 @@ codex 段 11 个站，得出「0/11 可用」的结论 —— 完全错误，两
   ① **7 个站根本不声明 gpt-5.6-sol**。
      CPA 只把请求路由到声明了该模型的凭据（service_models.go 的注册表），
      拿一个站没注册的模型去打，403/404/503 是必然的 —— 那不是站坏了，
-     是测错了。用户当场指出：CPAMP 面板上 relay-c 显示 100% 成功率。
+     是测错了。用户当场指出：CPAMP 面板上 cielo 显示 100% 成功率。
 
   ② **codex 段走 /v1/responses，不是 /v1/chat/completions**。
      config.yaml 的注释早就记了：「11 个站点中 2 个真正实现 Responses」。
@@ -41,9 +41,9 @@ compat 段的 relay-i 返回 `429 Too many requests` —— 而低并发时它�
   · 模型 = 从该条目的 `models` 字段读，**逐个都测**，不用种子
   · 路径 = 按段走对应协议（cpa_probe.request 已按段处理）
   · **请求头 = CPA 实际转发时那一套**（CPA_DEFAULT_UA[段] + 条目自己的
-    headers）。不带的话 relay-c 会全返 401 —— 我第一版就是这么
+    headers）。不带的话 cielo 会全返 401 —— 我第一版就是这么
     误报「codex 段 0 可用」的，而面板上它是 100% 成功率。
-  · 一个站在 A 段不可用，**不代表**它在 B 段不可用（relay-f 在 claude
+  · 一个站在 A 段不可用，**不代表**它在 B 段不可用（foxtrot 在 claude
     段实测 200，在 codex 段是 500 not implemented —— 因为它不实现 Responses）
 
 输出的「可用」只对「这个 key + 这个站 + 这个段 + 这个模型」四元组成立。
@@ -213,11 +213,11 @@ def probe_one(job: dict, timeout: int) -> dict:
 
     # 请求头必须与 **CPA 实际转发时** 一致，否则测的不是真实链路。
     #
-    # 2026-08-30 踩到：直连不带任何头去测 relay-c 的 codex 段，21 个组合
+    # 2026-08-30 踩到：直连不带任何头去测 cielo 的 codex 段，21 个组合
     # 全部 401 unauthorized client，于是我报「codex 段无可用组合」——
-    # 而用户截图里 CPAMP 面板显示 relay-c **100% 成功率**。
+    # 而用户截图里 CPAMP 面板显示 cielo **100% 成功率**。
     #
-    # 逐头对照实测（relay-c / gpt-5.6-sol）：
+    # 逐头对照实测（cielo / gpt-5.6-sol）：
     #     cpa-现状（带 codex UA）  200 ✓
     #     originator-only          401
     #     ua-only-codex            200 ✓
@@ -386,7 +386,7 @@ def main() -> int:
 
     print(f"\n{'─' * 76}")
     print("「可用」只对 (key, 站, 段, 模型) 四元组成立 —— 同一个站在不同段")
-    print("结论可以完全相反（relay-f 在 claude 段 200、在 codex 段 500）。")
+    print("结论可以完全相反（foxtrot 在 claude 段 200、在 codex 段 500）。")
     print(f"{'─' * 76}")
     return 0
 

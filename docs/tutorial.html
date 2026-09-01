@@ -563,7 +563,7 @@ footer code{background:none;padding:0}
   <p>中转站按客户端身份门禁。实测 2026-08-31：</p>
 
   <div class="tw"><table>
-    <thead><tr><th>谁在调用 CPA</th><th>下游发的头</th><th>zzzcoding 结果</th></tr></thead>
+    <thead><tr><th>谁在调用 CPA</th><th>下游发的头</th><th>zulu 结果</th></tr></thead>
     <tbody>
       <tr><td>日常用的 Claude Code</td><td>完整 CC 头集</td><td class="g">207 次成功</td></tr>
       <tr><td>CPAMP 测试按钮</td><td>只有 x-api-key + content-type</td><td class="r">503 门禁</td></tr>
@@ -590,7 +590,7 @@ footer code{background:none;padding:0}
     </tbody>
   </table></div>
 
-  <p><b>超集不是平行尝试</b> —— agentrouter 的门票是 <code>user-agent</code> +
+  <p><b>超集不是平行尝试</b> —— golf 的门票是 <code>user-agent</code> +
   <code>anthropic-beta</code> + <code>x-app</code> <b>三项缺一不可</b>。
   如果梯子是「试 A、试 B、试 C」，三项各试一遍全败，而它们的并集本来是通的。
   改成超集后，第 k 档失败即前 k 档的并集都不够，不必回头补试。</p>
@@ -616,23 +616,23 @@ footer code{background:none;padding:0}
     <thead><tr><th>站</th><th>baseline 结果</th><th>最小必需画像</th></tr></thead>
     <tbody>
       <tr><td>10 站</td><td class="g">200 可用</td><td>无需画像</td></tr>
-      <tr><td>agentrouter</td><td class="r">401 unauthorized client</td><td class="g">cc-std（三个头）</td></tr>
-      <tr><td>zzzcoding</td><td class="r">503 only allows CC clients</td><td class="g">cc-std + fingerprint-profile</td></tr>
+      <tr><td>golf</td><td class="r">401 unauthorized client</td><td class="g">cc-std（三个头）</td></tr>
+      <tr><td>zulu</td><td class="r">503 only allows CC clients</td><td class="g">cc-std + fingerprint-profile</td></tr>
     </tbody>
   </table></div>
 
   <p>画像写进 <b>config.yaml 条目 headers</b>（四段通用、与下游客户端无关、优先级最高）。
-  <code>fingerprint-profile</code> 只在站方要请求体字段时用（目前 13 站里只有 zzzcoding 一个）。</p>
+  <code>fingerprint-profile</code> 只在站方要请求体字段时用（目前 13 站里只有 zulu 一个）。</p>
 
   <h3>两个新类：时段与 WAF</h3>
   <div class="grid2">
     <div class="card"><div class="h">时段类（usable=True）</div>
-      <p>分组按窗口开放。实测 hybgzs codex 段 <code>09:00~18:00</code> ——
+      <p>分组按窗口开放。实测 hotel codex 段 <code>09:00~18:00</code> ——
       窗口外打凭据有效但站方拒绝，报 403 + 提示「限时段」；窗口内可用。</p>
       <p>立即收敛（不重试），导入时标注窗口并提示手工复测。</p>
     </div>
     <div class="card"><div class="h">WAF 类（usable=False）</div>
-      <p>站方 WAF 按形态拦。实测 hybgzs 三段带代理仍被拦 <code>访问已被拦截</code> ——
+      <p>站方 WAF 按形态拦。实测 hotel 三段带代理仍被拦 <code>访问已被拦截</code> ——
       换 IP 无效，不是封 IP，是请求形态问题。</p>
       <p>报告提示调整画像 / User-Agent，或放弃该站。</p>
     </div>
@@ -847,15 +847,15 @@ footer code{background:none;padding:0}
   单点测试、复现问题、定向清缓存都要它。</p>
 
   <h3>两层前缀：站级独占 + 段级别名</h3>
-  <p>14 站各自独占前缀（从域名生成，agentrouter → <code>AGR</code>、kktoken → <code>KKT</code>），
+  <p>14 站各自独占前缀（从域名生成，golf → <code>AGR</code>、kilo → <code>KKT</code>），
   保留原名轮询，用 <code>models[].alias</code> 补段级兼容名。</p>
 
   <div class="tw"><table>
     <thead><tr><th>你想要的</th><th>用哪个名字</th><th>效果</th></tr></thead>
     <tbody>
       <tr><td>让 CPA 自动挑最好的站</td><td class="m">claude-opus-5（原名）</td><td>按 priority 轮询全部 12 站</td></tr>
-      <tr><td>指名 agentrouter</td><td class="m">AGR/claude-opus-5</td><td>只落 agentrouter 那 7 条</td></tr>
-      <tr><td>指名 kktoken</td><td class="m">KKT/claude-opus-5</td><td>只落 kktoken 那 5 条</td></tr>
+      <tr><td>指名 golf</td><td class="m">AGR/claude-opus-5</td><td>只落 golf 那 7 条</td></tr>
+      <tr><td>指名 kilo</td><td class="m">KKT/claude-opus-5</td><td>只落 kilo 那 5 条</td></tr>
       <tr><td>兼容旧客户端（用 ANT/...）</td><td class="m">ANT/claude-opus-5（别名）</td><td>同原名轮询</td></tr>
     </tbody>
   </table></div>
@@ -869,30 +869,30 @@ footer code{background:none;padding:0}
   <div class="tw"><table>
     <thead><tr><th>域名</th><th>前缀</th><th>说明</th></tr></thead>
     <tbody>
-      <tr><td>agentrouter.org</td><td class="m">AGR</td><td>沿用你手工定的值</td></tr>
-      <tr><td>api.zzzcoding.org</td><td class="m">ZZZ</td><td>沿用你手工定的值</td></tr>
-      <tr><td>ai.hybgzs.com</td><td class="m">HYB</td><td rowspan="12">按域名生成，幂等</td></tr>
-      <tr><td>anyrouter.top</td><td class="m">ANY</td></tr>
-      <tr><td>api.123nhh.com</td><td class="m">N123</td></tr>
-      <tr><td>api.facai.cloudns.org</td><td class="m">FAC</td></tr>
+      <tr><td>golf.org</td><td class="m">AGR</td><td>沿用你手工定的值</td></tr>
+      <tr><td>api.zulu.org</td><td class="m">ZZZ</td><td>沿用你手工定的值</td></tr>
+      <tr><td>ai.hotel.com</td><td class="m">HOT</td> <td rowspan="12">按域名生成，幂等</td></tr>
+      <tr><td>alfa.top</td><td class="m">ALF</td></tr>
+      <tr><td>api.7x9zk.com</td><td class="m">N7X9</td></tr>
+      <tr><td>api.mysite.cloudns.org</td><td class="m">MYS</td></tr>
       <tr><td>api.justwoker.icu</td><td class="m">JUS</td></tr>
-      <tr><td>chiangma.com</td><td class="m">CHI</td></tr>
+      <tr><td>cielo.com</td><td class="m">CIE</td></tr>
       <tr><td>gorouter.app</td><td class="m">GOR</td></tr>
-      <tr><td>kktoken.cc</td><td class="m">KKT</td></tr>
+      <tr><td>kilo.cc</td><td class="m">KIL</td></tr>
       <tr><td>muyuan.do</td><td class="m">MUY</td></tr>
-      <tr><td>runanytime.hxi.me</td><td class="m">RUN</td></tr>
-      <tr><td>sub.100xlabs.space</td><td class="m">N100</td></tr>
-      <tr><td>tabitoken.com</td><td class="m">TAB</td></tr>
+      <tr><td>somesite.hxi.me</td><td class="m">SOM</td></tr>
+      <tr><td>sub.42labs.space</td><td class="m">N42L</td></tr>
+      <tr><td>tango.com</td><td class="m">TAN</td></tr>
     </tbody>
   </table></div>
 
-  <p><code>N123</code> / <code>N100</code> 前面那个 N 是必需的：数字开头的模型名
+  <p><code>N7X9</code> / <code>N42L</code> 前面那个 N 是必需的：数字开头的模型名
   在部分客户端里会被当数值解析。规则写死在代码里，同一个域名永远得到同一个前缀（幂等）。
   撞车时加序号。你手工定的值会被尊重，工具不动。</p>
 
   <h3>段级别名可选</h3>
   <p>补 <code>models[].alias: ANT/&lt;原名&gt;</code> 会让每个模型多一行，
-  config.yaml 明显变长。119 个条目里模型数最多的是 chiangma compat 段（64 个模型），
+  config.yaml 明显变长。119 个条目里模型数最多的是 cielo compat 段（64 个模型），
   那一个 provider 就多 64 行。</p>
 
   <p>这是保留 <code>ANT/xxx</code> 可用性的必然代价。

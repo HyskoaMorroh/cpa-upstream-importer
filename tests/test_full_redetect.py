@@ -212,7 +212,7 @@ def test_rebuild_config_preserves_comments():
 port: 8317
 
 gemini-api-key:
-  # relay-a 403 banned，从 900 降权待解封
+  # alfa 403 banned，从 900 降权待解封
   - api-key: "AIzaOLD"
     base-url: "old.example.com"
     priority: 200
@@ -262,7 +262,7 @@ claude-api-key:
     assert "port: 8317" in rebuilt
 
     # 验证注释保留
-    assert "relay-a 403 banned" in rebuilt
+    assert "alfa 403 banned" in rebuilt
     assert "relay-b 实测 503" in rebuilt
 
     # 验证 priority 更新（用正则取值，因为 render_entry 会在行尾附定档理由）
@@ -893,7 +893,7 @@ openai-compatibility:
 def test_batch_key_includes_api_key():
     """同一个站的多个 Key 不能互相覆盖。
 
-    结果键原来只用 row.bare（不含 api_key），于是 relay-f 那种 15 个 Key 的站
+    结果键原来只用 row.bare（不含 api_key），于是 foxtrot 那种 15 个 Key 的站
     只剩 1 条结果，而 _stats 仍报 15 个已完成。
     """
     class FakeProber:

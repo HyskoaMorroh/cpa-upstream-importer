@@ -2,7 +2,7 @@
 
 为什么行级编辑而不是 yaml.dump
 ------------------------------
-config.yaml 里 198 条注释是两夜排障的全部记忆（「relay-f 403 User has
+config.yaml 里 198 条注释是两夜排障的全部记忆（「foxtrot 403 User has
 been banned，从 900 降权待解封」这类）。yaml.safe_load + dump 会把它们
 全部丢掉。所以：读原文 → 按行插入 → 写原文。
 
@@ -395,7 +395,7 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
         # 该站的多个 Key 全部挂在它的 api-key-entries 下。
         #
         # 实测现有 12 个 provider 全部遵循这个约定，且每站名字唯一
-        # （relay-f 15 个 Key、relay-l 15 个，都在同一个 provider 里）。
+        # （foxtrot 15 个 Key、relay-l 15 个，都在同一个 provider 里）。
         # 每个 Key 生成一个同名 provider 会造成重名条目 —— CPA 的 compat 段
         # 不去重（SanitizeOpenAICompatibility 只丢缺 base-url 的），
         # 于是同一个站被注册成 N 个独立 provider，模型清单重复 N 遍。
@@ -495,7 +495,7 @@ def build_diffs(raw: str, plans: list[ImportPlan]) -> list[Diff]:
 
     compat 段按主机归并：该段一个条目 = 一个上游站，多个 Key 挂在它的
     api-key-entries 下。其余三段每个 Key 各占一条（现有 config.yaml
-    两种约定都实测确认过：relay-f 在 claude 段 15 条、在 compat 段 1 条）。
+    两种约定都实测确认过：foxtrot 在 claude 段 15 条、在 compat 段 1 条）。
 
     不归并会生成 N 个重名 provider。CPA 的 compat 段不去重
     （SanitizeOpenAICompatibility 只丢缺 base-url 的），于是同一个站被注册

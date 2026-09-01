@@ -108,7 +108,7 @@ def test_classify() -> None:
         ("403", "<html>Attention Required! | Cloudflare</html>", "IP封"),
         ("403", "challenge-platform script", "IP封"),
         # 「访问已被拦截/安全验证」是站方自建拦截页（WAF 按形态拦），
-        # 不是 CF 边缘拦截。2026-09-01 实测 hybgzs 带代理仍被拦 ——
+        # 不是 CF 边缘拦截。2026-09-01 实测 hotel 带代理仍被拦 ——
         # 若判成「IP封」，处置会写「加代理」，那条路已证伪。
         ("403", "访问已被拦截，请完成安全验证", "WAF"),
         # 403 空正文 = 概率性边缘拦截，重试即可，不代表站点坏
@@ -408,10 +408,10 @@ def test_priority() -> None:
     # 上面那个 band 没填 model_tiers，试用期算出的挡站数恒为 0，测不到东西。
     # 用带 model_tiers 的真实形状：claude 段那种「顶层 1000、下面还有 5 档」。
     trial = _band(
-        {1000: ["relay-h"], 950: ["relay-a"], 900: ["relay-f"],
+        {1000: ["hotel"], 950: ["alfa"], 900: ["foxtrot"],
          800: ["relay-l"], 120: ["relay-m"], 30: ["relay-j"]},
         {"opus-5": 1000},
-        {"opus-5": {1000: ["relay-h"], 950: ["relay-a"], 900: ["relay-f"],
+        {"opus-5": {1000: ["hotel"], 950: ["alfa"], 900: ["foxtrot"],
                     800: ["relay-l"], 120: ["relay-m"], 30: ["relay-j"]}},
     )
     p_trial, why_trial = cp.suggest_priority(trial, 100, models=["opus-5"])
@@ -503,22 +503,22 @@ def test_priority() -> None:
 
     section("影响面 · 挡下层")
     # 层级隔离下「插在中间」不是排序靠前，是把下面整层跳过。
-    # 真实案例：gemini 段插 465 不动 relay-g 的 900，却把 30/20/15/10
+    # 真实案例：gemini 段插 465 不动 golf 的 900，却把 30/20/15/10
     # 四档共 9 个站全挡在后面 —— 这是最容易漏看的影响面。
     shadow_band = _band(
-        {900: ["relay-g"], 30: ["relay-c", "relay-h"], 20: ["relay-d"],
+        {900: ["golf"], 30: ["cielo", "hotel"], 20: ["relay-d"],
          10: ["relay-e"]},
         {"gemini-2.5-pro": 900, "gemini-3.6-flash": 30},
         {
-            "gemini-2.5-pro": {900: ["relay-g"], 30: ["relay-c", "relay-h"],
+            "gemini-2.5-pro": {900: ["golf"], 30: ["cielo", "hotel"],
                                20: ["relay-d"], 10: ["relay-e"]},
-            "gemini-3.6-flash": {30: ["relay-c"]},
+            "gemini-3.6-flash": {30: ["cielo"]},
         },
     )
     imp = cp.compute_impact(shadow_band, ["gemini-2.5-pro"], 465)[0]
     eq("465 不劫持 900 顶层", imp.hijacks, False)
     eq("465 挡住下面全部 4 个站", sorted(imp.shadowed_hosts),
-       ["relay-c", "relay-d", "relay-e", "relay-h"])
+       sorted(["cielo", "relay-d", "relay-e", "hotel"]))
     eq("挡住的档位正确", sorted(imp.shadowed), [10, 20, 30])
 
     imp_low = cp.compute_impact(shadow_band, ["gemini-2.5-pro"], 25)[0]
@@ -527,14 +527,14 @@ def test_priority() -> None:
 
     imp_top = cp.compute_impact(shadow_band, ["gemini-2.5-pro"], 950)[0]
     eq("950 既劫持也挡住全部", imp_top.hijacks, True)
-    eq("950 连顶层站也挡住", "relay-g" in imp_top.shadowed_hosts, True)
+    eq("950 连顶层站也挡住", "golf" in imp_top.shadowed_hosts, True)
 
     imp_bottom = cp.compute_impact(shadow_band, ["gemini-2.5-pro"], 5)[0]
     eq("垫底不挡任何站", imp_bottom.shadowed_hosts, [])
 
     # 按模型分别算：同一个 priority 对不同模型挡住的站不同
     imp_flash = cp.compute_impact(shadow_band, ["gemini-3.6-flash"], 465)[0]
-    eq("flash 只有 30 档一个站被挡", imp_flash.shadowed_hosts, ["relay-c"])
+    eq("flash 只有 30 档一个站被挡", imp_flash.shadowed_hosts, ["cielo"])
 
     section("影响面 → 警告文案")
     sp_warn = cp.SectionPlan(section="gemini-api-key", base_url="https://x.com",
@@ -820,7 +820,7 @@ def test_real_config(path: str) -> None:
     section("compat 段按主机归并 · 同站多 Key 只出一个 provider")
     # 实测缺陷（2026-08-30 首次真实探测发现）：5 个 relay-i.example 的 Key 生成了
     # 5 个重名 compat provider，每个只带 1 个 Key。而现有 12 个 provider 全部
-    # 是「一站一条、多 Key 挂 api-key-entries」（relay-f 15 个、relay-l 15 个）。
+    # 是「一站一条、多 Key 挂 api-key-entries」（foxtrot 15 个、relay-l 15 个）。
     # CPA 的 compat 段不去重，重名会让同一站注册成 N 个 provider、模型清单重复 N 遍。
     import collections as _c
 

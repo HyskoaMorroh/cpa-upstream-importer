@@ -317,7 +317,7 @@ def main() -> int:
             else:
                 print(f"    {C_DIM}落差仅 {gap}，属同级微调{C_END}")
             # 无论落差大小，都必须先查实测记录 —— 这是踩过的坑：
-            # codex 段的 relay-c(800) 落差只有 100，看着像「稍差一点的备选」，
+            # codex 段的 cielo(800) 落差只有 100，看着像「稍差一点的备选」，
             # 实测却是 200 但正文为 CF_APP_WAF 拦截页（假阳性，状态码骗过判定）。
             # 光看 priority 落差会给出把必然失败的站提到顶层这种危险建议。
             print(f"    {C_WARN}提档前必须核实本段实测记录{C_END}"
@@ -360,7 +360,7 @@ def main() -> int:
                     f"（{', '.join(nxt_hosts)}），落差仅 {gap}。\n"
                     f"      {C_WARN}但提档前必须现测一次{C_END} —— priority 只是"
                     f"「当初定的档」，不代表现在还能用。\n"
-                    f"      {C_DIM}实测踩过：codex 段 relay-c 落差只有 100，"
+                    f"      {C_DIM}实测踩过：codex 段 cielo 落差只有 100，"
                     f"实测却返回 200 + CF_APP_WAF 拦截页（假阳性）。\n"
                     f"      核对三件事：状态码、返回的 model 字段是否被换、"
                     f"正文是不是 HTML 拦截页。{C_END}\n"

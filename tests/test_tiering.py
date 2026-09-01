@@ -30,7 +30,7 @@
 
   ④ 别名匹配漏判（修 ③ 时踩到的新坑）
      注释写人读短名，配置里是域名，两者不保证有公共子串：
-       jdw -> relay-h.example   （jdw ≠ relay-h）
+       jdw -> relay-h.example   （jdw ≠ hotel）
        sm       -> relay-m.example
      第一版用「短名是域名的点分标签」匹配，jdw 静默漏判 ——
      不报错，只让定档悄悄变保守，极难发现。
@@ -185,19 +185,19 @@ def main() -> int:
     # ── ⑤ 别名表：注释短名 vs 配置域名 ──────────────────────────────
     section("⑤ 别名匹配（jdw -> relay-h.example 这类）")
     alias = {"jdw": "relay-h.example", "sm": "relay-m.example",
-             "relay-a": "relay-a.example", "relay-e": "relay-e.example",
-             "relay-f": "relay-f.example"}
+             "alfa": "relay-a.example", "relay-e": "relay-e.example",
+             "foxtrot": "foxtrot.example"}
     for name, host in alias.items():
         eq(f"{name} 匹配 {host}",
            cp.host_matches_note(host, {name}, alias), True)
     # 反例：不能误匹配
-    eq("relay-h 不误匹配 relay-l.example",
+    eq("hotel 不误匹配 relay-l.example",
        cp.host_matches_note("relay-l.example", {"jdw"}, alias), False)
     eq("sm 不误匹配 relay-m.example.ai（别名表里是 relay-m.example）",
        cp.host_matches_note("other.example", {"sm"}, alias), False)
     # 没有别名表时的兜底：仍能匹配共享标签的
-    eq("无别名表时 relay-f 仍匹配 relay-f.example",
-       cp.host_matches_note("relay-f.example", {"relay-f"}, None), True)
+    eq("无别名表时 foxtrot 仍匹配 foxtrot.example",
+       cp.host_matches_note("foxtrot.example", {"foxtrot"}, None), True)
 
     section("⑤ 别名表从 openai-compatibility 的 name 字段建")
     cfg_fake = {"openai-compatibility": [
@@ -215,21 +215,21 @@ def main() -> int:
     section("⑥ 注释里的实测结论按段隔离")
     raw = "\n".join([
         "gemini-api-key:",
-        "# relay-f：实测 503 No available channel",
+        "# foxtrot：实测 503 No available channel",
         '  - api-key: "k1"',
-        '    base-url: "https://relay-f.example"',
+        '    base-url: "https://foxtrot.example"',
         "    priority: 30",
         "claude-api-key:",
-        "# relay-f：实测 200，3.6 秒",
+        "# foxtrot：实测 200，3.6 秒",
         '  - api-key: "k2"',
-        '    base-url: "https://relay-f.example"',
+        '    base-url: "https://foxtrot.example"',
         "    priority: 900",
         "other-key: 1",
     ])
     g = unhealthy_from_comments(raw, "gemini-api-key")
     c = unhealthy_from_comments(raw, "claude-api-key")
-    truthy(f"gemini 段判 relay-f 不可用（{sorted(g)}）", "relay-f" in g)
-    truthy(f"claude 段不判它不可用（{sorted(c)}）", "relay-f" not in c,
+    truthy(f"gemini 段判 foxtrot 不可用（{sorted(g)}）", "foxtrot" in g)
+    truthy(f"claude 段不判它不可用（{sorted(c)}）", "foxtrot" not in c,
            "同一个站在不同段的结论完全不同，跨段套用是错的")
 
     section("⑥ 各种「不可用」注释形态都要认")
@@ -332,8 +332,8 @@ def main() -> int:
         eq("「" + junk + "」不被当站名", junk in got, False)
 
     section("⑨-1 真站名仍要认得")
-    for note, want in [("# relay-f：实测 503 No available channel", "relay-f"),
-                       ("# relay-a：实测 403 分组权限被回收", "relay-a"),
+    for note, want in [("# foxtrot：实测 503 No available channel", "foxtrot"),
+                       ("# alfa：实测 403 分组权限被回收", "alfa"),
                        ("# relay-e 永久排除（2026-08-27）", "relay-e"),
                        ("# relay-b.example：实测 400", "relay-b.example"),
                        ("# jdw：实测 503", "jdw")]:
@@ -368,12 +368,12 @@ def main() -> int:
     # 曾经有 len(n)>=4 and startswith 的宽松匹配，实测会把不同站判成同一个。
     # 误判方向是「把活站当死站」—— 新站因此拿到过高档位，比漏判严重得多。
     for host, name in [("api.aliyuncs.com", "aliyun"),
-                       ("api.oaipro.com", "oaiproxy"),
+                       ("api.relaypro.com", "relayproxy"),
                        ("api.justdo.com", "jdw"),
-                       ("relay-f.examplex.com", "relay-f.example")]:
+                       ("foxtrot.examplex.com", "foxtrot.example")]:
         eq(host + " 不被 " + name + " 误匹配",
            cp.host_matches_note(host, {name}, None), False)
-    for host, name in [("relay-f.example", "relay-f"),
+    for host, name in [("foxtrot.example", "foxtrot"),
                        ("relay-l.example", "relay-l"),
                        ("relay-b.example", "relay-b")]:
         eq(host + " 与 " + name + " 精确匹配",

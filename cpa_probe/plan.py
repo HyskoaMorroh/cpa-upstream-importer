@@ -69,7 +69,7 @@ def credential_pair(api_key: str, base_url: str) -> str:
       「这两行配置是否完全相同」。CPA 用它决定要不要丢弃重复行。
 
     · credential_pair 问的是「这个凭据在这个站是不是已经配过了」。
-      导入工具需要的是这一个 —— 实测踩到：relay-f 的某个 Key 在 claude 段
+      导入工具需要的是这一个 —— 实测踩到：foxtrot 的某个 Key 在 claude 段
       已存在（带 prefix: ANT 和一个 UA），探测得出的方案没有那两项，
       五元组指纹因此不同，于是被判成新 Key 又写了一条。结果同一个凭据
       在同一个站出现两次，轮询池里占两个位、坏了一起坏。
@@ -302,7 +302,7 @@ _DEAD_NOTE = re.compile(
     r"|静默(?:重映射|替换)模型"
 )
 # 站名在注释里的两种位置：
-#   `# relay-f：实测 503 …`      冒号分隔（多数）
+#   `# foxtrot：实测 503 …`      冒号分隔（多数）
 #   `# relay-e 永久排除（2026-08-27）` 空格分隔，无冒号
 # 只要冒号形态会漏掉后者 —— 实测踩到：relay-e 在 codex 段的「永久排除」
 # 注释因此没被解析出来。
@@ -358,7 +358,7 @@ def _looks_like_host(name: str) -> bool:
 # 为什么要认引号（2026-08-30 自查）：原来是 `^[a-zA-Z_][a-zA-Z0-9_-]*\s*:`，
 # 遇到 `"codex-api-key":` 这种合法 YAML 写法认不出来，于是段边界算错 ——
 # 后一段的死站注释被并进前一段的 unhealthy_hosts。**跨段串扰**，与
-# 「同一站在不同段结论不同」的设计意图直接冲突（relay-f 在 claude 段
+# 「同一站在不同段结论不同」的设计意图直接冲突（foxtrot 在 claude 段
 # 实测 200、在 gemini 段 503，串了就会把好站当死站）。
 _TOP_KEY = re.compile(r"""^(?:['"]?)[A-Za-z_][A-Za-z0-9_.\-]*(?:['"]?)\s*:""")
 
@@ -419,7 +419,7 @@ def unhealthy_from_comments(raw: str, section: str) -> set[str]:
     绝不用它直接排除任何站 —— 真要排除该由用户写 weight: 0 显式表达。
 
     只在**本段范围内**匹配：同一个站在不同段的结论完全不同
-    （relay-f 在 claude 段实测 200，在 gemini 段是 503）。
+    （foxtrot 在 claude 段实测 200，在 gemini 段是 503）。
     """
     lines = raw.splitlines()
     st = None
@@ -461,13 +461,13 @@ def name_alias_map(cfg: dict, *,
     为什么需要显式表、不能靠字符串猜（2026-08-30 踩到）：
     注释里写的是人读短名，而 base-url 里是域名，两者**不保证有公共子串**：
 
-        jdw  ->  relay-h.example      （jdw ≠ relay-h）
+        jdw  ->  relay-h.example      （jdw ≠ hotel）
         sm        ->  relay-m.example
-        relay-a    ->  relay-a.example
+        alfa    ->  relay-a.example
         relay-e       ->  relay-e.example
 
     第一版用「短名是域名的点分标签之一」来匹配，jdw 静默漏判 ——
-    于是 gemini 段把实测 503 的 relay-h 当成活站保护，新站又被压低。
+    于是 gemini 段把实测 503 的 hotel 当成活站保护，新站又被压低。
     这种漏判不会报错，只会让定档悄悄变保守，极难发现。
 
     compat 段每个 provider 都同时有 `name` 与 `base-url`，是文件里唯一
@@ -520,7 +520,7 @@ def host_matches_note(host: str, note_names: set[str],
     自查实测它会把不同的站判成同一个（2026-08-30）：
 
         api.aliyuncs.com  被短名 aliyun    命中（aliyuncs.startswith(aliyun)）
-        api.oaipro.com    被短名 oaiproxy  命中（oaiproxy.startswith(oaipro)）
+        api.relaypro.com  被短名 relayproxy 命中（relayproxy.startswith(relaypro)）
         api.justdo.com    被短名 jdw 命中
 
     误判方向是**把活站当死站** —— 后果是新站拿到过高档位，把真正可用的
@@ -906,7 +906,7 @@ class Impact:
       hijacks   —— 抢走顶层。该模型原本的首选站再也不会被首选。
       shadowed  —— 挡住下层。这些站只在新站也不可用时才被尝试。
     第二件同样重要，却是「没劫持顶层」时容易被忽略的部分：gemini 段插
-    465 不动 relay-g 的 900，但把 30 档那批全挡在后面了。
+    465 不动 golf 的 900，但把 30 档那批全挡在后面了。
     """
 
     model: str
@@ -1203,7 +1203,7 @@ def build_plan(
     去重要查**两层**，问的是两个不同问题：
       seen        五元组指纹（与 CPA 同口径）—— 「这两行配置是否完全相同」
       seen_pairs  (key, base) 对             —— 「这个凭据在这个站配过没」
-    第二层不能省：现有条目常带 prefix / headers（relay-f 的 claude 条目
+    第二层不能省：现有条目常带 prefix / headers（foxtrot 的 claude 条目
     有 prefix: ANT 和一个 UA），探测方案不带，五元组因此不撞，
     只查第一层会把同一个凭据在同一个站重复写入。
 
@@ -1333,7 +1333,7 @@ def build_plan(
             # 五元组不同但 (key, base) 相同 —— 现有条目带了 prefix / headers /
             # proxy-url，探测方案没带，指纹因此不同。对 CPA 而言这仍是**同一个
             # 凭据在同一个站**，再写一条就是同 Key 在轮询池占两个位。
-            # 实测踩到：relay-f 某 Key 在 claude 段已存在（带 prefix: ANT），
+            # 实测踩到：foxtrot 某 Key 在 claude 段已存在（带 prefix: ANT），
             # 五元组判成新 Key，差点重复写入。
             sp.duplicate = True
             sp.duplicate_note = (

@@ -1,4 +1,4 @@
-"""复现 anyrouter.top 的形态：整梯全 400，正文只说「请启用 1m 上下文」。
+"""复现 alfa 的形态：整梯全 400，正文只说「请启用 1m 上下文」。
 
 假上游的规则与实测一致：
   · 不看客户端身份（任何 UA / x-app / X-Stainless 组合都一样待遇）
@@ -76,7 +76,7 @@ def main():
     events = []
     prober = Prober(gap=0.0, probe_context=False, swap_samples=0, workers=2,
                     on_event=lambda k, d: events.append((k, d)))
-    row = cp.parse_lines(f"{base},sk-ant-anyrouter-shape").valid[0]
+    row = cp.parse_lines(f"{base},sk-ant-alfa-shape").valid[0]
     res = prober.probe(row)
 
     v = res.sections.get("claude-api-key")

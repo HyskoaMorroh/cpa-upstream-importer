@@ -3,7 +3,7 @@
 三层命名同时存在（2026-09-01 定的方案）
 ------------------------------------
     claude-opus-5            原名     按 priority 轮询全部站（CPA 自动挑）
-    AGR/claude-opus-5        站级     定向落到 agentrouter
+    AGR/claude-opus-5        站级     定向落到某一个站
     ANT/claude-opus-5        段级     兼容旧客户端，靠 models[].alias 注册
 
 为什么三层能共存
@@ -53,7 +53,7 @@ SECTION_PREFIX_FALLBACK = {
 }
 
 # 前缀合法形态：字母开头，大写字母与数字，2-6 位。
-# 字母开头是硬要求 —— `123nhh` 直接取会得到 `123`，而以数字开头的模型名
+# 字母开头是硬要求 —— `7x9zk` 直接取会得到 `7`，而以数字开头的模型名
 # 在有些客户端里会被当成数值解析。
 _PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9]{1,5}$")
 
@@ -70,11 +70,13 @@ _TLD_TAIL = ("com", "cn", "net", "org", "io", "co", "cc", "me", "top",
 def stem(host: str) -> str:
     """从主机名取「站名」那一段。
 
-    api.123nhh.com        -> 123nhh
-    sub.100xlabs.space    -> 100xlabs
-    api.facai.cloudns.org -> facai      （cloudns 是动态 DNS 服务商，不是站名）
-    runanytime.hxi.me     -> runanytime
-    ai.hybgzs.com         -> hybgzs
+    例子用合成域名，但每一条对应一个实测形状（对照见 docs/SITE-CODENAMES.md）：
+
+    api.7x9zk.com          -> 7x9zk       数字开头，candidate() 要前置 N
+    sub.42labs.space       -> 42labs      子域名不是站名
+    api.mysite.cloudns.org -> mysite      cloudns 是动态 DNS 服务商，不是站名
+    somesite.hxi.me        -> somesite    无 api. 前缀，词干就在最左
+    ai.foobar.com          -> foobar      ai 是噪声词
     """
     h = host_of(host) or str(host or "").strip().lower()
     parts = [p for p in h.split(".") if p]
@@ -92,7 +94,7 @@ def stem(host: str) -> str:
 def candidate(host: str) -> str:
     """该主机的首选前缀。不保证唯一 —— 唯一性由 assign 负责。
 
-    取词干的前几个字母大写。数字开头时前置 N（`123nhh` -> `N123`），
+    取词干的前几个字母大写。数字开头时前置 N（`7x9zk` -> `N7X9`），
     因为以数字开头的模型名在部分客户端里会被当数值解析。
     """
     s = stem(host)

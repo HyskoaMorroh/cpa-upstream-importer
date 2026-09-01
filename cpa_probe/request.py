@@ -20,7 +20,7 @@ Anthropic 官方两种都支持，中转站实现不一。本模块**两个都�
 --------------------------------------------------
 原来这两处为了「少引入失败面」而故意与 CPA 不同，结果都造成了误判：
 
-  · gemini 段把 Key 放 query string。实测 chiangma.com 三种画像全部连接层
+  · gemini 段把 Key 放 query string。实测 cielo 三种画像全部连接层
     失败（000），而前端用 x-goog-api-key 头能拉到几百个模型 —— 探测测的
     不是 CPA 会走的那条路，于是把一个可用站判死。
   · claude 段不带 `?beta=true`。站方按 query 参数分流时，探测与真实转发
@@ -86,7 +86,7 @@ def build_request(
     if section == "gemini-api-key":
         # Key 走 **头** 而不是 query string —— CPA 只用 x-goog-api-key
         # （gemini_executor.go:190/304/424/504/665，全库无 `?key=`）。
-        # 2026-09-01 实测：用 query string 时 chiangma.com 三种画像全部
+        # 2026-09-01 实测：用 query string 时 cielo 三种画像全部
         # 连接层失败（000），而前端用头的方式能拉到几百个模型 —— 探测测的
         # 不是 CPA 真实会走的那条路，于是把一个可用站判死。
         url = f"{base}/v1beta/models/{model}:generateContent"
@@ -161,11 +161,11 @@ def identity_combos(section: str, cfg: dict | None = None):
     ----------------------
     原实现四段共用一份 codex 形态（User-Agent + Originator）。`Originator`
     是 codex 独有的头，对 claude / gemini 段毫无意义 —— 于是 claude 段一个
-    对的组合都没有，五种全试也过不去。实测 agentrouter 的门票是
+    对的组合都没有，五种全试也过不去。实测 golf 的门票是
     user-agent + anthropic-beta + x-app 三项缺一不可，而那三项从不在这个表里。
 
     更根本的是返回值只有 headers。`metadata.user_id` 是请求**体**字段，
-    这个签名压根表达不了它 —— 而它是 zzzcoding 的门票之一。
+    这个签名压根表达不了它 —— 而它是 zulu 的门票之一。
 
     新表见 cpa_probe/profiles.py：按段分开、按客户端族分组、族内嵌套超集、
     headers 与 body_patch 同时给。
