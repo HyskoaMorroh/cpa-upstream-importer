@@ -841,212 +841,171 @@ def rebuild_config_full(
         warnings.append("原文件未找到任何 *-api-key 段，全局配置可能不完整")
         first_section_idx = len(original_lines)
 
-    # 2. 提取每个站的人工注释（按 name 索引）
+    # 2. 提取每个站的人工注释（按 (段, 键) 索引）
     comments_map = _extract_entry_comments(original_lines)
 
     # 3. 按段组织所有方案
-    sections_data = {
+    #
+    # 注意 section 的取值：pipeline 与 build_plan 一路用的都是**完整 YAML 段名**
+    # （gemini-api-key / openai-compatibility），不是短名。这里按段名直接分组，
+    # 不做映射 —— 早先写成「短名→完整名」的映射表，结果每一段都 miss、
+    # 全部被判「映射失败」跳过，产出一个四段皆空的文件。
+    sections_data: dict[str, list[SectionPlan]] = {
         "gemini-api-key": [],
         "codex-api-key": [],
         "claude-api-key": [],
-        "openai-compatibility": []
-    }
-
-    section_map = {
-        "gemini": "gemini-api-key",
-        "codex": "codex-api-key",
-        "claude": "claude-api-key",
-        "compat": "openai-compatibility"
+        "openai-compatibility": [],
     }
 
     for (base_url, api_key), plan in all_plans.items():
-        # 遍历该站的所有段
         for sp in plan.sections.values():
             if not sp.writable:
-                warnings.append(f"站 {base_url} 段 {sp.section} 不可写，跳过")
+                warnings.append(f"{plan.host} 段 {sp.section} 不可写，跳过")
                 continue
-
-            section_full = section_map.get(sp.section)
-            if not section_full:
-                warnings.append(f"站 {base_url} 段 {sp.section} 映射失败，跳过")
+            if sp.section not in sections_data:
+                warnings.append(f"{plan.host} 段 {sp.section} 不是已知段名，跳过")
                 continue
+            sections_data[sp.section].append(sp)
 
-            sections_data[section_full].append(sp)
+    # 4. compat 段按 (host, base_url) 归并 —— 该段一个条目 = 一个上游站，
+    #    多个 Key 挂在它的 api-key-entries 下。不归并会生成 N 个重名 provider，
+    #    而 name 就是 CPA 的 provider 身份（冷却、模型能力、执行路由三处按它
+    #    索引），重名会让同一个 Key 命中两套配置。这与 build_diffs 的做法一致。
+    from .parse import host_of as _host_of
 
-    # 4. 按 priority 排序（每段内从高到低）
-    for section_full in sections_data:
-        sections_data[section_full].sort(
-            key=lambda sp: sp.priority,
-            reverse=True
-        )
+    compat_groups: dict[tuple[str, str], list[SectionPlan]] = {}
+    for sp in sections_data["openai-compatibility"]:
+        compat_groups.setdefault((_host_of(sp.base_url), sp.base_url), []).append(sp)
 
-    # 5. 渲染四段
+    # 5. 按 priority 排序（每段内从高到低；compat 按组内首个的 priority）
+    for section_full in ("gemini-api-key", "codex-api-key", "claude-api-key"):
+        sections_data[section_full].sort(key=lambda sp: sp.priority, reverse=True)
+    compat_ordered = sorted(compat_groups.items(),
+                            key=lambda kv: kv[1][0].priority, reverse=True)
+
+    # 6. 渲染四段
     output_lines = global_lines.copy()
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d")
 
-    for section_full in ["gemini-api-key", "codex-api-key", "claude-api-key", "openai-compatibility"]:
-        entries = sections_data[section_full]
-        if not entries:
-            # 该段为空，跳过
-            continue
-
-        # 段头
-        output_lines.append(f"{section_full}:\n")
-
-        # 检测原段的缩进（从原文件读）
+    def indents_for(section_full: str) -> tuple[str, str]:
         span = _section_span(original_lines, section_full)
         if span:
-            dash_indent, field_indent = _detect_indent(original_lines, span[0], span[1])
-        else:
-            dash_indent, field_indent = "  ", "    "
+            return _detect_indent(original_lines, span[0], span[1])
+        return "  ", "    "
 
-        # 渲染每个条目
-        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    def comments_for(section_full: str, sp: SectionPlan,
+                     used: set[str]) -> list[str]:
+        """按多个候选键查该站的人工注释，且同一份注释只挂一次。
+
+        为什么要去重（端到端验证抓到）：同一个站在同一段里可能有多个 Key
+        （前三段每个 Key 各占一条），按 host 匹配会让同一份注释被复制到
+        每一条上。原文件里它只出现一次，重建后变成 N 次。
+        """
+        sec = comments_map.get(section_full, {})
+        for cand in (sp.base_url, _host_of(sp.base_url)):
+            if not cand or cand not in sec:
+                continue
+            if cand in used:
+                return []           # 这份注释已经挂过了
+            used.add(cand)
+            return sec[cand]
+        return []
+
+    for section_full in ("gemini-api-key", "codex-api-key", "claude-api-key"):
+        entries = sections_data[section_full]
+        if not entries:
+            continue
+        output_lines.append(f"{section_full}:\n")
+        dash, field = indents_for(section_full)
+        used: set[str] = set()
         for sp in entries:
-            # 查找该站的人工注释
-            entry_comments = comments_map.get(section_full, {}).get(sp.base_url, [])
+            for c in comments_for(section_full, sp, used):
+                output_lines.append(c if c.endswith("\n") else c + "\n")
+            for line in render_entry(sp, dash, field, stamp):
+                output_lines.append(line + "\n")
+        output_lines.append("\n")
 
-            # 生成条目
-            entry_lines = _render_entry_full(
-                sp,
-                dash_indent,
-                field_indent,
-                stamp,
-                entry_comments
-            )
-            output_lines.extend(entry_lines)
-
+    if compat_ordered:
+        output_lines.append("openai-compatibility:\n")
+        dash, field = indents_for("openai-compatibility")
+        used = set()
+        for (host, base), group in compat_ordered:
+            head = group[0]
+            extra = [g.api_key for g in group[1:]]
+            for c in comments_for("openai-compatibility", head, used):
+                output_lines.append(c if c.endswith("\n") else c + "\n")
+            for line in render_entry(head, dash, field, stamp, extra_keys=extra):
+                output_lines.append(line + "\n")
         output_lines.append("\n")
 
     return "".join(output_lines), warnings
 
 
 def _extract_entry_comments(lines: list[str]) -> dict[str, dict[str, list[str]]]:
-    """提取每个站条目的人工注释
+    """提取每个站条目的人工注释，按 (段, 键) 索引。
 
-    Returns:
-        {section_full: {name_or_base_url: [comment_lines], ...}, ...}
+    键的选择：`name`（compat 段有）与 `host_of(base-url)` 两个都建，
+    渲染时按同样的两个候选去查。
+
+    为什么不能只用 base-url 原文（端到端验证抓到）
+    -------------------------------------------
+    写回时 `sp.base_url` 是 `base_for_section()` 的产物 —— codex 与 compat
+    段会补上 `/v1`，gemini 与 claude 不补。而注释是从原文件读的，那里的
+    base-url 是站方当初怎么写就怎么存。两边字符串对不上，注释就静默丢失。
+
+    取 host 做键绕开这个问题：协议、路径、尾部 /v1 都不参与比较，
+    而同一个站在同一段里只会有一个条目（多 Key 走 compat 的
+    api-key-entries，不是多条目）。
     """
-    comments = {}
+    from .parse import host_of
+
+    comments: dict[str, dict[str, list[str]]] = {}
     current_section = None
-    current_entry_name = None
-    current_comments = []
+    pending: list[str] = []
 
-    for i, line in enumerate(lines):
-        # 检测段头
-        m = re.match(r'^(gemini|codex|claude|openai)-api-key\s*:', line)
+    for line in lines:
+        # 段头：顶层键
+        m = re.match(r"^(gemini-api-key|codex-api-key|claude-api-key"
+                     r"|openai-compatibility)\s*:", line)
         if m:
-            current_section = m.group(0).rstrip(":")
-            current_entry_name = None
-            current_comments = []
-            if current_section not in comments:
-                comments[current_section] = {}
+            current_section = m.group(1)
+            comments.setdefault(current_section, {})
+            pending = []
             continue
 
-        # 检测注释行（在条目之前）
-        if line.lstrip().startswith("#"):
-            current_comments.append(line)
+        if current_section is None:
             continue
 
-        # 检测条目名或 base-url
-        if current_section:
-            # 检测 name: 或 base-url:
-            m_name = re.match(r'^\s+name:\s*(.+)', line)
-            m_base = re.match(r'^\s+base-url:\s*(.+)', line)
+        stripped = line.strip()
 
-            if m_name:
-                current_entry_name = m_name.group(1).strip().strip('"\'')
-                if current_comments:
-                    comments[current_section][current_entry_name] = current_comments
-                    current_comments = []
-            elif m_base and not current_entry_name:
-                # 如果没有 name，用 base-url 作为 key
-                base_url = m_base.group(1).strip().strip('"\'')
-                if current_comments:
-                    comments[current_section][base_url] = current_comments
-                    current_comments = []
+        # 注释行：攒着，等下一个条目认领
+        if stripped.startswith("#"):
+            pending.append(line)
+            continue
+
+        # 空行不清空 pending —— 注释与条目之间可以隔空行
+        if not stripped:
+            continue
+
+        # 顶层键（非本段）：离开该段
+        if re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]*\s*:", line):
+            current_section = None
+            pending = []
+            continue
+
+        m_name = re.match(r"^\s*-?\s*name:\s*(.+)$", line)
+        m_base = re.match(r"^\s*-?\s*base-url:\s*(.+)$", line)
+
+        if m_name and pending:
+            key = m_name.group(1).strip().strip("\"'")
+            comments[current_section][key] = pending
+            # 不清空 —— 同一条目的 base-url 可能在下一行，两个键都要能查到
+        elif m_base and pending:
+            raw_base = m_base.group(1).strip().strip("\"'")
+            h = host_of(raw_base)
+            if h:
+                comments[current_section][h] = pending
+            comments[current_section][raw_base] = pending
+            pending = []
 
     return comments
-
-
-def _render_entry_full(
-    sp: SectionPlan,
-    dash_indent: str,
-    field_indent: str,
-    stamp: str,
-    comments: list[str]
-) -> list[str]:
-    """渲染一个站的完整配置块
-
-    Args:
-        sp: SectionPlan（包含 priority/headers/models/...）
-        dash_indent: 列表项缩进（如 "  "）
-        field_indent: 字段缩进（如 "    "）
-        stamp: 时间戳（用于注释）
-        comments: 该站的人工注释（原样保留）
-
-    Returns:
-        行列表（每行带 \\n）
-    """
-    lines = []
-
-    # 保留人工注释
-    if comments:
-        lines.extend(comments)
-
-    # 条目开始
-    lines.append(f"{dash_indent}- name: {_quote(sp.base_url)}\n")
-    lines.append(f"{field_indent}base-url: {_quote(sp.base_url)}\n")
-    lines.append(f"{field_indent}api-key: {_quote(sp.api_key)}\n")
-
-    # models
-    if sp.models:
-        models_str = "[" + ", ".join(sp.models) + "]"
-        lines.append(f"{field_indent}model: {models_str}\n")
-
-    # priority
-    lines.append(f"{field_indent}priority: {sp.priority}\n")
-
-    # prefix
-    if sp.prefix:
-        lines.append(f"{field_indent}prefix: {sp.prefix}\n")
-
-    # proxy-url
-    if sp.proxy_url:
-        lines.append(f"{field_indent}proxy-url: {_quote(sp.proxy_url)}\n")
-
-    # headers
-    if sp.headers:
-        lines.append(f"{field_indent}headers:\n")
-        for k, v in sorted(sp.headers.items()):
-            lines.append(f"{field_indent}  {k}: {_quote(v)}\n")
-
-    # 添加重建时间戳注释
-    lines.append(f"{field_indent}# 重建于 {stamp}\n")
-
-    return lines
-
-
-def _quote(s: str) -> str:
-    """YAML 字符串引用（简化版）"""
-    if not s:
-        return '""'
-
-    # 需要引号的情况
-    needs_quote = (
-        s[0] in " \t" or
-        s[-1] in " \t" or
-        ":" in s or
-        "#" in s or
-        any(c in s for c in ["\n", "\r", "\t", "\\", '"'])
-    )
-
-    if not needs_quote:
-        return s
-
-    # 双引号 + 转义
-    escaped = s
-    for old, new in _YAML_ESCAPES.items():
-        escaped = escaped.replace(old, new)
-
-    return f'"{escaped}"'
-
