@@ -1090,6 +1090,22 @@ class SectionPlan:
     # None 表示原条目没写这个字段，渲染时也不写 —— 「没写」与「写了 1」
     # 在 CPA 侧等价，但保持原样能让 diff 干净。
     weight: int | None = None
+    # 原条目里 render_entry 不认识的字段，按 YAML 原文行搬运。
+    #
+    # 为什么必须有（2026-09-02 拿生产 config.yaml 核对发现）：render_entry 是
+    # 白名单式渲染（只写它知道的 10 个字段），而全量重探会用它**整段重写**。
+    # 生产配置 108 个条目里 106 条带白名单外的字段，重写后全部静默消失：
+    #
+    #   request-scoped-errors  105 条  按状态码+正文做冷却，丢了就没有冷却
+    #   excluded-models         39 条  `["*"]` = 该站只用显式列的模型
+    #   websockets               2 条  codex 段的 WebSocket 开关
+    #   fingerprint-profile      1 条  claude 段让 CPA 自己补设备指纹
+    #   disabled（compat）       1 条  手工停用的 provider 会复活
+    #
+    # 存原文行而不是解析后的值：这些字段的结构任意深（request-scoped-errors
+    # 是对象数组），重新序列化既要处理缩进又要处理引号风格，而原文行拿来就能
+    # 用、且逐字保真。键序也跟着原文，diff 干净。
+    carry_lines: list[str] = field(default_factory=list)
 
     @property
     def hijacked(self) -> list[Impact]:

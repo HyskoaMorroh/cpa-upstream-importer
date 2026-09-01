@@ -48,7 +48,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cpa_probe as cp  # noqa: E402
 from cpa_probe.pipeline import Prober, SEED_MODELS  # noqa: E402
 from cpa_probe.batch import (  # noqa: E402
-    BatchProber, existing_weights, extract_existing_entries,
+    BatchProber, existing_proxies, existing_weights,
+    extract_existing_entries,
 )
 from cpa_probe.writeback import (  # noqa: E402
     apply_diffs,
@@ -1358,6 +1359,10 @@ class Handler(BaseHTTPRequestHandler):
             # 逐出调度池」的唯一表达，而 CPA 缺这个字段时默认 1 —— 不搬运它
             # 等于让手工封禁的站全部复活。
             weights = existing_weights(cfg)
+            # proxy-url 同理。它只在探测当场判定「需要代理」时才有值，而重探时
+            # 那个站可能这次直连就通 —— 方案里 proxy_url 为空，整段重写就把原有
+            # 的 26 条 mihomo 代理全抹掉。见 existing_proxies 的说明。
+            proxies = existing_proxies(cfg)
 
             for res in job.results:
                 fh = forced.get(res.row.host) or {}
@@ -1369,6 +1374,13 @@ class Handler(BaseHTTPRequestHandler):
                 if w is not None:
                     for sp in p.sections.values():
                         sp.weight = w
+                pu = proxies.get((res.row.host, res.row.api_key))
+                if pu:
+                    for sp in p.sections.values():
+                        # 探测判定需要代理时它已有值，不覆盖 —— 那是本次实测
+                        # 结论；只补「原来有、这次没探出来」的情形。
+                        if not sp.proxy_url:
+                            sp.proxy_url = pu
                 all_plans[(res.row.bare, res.row.api_key)] = p
 
             # 应用用户覆盖
@@ -1610,6 +1622,18 @@ class Handler(BaseHTTPRequestHandler):
                                     "无法自动重载 —— 请 docker restart cli-proxy-api")
 
         if result.get("reload_ok"):
+            # 等 fsnotify 的 debounce 落地再验。
+            #
+            # 真正让新上游可被选中的是 reloadClients()，而它挂在 fsnotify
+            # 那一路上，前面有 150ms 的 debounce
+            # （internal/watcher/watcher.go:87 configReloadDebounce）。
+            # PUT 返回 200 只说明 CPA 接受了这份 YAML 并更新了管理 handler
+            # 的 h.cfg，凭据池此刻还没重建 —— 立刻打业务端点会打在旧池子上，
+            # 于是刚写进去的站被报成「验证失败」，而它其实是好的。
+            #
+            # 1.2 秒 = 150ms debounce + LoadConfig 与 reloadClients 的余量。
+            # 这一步的代价是固定 1.2 秒，而误报一个可用站的代价是用户把它删掉。
+            time.sleep(1.2)
             # 第二级验证：热重载**之后**打 CPA 自己的业务端点。
             # 重载成功只证明 CPA 接受了这份 YAML，证明不了新上游真能出活 ——
             # 直连 200 而经 CPA 换模是实测存在的情形（atlas 第 12 章）。
