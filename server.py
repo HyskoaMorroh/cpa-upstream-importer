@@ -782,6 +782,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "/api/context":
             self._api_context()
+        elif route.startswith("/api/export/"):
+            self._api_export(route[len("/api/export/"):])
         elif route.startswith("/api/job/"):
             jid = route[len("/api/job/"):]
             since = int((urllib.parse.parse_qs(p.query).get("since") or ["0"])[0])
@@ -1089,6 +1091,99 @@ class Handler(BaseHTTPRequestHandler):
                 for r in job.results
             ]
         self._json(200, snap)
+
+    def _api_export(self, jid: str) -> None:
+        """整份探测日志导出成纯文本。给运维留档、也给排障时贴给别人看。
+
+        为什么是 txt 而不是 JSON：这份东西的读者是人。JSON 要先格式化才能读，
+        而排障现场经常是「把这段贴到聊天里问别人」，txt 直接可读。
+        机器要的那份数据 /api/job 已经给了。
+
+        **脱敏是硬要求**：日志里带 api-key，而导出文件会被贴到聊天、
+        存到桌面、可能进网盘。全程只用 row.masked()，与 JSON 响应同一口径。
+        """
+        job = STORE.get_job(jid)
+        if not job:
+            self._json(404, {"error": f"没有这个任务：{jid}"})
+            return
+
+        L: list[str] = []
+        w = L.append
+        w("CPA 上游探测日志")
+        w("=" * 66)
+        w(f"任务 {job.id}")
+        w(f"状态 {job.state}" + (f" · 错误 {job.error}" if job.error else ""))
+        w(time.strftime("导出于 %Y-%m-%d %H:%M:%S", time.localtime()))
+        w(time.strftime("开始于 %Y-%m-%d %H:%M:%S", time.localtime(job.started)))
+        w(f"候选 {len(job.rows)} · 请求 {job.calls} 次 · "
+          f"耗时 {round((job.finished or time.time()) - job.started, 1)}s")
+        w("")
+        w("注：api-key 一律只出末四位。上游 URL 与模型名原样保留。")
+        w("")
+
+        opts = job.opts or {}
+        if opts:
+            w("── 探测参数 " + "─" * 52)
+            for k in sorted(opts):
+                w(f"  {k} = {opts[k]!r}")
+            w("")
+
+        for r in job.results:
+            row = r.row
+            w("─" * 66)
+            w(f"站 {row.bare}   key {row.masked()}   行 {row.line_no}")
+            w(f"  可用段 {len(r.usable_sections)}/4 · 请求 {r.total_calls} 次")
+            for sec, v in r.sections.items():
+                tag = "可用" if v.usable else "不可用"
+                w("")
+                w(f"  [{sec}] {tag} · {v.category or '-'} · {v.action or '-'}")
+                w(f"    base-url        {v.base_url or '-'}")
+                if v.models:
+                    w(f"    实测模型        {', '.join(v.models)}")
+                cat = list(getattr(v, "catalog", None) or [])
+                if cat:
+                    w(f"    站方目录 {len(cat)} 个   {', '.join(cat)}")
+                if v.profile_name:
+                    w(f"    请求指纹        {v.profile_name}")
+                if v.min_headers:
+                    w("    最小门票头      "
+                      + ", ".join(f"{k}: {x}" for k, x in v.min_headers.items()))
+                if v.min_body_kind:
+                    w(f"    需 body 补丁    {v.min_body_kind}")
+                w(f"    需代理          {'是' if v.need_proxy else '否'}")
+                if v.time_window:
+                    w(f"    可调用时段      {v.time_window[0]}~{v.time_window[1]}")
+                if v.max_context_length:
+                    w(f"    上下文上限      {v.max_context_length}"
+                      f"（实测于 {v.context_model or '?'}"
+                      f"{'，截断反推不可信' if v.context_untrusted else ''}）")
+                if v.swap:
+                    w(f"    静默换模        {v.swap}")
+                for a in v.attempts:
+                    w(f"      · {a.status:>3} {a.model:<28} {a.combo:<18}"
+                      f" {a.elapsed_ms:>6}ms"
+                      + (f" 代理={a.proxy}" if a.proxy else "")
+                      + (f" 回={a.resp_model}" if a.resp_model else ""))
+                    if a.excerpt:
+                        w(f"          {a.excerpt[:200]}")
+            w("")
+
+        w("─" * 66)
+        w("事件流")
+        for e in job.events:
+            w(f"  [{e.get('t')}s] {e.get('kind')} "
+              + " ".join(f"{k}={v}" for k, v in e.items()
+                         if k not in ("t", "kind")))
+
+        raw = ("\n".join(L) + "\n").encode("utf-8")
+        name = time.strftime("cpa-probe-%Y%m%d-%H%M%S.txt", time.localtime())
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="{name}"')
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
     def _api_plan(self, body: dict) -> None:
         """把探测结果变成写入方案 + diff 预览。不落盘。"""

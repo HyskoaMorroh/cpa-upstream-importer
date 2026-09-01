@@ -11,6 +11,41 @@ const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
   (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmt = (n) => (n == null ? '—' : Number(n).toLocaleString('en-US'));
 
+// 段 → 该段真正能转发的模型族。与后端 pipeline._SECTION_FAMILY 同源。
+//
+// 为什么必须按段分：CPA 每段走各自的协议路径，gemini 段拿 claude-opus-5 去打
+// /v1beta/models/claude-opus-5:generateContent，站方必然报 404 或 500。
+// 聚合站的 /models 目录把三族混在一起报，不按段筛就会把注定失败的模型
+// 注册进 config.yaml —— CPA 每次轮到它都失败，白耗重试预算。
+// compat 段是万能转发口，不筛。
+const SECTION_FAMILY = {
+  'gemini-api-key': /^gemini/i,
+  'codex-api-key': /^(?:gpt|o\d)/i,
+  'claude-api-key': /^claude/i,
+};
+
+// 该段默认预勾哪些模型。规则来自现场要求：codex/compat 默认 gpt 系，
+// claude 段默认 claude 系，gemini 段只默认 *-pro（pro 是主力，flash/lite
+// 是降级档，默认全勾会让轮询把请求分到弱模型上）。
+const SECTION_DEFAULT = {
+  'gemini-api-key': /^gemini-.*-pro/i,
+  'codex-api-key': /^(?:gpt|o\d)/i,
+  'claude-api-key': /^claude/i,
+  'openai-compatibility': /^(?:gpt|o\d)/i,
+};
+
+// 这个模型名在这个段里发得出去吗
+function famOk(sec, m) {
+  const re = SECTION_FAMILY[sec];
+  return !re || re.test(String(m || ''));
+}
+
+// 这个模型该不该默认勾上
+function defOn(sec, m) {
+  const re = SECTION_DEFAULT[sec];
+  return !!re && re.test(String(m || ''));
+}
+
 const SECTION_LABEL = {
   'gemini-api-key': 'gemini',
   'codex-api-key': 'codex',
@@ -883,6 +918,13 @@ function renderStream(events) {
       return `<div class="note">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
         + `限时段（${win}）—— 窗口内复测</div>`;
     }
+    // 二级代理救活：其余处置全用尽后换出口 IP 通了。要显眼 —— 这个段
+    // 写进 config.yaml 时必须带 proxy-url，没有代理的机器上它就是不通的。
+    if (e.kind === 'proxy-rescued') {
+      return `<div class="s2">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `${pad(e.model, 20)} 换出口 IP 后通（原判「${esc(e.was)}」）`
+        + ` —— 该段必须带 proxy-url</div>`;
+    }
     // 画像命中：第几次试到通的、什么档、是否需 body 补丁
     if (e.kind === 'profile-hit') {
       const body = e.needs_body ? '+body' : '';
@@ -1032,8 +1074,19 @@ function siteCard(r) {
       // 站方 /models 目录报出来的模型 —— 探测跑不通不等于站方没这些模型，
       // 现场就有「CPAMP 面板看得见模型、这里判死路」的形态：目录是站方
       // 声明有什么，探测测的是这把 Key 的分组能用什么，两者本就会不一致。
-      const cat = (v.catalog || []).filter((m) => m);
-      const picked = new Set(((S.forced[host] || {})[sec] || []));
+      // 目录按段过滤 —— 混族的名字在这个段发不出去，列出来只会误导
+      const cat = (v.catalog || []).filter((m) => m && famOk(sec, m));
+      const cut = (v.catalog || []).filter((m) => m && !famOk(sec, m)).length;
+      // 首次渲染：没有人工接管记录时按同族规则预勾，省掉一个一个点。
+      // 已有记录（用户改过）就完全尊重记录，不覆盖。
+      const rec = (S.forced[host] || {})[sec];
+      const picked = new Set(rec !== undefined ? rec
+        : cat.filter((m) => defOn(sec, m)));
+      // 预勾的结果要立刻回写 S.forced，否则「勾选即注册」只是视觉上的 ——
+      // 提交时读的是 S.forced，不读 DOM。
+      if (rec === undefined && picked.size) {
+        (S.forced[host] = S.forced[host] || {})[sec] = [...picked];
+      }
       return `<tr class="off" data-host="${esc(host)}" data-sec="${esc(sec)}">
         <td class="pick"><input type="checkbox" class="sel force"
           data-host="${esc(host)}" data-sec="${esc(sec)}"
@@ -1046,8 +1099,18 @@ function siteCard(r) {
               data-host="${esc(host)}" data-sec="${esc(sec)}"
               value="${esc(m)}"${picked.has(m) ? ' checked' : ''}>${esc(m)}</label>`
             ).join('')}</div>
-          <div class="hint">站方目录报出 ${cat.length} 个模型，勾选即注册</div>`
-            : ''}
+          <div class="mtools">
+            <button type="button" class="mini cmall" data-host="${esc(host)}"
+              data-sec="${esc(sec)}">全选</button>
+            <button type="button" class="mini cminv" data-host="${esc(host)}"
+              data-sec="${esc(sec)}">反选</button>
+            <button type="button" class="mini cmnone" data-host="${esc(host)}"
+              data-sec="${esc(sec)}">清空</button>
+            <span class="hint">目录 ${cat.length} 个，已勾 <b class="cmn">${picked.size}</b>
+              ${cut ? ` · 已滤掉 ${cut} 个跨族模型（该段发不出去）` : ''}</span>
+          </div>`
+            : (cut ? `<div class="hint">目录里 ${cut} 个模型都不属于本段协议族，
+              已全部滤掉 —— 写进去 CPA 每次轮到都会失败</div>` : '')}
           <div class="pedit"><input type="text" class="fm" style="width:100%"
             data-host="${esc(host)}" data-sec="${esc(sec)}"
             value="${esc(fm)}"
@@ -1200,6 +1263,26 @@ function attemptTable(label, v) {
 
 function bindResultEvents() {
   const box = $('#results');
+
+  // 目录模型的批量勾选。不自己写入 S.forced —— 改完 checkbox 状态后派发
+  // 一次 change，复用下面那个 .cm 处理器（它还要合并手填框里目录外的模型，
+  // 两处各写一遍必然分叉）。
+  box.addEventListener('click', (e) => {
+    const b = e.target.closest('.cmall, .cminv, .cmnone');
+    if (!b) return;
+    const tr = b.closest('tr');
+    if (!tr) return;
+    const cms = $$('.cm', tr);
+    if (!cms.length) return;
+    const mode = b.classList.contains('cmall') ? 'all'
+      : (b.classList.contains('cminv') ? 'inv' : 'none');
+    cms.forEach((c) => {
+      c.checked = mode === 'all' ? true
+        : (mode === 'inv' ? !c.checked : false);
+    });
+    cms[0].dispatchEvent(new Event('change', { bubbles: true }));
+  });
+
   box.addEventListener('change', (e) => {
     // 人工接管的模型清单
     // 目录复选框 —— 与手填框同一份 S.forced，勾选即写入
@@ -1222,6 +1305,8 @@ function bindResultEvents() {
       } else {
         delete S.forced[h][sc];
       }
+      const n = tr && tr.querySelector('.cmn');
+      if (n) n.textContent = String(chosen.length);
       refreshPlan(true);
       syncPickUI();
       return;
@@ -1264,6 +1349,12 @@ function bindResultEvents() {
       const key = pk(sel.dataset.host, sel.dataset.sec);
       if (sel.checked) S.picks.add(key); else S.picks.delete(key);
       syncPickUI();
+      // 勾选后必须重算 —— 后端只为**已勾选**的段生成方案（/api/plan 收
+      // body.selected），未勾的段不在返回里，于是 priority 栏一直停在
+      // placeholder「待定」、系统建议停在「勾选后计算」。
+      // 现场反馈正是这个：勾上了还是待定，而 priority 会写进 config.yaml，
+      // 「待定」是绝对不能出现的。
+      schedulePlanRefresh();
     }
   });
 
@@ -1276,6 +1367,43 @@ function bindResultEvents() {
       });
       $$('#results .pi').forEach((i) => { i.value = ''; });
       refreshPlan(true);
+    };
+  }
+
+  // 一键导出。走 fetch 而不是裸 <a href> —— 端点要 Bearer token，
+  // 裸链接带不上；把 token 拼进 query 又会进浏览器历史。
+  //
+  // 落点是浏览器的下载目录，不是服务端能指定的路径：这个服务通常跑在
+  // VPS 容器里，它写得到的「桌面」是容器里的，不是你面前这台机器的。
+  // 想直接落桌面就把浏览器下载目录设成桌面。
+  const be = $('#btnexport');
+  if (be) {
+    be.onclick = async () => {
+      if (!S.jobId) { alert('还没有探测任务'); return; }
+      const old = be.textContent;
+      be.disabled = true; be.textContent = '导出中…';
+      try {
+        const r = await fetch(`/api/export/${encodeURIComponent(S.jobId)}`,
+          { headers: { Authorization: 'Bearer ' + S.token } });
+        if (!r.ok) throw new Error(`导出失败 ${r.status}`);
+        const blob = await r.blob();
+        const cd = r.headers.get('Content-Disposition') || '';
+        const m = /filename="([^"]+)"/.exec(cd);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = m ? m[1] : 'cpa-probe.txt';
+        document.body.appendChild(a); a.click(); a.remove();
+        // 立刻 revoke 会让部分浏览器拿不到数据 —— 给它一拍
+        setTimeout(() => URL.revokeObjectURL(url), 4000);
+        be.textContent = '已导出';
+        setTimeout(() => { be.textContent = old; }, 2000);
+      } catch (e) {
+        alert(e.message);
+        be.textContent = old;
+      } finally {
+        be.disabled = false;
+      }
     };
   }
 
@@ -1307,10 +1435,28 @@ function applyPickPreset(mode) {
     });
   });
   syncPickUI();
+  // 预设按钮也要重算 —— 与单个勾选同理：后端只为已勾选的段出方案，
+  // 不重算的话「全勾选」之后 priority 栏还是 placeholder「待定」。
+  schedulePlanRefresh();
+  // 当前生效的是哪个预设 —— 三个按钮点下去界面没有任何回应，
+  // 操作员分不清自己执行的是哪一个（现场反馈）。
+  $$('#pickbtns button[data-mode]').forEach((b) => {
+    b.classList.toggle('on', b.dataset.mode === mode);
+  });
   if (mode === 'all' && missing.length) {
     $('#pickstat').textContent = `已勾选 ${S.picks.size} 项写入 · `
       + `${missing.length} 段异常无模型（后端缺陷，请报）`;
   }
+}
+
+// 勾选变化后的方案重算。防抖 —— 「全勾选」会连发几百次 change 事件，
+// 每次都打 /api/plan 会让后端串行排队、界面卡住。180ms 内的连续变化合并成
+// 一次请求；这个值取自实测：人手连点最快约 120ms 一次，180 能合上，
+// 又不至于让单次勾选感觉到延迟。
+let _planTimer = null;
+function schedulePlanRefresh() {
+  if (_planTimer) clearTimeout(_planTimer);
+  _planTimer = setTimeout(() => { _planTimer = null; refreshPlan(true); }, 180);
 }
 
 function syncPickUI() {

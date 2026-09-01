@@ -166,6 +166,17 @@ class FakeUpstream(BaseHTTPRequestHandler):
                 self._send(403, "")          # 403 + 空正文 = 边缘/CF
             return
 
+        # 二级代理专属画像：不带代理永远 500（判「临时」，重试也不通，
+        # 画像梯也救不了 —— 那是链路问题不是形态问题），带代理才 200。
+        # 一级代理只对「IP封/边缘」触发，够不到这里；只有处置链全部用尽后的
+        # 那一次 via-proxy-last 能救回它。
+        if profile == "linkdead":
+            if self.headers.get("X-Via-Proxy") == "1":
+                self._send(200, self._ok_payload(model, max(sent, 20)))
+            else:
+                self._send(500, {"error": {"message": "internal error"}})
+            return
+
         if profile == "identity":
             if self.headers.get("User-Agent") or self.headers.get("Originator"):
                 self._send(200, self._ok_payload(model, max(sent, 20)))
@@ -366,6 +377,31 @@ def main() -> int:
         eq("代理先于补头", combos.index("via-proxy") < len(combos), True)
 
         # ------------------------------------------------------------------
+        # 一级代理只认「IP封/边缘」，判「临时」的段够不到它；画像梯也救不了
+        # 链路问题。这一段验证处置链全部用尽后的那一次 via-proxy-last。
+        section("linkdead：500 临时 → 二级代理救回")
+        r = probe("linkdead")
+        eq("二级代理救回后四段可用", sorted(r.usable_sections), sorted(cp.SECTIONS))
+        v = r.sections["claude-api-key"]
+        eq("基线判为临时", v.attempts[0].category, "临时")
+        eq("需要代理", v.need_proxy, True)
+        eq("走的是二级代理组合",
+           any(a.combo == "via-proxy-last" and a.ok for a in v.attempts), True)
+        # 断言「二级代理排在所有**处置**尝试之后」，而不是「排在最后」——
+        # 段判可用后 _stage2 还会继续追加 model-scan 尝试，用 len-1 做判据
+        # 是把 stage1 的顺序当成了整段的顺序（我第一版就这么写，被抓到）。
+        combos_ld = [a.combo for a in v.attempts]
+        i_last = combos_ld.index("via-proxy-last")
+        eq("二级代理排在所有处置尝试之后",
+           all(i_last > j for j, c in enumerate(combos_ld)
+               if c == "baseline" or c.startswith(("retry", "id:", "via-proxy"))
+               and c != "via-proxy-last"),
+           True)
+        eq("救回后有模型", bool(v.models), True)
+        eq("发了 proxy-rescued 事件",
+           any(k == "proxy-rescued" for k, _ in seen_events), True)
+
+        # ------------------------------------------------------------------
         section("identity：401 → 补标识头救回")
         r = probe("identity")
         eq("补头后可用", sorted(r.usable_sections), sorted(cp.SECTIONS))
@@ -529,7 +565,16 @@ def main() -> int:
         r2 = p_reuse.probe(rows[1])
         r3 = p_reuse.probe(rows[2])
 
-        eq("首个 Key 走全量探测", first_calls > 12, True)
+        # 门槛按「段族过滤后」定（2026-09-01 改）：原来写 >12，那是四段都
+        # 拿整份混族目录去探时的量。加了 SECTION_FAMILY 闸之后，三个协议段
+        # 只探本族 —— 假上游的 10 个目录条目里，gemini 段剩 3、codex 剩 2、
+        # claude 剩 2，compat 仍 7，首个 Key 实测 10 次。
+        #
+        # 这里要断言的是「首个 Key 确实走了全量、不是复用」，判据是它比
+        # 后续 Key 多出好几倍，而不是某个绝对值。所以改成与 r2 比 ——
+        # 那个比较不会随目录形态或段族规则再次失效。
+        eq("首个 Key 走全量探测", first_calls >= 8, True)
+        eq("首个 Key 明显多于复用者", first_calls > r2.total_calls * 2, True)
         eq("第二个 Key 请求数大幅下降", r2.total_calls < first_calls / 2, True)
         eq("第三个 Key 同样复用", r3.total_calls, r2.total_calls)
         # 复用不是跳过：凭证有效性每段仍验一次

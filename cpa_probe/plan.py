@@ -32,7 +32,8 @@ from .parse import ParsedRow, base_for_section, host_of
 # pipeline 不导入 plan，这个方向无环。只取白名单判定与每段模型上限，
 # 目录读回来的名字必须过同一道白名单 —— 不然中转站目录里的
 # embedding / whisper / tts 之类会被注册成对话模型。
-from .pipeline import MAX_MODELS_PER_SECTION, SEED_MODELS, model_allowed
+from .pipeline import (MAX_MODELS_PER_SECTION, SEED_MODELS, model_allowed,
+                       model_fits_section)
 
 # 只有 gemini 段在配置层去重（静默丢弃）
 _DEDUP_SECTIONS = {"gemini-api-key"}
@@ -1324,11 +1325,17 @@ def build_plan(
             models, model_source = list(v.models), "probed"
         elif v.catalog:
             # 判死但目录能读到 —— 取目录里通过白名单的名字。
-            models = [m for m in v.catalog if model_allowed(m)][:MAX_MODELS_PER_SECTION]
+            # 段族闸再过一遍：v.catalog 正常已被 _stage0_catalog 滤过，但
+            # 形态复用（shape.catalog）与手填路径都能绕开那一步。写进
+            # config.yaml 的模型必须与段协议匹配 —— 纵深防御。
+            models = [m for m in v.catalog
+                      if model_allowed(m)
+                      and model_fits_section(v.section, m)][:MAX_MODELS_PER_SECTION]
             model_source = "catalog"
         else:
             # 目录也关了 —— 用种子。最低可信度，但保证这一段有确定清单。
-            models = list(SEED_MODELS.get(section, ()))[:MAX_MODELS_PER_SECTION]
+            models = [m for m in SEED_MODELS.get(section, ())
+                      if model_fits_section(section, m)][:MAX_MODELS_PER_SECTION]
             model_source = "seed"
 
         score = score_verdict(v)
