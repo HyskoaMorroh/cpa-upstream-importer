@@ -961,10 +961,175 @@ def verify_upstream(
     return True, f"200 · {actual or model} · 后端 {backend}"
 
 
+def _orphan_entry_lines(lines: list[str], span: tuple[int, int],
+                        section: str,
+                        planned: set[tuple[str, str]]) -> list[str]:
+    """段内**未被本次方案覆盖**的条目原文行（含它们自己的注释）。
+
+    整段重写只写 planned 里的凭据，这个函数把其余条目原样捞出来接在后面。
+    见 render_section 里 keep_unplanned 那一段的说明。
+
+    识别条目边界靠「该段条目级 dash 的缩进」—— 嵌套结构里的
+    `- status: 403` 也是 dash 行，按「有没有 dash」切会把一个条目切成好几段。
+    与 extract_carry_lines 同一套判据。
+
+    compat 段不走这里：它的结构是 provider 级 + api-key-entries，一个条目
+    含多个 Key，「未覆盖」要在 Key 粒度判断，语义与前三段不同。
+    """
+    from .parse import host_of
+
+    start, end = span
+    item_indent: int | None = None
+    blocks: list[tuple[list[str], str, str]] = []   # (行, host, api_key)
+    cur: list[str] = []
+    cur_host = cur_key = ""
+    pending: list[str] = []                        # 归属下一个条目的注释
+
+    def flush() -> None:
+        nonlocal cur, cur_host, cur_key
+        if cur:
+            blocks.append((cur, cur_host, cur_key))
+        cur, cur_host, cur_key = [], "", ""
+
+    for i in range(start + 1, end):
+        line = lines[i]
+        st = line.strip()
+        if not st:
+            (cur if cur else pending).append(line)
+            continue
+        if st.startswith("#"):
+            (cur if cur else pending).append(line)
+            continue
+        ind = len(line) - len(line.lstrip())
+        is_dash = bool(re.match(r"^\s*-\s+\S", line))
+        if is_dash and item_indent is None:
+            item_indent = ind
+        if is_dash and ind == item_indent:
+            flush()
+            if pending:
+                cur.extend(pending)
+                pending = []
+        cur.append(line)
+        m = re.match(r"^\s*(?:-\s+)?(api-key|base-url)\s*:(.*)$", line)
+        if m:
+            val = _scalar_value(m.group(2))
+            if m.group(1) == "api-key":
+                cur_key = val
+            else:
+                cur_host = host_of(val)
+    flush()
+
+    out: list[str] = []
+    for blk, h, k in blocks:
+        if not h or not k:
+            continue                    # 认不出身份的块不搬 —— 宁可漏不可错
+        if (h, k) in planned:
+            continue
+        out.extend(blk)
+    return out
+
+
+def _orphan_provider_lines(lines: list[str], span: tuple[int, int],
+                           touched_hosts: set[str]) -> list[str]:
+    """compat 段里**本次方案没碰到**的 provider 的原文行。
+
+    与 _orphan_entry_lines 分开写，因为 compat 的结构不同：一个 provider
+    条目含多个 api-key-entries，「未覆盖」只能按 provider 主机判，不能按
+    单个 Key 判 —— 按 Key 判会把同一个 provider 撕成两半。
+    """
+    from .parse import host_of
+
+    start, end = span
+    item_indent: int | None = None
+    blocks: list[tuple[list[str], str]] = []
+    cur: list[str] = []
+    cur_host = ""
+    pending: list[str] = []
+
+    def flush() -> None:
+        nonlocal cur, cur_host
+        if cur:
+            blocks.append((cur, cur_host))
+        cur, cur_host = [], ""
+
+    for i in range(start + 1, end):
+        line = lines[i]
+        st = line.strip()
+        if not st or st.startswith("#"):
+            (cur if cur else pending).append(line)
+            continue
+        ind = len(line) - len(line.lstrip())
+        is_dash = bool(re.match(r"^\s*-\s+\S", line))
+        if is_dash and item_indent is None:
+            item_indent = ind
+        if is_dash and ind == item_indent:
+            flush()
+            if pending:
+                cur.extend(pending)
+                pending = []
+        cur.append(line)
+        # provider 级 base-url 的缩进 == item_indent + 2；api-key-entries
+        # 底下的行更深，不会误取。
+        m = re.match(r"^\s*(?:-\s+)?base-url\s*:(.*)$", line)
+        if m and item_indent is not None and ind <= item_indent + 2:
+            cur_host = host_of(_scalar_value(m.group(1)))
+    flush()
+
+    out: list[str] = []
+    for blk, h in blocks:
+        if not h or h in touched_hosts:
+            continue
+        out.extend(blk)
+    return out
+
+
+def owned_sections(cfg: dict) -> dict[tuple[str, str], set[str]]:
+    """每个凭据 (host, api_key) **原本占了哪几个段**。
+
+    为什么必须有（2026-09-02 生产事故）：全量重探为每个凭据的四段都生成方案，
+    整段重写时全部写进去 —— 121 个条目变 246 个。而真实情况是每个凭据只配了
+    自己那几段：实测 79 个凭据里跨四段的只有 9 个，跨两段 49 个、单段 10 个，
+    合计 177 个 (凭据, 段) 组合。
+
+    凭空多出来的条目不是「多配一点没坏处」：那个凭据在那一段本来就不通
+    （否则原来就配了），写进去只会让 CPA 每次轮到它吃一次失败，耗掉
+    request-retry × max-retry-credentials 的预算。
+
+    键与 existing_weights / existing_proxies 同一套 —— base-url 在不同段
+    形态不同（codex/compat 带 /v1），只有 host 稳定。
+    """
+    from .parse import host_of
+
+    out: dict[tuple[str, str], set[str]] = {}
+    for section in ("gemini-api-key", "codex-api-key", "claude-api-key"):
+        for e in cfg.get(section) or []:
+            if not isinstance(e, dict):
+                continue
+            h = host_of(str(e.get("base-url") or ""))
+            k = str(e.get("api-key") or "")
+            if h and k:
+                out.setdefault((h, k), set()).add(section)
+
+    for prov in cfg.get("openai-compatibility") or []:
+        if not isinstance(prov, dict):
+            continue
+        h = host_of(str(prov.get("base-url") or ""))
+        for ke in prov.get("api-key-entries") or []:
+            if not isinstance(ke, dict):
+                continue
+            k = str(ke.get("api-key") or "")
+            if h and k:
+                out.setdefault((h, k), set()).add("openai-compatibility")
+    return out
+
+
 def rebuild_config_full(
     cfg: dict,
     all_plans: dict[tuple[str, str], ImportPlan],
-    original_lines: list[str]
+    original_lines: list[str],
+    *,
+    only_owned: bool = True,
+    keep_unplanned: bool = True,
 ) -> tuple[str, list[str]]:
     """全量重建四段，**原文件的其余部分逐字保留**。
 
@@ -1025,6 +1190,12 @@ def rebuild_config_full(
 
     # 2. 按段归集可写方案。section 用的是**完整 YAML 段名** ——
     #    pipeline 与 build_plan 一路如此，不做短名映射。
+    #
+    # only_owned：只更新凭据**原本占有**的段。见 owned_sections 的说明 ——
+    # 不设这道闸时 79 个凭据 × 4 段全部写进去，121 条目变 246。
+    owned = owned_sections(cfg) if only_owned else {}
+    skipped_unowned = 0
+
     sections_data: dict[str, list[SectionPlan]] = {s: [] for s in _SECTION_KEYS}
     for (base_url, api_key), plan in all_plans.items():
         for sp in plan.sections.values():
@@ -1034,7 +1205,19 @@ def rebuild_config_full(
             if sp.section not in sections_data:
                 warnings.append(f"{plan.host} 段 {sp.section} 不是已知段名，跳过")
                 continue
+            if only_owned:
+                have = owned.get((_host_of(sp.base_url), sp.api_key))
+                # have 为 None = 这是个新凭据（增量导入混进重探），照写。
+                # have 非空但不含本段 = 原来没配这一段，跳过。
+                if have is not None and sp.section not in have:
+                    skipped_unowned += 1
+                    continue
             sections_data[sp.section].append(sp)
+
+    if skipped_unowned:
+        warnings.append(
+            f"{skipped_unowned} 个 (凭据, 段) 组合原本不在 config.yaml 里，"
+            f"已跳过 —— 全量重探只更新既有条目，不新增段")
 
     # 3. compat 段按 (host, base_url) 归并 —— 一个条目 = 一个上游站，多个 Key
     #    挂在 api-key-entries 下。重名 provider 会让冷却、模型能力、执行路由
@@ -1075,6 +1258,19 @@ def rebuild_config_full(
                 for line in render_entry(head, dash, field, stamp,
                                          extra_keys=extra):
                     out.append(line + "\n")
+
+            # compat 段的「未覆盖」按 **provider 主机**判 —— 它的结构是
+            # provider 级 + api-key-entries，一个条目含多个 Key。本次方案
+            # 没碰到的 provider 整条原样保留，否则「只勾了 1 个站」会把另外
+            # 12 个 provider 全删掉（2026-09-02 实测 13 → 1）。
+            if keep_unplanned and span:
+                touched = {h for (h, _b), _g in compat_ordered}
+                kept = _orphan_provider_lines(original_lines, span, touched)
+                if kept:
+                    out.extend(kept)
+                    warnings.append(
+                        f"段 {section}：{len(touched)} 个 provider 按新方案重写，"
+                        f"其余 provider 已原样保留")
             return out
 
         entries = sections_data.get(section) or []
@@ -1091,6 +1287,23 @@ def rebuild_config_full(
                 out.append(c if c.endswith("\n") else c + "\n")
             for line in render_entry(sp, dash, field, stamp):
                 out.append(line + "\n")
+
+        # keep_unplanned：本段有方案的凭据只是一部分，其余原条目**原样保留**。
+        #
+        # 为什么必须有（2026-09-02 生产事故）：整段重写会把「没进方案」的条目
+        # 一并抹掉。而「没进方案」有三种完全无害的原因 ——
+        #   · 用户只勾了推荐项，其余段没勾
+        #   · 那个段判不可写（models 为空）
+        #   · 探测时抛异常，那个凭据整个不在结果里
+        # 三种都不该导致删除。删除只应由用户显式操作，不该是「没勾」的副作用。
+        if keep_unplanned and span:
+            planned = {(_host_of(x.base_url), x.api_key) for x in entries}
+            kept = _orphan_entry_lines(original_lines, span, section, planned)
+            if kept:
+                out.extend(kept)
+                warnings.append(
+                    f"段 {section}：{len(entries)} 条按新方案重写，"
+                    f"另有条目不在本次方案内 —— 已原样保留")
         return out
 
     # 5. 逐行走原文件，只替换四段的 span 内容，其余逐字保留。
