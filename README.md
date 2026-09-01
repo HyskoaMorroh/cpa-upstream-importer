@@ -427,22 +427,65 @@ basic auth 与 Bearer **抢同一个 `Authorization` 头**。投喂台前端
 basic auth 发的 `Authorization: Basic ...`。结果是**页面能打开、但所有 API 请求 401**，
 界面永远卡在加载状态。
 
-所以这一层只能用不占用该头的方式：**nginx IP 白名单**（`allow`/`deny`），
-或 Cloudflare Access（走 cookie）。片段里用的是白名单。
+所以这一层只能用不占用该头的方式：**nginx IP 白名单**（`allow`/`deny`）、
+**限速**（`limit_req`），或 Cloudflare Access（走 cookie）。
 
-两个方案怎么选：
+白名单最严，但出口 IP 一变就得改配置 —— 在外面临时要用时很麻烦。如果你要
+「随时能开网页输密钥」，那就只剩限速这条路：
 
-| | SSH 隧道 | nginx 反代 |
-|---|---|---|
-| 公网暴露 | 无 | 有（一个域名） |
-| 要配证书 | 不要 | 要（沿用通配证书） |
-| 要改 nginx.conf | 不要 | 要（1757 行的生产文件） |
-| 手机能用 | 不方便 | 能 |
-| 每次操作 | 先开隧道 | 直接输网址 |
-| 出口 IP 变动 | 无影响 | 白名单失效，要改配置 |
+```nginx
+# http 段
+limit_req_zone $binary_remote_addr zone=importer_auth:10m rate=12r/m;
+limit_req_zone $binary_remote_addr zone=importer_all:10m rate=240r/m;
+limit_conn_zone $binary_remote_addr zone=importer_conn:10m;
+# 回 429 而不是默认的 503 —— 前端能区分「你太快了」与「服务挂了」，
+# 而 503 会让人以为是上游站点的问题（那是这个工具最常见的报错类型）
+limit_req_status 429;
+limit_conn_status 429;
 
-偶尔加几个账号 —— 用隧道。经常用或要手机看 —— 配反代，
-但 TLS + IP 白名单 + 长随机 token 三层缺一不可。
+# server 段
+limit_conn importer_conn 8;          # 探测只用一条轮询连接，正常用不到 8
+
+# 登录与凭据校验：慢速档。/api/context 是登录后第一个被调的端点，
+# 撞密码必然经过它。burst 允许「输错一次再输一次」，nodelay 让这几次
+# 立刻放过而不是排队 —— 排队会让正常用户觉得卡。
+location = /api/context { limit_req zone=importer_auth burst=6 nodelay; proxy_pass http://127.0.0.1:8765; }
+location = /api/apply   { limit_req zone=importer_auth burst=3 nodelay; proxy_pass http://127.0.0.1:8765; }
+# 轮询是 1.5 秒一次，跑满 5 分钟约 200 次 —— 240r/m 够用；
+# burst 给到 60 是为了首屏那批静态资源不被拦
+location /             { limit_req zone=importer_all  burst=60 nodelay; proxy_pass http://127.0.0.1:8765; }
+```
+
+服务端本身已有按 IP 的失败封锁（5 次 / 30 分钟）。nginx 这一层是为了两件
+它做不到的事：让「换 IP 继续试」的成本更高（服务端封的是单 IP，这里限的是
+速率），以及把撞库流量挡在 Python 之外，不让它占满 `ThreadingHTTPServer`
+的线程。
+
+顺带把这几个响应头也加上 —— 响应里带上游站名与判定结论，那些不该进缓存或
+被别的站嵌进 iframe：
+
+```nginx
+add_header X-Robots-Tag "noindex, nofollow, noarchive" always;
+add_header Cache-Control "no-store" always;
+add_header X-Frame-Options "DENY" always;
+add_header Referrer-Policy "no-referrer" always;
+```
+
+三个方案怎么选：
+
+| | SSH 隧道 | 反代 + IP 白名单 | 反代 + 限速 |
+|---|---|---|---|
+| 公网暴露 | 无 | 有，但只对白名单 | 有 |
+| 要配证书 | 不要 | 要 | 要 |
+| 要改 nginx.conf | 不要 | 要 | 要 |
+| 手机能用 | 不方便 | 看出口 IP | 能 |
+| 每次操作 | 先开隧道 | 直接输网址 | 直接输网址 |
+| 出口 IP 变动 | 无影响 | **白名单失效，要改配置** | 无影响 |
+| 撞库防护 | 不可达 | 不可达 | 限速 + 服务端封锁 |
+
+偶尔加几个账号 —— 用隧道。固定在家/公司操作 —— 白名单最严。
+要随时随地开网页输密钥 —— 限速那套，但**长随机 token 是前提**：
+限速把爆破从「每秒几百次」压到「每分钟 12 次」，可它不能替代一把好密钥。
 
 ### 第 3 步 · 用完关掉
 
