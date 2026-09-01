@@ -173,7 +173,20 @@ Docker Hub 账号失守。
 ```bash
 docker buildx create --use --name multi 2>/dev/null || docker buildx use multi
 
-docker buildx build   --platform linux/amd64,linux/arm64   -f deploy/Dockerfile   -t <你的仓库>/cpa-upstream-importer:latest   --push .
+# 先登录（凭据存在 Docker Desktop 的 credsStore 里，不会落到文件）
+docker login
+
+# VERSION 会写进镜像的 org.opencontainers.image.version 标签。
+# 同时打 latest 与版本 tag —— latest 方便 compose 拉，版本 tag 用于回滚。
+VER=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)
+
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -f deploy/Dockerfile \
+  --build-arg VERSION="$VER" \
+  -t <你的仓库>/cpa-upstream-importer:latest \
+  -t <你的仓库>/cpa-upstream-importer:"$VER" \
+  --push .
 
 # 确认 manifest list 里真的有多个平台
 docker buildx imagetools inspect <你的仓库>/cpa-upstream-importer:latest
@@ -182,6 +195,12 @@ docker buildx imagetools inspect <你的仓库>/cpa-upstream-importer:latest
 加 `linux/arm/v7` 会慢很多 —— `bcrypt` 在那个平台没有预编译 wheel，
 要现场用 Rust 编译。Dockerfile 按 `TARGETPLATFORM` 自动判断，
 amd64/arm64 跳过编译工具链的安装。
+
+推完在 VPS 上升级：
+
+```bash
+docker compose pull cpa-upstream-importer && docker compose up -d
+```
 
 ---
 
@@ -201,6 +220,77 @@ amd64/arm64 跳过编译工具链的安装。
 ---
 
 ## 核心机制
+
+### 段族过滤（2026-09-02）
+
+**问题**：聚合站的 `/models` 目录把三族模型混在一起报。探测队列原样接收，
+于是 gemini 段拿 `claude-opus-4-6` 去打 `/v1beta/models/claude-opus-4-6:generateContent`
+—— CPA 永远不会这样发，段决定协议路径，模型必须是该协议下的模型。
+
+**量化**（79 凭据实跑日志）：
+
+| | 请求数 | 成功率 |
+|---|---|---|
+| 跨族 | 435 / 773（**56%**） | 5.5% |
+| 同族 | 338 | 24.6% |
+
+跨族请求里 **240 次返回 500**（占跨族 55%），而同族一次 500 都没有。500 被判
+「临时」触发重试，日志里 666 次 500 的最大头就是这么来的。除了白烧配额，
+反复拿协议不匹配的模型名轰炸正是站方风控盯的形态。
+
+**解法**：`SECTION_FAMILY` 闸，三个协议段只探本族（gemini→gemini、codex→gpt、
+claude→claude）。`compat` 段不设限 —— 它走 `/chat/completions`，本身就是万能
+转发口，三族都合法。过滤在三处（探测队列、目录落盘、方案生成）各做一次，
+纵深防御。
+
+### 目录优先（2026-09-02）
+
+**问题**：原来的顺序是「拿写死的种子模型撞 → 撞不上判死」，而 `/models` 目录
+在 `_stage2`，只在 `_stage1` 已经成功时才跑 —— 从头到尾没问过站方「你到底有
+什么」。实测 45/79 个凭据判 0 段可用，其中 7 个的目录明明拿得到模型（最多 199 个）。
+
+**解法**：`_stage0_catalog` 提到最前，用目录里真实存在的模型开打，种子只作兜底。
+GET 目录端点多数站不计费、不计入调用统计、不触发风控 —— 与「严禁简单测活」
+同向。CPAMP 的健康检查也只发 GET 目录（全库无 POST 测活）。
+
+gemini 段的 `/v1beta/models` 分页，最多翻 20 页（与 CPAMP 同一上限）。
+
+### 判死的段也给完整参数（2026-09-02）
+
+**问题**：判死的段不生成方案，界面上勾选框灰着、priority 显示「待定」。而很多
+中转站禁止测活却确实可用 —— 那样等于把可用站扔掉。
+
+**解法**：每段都算出确定参数，并标注模型清单的来源：
+
+| 标记 | 含义 | 默认勾选 |
+|---|---|---|
+| 实测 | 发过请求跑通 | ✓ |
+| 目录 | 站方 `/models` 声明 | ✗ |
+| 手填 | 操作员填的 | ✗ |
+| 猜测 | 种子兜底，最不可信 | ✗ |
+
+`priority` / `headers` / `proxy-url` / 指纹 / 上下文上限全部走与可用段同一套算法。
+**写进 config.yaml 的参数不会有未定项** —— 缺席比填错更难排查。
+
+### 未知字段搬运（2026-09-02）
+
+`render_entry` 是白名单式渲染，只写它认识的 10 个字段。而全量重探用它**整段重写**
+—— 生产配置 121 个条目里 106 条带白名单外的字段，重写后全部静默消失
+（`validate()` 报成功、YAML 合法，只是行为变了）：
+
+```
+request-scoped-errors  116 条   冷却规则，丢了欠费的 Key 留在轮询池
+excluded-models         39 条   ["*"] = 只用显式列的模型
+websockets               2 条   codex 的 WebSocket 开关
+fingerprint-profile      1 条   让 CPA 自己补设备指纹
+disabled                 1 条   手工停用的 provider 会复活
+proxy-url               24 条   必须走代理的站会改成直连
+```
+
+`extract_carry_lines()` 按**原文行**搬运 —— 这些字段结构任意深，重新序列化要
+处理缩进、引号风格、键序，而原文行拿来就用、逐字保真。索引键是
+`host\x00api-key`：同一个站的多个 Key 里只有一个带 `fingerprint-profile` 时，
+按 host 索引会让另两个也被染上。
 
 ### 画像系统（2026-09-01）
 
@@ -262,6 +352,30 @@ codex 段梯子（6 档）：
 三个名字同一条链路、同一套 headers、同一个成功率。段级别名可选（`--keep-section-prefix`），
 默认补上，config 变长但不破坏现有客户端。站级前缀自动分配、幂等、沿用你手工定的值。
 
+### 界面：进度与勾选
+
+**进度**（步骤 ②）除了「已完成 / 总数」还给三样：
+
+- **剩余时间区间** —— 点值用全量累计均值，区间用经验分位（p25 / p99）。跨 12 组
+  随机种子回放：平均误差 30-67%、区间命中 94-97%。
+- **吞吐率** —— 每分钟完成几个，实测量不是外推。
+- **在飞跟踪** —— 还有几个在跑、最早开始的那个已跑多久、是哪个站。
+
+ETA 只在**并发 ≤ 4** 时给。并发 30 时区间命中率只有 9% —— 剩余墙钟被「在飞
+最长的那个还需多久」主导（进度 40/79 时占比 100%），而那个值在它结束前无法从
+已完成的样本推出。这不是算法不够好，是信息不在样本里。超过阈值就只给吞吐率
+与在飞跟踪，并在界面上说明原因。
+
+**勾选**（步骤 ③）：
+
+- `全勾选` 不看判定状态 —— 很多站禁止测活却可用，按判定筛等于把它们扔掉。
+  唯一跳过的是 `duplicate`（撞已有 Key，写进去是重复条目）。
+- 三个预设按钮有选中态，`aria-pressed` 同步。
+- 目录模型给可勾选清单，按段默认预勾同族：codex / compat 预勾 `gpt-*`、
+  claude 预勾 `claude-*`、gemini 优先 `gemini-*-pro`。另有 全选 / 反选 / 清空。
+- **一键导出** txt 到浏览器下载目录。含请求指纹、最小门票头、body 补丁形态、
+  需代理、可调用时段、上下文上限及其实测模型。api-key 只出末四位。
+
 ---
 
 ## 目录
@@ -287,17 +401,18 @@ cpa-upstream-importer/
 ├ .github/workflows/  CI：3 个 Python 版本跑测试 + 多架构镜像发布
 ├ LICENSE             MIT
 ├ CONTRIBUTING.md     贡献指南
-├ tests/              回归测试（八个套件，零外网请求，自带最小样本）
-│  ├ run.py           跑全部，退出码 0/1，可接 CI
+├ tests/              回归测试（九个套件 936 项，零外网请求，自带最小样本）
+│  ├ run.py           跑全部，退出码 0/1，可接 CI。传 config.yaml 路径可加跑真实用例
 │  ├ fixture_cfg.py   自带的最小 config.yaml（各套件共用；不传路径时就用它）
 │  ├ test_probe.py    解析/判定/指纹/去重/定档/影响面/写回
 │  ├ test_server.py   HTTP 契约：鉴权/封锁/静态/路径穿越/写回闸门/非 ASCII 密码
-│  ├ test_pipeline.py 假上游端到端：四阶段编排 + 性能 + 事件流
+│  ├ test_pipeline.py 假上游端到端：四阶段编排 + 段族过滤 + 二级代理 + 事件流
 │  ├ test_edges.py    写回边界 12 形状：同站 100 Key / 撞已有站 / prefix
 │  ├ test_reload.py   生效链：inode 恒定 / 读回校验 / 403-CF 与状态码分类
 │  ├ test_speed.py    并发正确性：节流分桶 / single-flight / 缓存失效
 │  ├ test_web.py      前后端静态契约：DOM id / 事件 / 重试 / 地址 / 验证不跳过
-│  └ test_tiering.py  定档算法：分数生效 / 死站零代价 / 别名表 / 逐轮自查缺陷
+│  ├ test_tiering.py  定档算法：分数生效 / 死站零代价 / 别名表 / 逐轮自查缺陷
+│  └ test_full_redetect.py  全量重探：去重 / ETA / 未知字段与 proxy 搬运 / 注释保全
 ├ tools/
 │  ├ recheck.py       复核**既有**凭据：按各站声明的模型 + CPA 的真实转发头
 │  ├ diag403.py       403 结构性诊断：预算 vs 顶层池、单点、档位落差
