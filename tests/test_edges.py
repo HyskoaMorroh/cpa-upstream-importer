@@ -100,6 +100,59 @@ def make_result(row, *, compat_ok=True, claude_ok=True,
     return res
 
 
+def _dead_section_params() -> None:
+    """判死的段只要拿到目录，方案里就得是完整参数 —— 不留待定。
+
+    这是硬要求：方案会落进 config.yaml，priority 之类留空等于写坏配置。
+    覆盖两条路：目录来源（catalog）和人工手填（forced）。
+    """
+    row = cp.parse_lines("https://dead.example.com,sk-dead-key").valid[0]
+    res = CandidateResult(row=row)
+    res.sections = {
+        "claude-api-key": SectionVerdict(
+            section="claude-api-key", usable=False,
+            base_url=row.base_for("claude-api-key"),
+            # 站方目录报得出模型，但这把 Key 的分组跑不通 —— 现场就是这形态
+            catalog=["claude-opus-5", "claude-sonnet-5"],
+            category="死路", action="分组无该模型渠道"),
+        "gemini-api-key": SectionVerdict(
+            section="gemini-api-key", usable=False,
+            base_url=row.base_for("gemini-api-key"),
+            category="门禁", action="只放行官方客户端"),
+    }
+
+    cfg = {"claude-api-key": [], "gemini-api-key": []}
+    seen = cp.existing_fingerprints(cfg)
+    plan = cp.build_plan(row, res, cfg, bands={}, seen=seen, probation=True)
+
+    sp = plan.sections.get("claude-api-key")
+    eq("目录来源的判死段进得了方案", bool(sp is not None), True)
+    if sp:
+        eq("模型取自目录", sp.models, ["claude-opus-5", "claude-sonnet-5"])
+        eq("标注来源是目录", sp.model_source, "catalog")
+        eq("priority 是确定的整数", bool(isinstance(sp.priority, int)), True)
+        eq("priority 有理由", bool(bool(sp.priority_reason)), True)
+        eq("headers 非空（门票不能空着写进去）", bool(bool(sp.headers)), True)
+        eq("可勾选", bool(sp.writable), True)
+        eq("带警告说明它没跑通",
+           bool(any("目录" in w or "未跑通" in w for w in sp.warnings)), True)
+
+    # 无目录、无手填 —— 这段该缺席，不能凭空编模型名
+    eq("既无目录也无手填的段不进方案",
+       "gemini-api-key" in plan.sections, False)
+
+    # 手填接管：同一个段补上模型名就该进来
+    plan2 = cp.build_plan(row, res, cfg, bands={},
+                          seen=cp.existing_fingerprints(cfg), probation=True,
+                          force={"gemini-api-key": ["gemini-2.5-pro"]})
+    sp2 = plan2.sections.get("gemini-api-key")
+    eq("手填后判死段进方案", bool(sp2 is not None), True)
+    if sp2:
+        eq("标注来源是手填", sp2.model_source, "manual")
+        eq("手填段 priority 也是确定值", bool(isinstance(sp2.priority, int)), True)
+        eq("手填段 headers 非空", bool(bool(sp2.headers)), True)
+
+
 class Harness:
     def __init__(self, raw: str, cfg: dict):
         self.raw = raw
@@ -419,6 +472,9 @@ def main() -> int:
     if _tmp:
         import shutil
         shutil.rmtree(_tmp, ignore_errors=True)
+
+    section("判不可用的段：勾选后参数不许留「未定」")
+    _dead_section_params()
 
     print("\n" + "=" * 62)
     if _fail:

@@ -154,6 +154,9 @@ def verdict_json(v) -> dict:
         "usable": v.usable,
         "base_url": v.base_url,
         "models": v.models,
+        # 站方 /models 目录 —— 判死的段靠它给出可勾选的模型候选，
+        # 没有它前端只能让操作员手打模型名（现场反馈的主要摩擦点）
+        "catalog": list(getattr(v, "catalog", None) or []),
         "need_proxy": v.need_proxy,
         "min_headers": v.min_headers,
         "swap": v.swap,
@@ -195,6 +198,9 @@ def plan_json(p) -> dict:
                 "section": sp.section,
                 "base_url": sp.base_url,
                 "models": sp.models,
+                # probed / catalog / manual —— 界面要标清模型是实测跑通的、
+                # 站方目录报的，还是操作员手填的，三者可信度差一截
+                "model_source": sp.model_source,
                 "priority": sp.priority,
                 "priority_reason": sp.priority_reason,
                 "proxy_url": sp.proxy_url,
@@ -442,8 +448,10 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
                 "current": current,
                 "total": total,
                 "site": site,
+                # success = 至少一段可用（操作员真正关心的「这个凭据能用吗」）
+                # all_four = 四段全通，罕见，单独看
                 "success": stats["success"],
-                "partial": stats["partial"],
+                "all_four": stats.get("all_four", 0),
                 "failure": stats["failure"],
             })
 
@@ -476,7 +484,11 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
                 job.emit("error", {
                     "msg": f"  …另有 {len(batch_prober.errors) - 20} 条同类"})
 
-        job.emit("info", {"msg": f"探测完成：{batch_prober._stats['success']} 成功，{batch_prober._stats['partial']} 部分通，{batch_prober._stats['failure']} 失败"})
+        _st = batch_prober._stats
+        job.emit("info", {"msg": (
+            f"探测完成：{_st['success']} 个凭据至少一段可用"
+            f"（其中 {_st.get('all_four', 0)} 个四段全通），"
+            f"{_st['failure']} 个全灭")})
 
         job.state = "done"
     except Exception:

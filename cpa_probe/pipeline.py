@@ -23,6 +23,7 @@ import json
 import re
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -31,6 +32,7 @@ from typing import Callable
 # 从「模块」改写成「函数」，且它排在 `from .pipeline import ...` 之前 ——
 # 那样 cls 拿到的是函数，cls.classify(...) 必然 AttributeError。
 # 这条路径只有真发请求时才会走到，纯逻辑用例覆盖不到，所以必须写死成函数导入。
+from . import betas
 from .classify import body_excerpt as _body_excerpt
 from .classify import classify as _classify
 from .classify import has_error_envelope as _has_error_envelope
@@ -102,6 +104,31 @@ def _body_kind(prof) -> str:
     return kind
 
 
+# 「这个模型没有」的说法，按语义收拢而不是按状态码。
+#
+# 2026-09-01 复盘 79 凭据实跑：上游中转站（new-api / one-api 系）用
+# **503** 回 `No available channel for model X under group default`，
+# 全场出现 175 次、直接判死 92 个段。这句话的语义与 404 `model_not_found`
+# 完全相同 —— 「你要的这个模型，这个分组里没有」，是**模型专属**的。
+# 原来只豁免 404，于是 503 这条路整段收敛，45/79 个凭据判 0 段可用，
+# 而其中 27 个日志里其实出现过 200、7 个 /models 目录明明拿到过模型。
+#
+# 这句话确实来自上游而非 CPA：CLIProxyAPI 全仓库搜 "No available channel"
+# 零命中，它自己的措辞是 conductor_selection.go:492 的 auth_unavailable。
+_MODEL_SPECIFIC_DEAD_END = re.compile(
+    r"model_not_found"
+    r"|no available channel"          # 上游中转站：该分组无此模型的活跃通道
+    r"|无可用渠道|可用渠道不存在"
+    r"|model .{0,80}(?:not (?:supported|found)|does not exist)"
+    r"|不支持所选模型|模型不存在",
+    re.I,
+)
+
+# 只在这些码上认「模型专属」。200 不该走到这里；5xx 里只认 503
+# （中转站的调度失败），500/502/504 是站方故障，已归「临时」并会重试。
+_MODEL_SPECIFIC_CODES = frozenset({"400", "403", "404", "503"})
+
+
 def _model_specific_dead_end(att) -> bool:
     """这个「死路」是不是只针对**当前这个模型**，换个模型可能就通了。
 
@@ -110,13 +137,16 @@ def _model_specific_dead_end(att) -> bool:
     完全不能说明这个站不可用。实测某站 claude-sonnet-5 返回 404，整段被判死，
     而该站的 claude-opus-5 是可用的。
 
-    与之相对，敏感词拦截、分组无渠道、路径不存在这几种「死路」与模型无关，
-    换模型也救不了，那种要立即收敛以省请求数。
+    与之相对，敏感词拦截、Key 分组不匹配、路径不存在这几种「死路」与模型
+    无关，换模型也救不了，那种要立即收敛以省请求数。
+
+    判据按**正文语义**而不是状态码（2026-09-01 修正，见上方常量的说明）：
+    同一句「没有这个模型的渠道」，不同中转站分别用 400 / 403 / 404 / 503
+    发出来，只认 404 会漏掉最常见的那一种。
     """
-    body = (att.excerpt or "").lower()
-    if att.status == "404" and re.search(r"model_not_found|model .{0,80}(?:not (?:supported|found)|does not exist)|不支持所选模型|模型不存在", body):
-        return True
-    return False
+    if str(att.status) not in _MODEL_SPECIFIC_CODES:
+        return False
+    return bool(_MODEL_SPECIFIC_DEAD_END.search(att.excerpt or ""))
 
 
 def model_allowed(name: str) -> bool:
@@ -201,6 +231,15 @@ class SectionVerdict:
     category: str = ""
     action: str = ""
     attempts: list[Attempt] = field(default_factory=list)
+    # 站方 /models 目录声明的模型（白名单过滤后）。`_stage0_catalog` 填。
+    #
+    # 与 `models` 的区别是**声明**与**实测**：这里是站方说它有什么，`models`
+    # 是本工具实际验证通过的。两者的差集很有价值 —— 声明有却验不过的模型，
+    # 正是 CPAMP 面板「模型」列会显示、而真实转发会失败的那批（那一列读的
+    # 是 config.yaml 的 models 字段长度，rowData.ts:78-79，不做可用性校验）。
+    #
+    # 判死的段也要留着它：操作员人工接管时，这是唯一可选的候选清单。
+    catalog: list[str] = field(default_factory=list)
 
     @property
     def need_ua(self) -> bool:
@@ -497,6 +536,17 @@ class Prober:
     _TRANSIENT_RETRIES = 1
     _TRANSIENT_WAIT = 2.0
 
+    # 基线阶段打几个模型。原来是 `SEED_MODELS[section]` 的全长（2-3 个），
+    # 现在候选来自目录（可能几百个），必须显式限长 —— 基线的目的是定段归属
+    # 与找最小门票，不是把目录验穷（那是 _stage2 的活）。
+    #
+    # 取 2：一个够定归属，两个能区分「站级不可用」与「这个模型不在」。
+    _BASELINE_MODELS = 2
+
+    # 目录最多翻几页。只有 gemini 的 /v1beta/models 分页，与 CPAMP 的
+    # healthCheck.ts:279-364 取同一个上限，防异常站的无限 nextPageToken。
+    _CATALOG_PAGES = 20
+
     # 判定的严重度排序。全部种子都失败时取**最严重**的那个，而不是最后一个。
     # 越靠前越严重。不在表里的类别按「未知」处理。
     # 越靠前越严重。全部种子失败时取**最严重**的那个。
@@ -537,12 +587,24 @@ class Prober:
 
         改成：全部种子失败后，取**最严重**的类别（见 _SEVERITY）。
         「死路」只有在真的是死路时才成立，不会由一个不相干的模型带来。
+
+        探哪些模型（2026-09-01 改）
+        ------------------------
+        先 `_stage0_catalog` 问站方目录，用目录里真实存在的模型开打，种子只
+        作兜底。原来直接拿写死的种子撞，撞不上就判死 —— 那是把「我猜的模型
+        不在」当成了「这个站不能用」。
         """
         base = base_for_section(row.bare, section)
         v = SectionVerdict(section=section, base_url=base)
-        seen: list[tuple[str, str]] = []      # 每个种子的 (类别, 处置)
+        seen: list[tuple[str, str]] = []      # 每个候选的 (类别, 处置)
 
-        for model in SEED_MODELS[section]:
+        # 目录优先。拿不到就是空列表，`_probe_order` 自动回落到种子。
+        v.catalog = self._stage0_catalog(row, section, base)
+
+        # 基线阶段只打前几个 —— 这里的目的是「定段归属 + 找最小门票」，
+        # 不是把目录验穷。验穷是 _stage2 的活，且有 max_model_attempts 兜着。
+        probe_models = self._probe_order(section, v.catalog)[:self._BASELINE_MODELS]
+        for model in probe_models:
             att = self._call(section, base, row.api_key, model, combo="baseline")
             v.attempts.append(att)
 
@@ -719,6 +781,12 @@ class Prober:
                 "needs_body": bool(patch),
             })
             return True
+        # 整梯全败，但站方可能在正文里明说了缺什么能力 —— 补上再打一次。
+        # 见 betas 模块 docstring（anyrouter.top：八档正文逐字相同，全是
+        # 「请启用 1m 上下文」，说明站方没查客户端身份，只是缺一个 beta）。
+        if self._retry_with_betas(row, section, base, model, v, tried):
+            return True
+
         with self._lock:
             self._profiles_failed.add(pkey)
         self.on_event("profile-exhausted", {
@@ -726,35 +794,168 @@ class Prober:
         })
         return False
 
+    def _retry_with_betas(self, row: ParsedRow, section: str, base: str,
+                          model: str, v: SectionVerdict, tried: int) -> bool:
+        """正文点名要 beta 就补上重试。只 claude 段有 anthropic-beta。
+
+        用顶档（整梯最后一档的 headers）作基底：正文既然没在查客户端身份，
+        多带门票无害；而少带会引入第二个变量，分不清是 beta 补对了还是门票
+        本来就够。
+        """
+        if section != "claude-api-key":
+            return False
+
+        # 从已跑的尝试里找站方索要的项。取最后一次失败的正文 —— 八档一致时
+        # 取哪次都一样，不一致时最后一次对应门票最全，最可信。
+        extra: list[str] = []
+        for att in reversed(v.attempts):
+            extra = betas.wanted(att.excerpt or "")
+            if extra:
+                break
+        if not extra:
+            return False
+
+        # 基底取**非 alt 的族内最高档**。alt（browser-ua）是替换型画像，不是
+        # CC 门票的超集 —— 拿它作基底会把 CC 门票整个丢掉，实测落地只剩 2 个
+        # header。而 CPAMP 里能用的形态是「CC 门票 + 1m」，不是「浏览器 + 1m」。
+        top = None
+        for prof in profiles.ladder(section, self.cfg_snapshot):
+            if not prof.is_baseline and not prof.alt:
+                top = prof
+        if top is None:
+            return False
+
+        hdrs, patch = profiles.materialize(top, row.api_key)
+        hdrs = dict(hdrs)
+        # 头名大小写不敏感，但现有值可能挂在任意拼法上，逐个找
+        slot = next((k for k in hdrs if k.lower() == "anthropic-beta"),
+                    "anthropic-beta")
+        hdrs[slot] = betas.merge(hdrs.get(slot, ""), extra)
+
+        self.on_event("beta-retry", {
+            "section": section, "host": host_of(base), "model": model,
+            "added": extra, "profile": top.name, "after_tried": tried,
+        })
+        att = self._call(
+            section, base, row.api_key, model, combo=f"beta:{top.name}",
+            extra_headers=hdrs, body_patch=patch or None,
+            proxy=self.live_proxy if v.need_proxy else None,
+        )
+        v.attempts.append(att)
+        if not att.ok:
+            return False
+        models = self._accept(v, model, att)
+        if not models:
+            return False
+
+        v.usable = True
+        v.min_headers = hdrs
+        v.profile_name = f"{top.name}+beta"
+        v.min_body_kind = _body_kind(top)
+        v.category, v.action = att.category, att.action
+        v.models = models
+        self.on_event("beta-hit", {
+            "section": section, "host": host_of(base),
+            "profile": v.profile_name, "added": extra,
+        })
+        return True
+
+    # ---------- ⓿ 目录发现（先问站方，再动手打） ----------
+
+    def _stage0_catalog(self, row: ParsedRow, section: str,
+                        base: str, *, need_proxy: bool = False) -> list[str]:
+        """GET /models 拿站方声明的模型清单。**在任何推理请求之前**跑。
+
+        为什么必须前置（2026-09-01 复盘 79 凭据实跑）
+        --------------------------------------------
+        原来这一步在 `_stage2`，而 `_stage2` 只在 `_stage1` 已经成功时才跑
+        （见 `_full_probe`）—— 顺序完全颠倒：拿写死的种子模型去撞，撞不上
+        就判死，从头到尾没问过站方「你到底有什么」。实测后果：45/79 个凭据
+        判 0 段可用，其中 7 个的 /models 目录明明拿得到模型（最多 199 个），
+        而 model-scan 阶段（用目录里的模型）成功 200 共 78 次，模型名如
+        claude-opus-4-6 / claude-opus-4-8 / gpt-oss-120b —— 全都不在种子表里。
+
+        为什么这一步比推理请求安全
+        ------------------------
+        · GET 目录端点，多数站不计费、不计入调用统计、不触发风控；
+        · 参考实现全都只这么做：CPAMP 的健康检查只发 GET 目录
+          （healthCheck.ts:397-451，全库无 POST messages/chat 测活），
+          CLIProxyAPI 自己完全不探上游存活（唯一定时任务 model_updater.go
+          拉的是 GitHub 上的模型名录 JSON，不发推理请求）。
+        · 与用户「严禁 Hi/你好 这类简单测活」的要求同向：能不发推理就不发。
+
+        拿不到目录不是失败 —— 返回空列表，调用方回落到种子模型。
+        """
+        url, headers = request.models_endpoint(section, base, row.api_key)
+        proxy = self.live_proxy if need_proxy else None
+        seen: list[str] = []
+        token = ""
+
+        # gemini 的 /v1beta/models 分页；其余三段一页出完。上限 _CATALOG_PAGES
+        # 是为了不被恶意/异常的无限 nextPageToken 拖住。
+        for page in range(self._CATALOG_PAGES):
+            self._throttle(host_of(base), section)
+            page_url = url
+            if token:
+                sep = "&" if "?" in url else "?"
+                page_url = f"{url}{sep}pageToken={urllib.parse.quote(token)}"
+            resp = client.send(
+                page_url, headers=headers, body=b"", method="GET",
+                proxy=proxy, timeout=self.timeout,
+            )
+            if resp.status != "200":
+                if page == 0:
+                    # 与 catalog 事件同一套载荷约定：不重复 host。
+                    self.on_event("catalog-miss", {
+                        "section": section, "status": resp.status,
+                    })
+                    return []
+                break            # 翻页中断：已拿到的仍然算
+            for m in request.parse_models_response(section, resp.body):
+                if m not in seen:
+                    seen.append(m)
+            token = (request.next_page_token(resp.body)
+                     if section == "gemini-api-key" else "")
+            if not token:
+                break
+
+        catalog = [m for m in seen if model_allowed(m)]
+        # 载荷保持 {section, count} 两字段 —— 前端与 test_pipeline 的
+        # 「catalog 载荷字段」断言按这个约定写。host 由 candidate-start
+        # 给出，这里重复只会让事件流变胖；白名单滤掉多少不进载荷，避免
+        # 把上游的模型名规模也一起吐出去。
+        self.on_event("catalog", {"section": section, "count": len(catalog)})
+        return catalog
+
+    def _probe_order(self, section: str, catalog: list[str],
+                     exclude: list[str] | None = None) -> list[str]:
+        """验证顺序：目录里的模型优先，种子只作兜底。
+
+        目录是站方**声明有**的，种子是本工具**猜**的。先验声明的那批，命中率
+        高得多，也不会为不存在的模型白烧一次请求。种子仍保留在队尾：有些站
+        的目录端点不开放（401/404），但推理端点照常工作。
+        """
+        skip = set(exclude or ())
+        order: list[str] = []
+        # 目录里与种子同名的排到最前 —— 既在目录里、又是已知好用的模型
+        preferred = [m for m in SEED_MODELS[section] if m in catalog]
+        for m in preferred + catalog + SEED_MODELS[section]:
+            if m not in order and m not in skip and model_allowed(m):
+                order.append(m)
+        return order
+
     # ---------- ② 模型发现 ----------
 
     def _stage2(self, row: ParsedRow, v: SectionVerdict) -> None:
-        """先问 /models 目录，白名单过滤后逐个验。
+        """把段内还没验过的模型补齐到 max_models。
+
+        目录已经在 `_stage0_catalog` 拿过并缓存在 `v.catalog`，这里不再重复
+        GET —— 重复问同一个目录端点纯属浪费，且会撞节流。
 
         compat 段留空 = 注册 0 个模型，所以这一步对 compat 是硬要求。
         """
         found = list(v.models)
-        catalog: list[str] = []
-
-        # /models 是目录端点，与该段的推理端点不同路径，但仍算这个站这个段
-        # 的一次请求 —— 用同一个桶。原来这里漏传参数，落到 host="" 的全局桶，
-        # 结果是所有站所有段的 /models 互相等待。
-        self._throttle(host_of(v.base_url), v.section)
-        url, headers = request.models_endpoint(v.section, v.base_url, row.api_key)
-        resp = client.send(
-            url, headers=headers, body=b"", method="GET",
-            proxy=self.live_proxy if v.need_proxy else None, timeout=self.timeout,
-        )
-        if resp.status == "200":
-            catalog = [m for m in request.parse_models_response(v.section, resp.body)
-                       if model_allowed(m)]
-            self.on_event("catalog", {"section": v.section, "count": len(catalog)})
-
-        # 验证顺序：种子模型优先（已知好用），再补目录里的
-        order: list[str] = []
-        for m in SEED_MODELS[v.section] + catalog:
-            if m not in order and m not in found and model_allowed(m):
-                order.append(m)
+        order = self._probe_order(v.section, v.catalog, exclude=found)
 
         attempted = 0
         for model in order:
@@ -987,6 +1188,10 @@ class Prober:
         """
         base = base_for_section(row.bare, section)
         v = SectionVerdict(section=section, base_url=base)
+        # 目录是**主机**的属性（站方声明有哪些模型），与 Key 无关 —— 直接
+        # 沿用，不重新 GET。放在所有分支之前：底下有三个提前 return，
+        # 判死的段也要带着候选清单回去给操作员人工接管用。
+        v.catalog = list(shape.catalog)
 
         if not shape.models:
             # 主机在这一段本就没有可信模型 —— 换 Key 也不会变出模型来。
@@ -1046,7 +1251,13 @@ class Prober:
     # ---------- 编排 ----------
 
     def _full_probe(self, row: ParsedRow, section: str) -> SectionVerdict:
-        """一个段的完整四阶段探测。首个 Key 走这条，之后复用它的形态。"""
+        """一个段的完整探测。首个 Key 走这条，之后复用它的形态。
+
+        目录发现在 `_stage1` 内部最前面（`_stage0_catalog`），所以判死的段
+        也带着 `v.catalog` 回来 —— 操作员人工接管时需要那份候选清单。
+        只有「验穷模型 + 换模抽样 + 上限实测」这三步跳过：段不通时它们全都
+        问不出有效结果，白烧请求。
+        """
         v = self._stage1(row, section)
         if v.usable:
             self._stage2(row, v)

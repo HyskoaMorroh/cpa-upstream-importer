@@ -65,6 +65,24 @@ class Diff:
     # UI 与 CLI 要显式区分这两种 —— 「新增一个站」和「给已有站加 Key」
     # 对轮询池的影响完全不同。
     merged_into: str = ""
+    # 空段头改写：`claude-api-key: []` 这种自带空数组字面量的段头，插入块
+    # 序列前必须先把 `[]` 摘掉，否则产出
+    #     claude-api-key: []
+    #       - api-key: "..."
+    # 是非法 YAML（已是流式空序列，不能再挂块序列）。
+    # 值为 (1-based 行号, 新行内容)，由 apply_diffs 就地替换。
+    rewrite: tuple[int, str] | None = None
+    # 段头补建：这条 diff 的 lines 追加到**文件末尾**，不占 insert_at 坐标。
+    #
+    # 为什么单开一路而不复用 insert_at：build_diffs 是在「补过段头的
+    # lines」上算条目行号的，apply_diffs 却从原文起插。两套坐标系只有在
+    # 段头不参与行号排序时才对齐 —— 让段头永远追加到尾部，条目行号就与
+    # build_diffs 看到的完全一致。
+    #
+    # 曾经让段头也走 insert_at：四个段头挤在同一行号，条目串段（codex 的
+    # 条目插进 openai-compatibility），后来改成逐个独立行号，又因段头块里
+    # 的空行让排序不稳、条目重复落地（4 条变 8 条）。两次都是坐标系混用。
+    append_only: bool = False
 
     def render(self) -> str:
         what = (f"追加进已有 provider {self.merged_into}"
@@ -180,6 +198,29 @@ def _section_span(lines: list[str], section: str) -> tuple[int, int] | None:
                                or lines[end - 1].lstrip().startswith("#")):
         end -= 1
     return start, end
+
+
+def _empty_literal_rewrite(lines: list[str], start: int,
+                           section: str) -> tuple[int, str] | None:
+    """段头自带空字面量时，返回把它摘成裸键的改写；否则 None。
+
+    形态：`claude-api-key: []`、`claude-api-key: {}`（含行尾注释）。
+    这种段头在全新或被清空的 config.yaml 里很常见 —— CPA 自己生成的
+    模板就是这样，而 `[]` 后面直接挂 `- api-key:` 是非法 YAML。
+
+    2026-09-01 实测触发：假门禁站端到端脚本用 `claude-api-key: []` 造
+    空段，写回产出的文件 yaml.safe_load 直接报
+    `expected <block end>, but found '<block sequence start>'`。
+    原来的用例都基于「段里已有条目」的真实 config.yaml，从没覆盖到空段。
+
+    行尾注释保留 —— 那也是人写的。
+    """
+    m = re.match(rf"^({re.escape(section)}\s*:)\s*(\[\s*\]|\{{\s*\}})\s*(#.*)?$",
+                 lines[start])
+    if not m:
+        return None
+    tail = f"  {m.group(3)}" if m.group(3) else ""
+    return start + 1, f"{m.group(1)}{tail}"
 
 
 def _detect_indent(lines: list[str], start: int, end: int) -> tuple[str, str]:
@@ -403,6 +444,52 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
     return out
 
 
+def _ensure_sections(lines: list[str], plans: list[ImportPlan],
+                     stamp: str) -> tuple[list[str], list[Diff]]:
+    """为「有可写方案但 config.yaml 里没段头」的段补出段头。
+
+    返回 (补过段头的 lines, 段头 diff 列表)。段头插在文件末尾 ——
+    YAML 顶层键无序，位置不影响语义，而插在尾部不动任何现有行、
+    也不打乱已有注释的归属。
+
+    只补真正要写入的段：某段一个可写方案都没有就不补，免得给
+    config.yaml 添四个空段。
+    """
+    need: list[str] = []
+    for section in _SECTION_KEYS:
+        if any(sp is not None and sp.writable
+               for plan in plans
+               for sec, sp in plan.sections.items() if sec == section):
+            if _section_span(lines, section) is None:
+                need.append(section)
+    if not need:
+        return lines, []
+
+    out = list(lines)
+    # 末尾没有空行就补一个，别和最后一个条目粘在一起
+    while out and not out[-1].strip():
+        out.pop()
+
+    # 每个段头**各占一条 diff、各占独立行号**。
+    #
+    # 曾经的写法是四个段头共用一条 diff 插在同一个 insert_at —— 结果
+    # 各段的条目 diff 目标行号全落进同一块，codex 的条目插进了
+    # openai-compatibility 段里（yaml.safe_load 不报错，段归属却全错）。
+    # 段头必须逐个落地，中间留出空行，条目 span 才各归各段。
+    head_diffs: list[Diff] = []
+    for i, section in enumerate(need):
+        block = [""]
+        if i == 0:
+            block.append(f"# {stamp} 批量导入：以下段原本不存在，自动补出")
+        block.append(f"{section}:")
+        out.extend(block)
+        head_diffs.append(
+            Diff(section=section, insert_at=0, lines=block,
+                 host="(段头)", merged_into="", append_only=True)
+        )
+    return out, head_diffs
+
+
 def build_diffs(raw: str, plans: list[ImportPlan]) -> list[Diff]:
     """算出每个段要插入什么。**不修改任何现有行** —— 只追加。
 
@@ -415,8 +502,20 @@ def build_diffs(raw: str, plans: list[ImportPlan]) -> list[Diff]:
     成 N 个独立 provider，模型清单重复 N 遍 —— 5 个 Key 的站就是 5 份。
     """
     lines = raw.split("\n")
-    diffs: list[Diff] = []
     stamp = datetime.datetime.now().strftime("%Y-%m-%d")
+
+    # 段头缺失就先补出来。config.yaml 常常只有你实际用过的段 —— 缺 codex
+    # 或 compat 段头是常态，不是异常。
+    #
+    # 2026-09-01 修：原来 _section_span 返回 None 就 `continue`，于是勾选
+    # 过、参数齐全的段被**静默丢弃** —— 界面显示「已勾选 N 项写入」，
+    # 落盘却少几段，而且不报错不警告。这是这一轮最严重的一处：用户以为
+    # 写进去了。
+    # 补出的段头本身也是一条 diff（插在文件尾），这样 apply_diffs 只认
+    # diff 就够，不需要知道 build_diffs 内部改过 lines。
+    lines, head_diffs = _ensure_sections(lines, plans, stamp)
+
+    diffs: list[Diff] = list(head_diffs)
 
     # compat 段先按 (host, base_url) 归并同站的多个 Key
     compat_groups: dict[tuple[str, str], list] = {}
@@ -442,6 +541,7 @@ def build_diffs(raw: str, plans: list[ImportPlan]) -> list[Diff]:
                     insert_at=end,
                     lines=render_entry(sp, dash, field, stamp),
                     host=plan.host,
+                    rewrite=_empty_literal_rewrite(lines, start, section),
                 )
             )
 
@@ -490,15 +590,40 @@ def build_diffs(raw: str, plans: list[ImportPlan]) -> list[Diff]:
                     lines=render_entry(head, dash, field, stamp,
                                        extra_keys=keys[1:]),
                     host=host,
+                    rewrite=_empty_literal_rewrite(
+                        lines, start, "openai-compatibility"),
                 )
             )
     return diffs
 
 
 def apply_diffs(raw: str, diffs: list[Diff]) -> str:
-    """把 diff 应用到原文。从后往前插，避免行号偏移。"""
+    """把 diff 应用到原文。从后往前插，避免行号偏移。
+
+    空段头改写（rewrite）先做：它只改一行、不动行数，所以和插入的行号
+    互不影响。同一段有多个 diff 时改写内容相同，重复执行是幂等的。
+    """
     lines = raw.split("\n")
-    for d in sorted(diffs, key=lambda x: -x.insert_at):
+
+    # ① 补建的段头先追加到尾部 —— build_diffs 算条目行号时看到的就是这个
+    #    形态，两边坐标系必须一致。
+    heads = [d for d in diffs if d.append_only]
+    if heads:
+        while lines and not lines[-1].strip():
+            lines.pop()
+        for d in heads:
+            lines.extend(d.lines)
+
+    # ② 空段头改写：只改一行、不动行数，与插入的行号互不影响。
+    #    同段多个 diff 携带相同改写，重复执行是幂等的。
+    for d in diffs:
+        if d.rewrite:
+            ln, text = d.rewrite
+            lines[ln - 1] = text
+
+    # ③ 条目从后往前插，避免行号偏移
+    for d in sorted((x for x in diffs if not x.append_only),
+                    key=lambda x: -x.insert_at):
         lines[d.insert_at:d.insert_at] = d.lines
     return "\n".join(lines)
 

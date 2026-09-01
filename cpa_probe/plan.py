@@ -29,6 +29,10 @@ import re
 from dataclasses import dataclass, field
 
 from .parse import ParsedRow, base_for_section, host_of
+# pipeline 不导入 plan，这个方向无环。只取白名单判定与每段模型上限，
+# 目录读回来的名字必须过同一道白名单 —— 不然中转站目录里的
+# embedding / whisper / tts 之类会被注册成对话模型。
+from .pipeline import MAX_MODELS_PER_SECTION, model_allowed
 
 # 只有 gemini 段在配置层去重（静默丢弃）
 _DEDUP_SECTIONS = {"gemini-api-key"}
@@ -1061,6 +1065,14 @@ class SectionPlan:
     # 其余模型留空（CPA 会回落内置目录值），不把 A 的实测值外推到 B。
     context_model: str = ""
     score: int = 0
+    # 模型清单从哪来，可信度递减：
+    #   probed  —— 推理请求实测通过，返回的 model 字段与请求一致
+    #   catalog —— 只是目录 GET 读到的，站方声称有，未经推理验证
+    #   manual  —— 操作员手填，工具没验证过
+    # 必须一路带到界面：「验证过」和「站方声称有」不能长一个样。CPAMP 的
+    # 「模型」列就是显示 config.yaml 里写了几个（rowData.ts:78），并排放在
+    # 真实转发统计旁边，看着像测活结果 —— 那个坑不要再踩一遍。
+    model_source: str = "probed"
     duplicate: bool = False
     duplicate_note: str = ""
     impacts: list[Impact] = field(default_factory=list)
@@ -1092,8 +1104,11 @@ class SectionPlan:
           · 静默换模 —— 照常计费却返回另一个模型，比不可用更危险
           · 抢走顶层 —— 层级隔离下现有顶层站会完全不被尝试
           · 上限由截断反推 —— 那个数字是实测容量而非站方声明，可能偏保守
+          · 模型未经推理验证 —— 只有目录或手填，站方声称有不等于这把 Key 能用
         """
         if not self.writable:
+            return False
+        if self.model_source != "probed":
             return False
         if any("换模" in w for w in self.warnings):
             return False
@@ -1110,6 +1125,11 @@ class SectionPlan:
             return "已存在，跳过"
         if not self.models:
             return "无可信模型，写进去等于死条目"
+        if self.model_source == "catalog":
+            return (f"推理未通过，模型取自站方目录（{len(self.models)} 个）"
+                    " —— 参数已按试用期算全，确知可用再勾")
+        if self.model_source == "manual":
+            return f"手填 {len(self.models)} 个模型，工具未验证 —— 参数已算全"
         if any("换模" in w for w in self.warnings):
             return "检测到静默换模 —— 计费却拿不到要的模型，默认不勾"
         if self.hijacked:
@@ -1135,6 +1155,30 @@ class ImportPlan:
     @property
     def any_writable(self) -> bool:
         return any(p.writable for p in self.sections.values())
+
+
+def _fallback_headers(section: str, v, cfg: dict | None) -> dict[str, str]:
+    """判不可用的段该配哪套请求头。
+
+    min_headers 只在「找到最省可用档」时才有值，判死的段永远是空的。可是
+    判死的多数是门禁站 —— 门票不对正是它判死的原因。空 headers 写进
+    config.yaml 等于写了个必废的条目，而这条要求是明确的：勾选了就得有
+    确定的参数，不留「未定」。
+
+    取探测**实际打到的最高档**，因为那是实测走过的最完整形态。没有任何
+    id: 尝试记录时（连门票梯都没进就死了，比如 DNS 不通）回落到该段标准档
+    —— 不取全量档，设备指纹那类头有站方会拒。
+    """
+    from .profiles import ladder as _ladder
+
+    tried = {a.combo[3:] for a in v.attempts if a.combo.startswith("id:")}
+    rungs = _ladder(section, cfg, include_alt=False)
+    if tried:
+        hit = [p for p in rungs if p.name in tried]
+        if hit:
+            return dict(max(hit, key=lambda p: p.tier).headers)
+    std = [p for p in rungs if p.tier == 2] or [p for p in rungs if p.tier >= 1]
+    return dict(std[0].headers) if std else {}
 
 
 def build_plan(
@@ -1183,13 +1227,30 @@ def build_plan(
     force = force or {}
     for section, v in result.sections.items():
         forced_models = [m for m in (force.get(section) or []) if str(m).strip()]
-        if not v.usable and not forced_models:
+        # 判不可用的段也要生成完整方案 —— 只是默认不勾（recommended=False）。
+        # 曾经在这里 continue 掉，后果是界面上判死的段没有 priority / headers /
+        # 代理 / 指纹可看，勾选框灰着，不手填模型就无法勾选；而很多站禁止
+        # 测活却确实可用，那样等于把可用站丢掉。
+        #
+        # 前提是有模型清单：手填 > 探测通过 > 目录 GET 读到的。目录是 CPAMP
+        # 测活的唯一手段（它连推理都不发），可信度足够当候选。三者全空才跳过 ——
+        # 那时连注册哪些模型都不知道，compat 段的 models 还是必填字段
+        # （config_types.go:670 无 omitempty）。
+        if not v.usable and not forced_models and not v.catalog:
             plan.skipped[section] = f"{v.category or '不可用'} — {v.action or '不写入'}"
             continue
 
         base = base_for_section(row.bare, section)
         proxy = "http://mihomo:7890" if v.need_proxy else ""
         headers = dict(v.min_headers) if v.need_ua else {}
+        if not headers and not v.usable:
+            # 判死的段：min_headers 是空的（探测没走到「确定最省可用档」那步），
+            # 但门禁站恰恰是判死里的多数 —— 它判死的原因往往就是门票不对。
+            # 空 headers 写进 config.yaml 那条目必然废掉。
+            #
+            # 取探测实际打到的最高档门票：那是实测走过的最完整形态，比猜一个
+            # 档次可靠。不取全量档 —— 设备指纹那类头有站方会拒。
+            headers = _fallback_headers(section, v, cfg)
         # 沿用该段主导 prefix。CPA 的五元组指纹**含 prefix**
         # （formatGeminiKeyDedupID），所以要在算 fp 之前定下来。
         prefix = dominant_prefix(cfg, section)
@@ -1210,7 +1271,17 @@ def build_plan(
         # 人工接管的段：模型清单来自操作员，探测那边是空的。
         # 定档也要按这份清单算 —— 影响面是「这些模型各自挡住谁」，
         # 用空清单算出来的影响面恒为 0，等于没算。
-        models = forced_models if (forced_models and not v.usable) else list(v.models)
+        # 三种来源，可信度递减。model_source 要一路带到界面上 ——
+        # 「验证过」和「站方声称有」不能在界面上长一个样，那正是 CPAMP
+        # 「模型」列的毛病：显示 config.yaml 里写了几个，看着像测活结果。
+        if forced_models and not v.usable:
+            models, model_source = forced_models, "manual"
+        elif v.usable:
+            models, model_source = list(v.models), "probed"
+        else:
+            # 判死但目录能读到 —— 取目录里通过白名单的名字。
+            models = [m for m in v.catalog if model_allowed(m)][:MAX_MODELS_PER_SECTION]
+            model_source = "catalog"
 
         score = score_verdict(v)
         pri, reason = suggest_priority(band, score, models=models,
@@ -1229,6 +1300,7 @@ def build_plan(
             max_context_length=v.max_context_length,
             context_model=v.context_model,
             score=score,
+            model_source=model_source,
         )
 
         if fp in existing.get(section, set()):
@@ -1254,13 +1326,22 @@ def build_plan(
             existing.setdefault(section, set()).add(fp)
             pairs.setdefault(section, set()).add(pair)
 
-        if forced_models and not v.usable:
+        if model_source == "manual":
             sp.priority_reason = (
                 f"人工接管（探测判「{v.category or '不可用'}」）· {reason}")
             sp.warnings.append(
                 f"探测未通过（{v.category or '不可用'} — {v.action or ''}），"
                 f"模型清单由你手工指定：{', '.join(models)}。"
                 "工具没有验证过这些模型能用")
+        elif model_source == "catalog":
+            sp.priority_reason = (
+                f"未验证（探测判「{v.category or '不可用'}」，模型取自目录）· {reason}")
+            sp.warnings.append(
+                f"推理请求未通过（{v.category or '不可用'} — {v.action or ''}），"
+                f"但目录 GET 读到 {len(v.catalog)} 个模型，已取前 {len(models)} 个："
+                f"{', '.join(models)}。"
+                "站方目录只说明「声称有」，不等于这把 Key 的分组能用 —— "
+                "很多站禁止推理测活却确实可用，确知可用再勾")
 
         sp.impacts = compute_impact(band, sp.models, pri)
 

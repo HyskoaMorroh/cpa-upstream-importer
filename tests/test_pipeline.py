@@ -221,6 +221,21 @@ class FakeUpstream(BaseHTTPRequestHandler):
                     "type": "model_not_found"}})
             return
 
+        # 2026-09-01 现场形态：中转站（new-api/one-api 系）对没有活跃通道的
+        # 模型回 503 "No available channel for model X under group default"。
+        # 这句**不是 CPA 发的**（CPA 源码零命中，它的措辞是 auth_unavailable），
+        # 而是上游站自己的调度失败 —— 语义等同 404 model_not_found：换个模型
+        # 就通。曾把它当站级死路，175 次 503 判死 92 个段，可用站被整段丢弃。
+        if profile == "nochannel":
+            if model == ONLY_MODEL:
+                self._send(200, self._ok_payload(model, max(sent, 20)))
+            else:
+                self._send(503, {"error": {
+                    "message": f"No available channel for model {model} "
+                               f"under group default",
+                    "type": "server_error"}})
+            return
+
         if profile == "compatonly":
             if path.endswith("/chat/completions"):
                 self._send(200, self._ok_payload(model, max(sent, 20)))
@@ -584,6 +599,17 @@ def main() -> int:
         eq("定性为可用（不是死路）", v.category, "可用")
         eq("清单里有可用的那个模型", ONLY_MODEL in v.models, True)
         eq("清单里没有 404 的那个模型",
+           "claude-sonnet-5" in v.models, False)
+
+        section("nochannel：503「分组无该模型渠道」不许判死整段")
+        r = probe("nochannel")
+        v = r.sections["claude-api-key"]
+        # 与 onemodel 同形，只是站方用 503 而非 404 表达同一件事。
+        # 曾因 503 落在「临时」类之外的站级死路分支，整段被丢。
+        eq("换模型能通时仍判可用", v.usable, True)
+        eq("定性为可用（不是死路）", v.category, "可用")
+        eq("清单里有可用的那个模型", ONLY_MODEL in v.models, True)
+        eq("清单里没有 503 的那个模型",
            "claude-sonnet-5" in v.models, False)
 
     finally:
