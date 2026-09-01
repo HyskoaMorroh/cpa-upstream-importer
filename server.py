@@ -45,7 +45,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cpa_probe as cp  # noqa: E402
-from cpa_probe.pipeline import Prober  # noqa: E402
+from cpa_probe.pipeline import Prober, SEED_MODELS  # noqa: E402
 from cpa_probe.batch import BatchProber, extract_existing_entries  # noqa: E402
 from cpa_probe.writeback import (  # noqa: E402
     apply_diffs,
@@ -766,6 +766,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if route == "/api/parse":
                 self._api_parse(body)
+            elif route == "/api/diag":
+                self._api_diag(body)
             elif route == "/api/probe":
                 self._api_probe(body)
             elif route == "/api/plan":
@@ -919,6 +921,87 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {
             "valid": [row_json(r) for r in res.valid],
             "invalid": [row_json(r) for r in res.invalid],
+        })
+
+    def _api_diag(self, body: dict) -> None:
+        """单站诊断：只跑画像梯，回答「这个站要什么头」。
+
+        与 /api/probe 的区别是**意图不同**，不是参数不同：
+          · /api/probe  为导入服务 —— 探完要生成方案、要写回
+          · /api/diag   为排障服务 —— 只回答一个问题，不产生任何可写状态
+
+        所以它不建 Job、不进 STORE、不能被 /api/plan 引用。想导入的话，前端把
+        结果预填回步骤①走正常流水线 —— 诊断与写回之间必须有人工确认这一跳。
+
+        同步返回（不走轮询）：单段 3-8 次请求、几秒内完成，为它引入一套任务
+        状态不值得。四段全查才 25 次，也在可接受范围。
+        """
+        res = cp.parse_lines(f"{body.get('url') or ''},{body.get('key') or ''}")
+        if not res.valid:
+            why = res.invalid[0].error if res.invalid else "url 或 key 为空"
+            self._json(400, {"error": f"解析不了：{why}"})
+            return
+        row = res.valid[0]
+
+        want = str(body.get("section") or "").strip()
+        secs = [want] if want in cp.SECTIONS else list(cp.SECTIONS)
+
+        raw, cfg = self._load_cfg()
+        prober = Prober(
+            proxy=_resolve_proxy(str(body.get("proxy") or "")),
+            gap=float(body.get("gap", 0.5)),
+            timeout=int(body.get("timeout", 60)),
+            probe_context=False,       # 诊断不探上下文 —— 那是百万字符的大 body
+            swap_samples=0,            # 也不采样换模，那要 3 次额外请求
+            workers=len(secs),
+            cfg_snapshot=cfg,
+        )
+
+        out: dict[str, dict] = {}
+        for section in secs:
+            base = cp.base_for_section(row.bare, section)
+            model = SEED_MODELS[section][0]
+            rungs: list[dict] = []
+            hit: dict | None = None
+
+            for prof in cp.profiles.ladder(section, cfg):
+                hdrs, patch = cp.profiles.materialize(prof, row.api_key)
+                att = prober._call(section, base, row.api_key, model,
+                                   combo=prof.name,
+                                   extra_headers=hdrs or None,
+                                   body_patch=patch or None)
+                rungs.append({
+                    "profile": prof.name, "tier": prof.tier,
+                    "family": prof.family, "alt": prof.alt,
+                    "why": prof.why,
+                    "status": att.status, "category": att.category,
+                    "elapsed_ms": att.elapsed_ms,
+                    "excerpt": att.excerpt,
+                    "resp_model": att.resp_model,
+                    "headers": hdrs, "body_patch": bool(patch),
+                    "ok": att.ok and not att.error_envelope,
+                })
+                if att.ok and not att.error_envelope:
+                    hit = rungs[-1]
+                    break
+
+            out[section] = {
+                "base_url": base,
+                "model": model,
+                "rungs": rungs,
+                "hit": hit,
+                # 写进 config.yaml 的形态 —— baseline 通过时不需要任何 headers
+                "needed_headers": (hit["headers"] if hit and hit["profile"] != "baseline"
+                                   else {}),
+                "needs_body": bool(hit and hit["body_patch"]),
+                "calls": len(rungs),
+            }
+
+        self._json(200, {
+            "host": row.host,
+            "key_masked": row.masked(),
+            "sections": out,
+            "total_calls": sum(v["calls"] for v in out.values()),
         })
 
     def _api_probe(self, body: dict) -> None:

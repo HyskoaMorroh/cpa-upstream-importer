@@ -43,6 +43,7 @@ const S = {
   picks: null,          // Set("host\u0000section")，null = 尚未初始化
   reuseSaved: 0,        // 形态复用省下的请求数
   reuseSeen: null,      // 已计数过的 shape-reused 事件键（防重拉重复累加）
+  diagYaml: null,       // 诊断结果的 YAML 片段 {段: 文本}。不进 HTML 属性
 };
 
 const pk = (host, sec) => `${host}\u0000${sec}`;
@@ -450,6 +451,143 @@ $('#o_full_redetect').addEventListener('change', (e) => {
     });
   }
 });
+
+// ── 单站诊断 ──
+// 与批量导入是两个不同的意图，所以不共用流水线：这里只回答「这个站要什么头」，
+// 不建 Job、不生成方案、不写回。想导入就点「填进上面」走正常流程 ——
+// 诊断与写回之间必须有人工确认这一跳。
+$('#btndiag').onclick = async () => {
+  const url = $('#d_url').value.trim();
+  const key = $('#d_key').value.trim();
+  if (!url || !key) {
+    $('#diagmsg').innerHTML = '<span style="color:var(--bad)">地址与密钥都要填</span>';
+    return;
+  }
+  const btn = $('#btndiag');
+  btn.disabled = true;
+  $('#diagmsg').textContent = '诊断中…';
+  $('#diagout').innerHTML = '';
+
+  let d;
+  try {
+    d = await api('/api/diag', {
+      method: 'POST',
+      body: {
+        url, key,
+        section: $('#d_section').value,
+        proxy: $('#d_proxy').checked ? 'http://mihomo:7890' : '',
+      },
+    });
+  } catch (e) {
+    $('#diagmsg').innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
+    btn.disabled = false;
+    return;
+  }
+  btn.disabled = false;
+  $('#diagmsg').textContent = `${d.total_calls} 次请求`;
+  renderDiag(d);
+};
+
+function renderDiag(d) {
+  S.diagYaml = {};
+  const blocks = Object.keys(d.sections).map((sec) => {
+    const s = d.sections[sec];
+    const rungs = s.rungs.map((g) => {
+      const cls = g.ok ? 'rung hit' : 'rung miss';
+      const mark = g.ok ? '✓' : ' ';
+      const body = g.body_patch ? ' +body' : '';
+      return `<div class="${cls}">`
+        + `<span class="rs">${mark}</span>`
+        + `<span class="rn">${esc(g.profile)}${body}</span>`
+        + `<span class="rs">t${g.tier}</span>`
+        + `<span class="rs">${esc(g.status)}</span>`
+        + `<span class="rs">${esc(g.category || '')}</span>`
+        + `<span class="rs">${g.elapsed_ms}ms</span>`
+        + `<span class="rw">${esc(g.why || '')}</span>`
+        + (g.excerpt ? `<div class="rw" style="flex-basis:100%;padding-left:8px">`
+          + `${esc(String(g.excerpt).slice(0, 150))}</div>` : '')
+        + `</div>`;
+    }).join('');
+
+    let concl;
+    if (!s.hit) {
+      concl = `<div class="note w" style="margin-top:10px">`
+        + `<b>整梯 ${s.rungs.length} 档全不通。</b>`
+        + `这不一定是站方拒绝你 —— 也可能是余额、限时段、或它只认浏览器。`
+        + `看上面每档的正文摘要判断。`
+        + `如果你确知这个站能用，导入时可以用「人工接管」填模型清单。</div>`;
+    } else if (!Object.keys(s.needed_headers).length) {
+      concl = `<div class="note g" style="margin-top:10px">`
+        + `<b>baseline 就通，不需要任何 header。</b>`
+        + `导入时 <code>headers</code> 留空即可。</div>`;
+    } else {
+      const yaml = yamlHeaders(s.needed_headers, s.base_url);
+      S.diagYaml[sec] = yaml;
+      concl = `<div class="hdrbox">`
+        + `<div><b>最小必需画像：${esc(s.hit.profile)}</b>`
+        + `（试了 ${s.rungs.length} 档）`
+        + (s.needs_body ? ` · <b>还需要请求体字段</b>` : '')
+        + `</div>`
+        + (s.needs_body
+          ? `<div class="hint" style="margin-top:5px">headers 表达不了它 ——`
+            + ` claude 段可在条目里设 <code>fingerprint-profile: claude-code-cli</code>`
+            + ` 让 CPA 自己补；其余三段配置层无解。</div>`
+          : '')
+        + `<div class="hint" style="margin-top:6px">下面这段可直接粘进`
+        + ` <code>config.yaml</code> 的该段条目里：</div>`
+        + `<pre>${esc(yaml)}</pre>`
+        + `<div class="row" style="margin-top:8px">`
+        + `<button class="mini" data-yaml="${esc(sec)}">复制 YAML</button>`
+        + `<button class="mini" data-fill="1">填进上面的输入框</button>`
+        + `</div></div>`;
+    }
+
+    return `<div style="margin-top:16px">`
+      + `<div style="font-weight:650;margin-bottom:6px">`
+      + `${esc(SECTION_LABEL[sec] || sec)}`
+      + `<span class="hint"> · ${esc(s.model)} · ${s.calls} 次请求</span></div>`
+      + rungs + concl + `</div>`;
+  }).join('');
+
+  $('#diagout').innerHTML = blocks;
+
+  // YAML 通过 S.diagYaml 传递，不进 HTML 属性 —— 多行文本在属性里会被
+  // 转义破坏（换行变实体、引号提前闭合）。
+  $$('#diagout button[data-yaml]').forEach((b) => {
+    b.onclick = () => {
+      const text = (S.diagYaml || {})[b.dataset.yaml] || '';
+      if (!text) { b.textContent = '没有内容'; return; }
+      navigator.clipboard.writeText(text)
+        .then(() => { b.textContent = '已复制'; setTimeout(() => { b.textContent = '复制 YAML'; }, 1400); })
+        .catch(() => { b.textContent = '复制失败（请手工选中）'; });
+    };
+  });
+  $$('#diagout button[data-fill]').forEach((b) => {
+    b.onclick = () => {
+      const line = `${$('#d_url').value.trim()},${$('#d_key').value.trim()}`;
+      const cur = $('#input').value.trim();
+      $('#input').value = cur ? `${cur}\n${line}` : line;
+      $('#pdiag').open = false;
+      $('#input').scrollIntoView({ behavior: 'smooth', block: 'center' });
+      $('#btnparse').click();
+    };
+  });
+}
+
+// headers 渲染成 config.yaml 里的形态。缩进按四段现有条目的写法（2/4 空格）。
+function yamlHeaders(h, baseUrl) {
+  const lines = ['  - api-key: "<你的 key>"'];
+  if (baseUrl) lines.push(`    base-url: ${JSON.stringify(baseUrl)}`);
+  lines.push('    headers:');
+  Object.keys(h).forEach((k) => {
+    // 值里有 {uuid1} 这类模板变量时提示 —— 那是每请求都要新生成的，
+    // 写死进配置没有意义（CPA 自己会补）。
+    const v = String(h[k]);
+    const tip = /\{uuid\d?\}|\{key_hash\}/.test(v) ? '   # 每请求新生成，CPA 会自动补' : '';
+    lines.push(`      ${k}: ${JSON.stringify(v)}${tip}`);
+  });
+  return lines.join('\n');
+}
 
 // ── 探测 ──
 $('#btnprobe').onclick = async () => {
