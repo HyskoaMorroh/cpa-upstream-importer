@@ -206,6 +206,18 @@ textarea::placeholder{color:var(--ink-3)}
   font-family:var(--f-mono);font-size:12px;line-height:1.65;
   white-space:pre;overflow-x:auto;
 }
+/* 尝试明细：一个四段全不通的站有 30 次尝试，默认折起。
+   排障时真正要看的「哪一档通的、别的档报什么、哪个慢」都在这里。 */
+.adet{margin:2px 22px 14px;font-size:13px}
+.adet>summary{
+  cursor:pointer;user-select:none;padding:6px 0;
+  color:var(--ink-2);font-weight:600;
+}
+.adet>summary:hover{color:var(--ink)}
+.adet>summary .hint{font-weight:400;margin-left:8px}
+.adet .tw{margin-top:6px}
+.adet table{font-size:12px}
+.adet td,.adet th{padding:5px 9px}
 /* headers 手工编辑：塞在结果表每段的展开行里，默认折起 —— 多数时候不需要改，
    摊开会让本来就宽的结果表更难看。 */
 .hedit{margin-top:10px;font-size:13px}
