@@ -3,11 +3,18 @@
 验证：
 1. extract_existing_entries 提取既有站
 2. BatchProber 站级并发
-3. 进度回调
+3. rebuild_config_full 的注释保全、priority 排序与段字段结构
 """
 
+import os
+import sys
 import time
-import threading
+
+# 与其余套件一致：自己插 sys.path，不依赖调用方设 PYTHONPATH。
+# 漏了这两行 CI 上直接 ModuleNotFoundError —— 本地靠 PYTHONPATH=. 跑不会暴露。
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
 from cpa_probe.batch import extract_existing_entries, BatchProber
 from cpa_probe.pipeline import Prober
 from cpa_probe import parse as cp
@@ -409,8 +416,6 @@ openai-compatibility:
 if __name__ == "__main__":
     # 与其余套件同一套汇报约定：run.py 按「全部通过 · N 项」这行统计，
     # 失败行以 ✗ 开头。自己 print [OK] 不会被计入总数。
-    import sys
-
     CASES = [
         ("提取既有站", test_extract_existing_entries),
         ("站级并发与进度回调", test_batch_prober_progress),
