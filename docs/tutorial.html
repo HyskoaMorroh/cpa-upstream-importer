@@ -441,6 +441,90 @@ footer code{background:none;padding:0}
   敏感词、分组无渠道这类与模型无关的死路才立即收敛以省请求数。</p>
 </div></section>
 
+<section id="s4-5"><div class="wrap">
+  <div class="sech"><span class="no">04.5</span><h2>客户端门禁与画像系统</h2></div>
+  <p class="sub">同一站、同一 Key，探测 503 门禁、真实 Claude Code 207 次成功 —— 成败取决于下游客户端发的头。</p>
+
+  <h3>为什么需要画像</h3>
+  <p>中转站按客户端身份门禁。实测 2026-08-31：</p>
+
+  <div class="tw"><table>
+    <thead><tr><th>谁在调用 CPA</th><th>下游发的头</th><th>zzzcoding 结果</th></tr></thead>
+    <tbody>
+      <tr><td>日常用的 Claude Code</td><td>完整 CC 头集</td><td class="g">207 次成功</td></tr>
+      <tr><td>CPAMP 测试按钮</td><td>只有 x-api-key + content-type</td><td class="r">503 门禁</td></tr>
+      <tr><td>自写脚本 / 其他工具</td><td>各自的头</td><td>看运气</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>CPA config 条目 <code>fingerprint-profile</code> 空白时，
+  <code>preserveCallerFingerprint = true</code>（<code>claude_executor_request.go:755</code>），
+  做的是 <code>copyClaudeCallerFingerprintHeaders</code> —— <b>透传下游客户端的头</b>，
+  缺 UA 才补 <code>CLIProxyAPI/&lt;版本&gt;</code>。门禁成败外包给了下游。</p>
+
+  <h3>25 档画像梯 × 4 段</h3>
+  <p>按客户端族分组（cc / codex / gemini-cli / openai-sdk / browser），族内嵌套超集。
+  baseline 失败后逐档升级，第一个通的即最小必需画像。</p>
+
+  <div class="tw"><table>
+    <thead><tr><th>段</th><th>梯子（部分）</th></tr></thead>
+    <tbody>
+      <tr><td>claude</td><td class="m">baseline → cc-min → cc-std → cc-full → cc-body-json → browser-ua</td></tr>
+      <tr><td>codex</td><td class="m">baseline → originator-only → codex-tui → codex-full → browser-ua</td></tr>
+      <tr><td>gemini</td><td class="m">baseline → gemini-cli → gemini-cli-full → browser-ua</td></tr>
+      <tr><td>compat</td><td class="m">baseline → openai-sdk → cc-min → cc-std → cc-full → cc-body-json → browser-ua</td></tr>
+    </tbody>
+  </table></div>
+
+  <p><b>超集不是平行尝试</b> —— agentrouter 的门票是 <code>user-agent</code> +
+  <code>anthropic-beta</code> + <code>x-app</code> <b>三项缺一不可</b>。
+  如果梯子是「试 A、试 B、试 C」，三项各试一遍全败，而它们的并集本来是通的。
+  改成超集后，第 k 档失败即前 k 档的并集都不够，不必回头补试。</p>
+
+  <h3>headers + body_patch 双层</h3>
+  <p><code>metadata.user_id</code> 是请求<b>体</b>字段，旧 <code>identity_combos</code>
+  只返回 headers 表达不了。新 <code>Profile</code> 同时给 headers 与 body 补丁：</p>
+
+  <div class="tw"><table>
+    <thead><tr><th>画像</th><th>headers</th><th>body_patch</th></tr></thead>
+    <tbody>
+      <tr><td>cc-min</td><td>user-agent + anthropic-beta</td><td>metadata.user_id（JSON 形态）</td></tr>
+      <tr><td>cc-std</td><td>+ x-app + Anthropic-Dangerous-…</td><td>同上</td></tr>
+      <tr><td>cc-full</td><td>+ X-Stainless 全族 + session id</td><td>+ system 标记块 + stream</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>模板变量 <code>{key_hash}</code> / <code>{uuid1..3}</code> 按 Key 与请求求值 ——
+  静态 user_id 会让所有 Key 共用一个假身份，站方一眼看穿。</p>
+
+  <h3>实测依据（13 站 claude 段）</h3>
+  <div class="tw"><table>
+    <thead><tr><th>站</th><th>baseline 结果</th><th>最小必需画像</th></tr></thead>
+    <tbody>
+      <tr><td>10 站</td><td class="g">200 可用</td><td>无需画像</td></tr>
+      <tr><td>agentrouter</td><td class="r">401 unauthorized client</td><td class="g">cc-std（三个头）</td></tr>
+      <tr><td>zzzcoding</td><td class="r">503 only allows CC clients</td><td class="g">cc-std + fingerprint-profile</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>画像写进 <b>config.yaml 条目 headers</b>（四段通用、与下游客户端无关、优先级最高）。
+  <code>fingerprint-profile</code> 只在站方要请求体字段时用（目前 13 站里只有 zzzcoding 一个）。</p>
+
+  <h3>两个新类：时段与 WAF</h3>
+  <div class="grid2">
+    <div class="card"><div class="h">时段类（usable=True）</div>
+      <p>分组按窗口开放。实测 hybgzs codex 段 <code>09:00~18:00</code> ——
+      窗口外打凭据有效但站方拒绝，报 403 + 提示「限时段」；窗口内可用。</p>
+      <p>立即收敛（不重试），导入时标注窗口并提示手工复测。</p>
+    </div>
+    <div class="card"><div class="h">WAF 类（usable=False）</div>
+      <p>站方 WAF 按形态拦。实测 hybgzs 三段带代理仍被拦 <code>访问已被拦截</code> ——
+      换 IP 无效，不是封 IP，是请求形态问题。</p>
+      <p>报告提示调整画像 / User-Agent，或放弃该站。</p>
+    </div>
+  </div>
+</div></section>
+
 <section id="s5"><div class="wrap">
   <div class="sech"><span class="no">05</span><h2>静默换模：比不可用更危险</h2></div>
   <p class="sub">站方照常计费，却返回另一个模型。HTTP 200，一路绿灯。</p>
@@ -624,6 +708,89 @@ footer code{background:none;padding:0}
     <b>把活站当死站</b>，后果是新站拿到过高档位 —— 比漏判严重得多。
     所以宁可漏，不可错；匹配不上的短名会被记进
     <code>unmatched_notes</code> 显示给你，让漏判可见。</p>
+  </div>
+</div></section>
+
+<section id="s6-5"><div class="wrap">
+  <div class="sech"><span class="no">06.5</span><h2>前缀规整：站级前缀 + 段级别名</h2></div>
+  <p class="sub">62 个 claude 条目都是 ANT、13 个 compat provider 都是 CHMA —— 「指名某站」这个能力事实上不存在。</p>
+
+  <h3>现状的问题</h3>
+  <p><code>rewriteModelForAuth</code>（<code>conductor_models.go:685-698</code>）只判
+  「模型名是否以这个 prefix 开头」，不判「是哪个站的 prefix」。所以
+  <code>ANT/claude-opus-5</code> 同时命中全部 12 个 claude 站，
+  落到哪个由 priority + 加权轮询决定。</p>
+
+  <div class="tw"><table>
+    <thead><tr><th>你以为的</th><th>实际行为</th></tr></thead>
+    <tbody>
+      <tr><td>调 <code>ANT/claude-opus-5</code> 指名某站</td><td class="r">同时命中 12 站，轮询</td></tr>
+      <tr><td>调 <code>CHMA/gpt-5.6-sol</code> 指名某站</td><td class="r">同时命中 13 站，轮询</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>这不是 bug，是 prefix 的语义（namespace，不是唯一键）。但「叫得出某个站」是运维必需的 ——
+  单点测试、复现问题、定向清缓存都要它。</p>
+
+  <h3>两层前缀：站级独占 + 段级别名</h3>
+  <p>14 站各自独占前缀（从域名生成，agentrouter → <code>AGR</code>、kktoken → <code>KKT</code>），
+  保留原名轮询，用 <code>models[].alias</code> 补段级兼容名。</p>
+
+  <div class="tw"><table>
+    <thead><tr><th>你想要的</th><th>用哪个名字</th><th>效果</th></tr></thead>
+    <tbody>
+      <tr><td>让 CPA 自动挑最好的站</td><td class="m">claude-opus-5（原名）</td><td>按 priority 轮询全部 12 站</td></tr>
+      <tr><td>指名 agentrouter</td><td class="m">AGR/claude-opus-5</td><td>只落 agentrouter 那 7 条</td></tr>
+      <tr><td>指名 kktoken</td><td class="m">KKT/claude-opus-5</td><td>只落 kktoken 那 5 条</td></tr>
+      <tr><td>兼容旧客户端（用 ANT/...）</td><td class="m">ANT/claude-opus-5（别名）</td><td>同原名轮询</td></tr>
+    </tbody>
+  </table></div>
+
+  <p><b>三个名字同一条链路、同一套 headers、同一个成功率。</b>原名一直在，
+  不会因为改 prefix 而消失 —— <code>applyModelPrefixes</code>
+  （<code>service_models.go:576-616</code>）的 <code>forceModelPrefix</code>
+  判断保证了这点。</p>
+
+  <h3>站级前缀自动分配</h3>
+  <div class="tw"><table>
+    <thead><tr><th>域名</th><th>前缀</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>agentrouter.org</td><td class="m">AGR</td><td>沿用你手工定的值</td></tr>
+      <tr><td>api.zzzcoding.org</td><td class="m">ZZZ</td><td>沿用你手工定的值</td></tr>
+      <tr><td>ai.hybgzs.com</td><td class="m">HYB</td><td rowspan="12">按域名生成，幂等</td></tr>
+      <tr><td>anyrouter.top</td><td class="m">ANY</td></tr>
+      <tr><td>api.123nhh.com</td><td class="m">N123</td></tr>
+      <tr><td>api.facai.cloudns.org</td><td class="m">FAC</td></tr>
+      <tr><td>api.justwoker.icu</td><td class="m">JUS</td></tr>
+      <tr><td>chiangma.com</td><td class="m">CHI</td></tr>
+      <tr><td>gorouter.app</td><td class="m">GOR</td></tr>
+      <tr><td>kktoken.cc</td><td class="m">KKT</td></tr>
+      <tr><td>muyuan.do</td><td class="m">MUY</td></tr>
+      <tr><td>runanytime.hxi.me</td><td class="m">RUN</td></tr>
+      <tr><td>sub.100xlabs.space</td><td class="m">N100</td></tr>
+      <tr><td>tabitoken.com</td><td class="m">TAB</td></tr>
+    </tbody>
+  </table></div>
+
+  <p><code>N123</code> / <code>N100</code> 前面那个 N 是必需的：数字开头的模型名
+  在部分客户端里会被当数值解析。规则写死在代码里，同一个域名永远得到同一个前缀（幂等）。
+  撞车时加序号。你手工定的值会被尊重，工具不动。</p>
+
+  <h3>段级别名可选</h3>
+  <p>补 <code>models[].alias: ANT/&lt;原名&gt;</code> 会让每个模型多一行，
+  config.yaml 明显变长。119 个条目里模型数最多的是 chiangma compat 段（64 个模型），
+  那一个 provider 就多 64 行。</p>
+
+  <p>这是保留 <code>ANT/xxx</code> 可用性的必然代价。
+  <code>--keep-section-prefix</code> 开关控制要不要补。
+  如果确认没有客户端在用 <code>ANT/...</code> 这类名字，可以关掉，config 保持干净。</p>
+
+  <div class="note">
+    <div class="t">为什么段级别名必须走 alias 而不是 prefix</div>
+    <p>一个条目的 <code>prefix</code> 字段只能填一个值，站级占用了它。
+    CPA 的 <code>compileAPIKeyModelAliasForModels</code>
+    （<code>conductor_models.go:656-682</code>）会把 alias 与 name 双向注册进查表，
+    所以 <code>ANT/xxx</code> 照样能命中。</p>
   </div>
 </div></section>
 
