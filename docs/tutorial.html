@@ -361,6 +361,117 @@ footer code{background:none;padding:0}
   是<b>主机</b>的属性，换 Key 不会变；而凭证有效性是 <b>Key</b> 的属性。
   所以同主机第 2 个 Key 起只打一次基线，不重跑后三阶段。</figcaption>
   </figure>
+
+  <h3>探测发的请求不是「裸请求」：参数分三层</h3>
+  <p>常见的疑问是「会不会因为代理或头没配对，把好站判死」。答案分三层看 ——
+     每层的取舍不同，而<b>第一层是不给选择的</b>。</p>
+
+  <figure>
+  <svg viewBox="0 0 940 320" role="img"
+       aria-label="探测参数的三层结构：第一层 baseline 无条件带齐 CPA 真实转发的鉴权头与路径；第二层画像梯在被拒后由省到全逐档升级；第三层代理仅在判定为 IP 封或边缘拦截时触发且需先预检">
+    <defs>
+      <marker id="arL3" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="#6B7C8E"/>
+      </marker>
+    </defs>
+    <g font-size="12.5">
+      <!-- 第一层 -->
+      <rect x="14" y="14" width="912" height="96" rx="9"
+            fill="#EAF6EE" stroke="#2F7D52" stroke-width="1.8"/>
+      <text x="30" y="38" font-weight="700" fill="#2F7D52">第一层 · baseline 无条件带齐</text>
+      <text x="30" y="58" font-size="11.5" fill="#3F5061">
+        这些是 CPA 真实转发时一定会发的 —— 缺一个就是在测另一条路，而不是测这个站
+      </text>
+      <g font-family="var(--f-mono)" font-size="11">
+        <text x="30" y="80">gemini</text>
+        <text x="104" y="80" fill="#0F6E8C">x-goog-api-key</text>
+        <text x="250" y="80" fill="#8A6B2E">（走头，不是 ?key=）</text>
+        <text x="30" y="98">claude</text>
+        <text x="104" y="98" fill="#0F6E8C">Authorization + x-api-key + anthropic-version</text>
+        <text x="480" y="98" fill="#8A6B2E">URL 带 ?beta=true</text>
+        <text x="640" y="80">codex / compat</text>
+        <text x="760" y="80" fill="#0F6E8C">Authorization</text>
+      </g>
+
+      <!-- 箭头 -->
+      <path d="M470,112 L470,132" stroke="#6B7C8E" stroke-width="1.5"
+            marker-end="url(#arL3)"/>
+      <text x="484" y="127" font-size="11" fill="#6B7C8E">被拒才往下</text>
+
+      <!-- 第二层 -->
+      <rect x="14" y="136" width="912" height="90" rx="9"
+            fill="#E4F0F4" stroke="#0F6E8C" stroke-width="1.8"/>
+      <text x="30" y="160" font-weight="700" fill="#0F6E8C">第二层 · 画像梯逐档升级（25 档 / 四段）</text>
+      <text x="30" y="180" font-size="11.5" fill="#3F5061">
+        由省到全，第一个通过的档即最小必需集。<tspan font-weight="600">刻意不一次上全量</tspan> ——
+        那样虽然更容易通，却不知道哪几个头是必需的
+      </text>
+      <g font-family="var(--f-mono)" font-size="11" fill="#0F6E8C">
+        <text x="30" y="204">baseline</text>
+        <text x="108" y="204">→ cc-min</text>
+        <text x="188" y="204">→ cc-std</text>
+        <text x="268" y="204">→ cc-full</text>
+        <text x="352" y="204">→ +body</text>
+        <text x="424" y="204">→ browser-ua</text>
+      </g>
+      <text x="540" y="204" font-size="11" fill="#8A6B2E">
+        config.yaml 里 headers 越少越稳：站方改门禁时越不容易整体失效
+      </text>
+
+      <path d="M470,228 L470,248" stroke="#6B7C8E" stroke-width="1.5"
+            marker-end="url(#arL3)"/>
+
+      <!-- 第三层 -->
+      <rect x="14" y="252" width="912" height="56" rx="9"
+            fill="#FFF6E5" stroke="#8A6B2E" stroke-width="1.8"/>
+      <text x="30" y="276" font-weight="700" fill="#8A6B2E">第三层 · 代理（条件触发 + 先预检）</text>
+      <text x="30" y="296" font-size="11.5" fill="#3F5061">
+        只在判定为「IP封 / 边缘」时才试，且<tspan font-weight="600">先探代理自己通不通</tspan> ——
+        否则代理挂了会被记成「这个站不行」
+      </text>
+    </g>
+  </svg>
+  <figcaption>第一层不给选择（缺了就是测错了对象），第二层刻意分档（要找最小必需集），
+  第三层条件触发（避免把代理故障记到站头上）。</figcaption>
+  </figure>
+
+  <div class="note b">
+    <div class="t">第一层的每一条都是踩坑改出来的</div>
+    <p>· <b>gemini 用头不用 <code>?key=</code></b> —— 2026-09-01 实测：用 query
+       string 时某站三种画像全部连接层失败（000），而用头能拉到几百个模型。
+       探测测的不是 CPA 真实走的那条路，于是<b>把一个可用站判死</b>。</p>
+    <p>· <b>claude 两个鉴权头都发</b> —— 中转站实现不一，只发一个可能误判 401。</p>
+    <p>· <b>claude URL 带 <code>?beta=true</code></b> —— CPA 三条 claude 路径全都带。
+       原来不带的理由是「少一个变量」，但那让探测与真实转发形态不一致：站方按
+       query 参数分流时，探测通了而 CPA 不通，或反之。
+       <b>对齐优先于减少变量</b> —— 探测要问的是「CPA 这样发通不通」。</p>
+  </div>
+
+  <h3>仍会误判的四种情形</h3>
+  <p>说清边界比声称「不会误判」有用：</p>
+  <table>
+    <thead><tr><th style="width:210px">情形</th><th style="width:180px">现象</th><th>出路</th></tr></thead>
+    <tbody>
+      <tr><td>站方要真实客户端的<b>请求体</b>字段</td><td>25 档全过不了</td>
+        <td>claude 段设 <code>fingerprint-profile: claude-code-cli</code> 让 CPA 补；
+            其余三段配置层无解</td></tr>
+      <tr><td>分组<b>限时段</b></td><td>窗口外一律 403</td>
+        <td>已单独判为「时段」类而非「不可用」，并标出窗口</td></tr>
+      <tr><td>探测时<b>刚好余额不足</b></td><td>判「余额」</td>
+        <td>充值后重探。这一类不是误判，是时点事实</td></tr>
+      <tr><td>要的头<b>不在 25 档里</b></td><td>整梯全败</td>
+        <td>单站诊断看每档正文摘要；确知能用就人工接管</td></tr>
+    </tbody>
+  </table>
+  <div class="note w">
+    <div class="t">最后一种是根本限制</div>
+    <p>25 档来自实测积累，<b>不可能穷尽所有站方的门禁规则</b>。所以留了两个人工
+       出口：单站诊断（看每档报什么）与人工接管（你确知能用就填模型清单）。</p>
+    <p>换个说法：<b>baseline 那一层不会因为我们少发头而误判</b>（该发的都发了），
+       但<b>画像梯之外的门禁我们测不出来</b>。前者是「我们没犯错」，
+       后者是「我们的知识有边界」—— 两件事不该混为一谈。</p>
+  </div>
 </div></section>
 
 <section id="s4"><div class="wrap">
@@ -925,12 +1036,6 @@ footer code{background:none;padding:0}
   <figure>
   <svg viewBox="0 0 900 240" role="img"
        aria-label="站级并发与段级并发的两层结构，以及按站段分桶的节流">
-    <defs>
-      <marker id="a75" viewBox="0 0 10 10" refX="9" refY="5"
-              markerWidth="6" markerHeight="6" orient="auto">
-        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
-      </marker>
-    </defs>
 
     <text x="12" y="20" font-size="12.5" font-weight="600">站级并发（按 cgroup 推荐）</text>
     <g font-size="11.5">
