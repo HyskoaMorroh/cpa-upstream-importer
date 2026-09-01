@@ -45,6 +45,7 @@ const S = {
   reuseSeen: null,      // 已计数过的 shape-reused 事件键（防重拉重复累加）
   diagYaml: null,       // 诊断结果的 YAML 片段 {段: 文本}。不进 HTML 属性
   keepOpen: '',         // 重渲染后要重新展开哪个 headers 编辑器（pk(host,sec)）
+  parsedValid: 0,       // 上次解析出的有效行数。决定「开始探测」能不能点
 };
 
 const pk = (host, sec) => `${host}\u0000${sec}`;
@@ -428,9 +429,24 @@ async function doParse() {
       </tr></thead>
       <tbody>${rows}${bad}</tbody></table></div>`;
   $('#pparse').hidden = false;
-  $('#btnprobe').disabled = d.valid.length === 0;
+  S.parsedValid = d.valid.length;
+  syncProbeBtn();
   $('#parsemsg').textContent = d.valid.length
     ? `${d.valid.length} 行可探测 · ${hosts.length} 个主机` : '没有有效行';
+}
+
+// 「开始探测」什么时候能点。
+//
+// 两种情形都成立，不能只看有没有粘贴账号：
+//   · 增量模式 —— 必须有有效行，否则没东西可探
+//   · 全量重探 —— **不需要新账号**。「只体检既有站，不加新的」是常见需求
+//     （config.yaml 用久了想复核哪些还能用），后端 _api_probe 早就支持
+//     （`not res.valid and not full_redetect` 才拒绝），但前端按钮一直卡着
+//     「解析出有效行」这一个条件，于是那条路点不进去。
+function syncProbeBtn() {
+  const full = $('#o_full_redetect') && $('#o_full_redetect').checked;
+  const hasRows = (S.parsedValid || 0) > 0;
+  $('#btnprobe').disabled = !(hasRows || full);
 }
 
 // ── 全量重探勾选框交互 ──
@@ -438,17 +454,30 @@ $('#o_full_redetect').addEventListener('change', (e) => {
   const checked = e.target.checked;
   $('#o_max_workers_row').hidden = !checked;
   $('#full_redetect_warning').hidden = !checked;
+  // 勾上就能点「开始探测」，哪怕输入框是空的 —— 「只体检既有站」是独立需求
+  syncProbeBtn();
 
+  const box = $('#existing_count_text');
   if (checked) {
-    // 获取既有站数量
-    api('/api/context').then(ctx => {
-      const existingCount = ctx.existing_count || 0;
-      S.existingCount = existingCount;
-      $('#existing_count_text').textContent = existingCount > 0
-        ? `config.yaml 中有 ${existingCount} 个既有站。`
-        : '未检测到既有站（config.yaml 可能为空）。';
+    const n = S.ctx && S.ctx.existing_count;
+    if (n != null) {
+      // /api/context 在启动时已经拉过，直接用 —— 少一次请求，也避免
+      // 勾选后要等网络才显示数字
+      box.textContent = n > 0
+        ? `config.yaml 中有 ${n} 个既有条目。留空上面的输入框即可「只体检既有站」。`
+        : '未检测到既有条目（config.yaml 可能为空）。';
+      S.existingCount = n;
+      return;
+    }
+    api('/api/context').then((ctx) => {
+      S.ctx = ctx;
+      const c = ctx.existing_count || 0;
+      S.existingCount = c;
+      box.textContent = c > 0
+        ? `config.yaml 中有 ${c} 个既有条目。留空上面的输入框即可「只体检既有站」。`
+        : '未检测到既有条目（config.yaml 可能为空）。';
     }).catch(() => {
-      $('#existing_count_text').textContent = '无法读取既有站数量。';
+      box.textContent = '无法读取既有条目数量。';
     });
   }
 });
@@ -594,16 +623,25 @@ function yamlHeaders(h, baseUrl) {
 $('#btnprobe').onclick = async () => {
   const fullRedetect = $('#o_full_redetect').checked;
 
-  // 全量重探确认
+  // 全量重探确认。文案按「有没有同时加新站」分开 —— 两种情形的影响面不同，
+  // 用同一句话会让「只体检既有站」看起来也在往里加东西。
   if (fullRedetect) {
-    const existingCount = S.existingCount || 0;
-    const confirmMsg = existingCount > 0
-      ? `即将重新探测所有 ${existingCount} 个既有站，\n与新站一起重新生成配置（headers/代理/优先级/前缀全部更新）。\n\n预计耗时 5-8 分钟，是否继续？`
-      : `全量重探模式已开启，但未检测到既有站。\n\n是否仅探测新站？`;
-
-    if (!confirm(confirmMsg)) {
+    const n = S.existingCount || 0;
+    const newRows = S.parsedValid || 0;
+    if (!n && !newRows) {
+      alert('config.yaml 里没有既有条目，输入框也是空的 —— 没有可探测的对象。');
       return;
     }
+    let msg;
+    if (!newRows) {
+      msg = `只体检既有条目：重新探测 ${n} 个，按结果重新生成 `
+        + `headers / 代理 / 优先级 / 前缀。\n\n不会新增任何站。\n\n`
+        + `写回前会给出完整 diff 供逐项确认。是否开始？`;
+    } else {
+      msg = `重新探测 ${n} 个既有条目，并与本次新增的 ${newRows} 行一起`
+        + `重新生成配置。\n\n写回前会给出完整 diff 供逐项确认。是否开始？`;
+    }
+    if (!confirm(msg)) return;
   }
 
   const body = {
