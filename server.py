@@ -455,6 +455,9 @@ def _same_secret(a: str, b: str) -> bool:
 class Handler(BaseHTTPRequestHandler):
     server_version = "cpa-upstream-importer/1.0"
     cfg_path = ""
+    # CLIProxyAPI 源码根。给了就能精确核对画像梯是否随 CPA 升级而过期
+    # （见 cpa_source_probe）。容器里默认没有 —— 只挂了 config.yaml。
+    cpa_source_root = ""
     token = ""
     # 容器里 config.yaml 是单文件挂载，同目录不可写 —— 备份要落到另一个卷
     backup_dir = ""
@@ -849,6 +852,13 @@ class Handler(BaseHTTPRequestHandler):
         # 容器里 os.cpu_count() 是宿主机核数，必须读 cgroup —— 见 resources 模块。
         res = cp.detect_resources()
 
+        # 画像基线漂移：CPA 升级换了默认头而画像梯没跟上时，探测发的形态就与
+        # CPA 实际转发的不一致 —— 那会让「探测通了但 CPA 不通」或反之。
+        # 优先读 CPA 源码（能区分有条件/无条件 beta），读不到退回 config.yaml
+        # 的 header-defaults。两条都不成立时明确报「无法核对」，不假装检查过。
+        drift = cp.check_profile_drift(
+            source_root=type(self).cpa_source_root, cfg=cfg)
+
         self._json(200, {
             "config_path": type(self).cfg_path,
             "lines": raw.count("\n") + 1,
@@ -857,6 +867,7 @@ class Handler(BaseHTTPRequestHandler):
             "section_order": list(cp.SECTIONS),
             "existing_count": existing_count,
             "resources": res.as_dict(),
+            "profile_drift": drift,
         })
 
     def _api_parse(self, body: dict) -> None:
@@ -1270,6 +1281,11 @@ def main() -> None:
                     help="CPA 管理端点。写回后自动 PUT 到这里触发重载 —— "
                          "CPA 的 fsnotify 收不到单文件挂载的外部写入。"
                          "容器内默认取 CPA_UPSTREAM_URL（compose 已设服务名）")
+    ap.add_argument("--cpa-source",
+                    default=os.environ.get("CPA_SOURCE_ROOT", ""),
+                    help="CLIProxyAPI 源码根目录。给了才能精确核对画像梯是否"
+                         "随 CPA 升级过期；不给则退回读 config.yaml 的 "
+                         "claude-header-defaults（覆盖面小）")
     ap.add_argument("--no-cpa-key", action="store_true",
                     help="不接受 CPA 管理密钥登录，只认本服务的 token")
     args = ap.parse_args()
@@ -1286,6 +1302,7 @@ def main() -> None:
     Handler.backup_dir = args.backup_dir
     Handler.accept_cpa_key = not args.no_cpa_key
     Handler.cpa_url = args.cpa_url
+    Handler.cpa_source_root = args.cpa_source
 
     cpa_hash = Handler._cpa_mgmt_hash()
     try:

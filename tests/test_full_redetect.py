@@ -578,7 +578,136 @@ def test_profile_verdict_reuse_saves_calls():
           f"（省 {saved_pct:.0f}%）")
 
 
+def test_profile_drift_detection():
+    """画像基线漂移检测：能解析 Go 常量、能报差异、读不到源码时不假装检查过。"""
+    import tempfile
+    from cpa_probe import cpa_source_probe as csp
+
+    # ── 造一份假的 CPA 源码 ──
+    root = tempfile.mkdtemp(prefix="fake-cpa-")
+    gd = os.path.join(root, "internal", "runtime", "executor")
+    os.makedirs(gd, exist_ok=True)
+
+    import io as _io
+    with _io.open(os.path.join(gd, "claude_executor_request.go"), "w",
+                  encoding="utf-8") as f:
+        f.write('''package executor
+
+const (
+	claudeCodeBeta          = "claude-code-20250219"
+	claudeOAuthBeta         = "oauth-2025-04-20"
+	claudeMidConvSystemBeta = "mid-conversation-system-2026-04-07"
+	claudeEffortBeta        = "effort-2025-11-24"
+	claudeNewThingBeta      = "brand-new-2026-12-31"
+)
+
+var claudeCodeCLIConstantBetas = []string{
+	"interleaved-thinking-2025-05-14",
+	claudeRedactThinkingBeta,   // 常量名，但本文件没定义 → 应被跳过
+	"context-management-2025-06-27",
+}
+''')
+    with _io.open(os.path.join(gd, "codex_executor_request.go"), "w",
+                  encoding="utf-8") as f:
+        f.write('''package executor
+
+const (
+	codexUserAgent = "codex-tui/9.9.9 (Test) fake"
+	codexOriginator = "codex-tui"
+)
+''')
+
+    ident = csp.extract(root)
+    assert ident.ok, f"应能解析，errors={ident.errors}"
+
+    # 无条件序列：claudeCodeBeta + 切片(跳过未定义常量) + midconv + effort
+    assert ident.claude_betas_unconditional == [
+        "claude-code-20250219",
+        "interleaved-thinking-2025-05-14",
+        "context-management-2025-06-27",
+        "mid-conversation-system-2026-04-07",
+        "effort-2025-11-24",
+    ], ident.claude_betas_unconditional
+
+    # 有条件的要被单独归类（oauth 在这一类，因为 CPA 只在 oauthToken 时发）
+    assert ident.claude_betas_conditional.get("claudeOAuthBeta") == "oauth-2025-04-20"
+
+    assert ident.codex_user_agent == "codex-tui/9.9.9 (Test) fake"
+    assert ident.codex_originator == "codex-tui"
+
+    # 与真实画像梯比对：假源码里有 brand-new，画像梯没有 → 但它不在无条件
+    # 序列里（没被 append），所以不该报「少发」
+    drifts = csp.compare(ident)
+    whats = " ".join(d.what for d in drifts)
+    assert "brand-new" not in whats, "不在无条件序列里的 beta 不该被要求"
+
+    # ── 读不到源码时不能假装检查过 ──
+    r = csp.check(source_root=os.path.join(root, "nope"), cfg=None)
+    assert r["checked"] is False, r
+    assert r["why"], "必须说明为什么没核对"
+
+    # ── 退回 config.yaml 那条路 ──
+    # 用一个与内置常量必然不同的值：检测的是「CPA 侧更新了而抄录的常量没跟上」，
+    # 不是拿运行时派生值自比（那样永远相等，等于没检查）。
+    from cpa_probe import profiles as _pf
+    r2 = csp.check(source_root="", cfg={
+        "claude-header-defaults": {"os": _pf._CC_OS_DEFAULT + "-NEW"}
+    })
+    assert r2["checked"] is True and r2.get("partial") is True, r2
+    assert r2["uncovered"], "必须写明哪些没覆盖到"
+    assert any("x-stainless-os" in d["what"] for d in r2["drifts"]), r2["drifts"]
+    # 这类差异不影响当前探测（会用配置里的新值），所以是 info 而非 warn
+    assert all(d["severity"] == "info" for d in r2["drifts"]), r2["drifts"]
+
+    # 配置与内置常量一致时不该报漂移
+    r3 = csp.check(source_root="", cfg={
+        "claude-header-defaults": {"os": _pf._CC_OS_DEFAULT}
+    })
+    assert not r3["drifts"], r3["drifts"]
+
+    print(f"[OK] Drift detection: 解析 {len(ident.claude_betas_unconditional)} 项"
+          f"无条件 + {len(ident.claude_betas_conditional)} 项有条件；"
+          f"未核对与部分核对都有明确标记")
+
+
+def test_profile_matches_real_cpa_source():
+    """如果本机有 CPA 源码，画像梯必须与它一致（无 warn 级漂移）。
+
+    源码不在时跳过 —— 这一项是给开发机与 CI 的，不是运行前提。
+    """
+    from cpa_probe import cpa_source_probe as csp
+
+    candidates = [
+        os.path.expanduser("~/OneDrive/Desktop/CLIProxyAPI-main"),
+        os.path.join(os.path.dirname(ROOT), "CLIProxyAPI-main"),
+        os.path.join(os.path.dirname(ROOT), "CLIProxyAPI"),
+    ]
+    root = next((c for c in candidates if os.path.isdir(c)), "")
+    if not root:
+        print("[skip] Real CPA source not found")
+        return
+
+    ident, drifts = csp.report(root)
+    if not ident.ok:
+        print(f"[skip] 解析不了 {root}：{ident.errors}")
+        return
+
+    warns = [d for d in drifts if d.severity == "warn"]
+    detail = "; ".join(f"{d.what}（{d.note}）" for d in warns)
+    assert not warns, f"画像梯与 CPA 源码有 {len(warns)} 处漂移：{detail}"
+
+    print(f"[OK] Real CPA source: {len(ident.claude_betas_unconditional)} 项"
+          f"无条件 beta 全部对齐，无 warn 级漂移")
+
+
 if __name__ == "__main__":
+    # Windows 控制台默认 GBK，打不出 ✗。与 tests/run.py 同一套处理。
+    for _st in (sys.stdout, sys.stderr):
+        try:
+            _st.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     # 与其余套件同一套汇报约定：run.py 按「全部通过 · N 项」这行统计，
     # 失败行以 ✗ 开头。自己 print [OK] 不会被计入总数。
     CASES = [
@@ -592,6 +721,8 @@ if __name__ == "__main__":
         ("凭据去重", test_credential_dedup),
         ("探测文本非问候", test_probe_text_not_trivial),
         ("画像结论复用省请求", test_profile_verdict_reuse_saves_calls),
+        ("画像漂移检测", test_profile_drift_detection),
+        ("画像梯对齐真实 CPA 源码", test_profile_matches_real_cpa_source),
     ]
 
     ok = 0

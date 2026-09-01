@@ -114,7 +114,56 @@ async function boot() {
     `${S.ctx.lines.toLocaleString()} 行 · ${entries} 条目`;
   renderBands();
   applyResources();
+  renderDrift();
   updateBudget();
+}
+
+// ── 画像基线漂移 ──
+// CPA 升级换了默认头而画像梯没跟上时，探测发的形态与 CPA 实际转发的不一致，
+// 「探测通了但 CPA 不通」或反之都会发生。这里把核对结果显示出来 ——
+// 包括「没能核对」这一种，那比让人以为全都比过了要好。
+function renderDrift() {
+  const box = $('#driftbox');
+  if (!box) return;
+  const d = S.ctx && S.ctx.profile_drift;
+  if (!d) { box.hidden = true; return; }
+
+  if (!d.checked) {
+    box.className = 'note';
+    box.innerHTML = `<b>画像基线未核对。</b>${esc(d.why || '')}`;
+    box.hidden = false;
+    return;
+  }
+
+  const warns = (d.drifts || []).filter((x) => x.severity === 'warn');
+  const infos = (d.drifts || []).filter((x) => x.severity !== 'warn');
+
+  if (!d.drifts.length) {
+    box.className = 'note g';
+    let t = `<b>画像基线一致</b>（依据：${esc(d.source)}）`;
+    if (d.partial) {
+      t += `。未覆盖：${esc((d.uncovered || []).join('、'))}`;
+    }
+    box.innerHTML = t;
+    box.hidden = false;
+    return;
+  }
+
+  box.className = warns.length ? 'note w' : 'note';
+  const rows = d.drifts.map((x) => {
+    const mark = x.severity === 'warn' ? '⚠' : '·';
+    const note = x.note ? `<div class="hint" style="margin-left:1.4em">${esc(x.note)}</div>` : '';
+    return `<div>${mark} ${esc(x.what)}：画像梯 <code>${esc(x.ours)}</code>`
+      + ` · CPA <code>${esc(x.theirs)}</code></div>${note}`;
+  }).join('');
+  box.innerHTML =
+    `<b>画像基线漂移 ${d.drifts.length} 处</b>`
+    + (warns.length ? `（${warns.length} 处需处理）` : '')
+    + `（依据：${esc(d.source)}）`
+    + `<div style="margin-top:6px">${rows}</div>`
+    + `<div class="hint" style="margin-top:6px">漂移意味着探测发的形态与 CPA `
+    + `实际转发的不一致 —— 可能出现「探测通了但 CPA 不通」或反之。</div>`;
+  box.hidden = false;
 }
 
 // ── 运行环境与推荐并发 ──
