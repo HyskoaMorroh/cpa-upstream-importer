@@ -162,9 +162,14 @@ def section_allows(section: str, name: str) -> bool:
 # `k?` 捕获 kimi 的 `k2` / `k3` 形态 —— 那个 k 属于系列名而非版本号，
 # 要留在系列里，否则 `kimi-k2` 与 `kimi-2` 会被并成一个系列。
 #
-# 负向断言挡住 `gpt-4o`（4 后面紧跟 o）与 `gpt-oss-120b`（120 后面紧跟 b）——
-# 那两个不是「版本 4」和「版本 120」，整名就是系列名。
-_VERSION_RE = re.compile(r"(?<![A-Za-z0-9.])(k?)(\d+(?:[.\-]\d+)*)(?![A-Za-z0-9])")
+# `o?` 捕获 OpenAI 的 `4o` 形态（2026-09-02 补）。原来的负向断言把 `4o` 整个
+# 排除在版本之外，于是 `gpt-4o` 自成一系、永远不被 `gpt-5.6` 淘汰 ——
+# 现场截图里 codex 段勾着 gpt-4o 就是这个原因。`o` 是「omni」的代号后缀，
+# 不是新的产品线：`gpt-4o` 与 `gpt-5.6` 同属 gpt 线，只是世代不同。
+#
+# `-oss-120b` 那类仍被排除：120 后面紧跟 b，不匹配 `o?(?![A-Za-z0-9])`。
+_VERSION_RE = re.compile(
+    r"(?<![A-Za-z0-9.])(k?)(\d+(?:[.\-]\d+)*)(o?)(?![A-Za-z0-9])")
 
 
 def series_and_version(name: str) -> tuple[str, tuple[int, ...] | None]:
@@ -172,10 +177,11 @@ def series_and_version(name: str) -> tuple[str, tuple[int, ...] | None]:
 
         gpt-5.6-sol      → ("gpt-*-sol", (5, 6))
         gpt-5.7-sol      → ("gpt-*-sol", (5, 7))     同系列，版本更高
+        gpt-4o           → ("gpt-*", (4,))           o 是代号后缀，不是新系列
         claude-opus-5    → ("claude-opus-*", (5,))
         claude-opus-4-8  → ("claude-opus-*", (4, 8))  同系列，版本更低
         kimi-k3          → ("kimi-k*", (3,))
-        gpt-4o           → ("gpt-4o", None)           没有可比版本，自成一系
+        o1               → ("o1", None)              整名就是系列名
     """
     n = bare_name(name)
     m = _VERSION_RE.search(n)
@@ -187,6 +193,79 @@ def series_and_version(name: str) -> tuple[str, tuple[int, ...] | None]:
     except ValueError:
         return n, None
     return series, nums
+
+
+# 世代比较只取版本号的**前两位**（主.次）。
+#
+# 为什么必须截断（2026-09-02 实测）：`claude-haiku-4-5-20251001` 解析出
+# (4, 5, 20251001)，而 `claude-opus-5` 是 (5,)。逐位比较时 (4,5,20251001)
+# 与 (5,) 比第一位就分出胜负 —— 那一步是对的；但同产品线内
+# `claude-haiku-4-5-20251001` (4,5,20251001) 与假想的 `claude-haiku-4-5`
+# (4,5) 比时，日期戳会让带戳的那个「更新」，而它们其实是同一款。
+#
+# 取前两位后 (4,5,20251001) 与 (4,5) 相等，两个都保留 —— 那正是想要的：
+# 同一世代的不同写法都留下，让 CPA 自己去匹配。
+#
+# 缺位补 0：`claude-opus-5` (5,) → (5, 0)，于是 `claude-opus-5-1` (5,1) 更新。
+# 这与语义一致 —— 5.1 是 5 的后续小版本。
+def generation(version: tuple[int, ...] | None) -> tuple[int, int] | None:
+    """版本元组 → 可比较的世代 (主, 次)。None 表示无从比较。"""
+    if not version:
+        return None
+    padded = (version + (0, 0))[:2]
+    return (padded[0], padded[1])
+
+
+def newest_generation_per_line(names: list[str]) -> list[str]:
+    """每条产品线只留**最高世代**，该世代的所有变体全部保留。
+
+    这是用户 2026-09-02 规则的准确形态，`newest_per_series` 不够：
+
+        目录 = gpt-4o, gpt-5.1, gpt-5.5, gpt-5.6-luna, gpt-5.6-terra
+
+    按「系列」分组时 `gpt-5.5` 的系列是 `gpt-*`，而 luna / terra 各自是
+    `gpt-*-luna` / `gpt-*-terra` —— 三个独立系列，5.5 没有对手所以留下；
+    `gpt-4o` 更直接：旧正则不认 `4o` 是版本，它自成一系永远保留。
+    现场截图里 codex 段勾着 gpt-4o 与 gpt-5.5 就是这两件事叠加。
+
+    按「产品线」分组则四个都在 `gpt` 线上，最高世代 (5,6) →
+    只留 gpt-5.6-luna / gpt-5.6-terra，4o / 5.1 / 5.5 全丢。
+
+    产品线内无任何可比版本时（全是 `o1` 这种）整组保留 —— 无从比较不淘汰。
+    顺序按输入首次出现，保证同一批输入两次运行结果一致（diff 可复核）。
+    """
+    groups: dict[str, list[str]] = {}
+    order: list[str] = []
+    for n in names:
+        if not n:
+            continue
+        line = _product_line(n)
+        if line not in groups:
+            groups[line] = []
+            order.append(line)
+        groups[line].append(n)
+
+    keep: set[str] = set()
+    for line in order:
+        items = groups[line]
+        gens = [generation(series_and_version(x)[1]) for x in items]
+        known = [g for g in gens if g is not None]
+        if not known:
+            keep.update(items)          # 整组都认不出版本 —— 全留
+            continue
+        top = max(known)
+        for x, g in zip(items, gens):
+            if g == top:
+                keep.add(x)
+    # 按输入顺序输出，不按分组顺序 —— 调用方（rank_models）之后还要排序，
+    # 但保持输入序让「没排序时也可复核」成立。
+    seen: set[str] = set()
+    out: list[str] = []
+    for n in names:
+        if n in keep and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
 
 
 def newest_per_series(names: list[str]) -> list[str]:
@@ -479,7 +558,7 @@ def latest_models(section: str, *, cfg: dict | None = None,
         src.extend(built)
         used.append(f"内置兜底 {len(built)} 个")
 
-    out = newest_per_series(src)
+    out = newest_generation_per_line(src)
     # 排序必须在截取之前。不排的话取前 N 个拿到的是「输入顺序靠前」的那些，
     # 而输入顺序来自 CPA 名录的 JSON 排列 —— 与「哪个模型更该用」无关。
     # 实测 claude 段不排序时前三名是 haiku / sonnet / opus，正好倒过来。
@@ -505,10 +584,17 @@ def latest_models(section: str, *, cfg: dict | None = None,
 # 为什么 `-sol` / `-luna` / `-terra` 也剥掉：那三个是 OpenAI 同一代的三个
 # 变体（同一条产品线），不该占三个轮转位。而 `-high` / `-low` 是 gemini pro
 # 的算力档，同理。
+#
+# 2026-09-02 补：版本 token 加 `o?`（`gpt-4o` → `gpt`），并补上 `-nano`、
+# `-32k`、`-256k`、`-1m`、`-chat`、`-codex`、`-audio-preview` 这几类后缀。
+# 它们都是「同一条线的规格差异」而非独立产品线 —— 不剥的话
+# `gpt-4-32k` 会自成一线，从而躲过「取最高世代」。
 _LINE_STRIP = re.compile(
-    r"(?<![A-Za-z0-9.])k?\d+(?:[.\-]\d+)*(?![A-Za-z0-9])"   # 版本 token
+    r"(?<![A-Za-z0-9.])k?\d+(?:[.\-]\d+)*o?(?![A-Za-z0-9])"   # 版本 token
     r"|-(?:thinking|m-aws|agent|latest|fast|high|low|extra-low"
-    r"|sol|luna|terra|preview|search|customtools|spark|mini|lite)(?=$|[-.])"
+    r"|sol|luna|terra|preview|search|customtools|spark"
+    r"|mini|nano|lite|chat|audio-preview"
+    r"|32k|64k|128k|256k|512k|1m)(?=$|[-.])"
 )
 
 

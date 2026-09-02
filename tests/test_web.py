@@ -163,18 +163,36 @@ def main() -> int:
         # 只取 app.js 里 SECTION_LABEL 之前那段 —— 规则全在那里，
         # 后面的代码碰 DOM，在 node 里跑会崩。
         cut = js.index("const SECTION_LABEL")
-        payload = _json.dumps({"secs": list(_SECS), "models": _SAMPLES})
+        # 每条产品线取最高世代的判据（2026-09-02 从「同系列取最新」改过来）。
+        # key 是标签，值是要喂给两侧的清单 —— 两边跑完逐条比。
+        _GEN_CASES = {
+            # 现场截图那组：gpt-4o 与 gpt-5.5 必须被 5.6 挤掉
+            "shot": ["gpt-4o", "gpt-5.1", "gpt-5.5", "gpt-5.6-luna",
+                     "gpt-5.6-terra"],
+            "gpt": ["gpt-5.6-sol", "gpt-5.7-sol", "gpt-5.6"],
+            "claude": ["claude-opus-4-8", "claude-opus-5"],
+            "kimi": ["kimi-k2", "kimi-k3"],
+            "prefix": ["anthropic/claude-opus-5", "claude-opus-5"],
+            # 日期戳不该让同世代的一款「更新」而挤掉另一款
+            "stamp": ["claude-haiku-4-5", "claude-haiku-4-5-20251001"],
+            # 整组都认不出版本 —— 全留
+            "nover": ["o1", "o3-mini"],
+            # 规格后缀不该自成产品线（32k / nano / codex）
+            "specs": ["gpt-4-32k", "gpt-5.4-nano", "gpt-5.6",
+                      "gpt-5.3-codex", "gpt-5-codex"],
+        }
+        payload = _json.dumps({"secs": list(_SECS), "models": _SAMPLES,
+                               "gen": _GEN_CASES})
         script = js[:cut] + f"""
 const IN = {payload};
-const out = {{allow: {{}}, newest: {{}}}};
+const out = {{allow: {{}}, gen: {{}}, line: {{}}}};
 IN.secs.forEach((s) => {{
   out.allow[s] = IN.models.filter((m) => famOk(s, m));
 }});
-out.newest['gpt'] = newestPerSeries(['gpt-5.6-sol', 'gpt-5.7-sol', 'gpt-5.6']);
-out.newest['claude'] = newestPerSeries(['claude-opus-4-8', 'claude-opus-5']);
-out.newest['kimi'] = newestPerSeries(['kimi-k2', 'kimi-k3']);
-out.newest['prefix'] = newestPerSeries(['anthropic/claude-opus-5', 'claude-opus-5']);
-out.newest['nover'] = newestPerSeries(['gpt-4o', 'gpt-5.6']).sort();
+Object.keys(IN.gen).forEach((k) => {{
+  out.gen[k] = newestGenerationPerLine(IN.gen[k]);
+}});
+IN.models.forEach((m) => {{ out.line[m] = productLine(m); }});
 console.log(JSON.stringify(out));
 """
         r = subprocess.run([node, "-e", script], capture_output=True,
@@ -187,17 +205,12 @@ console.log(JSON.stringify(out));
             for s in _SECS:
                 want = [m for m in _SAMPLES if _mc.section_allows(s, m)]
                 eq(f"{s} 放行集合两侧一致", got["allow"][s], want)
-            eq("同系列取最新 · gpt", got["newest"]["gpt"],
-               _mc.newest_per_series(["gpt-5.6-sol", "gpt-5.7-sol", "gpt-5.6"]))
-            eq("同系列取最新 · claude", got["newest"]["claude"],
-               _mc.newest_per_series(["claude-opus-4-8", "claude-opus-5"]))
-            eq("同系列取最新 · kimi", got["newest"]["kimi"],
-               _mc.newest_per_series(["kimi-k2", "kimi-k3"]))
-            eq("同版本裸名优先", got["newest"]["prefix"],
-               _mc.newest_per_series(["anthropic/claude-opus-5",
-                                      "claude-opus-5"]))
-            eq("无版本互不淘汰", got["newest"]["nover"],
-               sorted(_mc.newest_per_series(["gpt-4o", "gpt-5.6"])))
+            for k, ms in _GEN_CASES.items():
+                eq(f"取最高世代 · {k}", got["gen"][k],
+                   _mc.newest_generation_per_line(ms))
+            # 产品线拆分也要逐条一致 —— 它决定分组，错一个就全错
+            for m in _SAMPLES:
+                eq(f"产品线 · {m}", got["line"][m], _mc._product_line(m))
 
     # ── ③ 响应字段契约 ─────────────────────────────────────────────
     section("③ 前端依赖的响应字段，后端真的会给")
@@ -231,6 +244,27 @@ console.log(JSON.stringify(out));
     # 2026-09-02 现场：漂移检测在 /api/context 的请求路径里拉 GitHub，国内
     # VPS 拉不通时干等 15 秒，而 #gate 与 #app 都 hidden —— 那段时间只有页头，
     # 正文纯空白且没有任何提示，看起来像页面坏了。
+    # ── ③e 目录读不到时后端填的模型必须显示出来 ────────────────────────
+    #
+    # 2026-09-02 现场（截图1）：后端已按「当前市面最新」填了 6 个模型、警告
+    # 文本里也列着那 6 个名字，而那一格只渲染了一个空的手填框 —— 它从
+    # S.forced 取值，而 S.forced 此刻是空的。用户看到空白，且提交时读的正是
+    # S.forced，所以那个段勾上也写不进任何模型。
+    section("③e 无目录时用后端方案填勾选框")
+    truthy("留了 fallback 容器", "cats fallback" in js,
+           "没有容器就没地方填，用户只能看到空手填框")
+    truthy("refreshPlan 用 sp.models 填它",
+           ".cats.fallback" in js and "sp.models.map" in js)
+    truthy("填完立刻回写 S.forced", "S.forced[p.line_no] = S.forced[p.line_no]" in js,
+           "提交时读的是 S.forced 不是 DOM —— 不回写就是「勾着但没接管」")
+    truthy("已有用户记录时不覆盖", "rec !== undefined ? rec : sp.models" in js)
+    truthy("容器已填过就不重填", "!fb.querySelector('.cm')" in js,
+           "每次 refreshPlan 都重填会把用户的取消勾选覆盖掉")
+    truthy("全选/反选/清空按钮跟着出现", "fallback-tools" in js)
+    truthy("placeholder 不再说「手填模型名」",
+           "站方目录也没报模型：手填模型名" not in js,
+           "模型已经填好了，再让用户手填是误导")
+
     # ── ③d weight:0 的措辞必须跟着调度策略变 ─────────────────────────
     #
     # 2026-09-02 核实 CPA 源码：只有 WeightedRoundRobinSelector.Pick 调

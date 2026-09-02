@@ -89,7 +89,9 @@ function defOn(sec, m) {
 }
 
 // 版本 token 与 kimi 的 k 前缀。与 Python 侧 _VERSION_RE 同一个模式。
-const VERSION_RE = /(?:^|[^A-Za-z0-9.])(k?)(\d+(?:[.\-]\d+)*)(?![A-Za-z0-9])/;
+// 版本 token。`k?` 是 kimi 的 k2/k3（属于系列名），`o?` 是 OpenAI 的 4o
+// 代号后缀 —— 与 Python 侧 _VERSION_RE 同一个模式。
+const VERSION_RE = /(?:^|[^A-Za-z0-9.])(k?)(\d+(?:[.\-]\d+)*)(o?)(?![A-Za-z0-9])/;
 
 // 拆成 [系列, 版本数组]。认不出版本时版本为 null。
 function seriesAndVersion(m) {
@@ -97,45 +99,94 @@ function seriesAndVersion(m) {
   const mm = VERSION_RE.exec(n);
   if (!mm) return [n, null];
   // exec 的 index 指向前置分隔符，真正的版本从 mm[1] 起算
-  const start = mm.index + mm[0].length - mm[1].length - mm[2].length;
+  const start = mm.index + mm[0].length - mm[1].length - mm[2].length - mm[3].length;
   const series = n.slice(0, start) + mm[1] + '*' + n.slice(mm.index + mm[0].length);
   const nums = mm[2].split(/[.\-]/).map((x) => parseInt(x, 10));
   if (nums.some((x) => Number.isNaN(x))) return [n, null];
   return [series, nums];
 }
 
-function verGreater(a, b) {
+// 版本数组 → 可比较的世代 [主, 次]。null 表示无从比较。
+// 只取前两位：`claude-haiku-4-5-20251001` 的日期戳不该让它比
+// `claude-haiku-4-5` 更新（同一款）。缺位补 0，于是 5 < 5.1。
+// 与 Python 侧 generation 同一套。
+function generationOf(m) {
+  const [, ver] = seriesAndVersion(m);
+  if (!ver || !ver.length) return null;
+  return [ver[0], ver.length > 1 ? ver[1] : 0];
+}
+
+function genGreater(a, b) {
   if (!a) return false;
   if (!b) return true;
-  for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
-    const x = a[i] === undefined ? -1 : a[i];
-    const y = b[i] === undefined ? -1 : b[i];
-    if (x !== y) return x > y;
-  }
-  return false;
+  if (a[0] !== b[0]) return a[0] > b[0];
+  return a[1] > b[1];
 }
 
-// 同系列只留最新版。与 Python 侧 newest_per_series 同一套判据。
-function newestPerSeries(names) {
-  const best = new Map();
-  const order = [];
+function genEqual(a, b) {
+  if (!a || !b) return a === b;
+  return a[0] === b[0] && a[1] === b[1];
+}
+
+// 产品线：把版本与常见变体后缀剥掉之后剩下的名字。
+// 与 Python 侧 _LINE_STRIP / _product_line 同一套。
+const LINE_STRIP = new RegExp(
+  '(?:^|[^A-Za-z0-9.])k?\\d+(?:[.\\-]\\d+)*o?(?![A-Za-z0-9])'
+  + '|-(?:thinking|m-aws|agent|latest|fast|high|low|extra-low'
+  + '|sol|luna|terra|preview|search|customtools|spark'
+  + '|mini|nano|lite|chat|audio-preview'
+  + '|32k|64k|128k|256k|512k|1m)(?=$|[-.])', 'g');
+
+function productLine(m) {
+  let n = bareName(m);
+  let prev = null;
+  // 反复剥到不动为止 —— gemini-3.1-pro-preview-customtools 要剥三次。
+  // 版本 token 那一支会吃掉前置分隔符，所以剥完要补回一个 `-`，
+  // 否则 `gpt-5.6-luna` 会变成 `gptluna` 而不是 `gpt-luna`。
+  while (n !== prev) {
+    prev = n;
+    n = n.replace(LINE_STRIP, (s) => (/^[^A-Za-z0-9.]/.test(s) ? '-' : ''));
+  }
+  return n.replace(/[-.]{2,}/g, '-').replace(/^[-.]+|[-.]+$/g, '') || bareName(m);
+}
+
+// 每条产品线只留**最高世代**，该世代的所有变体全部保留。
+// 与 Python 侧 newest_generation_per_line 同一套判据。
+//
+// 为什么不是「同系列取最新」（2026-09-02 现场截图）：按系列分组时
+// gpt-5.5 的系列是 `gpt-*`，而 luna / terra 各自是 `gpt-*-luna` /
+// `gpt-*-terra` —— 三个独立系列，5.5 没有对手所以留下；gpt-4o 则因为
+// 旧正则不认 `4o` 是版本而自成一系。两件事叠加就是截图里 codex 段
+// 勾着 gpt-4o 与 gpt-5.5 的原因。
+function newestGenerationPerLine(names) {
+  const groups = new Map();
   (names || []).forEach((n) => {
     if (!n) return;
-    const [series, ver] = seriesAndVersion(n);
-    if (!best.has(series)) { best.set(series, [ver, n]); order.push(series); return; }
-    const [pv, pn] = best.get(series);
-    if (verGreater(ver, pv)) best.set(series, [ver, n]);
-    else if (JSON.stringify(ver) === JSON.stringify(pv)
-             && String(pn).includes('/') && !String(n).includes('/')) {
-      best.set(series, [ver, n]);           // 同版本时裸名优先
-    }
+    const line = productLine(n);
+    if (!groups.has(line)) groups.set(line, []);
+    groups.get(line).push(n);
   });
-  return order.map((s) => best.get(s)[1]);
+  const keep = new Set();
+  groups.forEach((items) => {
+    const gens = items.map(generationOf);
+    const known = gens.filter((g) => g);
+    if (!known.length) { items.forEach((x) => keep.add(x)); return; }
+    let top = known[0];
+    known.forEach((g) => { if (genGreater(g, top)) top = g; });
+    items.forEach((x, i) => { if (genEqual(gens[i], top)) keep.add(x); });
+  });
+  // 按输入顺序输出，保证同一批输入两次运行结果一致（diff 可复核）
+  const seen = new Set();
+  return (names || []).filter((n) => {
+    if (!keep.has(n) || seen.has(n)) return false;
+    seen.add(n);
+    return true;
+  });
 }
 
-// 该段默认勾选哪些：先过段规则，再同系列取最新。
+// 该段默认勾选哪些：先过段规则，再每条产品线取最高世代。
 function pickDefaults(sec, catalog) {
-  return newestPerSeries((catalog || []).filter((m) => defOn(sec, m)));
+  return newestGenerationPerLine((catalog || []).filter((m) => defOn(sec, m)));
 }
 
 const SECTION_LABEL = {
@@ -1391,14 +1442,32 @@ function siteCard(r) {
             <span class="hint">目录 ${cat.length} 个，已勾 <b class="cmn">${picked.size}</b>
               ${cut ? ` · 已滤掉 ${cut} 个不符合本段规则的模型` : ''}</span>
           </div>`
-            : (cut ? `<div class="hint">目录里 ${cut} 个模型都不符合本段规则
-              （跨族、图像/语音/oss，或 gemini 段的非 pro 档）——
-              后端会改用「当前市面最新」清单，勾选即接管</div>` : '')}
+            // 目录读不到（或目录里的名字全被规则滤掉）—— 这里**留一个空容器**，
+            // 由 refreshPlan 用后端方案里的 sp.models 填成勾选框。
+            //
+            // 2026-09-02 现场（截图1）：后端已经按「当前市面最新」填了 6 个模型，
+            // 警告文本里也写着那 6 个名字，而这一格只渲染了一个空的手填框 ——
+            // 它从 S.forced 取值，而 S.forced 此刻是空的。于是用户看到空白，
+            // 而提交时读的正是 S.forced：那个段勾上也写不进任何模型。
+            : `<div class="cats fallback" data-rid="${esc(rid)}"
+                 data-host="${esc(host)}" data-sec="${esc(sec)}"></div>
+               <div class="mtools fallback-tools" hidden>
+                 <button type="button" class="mini cmall" data-rid="${esc(rid)}"
+                   data-host="${esc(host)}" data-sec="${esc(sec)}">全选</button>
+                 <button type="button" class="mini cminv" data-rid="${esc(rid)}"
+                   data-host="${esc(host)}" data-sec="${esc(sec)}">反选</button>
+                 <button type="button" class="mini cmnone" data-rid="${esc(rid)}"
+                   data-host="${esc(host)}" data-sec="${esc(sec)}">清空</button>
+                 <span class="hint">已勾 <b class="cmn">0</b></span>
+               </div>
+               ${cut ? `<div class="hint">站方目录里 ${cut} 个模型都不符合本段规则
+                 （跨族、图像/语音/oss，或 gemini 段的非 pro 档），已全部滤掉 ——
+                 下面这批取自「当前市面最新」</div>` : ''}`}
           <div class="pedit"><input type="text" class="fm" style="width:100%"
             data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}"
             value="${esc(fm)}"
             placeholder="${cat.length ? '也可手填目录外的模型名，逗号分隔'
-              : '站方目录也没报模型：手填模型名，逗号分隔，如 claude-opus-5'}"></div>
+              : '还可手填目录外的模型名，逗号分隔（上面那批已按市面最新填好）'}"></div>
           <div class="hint">工具不会验证这些模型 —— 写错会让 CPA 每次轮到它都失败</div>
         </td>
         <td class="num">${v.max_context_length ? fmt(v.max_context_length) : '—'}
@@ -1789,6 +1858,36 @@ async function refreshPlan(silent) {
       if (!tr) return;
       const inp = tr.querySelector('.pi');
       if (inp && !inp.value) inp.value = sp.priority;
+
+      // 目录读不到的段：把后端方案里的模型填成勾选框。
+      //
+      // 2026-09-02 现场（截图1）：后端已按「当前市面最新」填了 6 个模型、
+      // 警告文本里也列着那 6 个名字，而那一格只有一个空的手填框 —— 它从
+      // S.forced 取值，而 S.forced 此刻是空的。用户看到空白，且提交时读的
+      // 正是 S.forced，所以那个段勾上也写不进任何模型。
+      //
+      // 只在容器空时填一次：用户改过之后不能被覆盖（与目录分支同一条规则）。
+      const fb = tr.querySelector('.cats.fallback');
+      if (fb && !fb.querySelector('.cm') && (sp.models || []).length) {
+        const rec = (S.forced[p.line_no] || {})[sec];
+        const on = new Set(rec !== undefined ? rec : sp.models);
+        fb.innerHTML = sp.models.map((m) => `
+          <label class="catpick"><input type="checkbox" class="cm"
+            data-rid="${esc(p.line_no)}" data-host="${esc(p.host)}"
+            data-sec="${esc(sec)}"
+            value="${esc(m)}"${on.has(m) ? ' checked' : ''}>${esc(m)}</label>`).join('');
+        const tools = tr.querySelector('.mtools.fallback-tools');
+        if (tools) {
+          tools.hidden = false;
+          const n = tools.querySelector('.cmn');
+          if (n) n.textContent = String([...on].filter((m) => sp.models.includes(m)).length);
+        }
+        // 立刻回写 S.forced —— 提交时读的是它，不读 DOM。
+        // 不写的话「界面上勾着、实际没接管」，正是这一轮要修的症状。
+        if (rec === undefined) {
+          (S.forced[p.line_no] = S.forced[p.line_no] || {})[sec] = [...on];
+        }
+      }
       // weight: 0 必须显眼 —— 全量重探会如实把原值搬回来。
       //
       // 但它的**含义取决于 routing.strategy**（2026-09-02 核实 CPA 源码）：

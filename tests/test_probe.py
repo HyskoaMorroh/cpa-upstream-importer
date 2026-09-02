@@ -728,24 +728,53 @@ def test_request() -> None:
         for m in ("gpt-image-2", "gpt-oss-120b", "gpt-oss-20b"):
             eq(f"{sec} 拒非对话 {m}", _mc.section_allows(sec, m), False)
 
-    section("同系列取最新版（旧版不放入）")
-    eq("gpt-5.7 挤掉 gpt-5.6（同一变体线）",
-       _mc.newest_per_series(["gpt-5.6-sol", "gpt-5.7-sol"]), ["gpt-5.7-sol"])
+    section("每条产品线取最高世代（旧世代不放入）")
+    # 2026-09-02 从「同系列取最新」改成「产品线取最高世代」。
+    #
+    # 为什么改（现场截图）：按系列分组时 `gpt-5.5` 的系列是 `gpt-*`，而
+    # luna / terra 各自是 `gpt-*-luna` / `gpt-*-terra` —— 三个独立系列，
+    # 5.5 没有对手所以留下；`gpt-4o` 更直接：旧正则不认 `4o` 是版本，
+    # 它自成一系永远保留。两件事叠加就是 codex 段勾着 gpt-4o 与 gpt-5.5。
+    ngl = _mc.newest_generation_per_line
+    eq("现场截图那组：4o / 5.1 / 5.5 全被 5.6 挤掉",
+       ngl(["gpt-4o", "gpt-5.1", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra"]),
+       ["gpt-5.6-luna", "gpt-5.6-terra"])
+    eq("gpt-5.7 挤掉 gpt-5.6", ngl(["gpt-5.6-sol", "gpt-5.7-sol"]),
+       ["gpt-5.7-sol"])
     eq("opus-5 挤掉 opus-4-8",
-       _mc.newest_per_series(["claude-opus-4-8", "claude-opus-5"]),
-       ["claude-opus-5"])
-    eq("kimi-k3 挤掉 kimi-k2",
-       _mc.newest_per_series(["kimi-k2", "kimi-k3"]), ["kimi-k3"])
-    eq("不同变体线各自保留",
-       _mc.newest_per_series(["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra"]),
-       ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra"])
+       ngl(["claude-opus-4-8", "claude-opus-5"]), ["claude-opus-5"])
+    eq("kimi-k3 挤掉 kimi-k2", ngl(["kimi-k2", "kimi-k3"]), ["kimi-k3"])
+    eq("同世代的所有变体都保留",
+       ngl(["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6"]),
+       ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6"])
+    # 产品线不同就各自留 —— opus / sonnet / fable 是三条线
+    eq("不同产品线互不淘汰",
+       ngl(["claude-opus-5", "claude-sonnet-5", "claude-fable-5"]),
+       ["claude-opus-5", "claude-sonnet-5", "claude-fable-5"])
+    # 日期戳只是同一世代的另一种写法，不该让它挤掉不带戳的那个
+    eq("日期戳不构成更高世代",
+       ngl(["claude-haiku-4-5", "claude-haiku-4-5-20251001"]),
+       ["claude-haiku-4-5", "claude-haiku-4-5-20251001"])
+    # 规格后缀（32k / nano / codex）不该自成产品线从而躲过世代过滤
+    eq("规格后缀不自成产品线",
+       ngl(["gpt-4-32k", "gpt-5.4-nano", "gpt-5.6"]), ["gpt-5.6"])
+    eq("codex 是同一条线上的变体",
+       ngl(["gpt-5-codex", "gpt-5.3-codex"]), ["gpt-5.3-codex"])
+    # 整组都认不出版本 —— 全留，无从比较不淘汰
+    eq("无版本的整组保留", ngl(["o1", "o3-mini"]), ["o1", "o3-mini"])
+    # 4o 现在被识别为世代 (4, 0)，与 5.6 同线可比
+    eq("gpt-4o 被 gpt-5.6 挤掉", ngl(["gpt-4o", "gpt-5.6"]), ["gpt-5.6"])
+    eq("产品线拆分：4o 与 5.6 同线",
+       (_mc._product_line("gpt-4o"), _mc._product_line("gpt-5.6")),
+       ("gpt", "gpt"))
+    # 幂等：同一批输入两次结果一致（diff 要可复核）
+    _batch = ["gpt-5.6", "gpt-4o", "claude-opus-5", "kimi-k3", "gpt-5.5"]
+    eq("幂等", ngl(_batch), ngl(_batch))
+
+    section("同系列取最新版（保留给手填等窄场景）")
     eq("同版本时裸名优先于带前缀的",
        _mc.newest_per_series(["anthropic/claude-opus-5", "claude-opus-5"]),
        ["claude-opus-5"])
-    # 认不出版本的自成一系，永远保留 —— 无从比较就不淘汰
-    eq("gpt-4o 与 gpt-5.6 互不淘汰",
-       sorted(_mc.newest_per_series(["gpt-4o", "gpt-5.6"])),
-       ["gpt-4o", "gpt-5.6"])
 
 
 # ==========================================================================

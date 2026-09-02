@@ -1703,11 +1703,16 @@ claude-api-key:
                                "gpt-5.5", "claude-opus-5"]})
     sp4 = p4.sections["codex-api-key"]
     assert sp4.model_source == "manual", sp4.model_source
-    assert sp4.models == ["gpt-5.6-sol", "gpt-5.5"], sp4.models
+    # gpt-5.5 与 gpt-5.6-sol 同产品线（gpt），5.6 是更高世代 → 5.5 被挤掉。
+    # 2026-09-02 从「同系列取最新」改成「产品线取最高世代」之后才成立：
+    # 按系列分组时 gpt-5.5 的系列是 gpt-*、5.6-sol 是 gpt-*-sol，互不相干。
+    assert sp4.models == ["gpt-5.6-sol"], sp4.models
     d4 = [w for w in sp4.warnings if "已丢弃" in w]
-    assert d4 and "gpt-image-2" in d4[0] and "claude-opus-5" in d4[0], d4
+    assert d4, "手填有丢弃项却没提示"
+    for m in ("gpt-image-2", "gpt-oss-20b", "claude-opus-5", "gpt-5.5"):
+        assert m in d4[0], f"丢弃清单里缺 {m}：{d4[0]}"
 
-    print("[OK] No dead end: 目录全不合规落到市面清单、同系列取最新、"
+    print("[OK] No dead end: 目录全不合规落到市面清单、产品线取最高世代、"
           "手填丢弃项两种情形都有提示")
 
 

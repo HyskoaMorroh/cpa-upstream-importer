@@ -609,7 +609,7 @@ def _clean_override_models(section: str, raw_models: list) -> list[str]:
     warnings 里说明。
     """
     got = [str(m).strip() for m in raw_models if str(m).strip()]
-    kept = cp.model_catalog.newest_per_series(
+    kept = cp.model_catalog.newest_generation_per_line(
         [m for m in got if cp.model_catalog.section_allows(section, m)])
     return kept or got
 
