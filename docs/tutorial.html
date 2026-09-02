@@ -1298,9 +1298,97 @@ footer code{background:none;padding:0}
      （debounce + LoadConfig 与重建的余量）。误报一个可用站的代价是用户把它删掉，
      而这一步只花固定 1.2 秒。</p>
 
+  <h3>一批站不能都拿同一个值</h3>
+  <p>写回落盘后 <code>claude</code> 段 <b>74 个条目全是 175</b>、<code>gemini</code> 段
+     76 个全是 225。根因在 <code>suggest_priority</code> 一次只回答「这一个站该放哪」，
+     而它问的是「<b>当前</b> config.yaml 有哪些空档」—— 整批算完之前那份文件不会变，
+     于是 79 个凭据串行调用它、拿到同一个答案。<code>priority</code> 的唯一作用就是
+     区分先后，全同值等于这个字段没写。</p>
+
+  <div class="note b">
+    <div class="t">同站同值，站间不同 —— 这是 CPA 的调度语义，不是审美选择</div>
+    <p>原 config.yaml 三段无一例外：<code>kktoken.cc</code> 5 个 Key 全 1000、
+       <code>tabitoken.com</code> 14 个全 990、<code>gorouter.app</code> 15 个全 985。</p>
+    <p><code>priority</code> 决定<b>哪一层</b>先被尝试，同层内部按 <code>weight</code>
+       轮询（<code>selector.go:539-549</code> 只取最高那一桶）。同站多 Key 指向同一个
+       上游、能力相同，本该在同一层。给它们不同值会让第 2 把 Key 只在第 1 把不可用时
+       才被碰 —— 把「多 Key 轮询」变成「主备切换」，白费配额。</p>
+  </div>
+
+  <h3>第一版修法绕开了安全边界</h3>
+  <p>第一版直接从空档由高到低铺值：站按探测质量排序，一个站一个值。
+     「各站分开」这件事做到了，但它<b>没走</b> <code>suggest_priority</code> ——
+     于是第 05 章那三条硬约束（不动现有值、不劫持顶层、试用期进最低可插档）
+     一条都不生效。拿生产 config.yaml 实测（14 站 × 3 Key）：</p>
+
+  <div class="tw"><table>
+    <thead><tr><th style="width:110px">段</th><th style="width:150px">第一版分配</th>
+      <th style="width:90px">上限</th><th>后果</th></tr></thead>
+    <tbody>
+      <tr><td><code>codex</code></td><td>787..618</td><td>550</td>
+        <td><b>14/14 站</b>抢走 <code>gpt-5.5</code> 等模型的顶层</td></tr>
+      <tr><td><code>compat</code></td><td>549..536</td><td>520</td>
+        <td><b>14/14 站</b>抢顶层</td></tr>
+      <tr><td><code>claude</code></td><td>999..949</td><td>500</td>
+        <td>最高档挡住 5 个<b>在用</b>站（试用期本该 0 个）</td></tr>
+      <tr><td><code>gemini</code></td><td>587..418</td><td>280</td>
+        <td>零劫持，但仍越过了两个现有档位</td></tr>
+    </tbody></table></div>
+
+  <p>最隐蔽的是连带后果：<b>劫持顶层是「不建议勾选」的四个条件之一</b>，
+     于是 <code>recommended</code> 在那两段整段翻假，<code>selected=None</code> 时的默认
+     写入集合从 24 段塌到 12 段。界面上表现为「codex 与 compat 两段默认一个都不勾」,
+     而勾选逻辑本身完全没问题。</p>
+
+  <div class="note g">
+    <div class="t">现在的做法：上限归 suggest_priority，分开归 assign_priorities</div>
+    <p>每站先算出自己的上限 <code>cap</code>（安全边界只在那个函数里定义，
+       <code>test_tiering</code> 的 180 项守着它），再按探测质量降序取
+       <code>min(cap, 上一站 - 1)</code>，跳过与现有档位相撞的值。</p>
+    <p>模型清单取<b>组内并集</b> —— 同站不同 Key 可能只开了部分模型，而值是站级共用的。
+       按并集算上限才不会让某把 Key 的模型被悄悄抬到它自己的顶层之上。</p>
+    <p>修后四段全部 <b>0 劫持</b>、最高档挡 0-1 个在用站、站内多值 0、站间重复 0。</p>
+  </div>
+
+  <h3>空档太窄时整批下移</h3>
+  <p><code>claude</code> 段高位档位谱极密（1000/995/990/985 相邻只差 5），14 个站挤进去
+     成了 999/998/997… <b>正确但没法手工微调</b> —— 改一个值就撞邻居。</p>
+  <p>所以站数超过该空档容量两倍时，往下找更宽的空档整批下移。<b>代价约束不松</b>：
+     只接受「挡住的在用站数<b>不多于</b>原档」的空档，找不到就保持原样。生产
+     config.yaml 上符合这条的：<code>claude</code> 500(挡0) → <code>gap(50,300)</code>
+     容 249 个仍挡 0；<code>codex</code> 425(挡1) → <code>gap(10,300)</code> 容 289 个仍挡 1；
+     <code>compat</code> 的 45 已在最低空档，没有更宽的可换。</p>
+  <p>代价是新站整体排得更低。这是明确的取舍：<b>宁可低一点，也要留出手工调整的空间</b>。</p>
+
+  <h3>四类提示必须回到界面</h3>
+  <p><code>/api/plan</code> 一直返回 <code>warnings</code>，而前端<b>从来不读它</b>。
+     定档退化不影响单个条目能不能用，它改变的是<b>哪个站先被尝试</b> ——
+     悄悄发生等于这一轮没修。现在显示在方案页顶部：</p>
+  <ul>
+    <li><b>整批下移</b> —— 排不进算法给的空档，已下移到哪一段区间</li>
+    <li><b>越过现有档位</b> —— 哪几个站与那批现有站的先后关系变了</li>
+    <li><b>压到最低值 1</b> —— 再往下无可用整数，这些站会同层轮询</li>
+    <li><b>手工改出的同层</b> —— 用户覆盖在 <code>assign_priorities</code> <b>之后</b>应用，
+      把 A 站改成 B 站的值两站就同层了。同层按 weight 轮询是合法配置，
+      但它取消的正是「不同网站不同优先级」，所以 <code>priority_collisions</code>
+      在覆盖之后再查一遍</li>
+  </ul>
+
+  <div class="note w">
+    <div class="t">raw 漏传一处，三条途径就给出不同的 priority</div>
+    <p><code>build_band</code> 只在拿到 config.yaml <b>原文</b>时才解析注释里的
+       「实测不可用」结论，而那直接决定「挡住下层算不算代价」。漏传不报错，
+       只是把可用新站压到一堆死站后面。</p>
+    <p>实测差距（满分候选）：<code>claude</code> 段 <b>175 → 500</b>、
+       <code>gemini</code> 段 <b>225 → 280</b>，另两段不变。</p>
+    <p>单站诊断此前就漏了这一处 —— 同一个站，诊断页显示 175、全量重探显示 500。
+       现在网页端两条路径、CLI 与 <code>assign_priorities</code> 全部传。
+       CLI 还漏过整个批量定档：同一份输入在命令行与网页端落盘出不同的值。</p>
+  </div>
+
   <h3>一条方法论</h3>
   <p>这几批缺陷都是<b>在测试全绿的情况下</b>被专门审计找出来的（第一批 869 项时，
-     第二批 934 项时）。原因是那些测试的构造数据按我自己的理解写的，跟真实产出
+     第二批 934 项时、第三批 946 项时）。原因是那些测试的构造数据按我自己的理解写的，跟真实产出
      不一样 —— <b>测试只能证明代码符合我的意图，不能证明我的意图对</b>。</p>
   <p>第二批更进一步：<b>拿生产 config.yaml 逐字段对账</b>，把重建前后的 15 个
      字段计数与每个条目的每个字段值全部比一遍。这一步立刻暴露了三个坑，
@@ -1312,7 +1400,7 @@ footer code{background:none;padding:0}
 
   <div class="note w">
     <div class="t">如实说明：验证到哪一步</div>
-    <p><b>已验证</b>：假上游套件、单元测试（936 项，含真实 config.yaml 用例）、
+    <p><b>已验证</b>：假上游套件、单元测试（950 项，含真实 config.yaml 用例时 952 项）、
        端到端演练、以及拿生产 config.yaml 做的重建对账（121 条目 / 79 凭据，
        字段计数与值零差异）。</p>
     <p><b>未验证</b>：没有对这 79 个真实站跑过一次<b>完整的写回流程</b> ——

@@ -132,6 +132,16 @@ def main() -> int:
             truthy(f"d.{f} 后端有提供", in_srv,
                    "前端读了但后端 snapshot/结果里没有这个键")
 
+    # 方案级警告必须被读。后端一直返回 /api/plan 的 warnings，前端曾从来
+    # 不读 —— 定档退化（整批下移、越过现有档位、用户改成同值）会改变哪个站
+    # 先被尝试，不显示等于那一轮修复不可见。
+    section("③ 定档提示必须显示在界面上")
+    truthy("/api/plan 返回 warnings", '"warnings"' in srv)
+    truthy("前端读 d.warnings", "d.warnings" in js,
+           "后端返回但前端不读 = 定档退化悄悄发生")
+    truthy("有渲染函数把它放进 planmeta",
+           "planWarnings(d)" in js and "function planWarnings" in js)
+
     # 写回响应的关键字段 —— 生效链的可见性全靠它们
     section("③ 写回响应：重载状态必须可见")
     for f in ("reload_ok", "reload_msg", "written", "backup", "diffs"):

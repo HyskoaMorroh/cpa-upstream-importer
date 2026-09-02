@@ -28,7 +28,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
-from .parse import ParsedRow, base_for_section, host_of
+from .parse import SECTIONS, ParsedRow, base_for_section, host_of
 # pipeline 不导入 plan，这个方向无环。只取白名单判定与每段模型上限，
 # 目录读回来的名字必须过同一道白名单 —— 不然中转站目录里的
 # embedding / whisper / tts 之类会被注册成对话模型。
@@ -1255,6 +1255,7 @@ def build_plan(
     probation: bool = True,
     force: dict[str, list[str]] | None = None,
     rebuild: bool = False,
+    raw: str = "",
 ) -> ImportPlan:
     """把一个候选的探测结果变成写入方案。
 
@@ -1299,6 +1300,12 @@ def build_plan(
 
     重探要判的不是「有没有重复」，而是「这次的方案与原条目有没有变化」——
     那个由 diff 预览呈现，不需要在这里拦。
+
+    raw：config.yaml 原文，转交 `build_band`。给了才会解析注释里的「实测不可用」
+    结论，而那直接决定「挡住下层算不算代价」。实测差距（生产 config.yaml，
+    满分候选）：claude 段 175 → 500、gemini 段 225 → 280。不传不报错，只是
+    把可用新站压到一堆死站后面 —— 单站诊断与批量导入因此给出不同的 priority，
+    正是「三条途径字段齐平」要消除的那类差异。
     """
     bands = bands or {}
     existing = seen if seen is not None else existing_fingerprints(cfg)
@@ -1357,7 +1364,7 @@ def build_plan(
         )
         pair = credential_pair(row.api_key, base)
 
-        band = bands.get(section) or build_band(cfg, section)
+        band = bands.get(section) or build_band(cfg, section, raw=raw)
         bands[section] = band
 
         # 人工接管的段：模型清单来自操作员，探测那边是空的。
@@ -1522,7 +1529,7 @@ def build_plan(
 
 
 def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
-                      probation: bool = True) -> list[str]:
+                      probation: bool = True, raw: str = "") -> list[str]:
     """给一批方案统一定档：**站与站之间不同值，同站所有 Key 同值**。
 
     为什么必须批量做（2026-09-02 现场）
@@ -1545,15 +1552,32 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
     上游、能力相同，本该在同一层；给它们不同值会让第 2 把 Key 只在第 1 把不可用
     时才被尝试 —— 把「多 Key 轮询」变成「主备切换」，白费配额。
 
-    分配办法
-    -------
-    按段独立处理。站按「探测质量」降序排（组内最高分，同分按主机名保证稳定），
-    然后从可用空档里由高到低取值，一个站一个值。
+    分配办法（2026-09-02 二轮修正）
+    ---------------------------
+    「把各站分开」是本函数的**唯一**职责，安全边界仍由 `suggest_priority` 划：
+    先为每个站算出它的**上限** `cap`（那里已实现三条硬约束：不动现有值、
+    不劫持顶层、试用期进最低可插档，且 test_tiering 的 180 项守着它），
+    再按分数降序逐站取 `min(cap, 上一站的值 - 1)`，跳过与现有档位相撞的值。
 
-    空档不够时退化为「在最低现有档之下等距铺开」—— 那时无论如何都要挤在一起，
-    但至少各站仍互不相同。
+    第一版直接从空档由高到低铺值，绕开了那三条约束。拿生产 config.yaml
+    实测的后果（14 站 × 3 Key）：
 
-    返回 warnings（哪些段空档不够、退化了）。
+        codex    14/14 站抢走 gpt-5.5 等模型的顶层（cap 是 550，实发 787..618）
+        compat   14/14 站抢顶层（cap 520，实发 549..536）
+        claude   最高档挡住 5 个在用站（试用期本该只挡 0 个）
+
+    抢顶层会让 `recommended` 整段翻假（劫持是不建议勾选的四个条件之一），
+    于是 `selected=None` 时的默认写入集合从 24 段塌到 12 段 —— 界面上表现为
+    「codex 与 compat 两段默认一个都不勾」。
+
+    同站同值不受影响：值按站分配，站内所有 Key 复制同一个。
+
+    raw 是 config.yaml 原文。**必须传** —— `build_band` 只在拿到原文时才解析
+    注释里的「实测不可用」结论，而那个结论直接决定「挡住下层算不算代价」。
+    实测差距（生产 config.yaml，满分候选）：claude 段 175 → 500、gemini 段
+    225 → 280，另两段不变。不传不会报错，只是把可用新站压到一堆死站后面。
+
+    返回 warnings（哪些段挤到了现有档位之下、哪些段排不下）。
     """
     warns: list[str] = []
 
@@ -1567,7 +1591,8 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
             per_section.setdefault(sec, {}).setdefault(host, []).append(sp)
 
     for section, by_host in per_section.items():
-        band = build_band(cfg, section)
+        band = build_band(cfg, section, raw=raw)
+        taken = set(band.tiers)     # 不与现有档位相撞：撞上等于与那个站同层轮询
 
         # 2. 站级排序：组内最高分降序。同分按主机名 —— 必须稳定，否则同一批
         #    输入两次运行给出不同档位，diff 变得无法复核。
@@ -1576,66 +1601,182 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
             key=lambda kv: (-max(x.score for x in kv[1]), kv[0]),
         )
 
-        # 3. 候选档位：从空档里取。每个空档能放几个站取决于宽度 ——
-        #    (lo, hi) 之间能放 hi-lo-1 个整数，但贴着边界不安全（现有站就在
-        #    lo 与 hi 上），所以留 1 点余量、按等距取。
-        slots: list[int] = []
-        for lo, hi in band.gaps():                 # 已降序
-            width = hi - lo
-            if width <= 2:
-                continue                            # 只够放 1 个且贴边，跳过
-            room = width - 1                        # 可用整数个数
-            take = min(room, len(ranked))           # 不必超过站数
-            if take <= 0:
-                continue
-            step = room // (take + 1) or 1
-            for i in range(1, take + 1):
-                v = hi - step * i
-                if lo < v < hi:
-                    slots.append(v)
-            if len(slots) >= len(ranked):
-                break
-        slots = sorted(set(slots), reverse=True)
-
-        # 4. 空档不够 —— 在最低现有档之下等距铺开。
-        if len(slots) < len(ranked):
-            floor_v = min(band.tiers) if band.tiers else 100
-            need = len(ranked) - len(slots)
-            # 步长取 5：与现有配置的档位间距同量级（实测 990/985 差 5），
-            # 且留出手工微调的空间。下界钳 1 —— priority 0 与负数在 CPA 里
-            # 语义未定义。
-            extra = []
-            v = floor_v - 5
-            while len(extra) < need and v >= 1:
-                extra.append(v)
-                v -= 5
-            slots.extend(extra)
-            if len(slots) < len(ranked):
-                warns.append(
-                    f"段 {section}：{len(ranked)} 个站只排得下 {len(slots)} 个"
-                    f"互不相同的档位（现有档位谱太密），末尾几个会共用最低档")
-            else:
-                warns.append(
-                    f"段 {section}：可插空档不足，{need} 个站排在最低现有档"
-                    f"{floor_v} 之下（每 5 点一档）")
-
-        # 5. 落值。同站所有 Key 拿同一个值。
-        for idx, (host, sps) in enumerate(ranked):
-            v = slots[idx] if idx < len(slots) else max(slots[-1] if slots else 1, 1)
-            v = max(int(v), 1)
+        # 3. 每个站的上限：走 suggest_priority。安全边界只在那里定义 ——
+        #    不劫持顶层、不挡在用站、试用期不越过得分支持的上限，三条都在
+        #    那个函数里，且 test_tiering 的 180 项守着。这里只负责「把各站
+        #    分开」，绝不自己重新推导安全值。
+        #
+        #    models 用**组内并集**：同站不同 Key 声明的模型可能不同（有的 Key
+        #    只开了部分模型），而值是站级共用的 —— 按并集算上限才不会让某把
+        #    Key 的模型被悄悄抬到它自己的顶层之上。
+        caps: list[tuple[str, list[SectionPlan], int, int]] = []
+        for host, sps in ranked:
+            union: list[str] = []
+            for sp in sps:
+                for m in sp.models:
+                    if m not in union:
+                        union.append(m)
             best = max(x.score for x in sps)
+            cap, _reason = suggest_priority(
+                band, best, models=union, probation=probation)
+            caps.append((host, sps, max(int(cap), 1), best))
+
+        # 3b. 空档太窄时往下找更宽的空档（用户 2026-09-02 要求）。
+        #
+        # 为什么需要：cap 落在哪个空档由 suggest_priority 按「代价最小的最高档」
+        # 选，它不知道本批有多少个站要排。claude 段的现有档位谱在高位极密
+        # （1000/995/990/985 相邻只差 5），14 个站挤进去就成了 999/998/997…
+        # —— 正确但手工微调的余地几乎没有，改一个值就会撞上邻居。
+        #
+        # 代价约束不能松：只接受「挡住的在用站数**不多于** cap 处」的空档。
+        # 实测（生产 config.yaml，满分候选）符合这条的更宽空档：
+        #   claude  cap=500(挡0) → gap(50,300) room=249 挡0
+        #   gemini  cap=280(挡0) → gap(200,250) room=49  挡0
+        #   codex   cap=425(挡1) → gap(10,300)  room=289 挡1
+        # compat 段 cap=45 已在最低空档，没有更宽的可换 —— 那时保持原样。
+        #
+        # 代价是新站整体排得更低。这是用户在 2026-09-02 明确选的取舍：
+        # 「宁可低一点，也要留出手工调整的空间」。
+        need = len(caps)
+        if need > 1:
+            top_cap = max(c for _h, _s, c, _b in caps)
+            room_at_cap = 0
+            for lo, hi in band.gaps():
+                if lo < top_cap < hi:
+                    room_at_cap = hi - lo - 1
+                    break
+            if room_at_cap and room_at_cap < need * 2:
+                # 各站模型的并集 —— 换档影响的是整批，代价要按整批算
+                all_models: list[str] = []
+                for _h, sps, _c, _b in caps:
+                    for sp in sps:
+                        if sp.models and sp.models[0] not in all_models:
+                            all_models.extend(
+                                m for m in sp.models if m not in all_models)
+                cost_at_cap = _shadow_count(band, all_models, top_cap)
+                for lo, hi in band.gaps():          # 已降序
+                    if hi > top_cap:
+                        continue
+                    room = hi - lo - 1
+                    if room < need * 2 or room <= room_at_cap:
+                        continue
+                    mid = (lo + hi) // 2
+                    if _shadow_count(band, all_models, mid) > cost_at_cap:
+                        continue                    # 代价变大，不换
+                    # 换：所有站的上限压到这个空档的上界之下
+                    ceil_here = hi - 1
+                    caps = [(h, s, min(c, ceil_here), b) for h, s, c, b in caps]
+                    warns.append(
+                        f"段 {section}：{need} 个站排不进 {top_cap} 所在的空档"
+                        f"（只容 {room_at_cap} 个整数），已整批下移到 "
+                        f"{lo}↔{hi}（容 {room} 个，挡住的在用站数不变）—— "
+                        f"档位更低但留出了手工微调的空间")
+                    break
+
+        # 4. 逐站取值：min(自己的上限, 上一站 - 1)，且跳过现有档位。
+        #    单调递减保证「分数高的站不会排在分数低的站之后」，而 cap 保证
+        #    没有任何站越过 suggest_priority 划的线。
+        #
+        #    「比上一站低 1」是**正常结果**，不是退化 —— 同段各站必须取不同值。
+        #    只有两种情形值得报出来：
+        #      · 掉出了 cap 所在的那个空档 —— 那意味着这个站越过了某个现有档位，
+        #        它与那批现有站的先后关系变了（不是只在新站之间变）
+        #      · 压到 1 还排不下 —— 那时站与站真的分不开了
+        def _floor_of(value: int) -> int:
+            """value 所在空档的下界。不在任何空档里就返回 0（无下界可越）。"""
+            for lo, hi in band.gaps():
+                if lo < value < hi:
+                    return lo
+            return 0
+
+        dropped: list[str] = []     # 掉出自己空档的站
+        floor_hit = 0               # 压到 1 还排不下的站数
+        prev: int | None = None
+        for idx, (host, sps, cap, best) in enumerate(caps):
+            v = cap if prev is None else min(cap, prev - 1)
+            while v >= 1 and v in taken:            # 撞现有档位就再降一格
+                v -= 1
+            if v < 1:
+                v = 1
+                floor_hit += 1
+            if v <= _floor_of(cap):
+                dropped.append(host)
+            taken.add(v)
+            prev = v
+
             for sp in sps:
                 sp.priority = v
-                sp.priority_reason = (
-                    f"批量定档：{section} 段第 {idx + 1}/{len(ranked)} 站"
-                    f"（组内最高分 {best}，同站 {len(sps)} 个 Key 共用此档）"
-                )
+                # 理由会原样落进 config.yaml 的行尾注释（render_entry），所以
+                # 不重复段名 —— 那个条目本来就在那一段里面。
+                note = (f"批量定档第 {idx + 1}/{len(caps)} 站"
+                        f"（组内最高分 {best}，"
+                        f"同站 {len(sps)} 个 Key 共用此档）")
+                if v < cap:
+                    note += f"；算法上限 {cap}，为与前一站分开降到 {v}"
+                sp.priority_reason = note
                 # 影响面要按新值重算 —— 旧值算出来的 impacts 会误导。
                 sp.impacts = compute_impact(band, sp.models, v)
+                # 劫持警告由 build_plan 按旧值加过，这里换了值必须**先清后加**，
+                # 否则界面上会留一条指向旧 priority 的陈述。同理，挡站那条
+                # 警告里写着具体数值，也要按新值重写。
+                sp.warnings = [w for w in sp.warnings
+                               if "抢走" not in w and "挡在其后" not in w]
                 if sp.hijacked:
                     names = ", ".join(i.model for i in sp.hijacked[:4])
                     sp.warnings.append(
                         f"会抢走 {len(sp.hijacked)} 个模型的顶层（{names}）——"
                         "层级隔离下现有顶层站将完全不被尝试")
+                else:
+                    shadow: dict[str, list[str]] = {}
+                    for imp in sp.impacts:
+                        for h in imp.shadowed_hosts:
+                            shadow.setdefault(h, []).append(imp.model)
+                    if shadow:
+                        hosts = sorted(shadow)
+                        head = "、".join(hosts[:5]) + ("…" if len(hosts) > 5 else "")
+                        sp.warnings.append(
+                            f"priority {v} 会把 {len(hosts)} 个现有站挡在其后"
+                            f"（{head}）—— 它们只在本站也不可用时才被尝试")
+
+        if dropped:
+            head = "、".join(dropped[:4]) + ("…" if len(dropped) > 4 else "")
+            warns.append(
+                f"段 {section}：{len(dropped)}/{len(caps)} 个站排不进算法给的空档，"
+                f"已越过下一个现有档位（{head}）—— 它们与那批现有站的先后关系"
+                f"随之改变，请复核这几站的 priority")
+        if floor_hit:
+            warns.append(
+                f"段 {section}：{floor_hit} 个站已压到最低值 1，"
+                f"再往下无可用整数 —— 这些站会与已取 1 的站同层轮询")
 
     return warns
+
+
+def priority_collisions(plans: list[ImportPlan]) -> list[str]:
+    """本批里有哪些站在同一段拿到了相同的 priority。
+
+    为什么要单独一个函数（2026-09-02）：`assign_priorities` 保证站与站不同，
+    但**用户覆盖在它之后应用** —— 手工把 A 站改成 B 站的值，两站就同层了。
+    这不是错误（同层按 weight 轮询是合法配置），但它取消的正是用户这轮要的
+    「不同网站不同优先级」，所以必须说出来而不是默默照写。
+
+    只看同一段内部：跨段同值毫无关系，各段的档位谱独立。
+    """
+    out: list[str] = []
+    for section in SECTIONS:
+        at: dict[int, list[str]] = {}
+        for plan in plans:
+            sp = plan.sections.get(section)
+            if sp is None or not sp.writable:
+                continue
+            host = host_of(sp.base_url)
+            names = at.setdefault(sp.priority, [])
+            if host not in names:
+                names.append(host)
+        for pri, hosts in sorted(at.items(), reverse=True):
+            if len(hosts) > 1:
+                out.append(
+                    f"段 {section}：{len(hosts)} 个站共用 priority {pri}"
+                    f"（{'、'.join(sorted(hosts))}）—— 它们会在同一层按 weight "
+                    f"轮询，而不是分先后。手工改过 priority 的话这是预期结果")
+    return out

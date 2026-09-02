@@ -286,9 +286,21 @@ def main() -> None:
     results, plans = [], []
     for row, res in zip(parsed.valid, slots):
         plan = cp.build_plan(row, res, cfg, bands=bands, seen=seen,
-                             probation=not args.by_score)
+                             probation=not args.by_score, raw=raw)
         results.append(res)
         plans.append(plan)
+
+    # 批量定档 —— 与网页端（server.py 的 /api/plan）同一个函数。
+    #
+    # 不加这一步时 CLI 与网页端会给出**不同的 priority**：build_plan 里的
+    # suggest_priority 每个候选都问「当前 config 有哪些空档」，bands 共享且
+    # 不随本批新增更新，于是一批站全拿同一个值。网页端 2026-09-02 已修，
+    # CLI 漏了 —— 同一份输入两条途径落盘结果不一致，正是「三条途径字段齐平」
+    # 要消除的那类差异。
+    prio_warns = cp.assign_priorities(plans, cfg,
+                                      probation=not args.by_score, raw=raw)
+    for w in prio_warns:
+        print(f"  {C_WARN}⚠{C_END} {w}")
 
     print(f"\n{'='*72}\n结论（耗时 {int(time.monotonic()-t0)}s）\n{'='*72}")
     for res, plan in zip(results, plans):

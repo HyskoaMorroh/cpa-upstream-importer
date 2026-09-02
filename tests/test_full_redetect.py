@@ -1359,6 +1359,226 @@ openai-compatibility:
     print("[OK] Weight preserved: weight:0 搬回，未写的不凭空添加")
 
 
+def test_assign_priorities_site_level():
+    """批量定档：站与站不同值、同站所有 Key 同值，且不越过安全上限。
+
+    2026-09-02 现场（用户截图）：写回后 claude 段 74 个条目全是 175、
+    gemini 段 76 个全是 225 —— `suggest_priority` 每次只看「当前 config 有
+    哪些空档」，79 个凭据串行调用它、每个都拿到同一个答案。priority 的唯一
+    作用就是区分先后，全同值等于这个字段没写。
+
+    第一版修法（从空档由高到低铺值）绕开了 `suggest_priority` 的三条硬约束，
+    拿生产 config.yaml 实测：codex 与 compat 两段 14/14 站抢走现有顶层，
+    `recommended` 整段翻假，默认写入集合从 24 段塌到 12 段。所以这里同时守
+    「各站分开」与「不越过 cap」两件事 —— 只守前者会放过那个回归。
+    """
+    import yaml
+    from cpa_probe.plan import (ImportPlan, SectionPlan, assign_priorities,
+                                build_band, suggest_priority)
+
+    # 两个现有站：顶层 900 承载 m1，低层 100。新站的安全上限必须 <= 900。
+    cfg = yaml.safe_load('''
+claude-api-key:
+  - api-key: "old1"
+    base-url: "https://top.example"
+    priority: 900
+    models:
+      - name: "m1"
+        alias: ""
+  - api-key: "old2"
+    base-url: "https://low.example"
+    priority: 100
+    models:
+      - name: "m1"
+        alias: ""
+''')
+
+    def mkplans(nhost, nkey):
+        out = []
+        for hi in range(nhost):
+            host = f"new{hi}.example"
+            for k in range(nkey):
+                pl = ImportPlan(host=host, masked_key="k", line_no=hi * 10 + k)
+                pl.sections["claude-api-key"] = SectionPlan(
+                    section="claude-api-key", base_url=f"https://{host}",
+                    api_key=f"sk-{hi}-{k}", models=["m1"],
+                    score=100 - hi * 5, model_source="probed")
+                out.append(pl)
+            # 同站不同 Key 声明的模型可以不同 —— 上限按并集算
+        return out
+
+    band = build_band(cfg, "claude-api-key")
+    cap, _ = suggest_priority(band, 100, models=["m1"], probation=True)
+    assert cap <= 900, f"上限本身就该避让顶层 900，实得 {cap}"
+
+    plans = mkplans(4, 3)
+    warns = assign_priorities(plans, cfg, probation=True)
+    by_host: dict[str, set[int]] = {}
+    for pl in plans:
+        sp = pl.sections["claude-api-key"]
+        by_host.setdefault(pl.host, set()).add(sp.priority)
+
+    # ① 同站所有 Key 同值 —— 给不同值会把「多 Key 轮询」变成「主备切换」
+    for host, vals in by_host.items():
+        assert len(vals) == 1, f"{host} 的 3 个 Key 拿到 {vals}，同站必须同值"
+
+    # ② 站与站互不相同 —— 这就是这轮要修的那个 bug
+    flat = [next(iter(v)) for v in by_host.values()]
+    assert len(set(flat)) == len(flat), f"站间出现重复档位：{flat}"
+
+    # ③ 不越过 suggest_priority 划的上限（第一版修法在这里翻车）
+    assert max(flat) <= cap, f"有站越过上限 {cap}：{flat}"
+
+    # ④ 不抢现有顶层，因此 recommended 不该被劫持翻假
+    for pl in plans:
+        sp = pl.sections["claude-api-key"]
+        assert not sp.hijacked, (
+            f"priority {sp.priority} 抢走了顶层：{[i.model for i in sp.hijacked]}")
+        assert sp.recommended, (
+            f"探测通过且未劫持的段该默认勾选，warnings={sp.warnings}")
+
+    # ⑤ 不与现有档位相撞 —— 撞上等于与那个站同层轮询，不是「排在它前面」
+    assert not (set(flat) & set(band.tiers)), (
+        f"分配值撞上现有档位 {sorted(set(flat) & set(band.tiers))}")
+
+    # ⑥ 排序按探测质量降序：score 高的站档位更高
+    ranked = sorted(by_host.items(), key=lambda kv: kv[0])   # new0 分最高
+    vals_in_order = [next(iter(v)) for _h, v in ranked]
+    assert vals_in_order == sorted(vals_in_order, reverse=True), vals_in_order
+
+    # ⑦ 幂等/可复核：同一批输入跑两次给出同样的值，否则 diff 无法复核
+    again = mkplans(4, 3)
+    assign_priorities(again, cfg, probation=True)
+    assert ([p.sections["claude-api-key"].priority for p in plans]
+            == [p.sections["claude-api-key"].priority for p in again])
+
+    # ⑧ 理由要写清「为什么不是 cap」，否则用户只看到一个数字
+    lows = [p for p in plans if p.sections["claude-api-key"].priority < cap]
+    assert lows, "构造有误：应当至少有一个站被前一站挤低"
+    assert "算法上限" in lows[0].sections["claude-api-key"].priority_reason
+
+    # ⑨ 旧值的警告必须清掉 —— 留着会指向一个已经不存在的 priority
+    stale = [w for pl in plans for w in pl.sections["claude-api-key"].warnings
+             if "priority" in w
+             and f"priority {pl.sections['claude-api-key'].priority}" not in w]
+    assert not stale, f"警告里残留旧 priority：{stale}"
+
+    # ⑩ 不可写的段不参与定档 —— 它们不会落盘，改它的 priority 只会误导界面
+    dup = ImportPlan(host="dup.example", masked_key="k", line_no=999)
+    dup.sections["claude-api-key"] = SectionPlan(
+        section="claude-api-key", base_url="https://dup.example",
+        api_key="sk-dup", models=["m1"], score=100, duplicate=True)
+    before = dup.sections["claude-api-key"].priority
+    assign_priorities([dup], cfg, probation=True)
+    assert dup.sections["claude-api-key"].priority == before
+
+    # ⑪ raw 必须影响上限 —— 注释里的「实测不可用」结论决定「挡住下层算不算
+    #    代价」。不传 raw 时那批站被当活站保护，可用新站被压到它们之下。
+    #    生产 config.yaml 实测差 325 点（claude 段 175 vs 500）。
+    cfg2 = yaml.safe_load('''
+claude-api-key:
+  - api-key: "t1"
+    base-url: "https://alive.example"
+    priority: 900
+    models:
+      - name: "m2"
+        alias: ""
+  - api-key: "t2"
+    base-url: "https://broken.example"
+    priority: 500
+    models:
+      - name: "m2"
+        alias: ""
+  - api-key: "t3"
+    base-url: "https://floor.example"
+    priority: 100
+    models:
+      - name: "m2"
+        alias: ""
+''')
+    raw2 = ('claude-api-key:\n'
+            '  # broken.example：实测 503 站点级不可用\n'
+            '  - api-key: "t1"\n')
+
+    def one(rawtext):
+        pl = ImportPlan(host="n.example", masked_key="k", line_no=1)
+        pl.sections["claude-api-key"] = SectionPlan(
+            section="claude-api-key", base_url="https://n.example",
+            api_key="sk-n", models=["m2"], score=100, model_source="probed")
+        assign_priorities([pl], cfg2, probation=True, raw=rawtext)
+        return pl.sections["claude-api-key"].priority
+
+    without, with_raw = one(""), one(raw2)
+    assert with_raw > without, (
+        f"传 raw 后档位该更高（注释判死的站不值得保护），"
+        f"实得 不传={without} 传={with_raw}")
+
+    # ⑫ 空档太窄时整批下移到更宽的空档（用户 2026-09-02 明确要的取舍）。
+    #    高位档位谱密集时（相邻只差 5），一批站挤进去成了 999/998/997… ——
+    #    正确但改一个值就撞邻居。代价约束不松：只换「挡住的在用站数不多于
+    #    原档」的更宽空档，换不到就保持原样。
+    #
+    #    构造复刻生产 claude 段的形态：高位三档相邻只差 5，低位留一个大空档。
+    #    下面两站 weight: 0（已被逐出调度池），所以挡住它们零代价 ——
+    #    这让 suggest_priority 选中最高那个**窄**空档，正是要下移的情形。
+    cfg3 = yaml.safe_load('''
+claude-api-key:
+  - api-key: "n1"
+    base-url: "https://a.example"
+    priority: 1000
+    models: [{name: "m3", alias: ""}]
+  - api-key: "n2"
+    base-url: "https://b.example"
+    priority: 995
+    weight: 0
+    models: [{name: "m3", alias: ""}]
+  - api-key: "n3"
+    base-url: "https://c.example"
+    priority: 400
+    weight: 0
+    models: [{name: "m3", alias: ""}]
+''')
+
+    def batch(n):
+        out = []
+        for hi in range(n):
+            pl = ImportPlan(host=f"w{hi}.example", masked_key="k", line_no=hi)
+            pl.sections["claude-api-key"] = SectionPlan(
+                section="claude-api-key", base_url=f"https://w{hi}.example",
+                api_key=f"sk-w{hi}", models=["m3"], score=100 - hi,
+                model_source="probed")
+            out.append(pl)
+        return out
+
+    band3 = build_band(cfg3, "claude-api-key")
+    cap3, _ = suggest_priority(band3, 100, models=["m3"], probation=True)
+    narrow = [(lo, hi) for lo, hi in band3.gaps() if lo < cap3 < hi]
+    assert narrow, f"构造有误：cap {cap3} 不在任何空档里"
+    room3 = narrow[0][1] - narrow[0][0] - 1
+
+    # 一个站：不该触发下移（放得下）
+    few = batch(1)
+    w_few = assign_priorities(few, cfg3, probation=True)
+    assert few[0].sections["claude-api-key"].priority == cap3
+    assert not any("整批下移" in w for w in w_few), w_few
+
+    # 站数超过空档容量的两倍：触发下移，且必须落进更宽的空档
+    many = batch(room3 * 2 + 4)
+    w_many = assign_priorities(many, cfg3, probation=True)
+    moved = [w for w in w_many if "整批下移" in w]
+    assert moved, f"{len(many)} 个站挤进只容 {room3} 个整数的空档，该整批下移：{w_many}"
+    vals3 = [p.sections["claude-api-key"].priority for p in many]
+    assert max(vals3) < narrow[0][0], (
+        f"下移后最高档 {max(vals3)} 该落到原空档下界 {narrow[0][0]} 之下")
+    assert len(set(vals3)) == len(vals3), f"下移后仍要各站不同：{vals3}"
+    assert all(not p.sections["claude-api-key"].hijacked for p in many)
+
+    print(f"[OK] Batch tiering: 4 站 × 3 Key → 站内同值、站间 {len(set(flat))} "
+          f"个不同档位，全部 <= 上限 {cap}，零劫持；raw 生效 "
+          f"{without} → {with_raw}；{len(many)} 站时整批下移到 "
+          f"{max(vals3)}..{min(vals3)}（warns={len(warns)}）")
+
+
 def test_batch_key_includes_api_key():
     """同一个站的多个 Key 不能互相覆盖。
 
@@ -1550,6 +1770,7 @@ if __name__ == "__main__":
         ("重探不判重", test_rebuild_skips_dedup),
         ("条目守恒与未勾不删", test_rebuild_entry_conservation),
         ("重建保留 weight", test_rebuild_keeps_weight),
+        ("批量定档站级差异", test_assign_priorities_site_level),
         ("批量键含 api_key", test_batch_key_includes_api_key),
         ("批量记录异常站", test_batch_records_errors),
         ("cgroup 异常值降级", test_cgroup_bad_values),

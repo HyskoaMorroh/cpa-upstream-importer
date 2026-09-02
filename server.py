@@ -1295,7 +1295,8 @@ class Handler(BaseHTTPRequestHandler):
             # 时该如实报 duplicate，那正是操作员要知道的。
             pl = cp.build_plan(row, result, cfg, bands={},
                                seen=cp.existing_fingerprints(cfg),
-                               probation=bool(body.get("probation", True)))
+                               probation=bool(body.get("probation", True)),
+                               raw=raw)
             plan_out = plan_json(pl)
 
         self._json(200, {
@@ -1518,7 +1519,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 探测建议不同、五元组恰好没撞），其余 260 个段全判 duplicate
                 # → writable=False → 「全勾选」跳过，勾选框点不动。
                 p = cp.build_plan(res.row, res, cfg, bands=bands, seen=seen,
-                                  probation=probation, rebuild=True,
+                                  probation=probation, rebuild=True, raw=raw,
                                   force={str(k): [str(m) for m in (v or [])]
                                          for k, v in fh.items()} if fh else None)
                 w = weights.get((res.row.host, res.row.api_key))
@@ -1542,8 +1543,10 @@ class Handler(BaseHTTPRequestHandler):
             # 全是 175，站与站之间毫无区分，而 priority 的唯一作用就是区分先后。
             #
             # 用户覆盖在这之后应用，所以手工改的 priority 不会被它冲掉。
+            # raw 必传：定档的安全上限要读注释里的「实测不可用」结论，不传会把
+            # 可用新站压到一堆死站后面（claude 段实测 500 → 175）。
             prio_warns = cp.assign_priorities(
-                list(all_plans.values()), cfg, probation=probation)
+                list(all_plans.values()), cfg, probation=probation, raw=raw)
 
             # 应用用户覆盖
             for (base_url, api_key), p in all_plans.items():
@@ -1565,6 +1568,12 @@ class Handler(BaseHTTPRequestHandler):
 
             # 全量重建
             preview, warnings = cp.rebuild_config_full(cfg, all_plans, raw.splitlines(keepends=True))
+            # 覆盖之后再查同值：assign_priorities 保证站与站不同，但用户手工
+            # 改 priority 是在它之后应用的 —— 改成邻站的值就同层了。同层按
+            # weight 轮询是合法配置，但它取消的正是「不同网站不同优先级」，
+            # 必须报出来而不是默默照写。
+            prio_warns = list(prio_warns) + cp.priority_collisions(
+                list(all_plans.values()))
             warnings = list(prio_warns) + list(warnings)
 
             # 生成完整 diff（整个文件）
@@ -1603,7 +1612,7 @@ class Handler(BaseHTTPRequestHandler):
         for res in job.results:
             fh = _by_row(forced, res.row)
             p = cp.build_plan(res.row, res, cfg, bands=bands, seen=seen,
-                              probation=probation,
+                              probation=probation, raw=raw,
                               force={str(k): [str(m) for m in (v or [])]
                                      for k, v in fh.items()} if fh else None)
             plans.append(p)
@@ -1613,7 +1622,7 @@ class Handler(BaseHTTPRequestHandler):
         # 一次粘贴 15 个站时，build_plan 里的 suggest_priority 同样会给它们
         # 相同的值（bands 共享且不随本批新增更新）。批量分配保证站与站之间
         # 不同、同站多 Key 同值，与 config.yaml 既有的规律一致。
-        prio_warns = cp.assign_priorities(plans, cfg, probation=probation)
+        prio_warns = cp.assign_priorities(plans, cfg, probation=probation, raw=raw)
 
         # 应用用户覆盖（优先级 / 代理 / 头 / 模型 / 是否写入）
         for p in plans:
@@ -1693,9 +1702,11 @@ class Handler(BaseHTTPRequestHandler):
             "validate_msg": msg,
             "lines_before": raw.count("\n") + 1,
             "lines_after": preview.count("\n") + 1,
-            # 定档时的退化提示（空档不够、末尾共用最低档）—— 那会影响
-            # 站与站的先后，必须让人看到而不是只写进日志。
-            "warnings": prio_warns,
+            # 定档提示：整批下移、越过现有档位、压到最低值，以及用户覆盖
+            # 造成的同层。全都会影响站与站的先后，必须让人看到。
+            # 只查真正写进去的那些段（for_write）—— 未勾选的段不落盘，
+            # 报它们同值只是噪声。
+            "warnings": list(prio_warns) + cp.priority_collisions(for_write),
         })
 
     def _cpa_password_for(self, body: dict) -> str:
