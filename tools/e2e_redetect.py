@@ -163,12 +163,36 @@ claude-api-key:
         # 结果键含 api_key —— 同站多 Key 不能互相覆盖（见 batch.probe_one）
         res = results.get((row.bare, row.api_key))
         assert res is not None, f"站 {row.bare} 无结果"
-        p = cp.build_plan(row, res, cfg, bands=bands, seen=seen, probation=True)
+        p = cp.build_plan(row, res, cfg, bands=bands, seen=seen, probation=True,
+                          rebuild=True, raw=raw)
         all_plans[(row.bare, row.api_key)] = p
 
     writable = sum(1 for p in all_plans.values()
                    for sp in p.sections.values() if sp.writable)
     print(f"④ 生成方案: {len(all_plans)} 个站, {writable} 个可写段")
+
+    # ④b 批量定档 —— server.py 的 _api_plan 在 build_plan 之后就跑它。
+    #     这一步漏在链外的话，本脚本就证明不了「落盘的 priority 站与站不同」，
+    #     而那正是 2026-09-02 那批缺陷的核心。
+    prio_warns = cp.assign_priorities(list(all_plans.values()), cfg,
+                                      probation=True, raw=raw)
+    by_section = {}
+    for p in all_plans.values():
+        for sec, sp in p.sections.items():
+            if sp.writable:
+                by_section.setdefault(sec, {}).setdefault(
+                    cp.host_of(sp.base_url), set()).add(sp.priority)
+    for sec, per_host in by_section.items():
+        for host, vals in per_host.items():
+            assert len(vals) == 1, f"{sec} 的 {host} 同站多值 {vals}"
+        flat = [next(iter(v)) for v in per_host.values()]
+        assert len(set(flat)) == len(flat), f"{sec} 站间重复档位 {flat}"
+    # 覆盖之后的同层检查也要能跑（这里没有用户覆盖，应为空）
+    assert cp.priority_collisions(list(all_plans.values())) == []
+    hij = sum(1 for p in all_plans.values()
+              for sp in p.sections.values() if sp.writable and sp.hijacked)
+    print(f"④b 批量定档: {sum(len(v) for v in by_section.values())} 个 (段,站) 组合, "
+          f"站内同值 / 站间不同, 劫持 {hij} 个, {len(prio_warns)} 条提示")
 
     # ⑤ 全量重建
     new_text, warns = rebuild_config_full(cfg, all_plans, raw.splitlines(True))
