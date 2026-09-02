@@ -524,6 +524,20 @@ footer code{color:var(--ink-2)}
   </div>
 </div></div>
 
+<!-- ═══ 启动骨架 ═══
+     /api/context 返回前显示这个。原来 #gate 与 #app 都 hidden，那段时间是
+     **纯空白**（只有页头）—— 2026-09-02 现场：漂移检测在请求路径里拉 GitHub，
+     国内 VPS 拉不通时干等 15 秒，用户看到的是坏掉的页面而没有任何提示。
+     后端已改成不阻塞，但「首屏要有话说」这条独立成立：网络慢、config.yaml
+     很大、服务刚起都会让这一步花上几秒。 -->
+<div class="wrap" id="bootbox">
+  <div class="panel">
+    <div class="ph"><h2><span class="spin"></span> 正在读取 config.yaml</h2></div>
+    <p class="psub" id="bootmsg">解析档位谱、统计既有条目、探测运行环境。
+       首次打开还会在后台核对画像基线。</p>
+  </div>
+</div>
+
 <!-- ═══ 登录门 ═══ -->
 <div class="wrap gate" id="gate" hidden>
   <div class="logo">灌</div>

@@ -1417,7 +1417,7 @@ footer code{background:none;padding:0}
 
   <div class="note w">
     <div class="t">如实说明：验证到哪一步</div>
-    <p><b>已验证</b>：假上游套件、单元测试（957 项，含真实 config.yaml 用例时 959 项）、
+    <p><b>已验证</b>：假上游套件、单元测试（968 项，含真实 config.yaml 用例时 970 项）、
        端到端演练、以及拿生产 config.yaml 做的重建对账（121 条目 / 79 凭据，
        字段计数与值零差异）。</p>
     <p><b>未验证</b>：没有对这 79 个真实站跑过一次<b>完整的写回流程</b> ——
@@ -1695,6 +1695,69 @@ bash upstream-importer/tools/export-logs.sh</pre>
     <p>写错会让 CPA 每次轮到它都失败，消耗重试预算。填之前先在站方后台
     或用 <code>/v1/models</code> 确认。命令行侧目前没有等价参数，要人工接管请用网页。</p>
   </div>
+
+  <h3>一次外网请求把首屏卡成白屏</h3>
+  <p>输入 token 后很长时间只有页头，正文全空，没有任何提示 —— 看起来像页面坏了。
+     根因两层叠加，单独看每一层都「合理」：</p>
+  <div class="note b">
+    <div class="t">同步拉 GitHub + 失败不缓存 = 每次都慢</div>
+    <p><code>/api/context</code> 同步调画像漂移检测，而远程模式要串行拉两个 GitHub
+       文件（<code>claude_executor_request.go</code> 与 <code>codex_executor_request.go</code>）。
+       国内 VPS 直连 <code>raw.githubusercontent</code> 不通，实测<b>每次干等 15 秒</b>；
+       最坏还能叠上 codex 那个文件 15 秒与 <code>remote_commit</code> 10 秒 = <b>40 秒</b>。</p>
+    <p><code>extract_remote</code> <b>只在成功时写缓存</b>：</p>
+    <p><code>if use_cache and out.claude_betas_unconditional:  # 失败时这里为空</code></p>
+    <p>所以拉不通的环境根本没有缓存，第二次跟第一次一样慢。<code>remote_commit</code>
+       连缓存都没有 —— 实测连打三次全走网络。</p>
+    <p>前端那侧 <code>#gate</code> 与 <code>#app</code> 都 <code>hidden</code>，要等这个响应回来才
+       <code>#app.hidden = false</code>。页头是静态 HTML 所以立刻可见，中间那段空白就是
+       <b>没有任何加载提示</b>的白屏。</p>
+  </div>
+
+  <p>这类缺陷的形态值得记一笔：<b>它只在特定网络环境下出现</b>。本机能拉通 GitHub，
+     首次 4.3 秒、之后 0.5 秒，完全不像有问题；只有在拉不通的机器上才暴露成
+     每次 15 秒。968 项测试没有一项碰到它 —— 它们都不发真实外网请求，
+     而这恰恰是那个缺陷的触发条件。</p>
+
+  <h3>修法：把网络请求挪出请求路径</h3>
+  <div class="tw"><table>
+    <thead><tr><th style="width:290px">改动</th><th>效果</th></tr></thead>
+    <tbody>
+      <tr><td><code>_drift_snapshot()</code>：接口只读缓存，缺失或过期时丢给后台线程</td>
+        <td><code>/api/context</code> 从不因它阻塞</td></tr>
+      <tr><td>失败也缓存（10 分钟；成功仍 6 小时）</td>
+        <td>拉不通的环境第二次起瞬时返回</td></tr>
+      <tr><td><code>remote_commit</code> 纳入同一套缓存</td>
+        <td>少一次每次都走的网络请求</td></tr>
+      <tr><td>单次超时 15 → 8 秒</td>
+        <td>有负缓存兜底后长超时没有收益</td></tr>
+      <tr><td><code>X-CPA-COMMIT</code> 探测也挪进后台线程</td>
+        <td>那也是网络请求（3 秒），不该抬高接口下限</td></tr>
+      <tr><td>前端加启动骨架 <code>#bootbox</code>，3 秒后换文案说明原因</td>
+        <td>首屏不再是白屏，慢也说得出为什么</td></tr>
+      <tr><td><code>pending</code> / <code>refreshing</code> 两个状态</td>
+        <td>「还没算完」与「这是几小时前的结论」界面上分得开</td></tr>
+    </tbody></table></div>
+
+  <div class="note g">
+    <div class="t">功能一项没减</div>
+    <p>三条检测路径（本地源码 / 远程拉取 / <code>config.yaml</code> 的 header-defaults）
+       与所有输出字段全部保留，只是换成异步刷新。首次打开时漂移那一块显示
+       「正在核对」，每 3 秒自取一次（最多 10 次，30 秒拿不到就说清并停手），
+       算完就地替换。</p>
+    <p><b>只更新这一块，不整页重渲染</b> —— <code>renderBands</code> 与
+       <code>applyResources</code> 都是幂等的，但重复调用会把你改过的并发数输入框
+       重置回推荐值。</p>
+  </div>
+
+  <div class="tw"><table>
+    <thead><tr><th style="width:150px">环境</th><th style="width:190px">修前（首次 → 第二次）</th>
+      <th>修后（首次 → 第二次）</th></tr></thead>
+    <tbody>
+      <tr><td>GitHub 可达</td><td>4.27s → 0.51s</td><td>0.26s → 0.02s</td></tr>
+      <tr><td>GitHub 不通</td><td><b>15.0s → 15.0s</b></td><td>0.49s → 0.06s</td></tr>
+    </tbody></table></div>
+  <p>关键差别在<b>第二次</b>：修前没有负缓存，反复刷新页面就是反复付超时。</p>
 
   <h3>三条红线</h3>
   <div class="grid2">

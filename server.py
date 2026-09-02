@@ -526,6 +526,71 @@ def run_job(job: Job, cfg_path: str) -> None:
 _CPA_COMMIT_CACHE: dict = {"at": 0.0, "commit": ""}
 _CPA_COMMIT_TTL = 300.0
 
+# ── 漂移检测的服务端缓存 ──
+#
+# 为什么必须挪出请求路径（2026-09-02 现场）：`/api/context` 原来同步调
+# check_profile_drift，而远程模式要拉两个 GitHub 文件。国内 VPS 直连
+# raw.githubusercontent 不通，实测每次打开网页干等 15 秒 —— 而前端要等这个
+# 响应回来才 `#app.hidden = false`，用户看到的是只有页头、正文全空的白屏。
+#
+# 现在：`/api/context` **只读缓存，永不阻塞**。缓存为空或过期时丢给后台线程，
+# 本次先返回 pending，前端显示「正在核对」并稍后自动重取。
+# 功能一项没少 —— 三条路径（本地源码 / 远程拉取 / config.yaml）全部保留，
+# 只是换成异步刷新。
+_DRIFT_CACHE: dict = {"at": 0.0, "value": None, "inflight": False}
+_DRIFT_LOCK = threading.Lock()
+# 成功结论 6 小时（与 cpa_source_probe 的远程缓存同量级），失败 10 分钟。
+# 本地源码模式不走网络，但也走这套缓存 —— 它要读几个文件加 .git，
+# 同样没必要每次打开网页重做。
+_DRIFT_TTL_OK = 6 * 3600
+_DRIFT_TTL_BAD = 600
+
+
+def _drift_snapshot(*, runtime_commit_url: str = "", **kw) -> dict:
+    """漂移检测结果：只读缓存，过期则后台刷新。绝不阻塞调用方。
+
+    kw 原样转交 cp.check_profile_drift。
+
+    runtime_commit_url 是 CPA 管理端点，在**后台线程里**才去打它的 /healthz
+    取 X-CPA-COMMIT —— 那一步也是网络请求（超时 3 秒），在请求路径里算等于
+    把这个接口的下限抬到 3 秒。它只是个增强信号（发现「源码更新了但 CPA 没
+    重启」），不该决定页面能不能显示。
+    """
+    now = time.time()
+    with _DRIFT_LOCK:
+        cached = _DRIFT_CACHE["value"]
+        ttl = _DRIFT_TTL_OK if (cached or {}).get("checked") else _DRIFT_TTL_BAD
+        fresh = cached is not None and now - _DRIFT_CACHE["at"] < ttl
+        need = not fresh and not _DRIFT_CACHE["inflight"]
+        if need:
+            _DRIFT_CACHE["inflight"] = True
+
+    if need:
+        def work() -> None:
+            try:
+                got = cp.check_profile_drift(
+                    runtime_commit=_cpa_runtime_commit(runtime_commit_url),
+                    **kw)
+            except Exception as e:                       # noqa: BLE001
+                # 后台线程里抛出去没人接，会静默丢失整个检查。转成一条
+                # 「没能核对」的结论 —— 与三条路径都不成立时同一个形状。
+                got = {"checked": False, "drifts": [],
+                       "why": f"核对时出错：{type(e).__name__}: {e}"}
+            with _DRIFT_LOCK:
+                _DRIFT_CACHE.update(at=time.time(), value=got, inflight=False)
+        threading.Thread(target=work, daemon=True,
+                         name="drift-refresh").start()
+
+    if cached is not None:
+        out = dict(cached)
+        # 过期但正在后台刷新 —— 让前端知道这份是旧的，不必等
+        if not fresh:
+            out["refreshing"] = True
+        return out
+    # 从来没算过：给一个明确的 pending，前端据此显示「正在核对」并稍后重取
+    return {"checked": False, "pending": True, "drifts": [],
+            "why": "正在核对画像基线（首次要拉 CPA 源码，不阻塞其他功能）"}
+
 
 def _cpa_runtime_commit(base: str) -> str:
     """读运行中 CPA 的 commit（管理响应头 X-CPA-COMMIT，handler.go:267-269）。
@@ -1157,9 +1222,12 @@ class Handler(BaseHTTPRequestHandler):
         # CPA 实际转发的不一致 —— 那会让「探测通了但 CPA 不通」或反之。
         # 优先读 CPA 源码（能区分有条件/无条件 beta），读不到退回 config.yaml
         # 的 header-defaults。两条都不成立时明确报「无法核对」，不假装检查过。
-        drift = cp.check_profile_drift(
+        #
+        # 走 _drift_snapshot 而不是直接调 —— 远程模式要拉 GitHub，拉不通时
+        # 单次 8 秒起，而这个接口决定前端能不能显示页面。见那个函数的说明。
+        drift = _drift_snapshot(
             source_root=type(self).cpa_source_root, cfg=cfg,
-            runtime_commit=_cpa_runtime_commit(type(self).cpa_url),
+            runtime_commit_url=type(self).cpa_url,
             allow_remote=type(self).cpa_source_remote,
             remote_ref=type(self).cpa_source_ref,
             proxy=type(self).drift_proxy or None)

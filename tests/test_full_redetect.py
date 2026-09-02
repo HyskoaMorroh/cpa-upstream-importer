@@ -816,6 +816,114 @@ def test_drift_remote_degrade():
     print("[OK] Remote degrade: 拉取失败时降级到 config 路径并带出原因")
 
 
+def test_drift_never_blocks_context():
+    """漂移检测不许挡住 /api/context —— 它决定前端能不能显示页面。
+
+    2026-09-02 现场：`/api/context` 同步调 check_profile_drift，而远程模式要拉
+    两个 GitHub 文件。国内 VPS 直连 raw.githubusercontent 不通，实测**每次**
+    打开网页干等 15 秒（失败不进缓存，第二次一样慢），而前端要等这个响应回来
+    才 `#app.hidden = false` —— 用户看到的是只有页头、正文全空的白屏。
+
+    这里守两件事：
+      ① 失败结论也进缓存（否则「每次都慢」这个症状原样回来）
+      ② _drift_snapshot 立即返回，把真正的核对丢给后台线程
+    """
+    import cpa_probe as cp
+    import server as srv
+    from cpa_probe import cpa_source_probe as csp
+
+    # ── ① 负缓存 ──
+    csp._remote_cache.update(at=0.0, ident=None, ref="", ok=False)
+    r1 = csp.extract_remote(ref="no-such-ref-xyz-9999", timeout=2)
+    assert not r1.claude_betas_unconditional, "这个 ref 不该存在"
+    assert csp._remote_cache["ident"] is not None, (
+        "失败必须写缓存 —— 否则拉不通的环境每次打开网页都重付一遍超时")
+    assert csp._remote_cache["ok"] is False, "失败的缓存要标 ok=False"
+
+    t0 = time.time()
+    r2 = csp.extract_remote(ref="no-such-ref-xyz-9999", timeout=2)
+    dt = time.time() - t0
+    assert r2 is r1, "第二次该直接拿缓存对象"
+    assert dt < 0.5, f"命中负缓存该是瞬时的，实测 {dt:.2f}s"
+
+    # 失败 TTL 必须远短于成功 TTL：网络故障通常是暂时的
+    assert csp._REMOTE_FAIL_TTL < csp._REMOTE_TTL, (
+        f"失败 TTL {csp._REMOTE_FAIL_TTL} 不该 >= 成功 TTL {csp._REMOTE_TTL}")
+
+    # commit 号同样要缓存 —— 它与 extract_remote 打同一个 GitHub
+    csp._commit_cache.update(at=0.0, commit=None, ref="")
+    c1 = csp.remote_commit(ref="no-such-ref-xyz-9999", timeout=2)
+    assert csp._commit_cache["commit"] is not None, "commit 失败也要缓存"
+    t0 = time.time()
+    c2 = csp.remote_commit(ref="no-such-ref-xyz-9999", timeout=2)
+    assert c2 == c1 and time.time() - t0 < 0.5, "commit 该命中缓存"
+
+    # ── ② _drift_snapshot 不阻塞 ──
+    srv._DRIFT_CACHE.update(at=0.0, value=None, inflight=False)
+    slept: list[float] = []
+
+    def slow_check(**kw):
+        slept.append(time.time())
+        time.sleep(1.5)                 # 冒充「拉 GitHub 拉了很久」
+        return {"checked": True, "source": "假的", "drifts": []}
+
+    real = cp.check_profile_drift
+    try:
+        cp.check_profile_drift = slow_check       # type: ignore[assignment]
+        t0 = time.time()
+        first = srv._drift_snapshot(source_root="", cfg={}, allow_remote=True)
+        dt = time.time() - t0
+        assert dt < 0.5, f"第一次必须立即返回，实测 {dt:.2f}s —— 就是那个白屏"
+        assert first.get("pending") is True, first
+        assert first.get("checked") is False, "pending 时不能声称核对过"
+        assert first.get("drifts") == [], "形状要与真结论一致，前端才不用特判"
+
+        # 后台还在跑时再来几次：仍然立即返回，且**不重复起线程**
+        for _ in range(3):
+            t0 = time.time()
+            again = srv._drift_snapshot(source_root="", cfg={}, allow_remote=True)
+            assert time.time() - t0 < 0.3
+            assert again.get("pending") is True
+        assert len(slept) == 1, f"inflight 期间不该重复起线程，实起 {len(slept)} 次"
+
+        # 等后台跑完 —— 这次该拿到真结论，而且是瞬时的
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            got = srv._drift_snapshot(source_root="", cfg={}, allow_remote=True)
+            if not got.get("pending"):
+                break
+            time.sleep(0.2)
+        assert got.get("checked") is True, f"后台算完该有真结论：{got}"
+        assert got.get("source") == "假的"
+        t0 = time.time()
+        srv._drift_snapshot(source_root="", cfg={}, allow_remote=True)
+        assert time.time() - t0 < 0.3, "命中缓存该是瞬时的"
+
+        # ── ③ 后台线程里抛异常不能吞掉整个检查 ──
+        srv._DRIFT_CACHE.update(at=0.0, value=None, inflight=False)
+
+        def boom(**kw):
+            raise RuntimeError("模拟核对时崩了")
+
+        cp.check_profile_drift = boom                # type: ignore[assignment]
+        srv._drift_snapshot(source_root="", cfg={}, allow_remote=True)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            got = srv._drift_snapshot(source_root="", cfg={}, allow_remote=True)
+            if not got.get("pending"):
+                break
+            time.sleep(0.2)
+        assert got.get("checked") is False, got
+        assert "模拟核对时崩了" in (got.get("why") or ""), got
+        assert srv._DRIFT_CACHE["inflight"] is False, "异常后必须清 inflight"
+    finally:
+        cp.check_profile_drift = real                # type: ignore[assignment]
+        srv._DRIFT_CACHE.update(at=0.0, value=None, inflight=False)
+
+    print("[OK] Drift async: 负缓存生效、_drift_snapshot 立即返回、"
+          "后台异常不丢检查")
+
+
 def test_stale_binary_detection():
     """源码 commit 与运行中 CPA 的 commit 不一致时要警告。"""
     from cpa_probe import cpa_source_probe as csp
@@ -1762,6 +1870,7 @@ if __name__ == "__main__":
         ("画像漂移检测", test_profile_drift_detection),
         ("画像梯对齐真实 CPA 源码", test_profile_matches_real_cpa_source),
         ("远程模式降级", test_drift_remote_degrade),
+        ("漂移检测不阻塞 context", test_drift_never_blocks_context),
         ("旧二进制检测", test_stale_binary_detection),
         ("headers 覆盖写进 YAML", test_headers_override_reaches_yaml),
         ("重建保留其余内容", test_rebuild_preserves_everything_else),

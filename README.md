@@ -459,7 +459,7 @@ cpa-upstream-importer/
 ├ .github/workflows/  CI：3 个 Python 版本跑测试 + 多架构镜像发布
 ├ LICENSE             MIT
 ├ CONTRIBUTING.md     贡献指南
-├ tests/              回归测试（九个套件 957 项，零外网请求，自带最小样本）
+├ tests/              回归测试（九个套件 968 项，零外网请求，自带最小样本）
 │  ├ run.py           跑全部，退出码 0/1，可接 CI。传 config.yaml 路径可加跑真实用例
 │  ├ fixture_cfg.py   自带的最小 config.yaml（各套件共用；不传路径时就用它）
 │  ├ test_probe.py    解析/判定/指纹/去重/定档/影响面/写回
@@ -1663,7 +1663,48 @@ CPA 源码里**没有**这个信息。它只知道自己转发时发什么，从
 | 头的值从 CPA 派生 | ✅ | `profiles.defaults_from_config()` 读 `claude-header-defaults` / `codex.header-defaults` |
 | beta 清单与 CPA 源码比对 | ✅ | `cpa_probe/cpa_source_probe.py` 解析 Go 常量表 |
 | 漂移在界面显示 | ✅ | `/api/context` 返回 `profile_drift`，前端渲染 |
+| 检测不阻塞页面 | ✅ | 后台线程算，接口只读缓存 —— 见下 |
 | 档次划分 | ❌ 手工维护 | 信息上不成立，见上 |
+
+### 这个检测曾经把首屏卡成白屏（2026-09-02 修）
+
+**症状**：输入 token 后很长时间只有页头，正文全空，没有任何提示。
+
+**根因两层叠加**：
+
+1. `/api/context` **同步**调 `check_profile_drift`，远程模式要串行拉两个
+   GitHub 文件。国内 VPS 直连 `raw.githubusercontent` 不通，实测每次干等
+   15 秒；最坏还能叠上 codex 文件 15 秒与 `remote_commit` 10 秒 = **40 秒**。
+2. `extract_remote` **只在成功时写缓存**，所以拉不通的环境每次打开网页都重付
+   一遍 —— 实测第二次跟第一次一样慢。`remote_commit` 连缓存都没有。
+
+前端那侧 `#gate` 与 `#app` 都 `hidden`，要等这个响应回来才 `#app.hidden = false`，
+于是那 15-40 秒里只剩静态页头。
+
+**三处都改了，一项功能没减**：
+
+| 改动 | 效果 |
+|---|---|
+| `_drift_snapshot()`：接口只读缓存，缺失/过期丢后台线程 | `/api/context` 从不因它阻塞 |
+| 失败也缓存（10 分钟，成功仍 6 小时） | 拉不通的环境第二次起瞬时返回 |
+| `remote_commit` 纳入同一套缓存 | 少一次每次都走的网络请求 |
+| 单次超时 15 → 8 秒 | 有负缓存兜底后长超时没有收益 |
+| `X-CPA-COMMIT` 探测也挪进后台线程 | 那也是网络请求（3 秒），不该抬高接口下限 |
+| 前端加启动骨架 `#bootbox` + 3 秒后换文案 | 首屏不再是白屏，慢也说得出为什么 |
+| `pending` / `refreshing` 两个状态 | 「还没算完」与「这是几小时前的结论」界面上分得开 |
+
+三条检测路径（本地源码 / 远程拉取 / `config.yaml` 的 header-defaults）与所有
+输出字段全部保留，只是换成异步刷新。首次打开时漂移那一块显示「正在核对」，
+每 3 秒自取一次（最多 10 次），算完就地替换 —— 只更新这一块，不整页重渲染
+（否则会把你改过的并发数输入框重置回推荐值）。
+
+实测：
+
+```
+              修前              修后
+GitHub 可达    4.27s → 0.51s     0.26s → 0.02s
+GitHub 不通    15.0s → 15.0s     0.49s → 0.06s   ← 关键差别在第二次
+```
 
 ### 漂移检测抓到的第一个缺陷
 
