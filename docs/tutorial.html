@@ -1444,6 +1444,55 @@ footer code{background:none;padding:0}
      <code>gpt-5.6-sol, gpt-image-2, gpt-oss-20b, gpt-5.5, claude-opus-5</code>
      时收下前两个合法的，并警告「手填的 3 个模型已丢弃」。</p>
 
+  <h3>weight: 0 的含义取决于 routing.strategy</h3>
+  <p>本项目多处把 <code>weight: 0</code> 当「站已被逐出调度池、挡住它零代价」的
+     <b>强信号</b>读 —— 定档算法据此把新站排到它们之前。核对 CPA 源码后发现
+     那<b>只在一种策略下成立</b>：</p>
+  <div class="tw"><table>
+    <thead><tr><th style="width:230px">策略</th><th style="width:110px">读 weight 吗</th>
+      <th>weight: 0 的效果</th></tr></thead>
+    <tbody>
+      <tr><td><code>weighted-round-robin</code></td><td>是</td>
+        <td><code>positiveWeightAuths</code> 整个剔除（<code>selector.go:650 → 637-644</code>）</td></tr>
+      <tr><td><code>round-robin</code>（<b>默认</b>）</td><td>否</td>
+        <td>照常参与轮询（<code>selector.go:589</code>）</td></tr>
+      <tr><td><code>fill-first</code></td><td>否</td>
+        <td>照常参与轮询（<code>selector.go:787</code>）</td></tr>
+    </tbody></table></div>
+  <div class="note b">
+    <div class="t">默认策略下把零权重站当死站，会把新站插到在服务的站之前</div>
+    <p>没配 <code>routing.strategy</code> 的部署走默认 round-robin。此时定档以为
+       「挡住它没代价」，而那些站其实照常出活 —— 方向正是本项目反复强调的更坏
+       那个：<b>把活站当死站</b>。</p>
+    <p>当前部署实测配的是 <code>weighted-round-robin</code>，所以旧行为一直是对的；
+       但那是<b>配置的巧合，不是代码的保证</b>。这类缺陷换一份 config 就会现形，
+       而测试里的构造数据恰好也没配 routing —— 两边都「碰巧对」。</p>
+  </div>
+  <p><code>weight_zero_excludes(cfg)</code> 按配置判断策略（认三种拼法，大小写与空格
+     不敏感，与 <code>service_config.go:42-47</code> 一致），<code>build_band</code> 据它决定
+     要不要把零权重站计入 <code>dead_hosts</code>。界面提示也跟着分岔 —— 非 wrr 时说
+     「当前策略不读 weight，仍参与轮询」，并说明 CPAMP 面板的「未启用」是按 weight
+     判的、与实际调度不一致。</p>
+
+  <h3>规则收紧不许把段变成「勾不上」</h3>
+  <p>新规则上线后自查抓到两处「各自合理、合起来出错」：</p>
+  <div class="note w">
+    <div class="t">① 目录非空但全不合规 = 段勾不上</div>
+    <p><code>elif v.catalog:</code> 只判目录<b>非空</b>。一个只报 flash / oss / grok 的站，
+       过滤后是空列表 → <code>models=[]</code> → <code>writable=False</code> →
+       <b>那个段连勾选框都点不动</b>。这正是 2026-09-01 修过的「判死段勾不上」
+       被新规则重新引入。改成「目录为空<b>或</b>过滤后为空」都落到市面最新清单。</p>
+  </div>
+  <div class="note w">
+    <div class="t">② 手填全不合规时，「已丢弃」警告永远不触发</div>
+    <p>手填的全部不合规 → <code>forced_models</code> 变空 →
+       <code>if forced_models and not v.usable</code> 为假 → 落到 seed 分支 →
+       <code>model_source</code> 是 <code>seed</code> 而非 <code>manual</code>，
+       而那条警告写在 manual 分支里。用户手填了两个、一个都没进去、界面上一句提示
+       都没有，工具悄悄换成了自己那份清单 —— 正是这条警告要防的那件事。</p>
+    <p>警告挪出 manual 分支无条件报，并额外说明「已改用市面最新清单」。</p>
+  </div>
+
   <h3>上下文上限：10 个 token 的窗口</h3>
   <div class="note b">
     <div class="t">这个值会让整个站不可用，而 validate 报成功</div>
@@ -1512,7 +1561,7 @@ footer code{background:none;padding:0}
 
   <div class="note w">
     <div class="t">如实说明：验证到哪一步</div>
-    <p><b>已验证</b>：假上游套件、单元测试（1028 项，含真实 config.yaml 用例时 1030 项）、
+    <p><b>已验证</b>：假上游套件、单元测试（1039 项，含真实 config.yaml 用例时 1041 项）、
        端到端演练、以及拿生产 config.yaml 做的重建对账（121 条目 / 79 凭据，
        字段计数与值零差异）。</p>
     <p><b>未验证</b>：没有对这 79 个真实站跑过一次<b>完整的写回流程</b> ——

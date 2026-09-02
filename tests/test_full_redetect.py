@@ -1629,6 +1629,88 @@ gemini-api-key:
           "compat 按族轮转、失败进负缓存")
 
 
+def test_model_rules_no_dead_end():
+    """规则收紧不许把段变成「勾不上」—— 那是 2026-09-01 修过的老症状。
+
+    2026-09-02 自查发现的两处：
+
+      ① `elif v.catalog:` 只判目录**非空**。规则收紧后一个只报 flash /
+         oss / grok 的站会过滤出空列表 → models=[] → writable=False →
+         那个段连勾选框都点不动。目录非空但全不合规必须也落到市面最新清单。
+      ② 手填的**全部**不合规时 forced_models 变空 → 落到 seed 分支 →
+         model_source 是 "seed" 不是 "manual" → 那条「已丢弃」警告永远
+         不触发。用户手填了两个、一个都没进去、界面上一句提示都没有。
+    """
+    import yaml
+    import cpa_probe as cpa                 # cp 是 parse 模块的别名，不是包
+    from cpa_probe import model_catalog
+    from cpa_probe.pipeline import CandidateResult, SectionVerdict
+
+    cfg = yaml.safe_load("""
+claude-api-key:
+  - api-key: "old"
+    base-url: "https://old.example"
+    priority: 500
+    models: [{name: "claude-opus-5", alias: ""}]
+""")
+
+    def plan_with(catalog, force=None):
+        row = cpa.parse_lines("https://t.example,sk-t").valid[0]
+        res = CandidateResult(row=row)
+        for s in cpa.SECTIONS:
+            res.sections[s] = SectionVerdict(
+                section=s, usable=False, base_url=row.base_for(s),
+                models=[], catalog=list(catalog), category="死路", action="x")
+        return cpa.build_plan(row, res, cfg, bands={},
+                             seen=cpa.existing_fingerprints(cfg),
+                             probation=True, force=force)
+
+    # ── ① 目录非空但全不合规 ──
+    dirty = ["gemini-3.5-flash", "gpt-oss-120b", "grok-4.6", "gpt-image-2"]
+    p = plan_with(dirty)
+    for s in ("gemini-api-key", "codex-api-key", "claude-api-key"):
+        sp = p.sections[s]
+        assert sp.models, f"{s} 目录全不合规时清单为空 —— 那个段勾不上"
+        assert sp.writable, f"{s} writable=False —— 勾选框点不动"
+        assert sp.model_source == "seed", (
+            f"{s} 该落到市面最新清单，实得 {sp.model_source}")
+        for m in sp.models:
+            assert model_catalog.section_allows(s, m), f"{s} 兜底里有违规 {m}"
+
+    # ── 目录里有合规项时仍走 catalog，且同系列取最新 ──
+    mixed = ["gpt-5.5", "gpt-5.6", "claude-opus-4-8", "claude-opus-5",
+             "gemini-2.5-pro", "gemini-3.1-pro"]
+    p2 = plan_with(mixed)
+    assert p2.sections["codex-api-key"].model_source == "catalog"
+    assert p2.sections["codex-api-key"].models == ["gpt-5.6"], (
+        f"同系列旧版没被剔除：{p2.sections['codex-api-key'].models}")
+    assert p2.sections["claude-api-key"].models == ["claude-opus-5"]
+    assert p2.sections["gemini-api-key"].models == ["gemini-3.1-pro"]
+
+    # ── ② 手填全不合规：仍要报「已丢弃」 ──
+    p3 = plan_with([], force={"gemini-api-key":
+                              ["gemini-3.5-flash", "gemini-3.6-flash"]})
+    sp3 = p3.sections["gemini-api-key"]
+    assert sp3.model_source == "seed", sp3.model_source
+    dropped = [w for w in sp3.warnings if "手填" in w and "已丢弃" in w]
+    assert dropped, (
+        f"手填全不合规却没有提示 —— 工具悄悄换了清单：{sp3.warnings}")
+    assert "全部不合规" in dropped[0], dropped[0]
+
+    # ── 手填部分合规：收下合规的，丢弃项照样报 ──
+    p4 = plan_with([], force={"codex-api-key":
+                              ["gpt-5.6-sol", "gpt-image-2", "gpt-oss-20b",
+                               "gpt-5.5", "claude-opus-5"]})
+    sp4 = p4.sections["codex-api-key"]
+    assert sp4.model_source == "manual", sp4.model_source
+    assert sp4.models == ["gpt-5.6-sol", "gpt-5.5"], sp4.models
+    d4 = [w for w in sp4.warnings if "已丢弃" in w]
+    assert d4 and "gpt-image-2" in d4[0] and "claude-opus-5" in d4[0], d4
+
+    print("[OK] No dead end: 目录全不合规落到市面清单、同系列取最新、"
+          "手填丢弃项两种情形都有提示")
+
+
 def test_context_limit_lower_bound():
     """截断反推出的荒谬小值不许写进 config.yaml。
 
@@ -1847,6 +1929,8 @@ claude-api-key:
     #    下面两站 weight: 0（已被逐出调度池），所以挡住它们零代价 ——
     #    这让 suggest_priority 选中最高那个**窄**空档，正是要下移的情形。
     cfg3 = yaml.safe_load('''
+routing:
+  strategy: weighted-round-robin
 claude-api-key:
   - api-key: "n1"
     base-url: "https://a.example"
@@ -2098,6 +2182,7 @@ if __name__ == "__main__":
         ("重建保留 weight", test_rebuild_keeps_weight),
         ("批量定档站级差异", test_assign_priorities_site_level),
         ("模型库三层兜底", test_model_catalog_three_layers),
+        ("规则收紧不留死角", test_model_rules_no_dead_end),
         ("上下文上限下限校验", test_context_limit_lower_bound),
         ("批量键含 api_key", test_batch_key_includes_api_key),
         ("批量记录异常站", test_batch_records_errors),

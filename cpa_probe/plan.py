@@ -609,14 +609,19 @@ def _weight_is_zero(w) -> bool:
         internal/credentialweight/weight.go:21-24
             if weight <= 0 { return 0, nil }      ← **负数也归零**
 
-    归零后 `positiveWeightAuths`（selector.go:423-430）把它整个剔除。
+    归零后 `positiveWeightAuths`（selector.go:637-644）把它整个剔除。
     所以 `weight: -1` 与 `weight: 0` 效果完全相同 —— 只判 `== 0` 会漏掉负数，
     把一个已被逐出的站当成活站保护，新站因此被压低。
 
-    None（没设 weight）不算 —— 那走默认值 1，是活的。
-    字符串形态（YAML 里写 `weight: "0"`）也认：CPA 侧的
-    validateCredentialWeightYAML（internal/config/weight.go:74-76）会要求
-    整数、拒绝这份配置，但在它拒绝之前我们不该把它当成活站。
+    **前提：`routing.strategy` 是 `weighted-round-robin`**（2026-09-02 核实）。
+    只有 `WeightedRoundRobinSelector.Pick` 调 `positiveWeightAuths`
+    （selector.go:650）；`RoundRobinSelector`（:589，也是**默认**策略）与
+    `FillFirstSelector`（:787）根本不读 weight —— 那两种策略下 `weight: 0`
+    的站照常参与轮询。
+
+    本项目对此的处理：`weight_zero_excludes` 按配置判断策略再决定要不要把
+    零权重当「已逐出」。当前部署实测 `strategy: weighted-round-robin`，
+    所以语义成立；换成默认 round-robin 后定档会自动改按「活站」对待它们。
     """
     if w is None:
         return False
@@ -631,6 +636,39 @@ def _weight_is_zero(w) -> bool:
         return False
 
 
+# 只有这个策略会把零权重凭据整个剔除。CPA 的解析接受三种拼法
+# （service_config.go:42-47），大小写与空格都不敏感。
+_WRR_ALIASES = frozenset({"weighted-round-robin", "weightedroundrobin", "wrr"})
+
+
+def weight_zero_excludes(cfg: dict) -> bool:
+    """`weight: 0` 在这份配置下是否真的把凭据逐出调度池。
+
+    为什么必须问这一句（2026-09-02 核实 CPA 源码后发现）
+    ------------------------------------------------
+    本模块多处把 `weight: 0` 当「站已被逐出、挡住它零代价」的**强信号**读，
+    而那只在 `routing.strategy = weighted-round-robin` 下成立：
+
+        WeightedRoundRobinSelector.Pick  → positiveWeightAuths  → 剔除 weight<=0
+                                           (selector.go:650, 637-644)
+        RoundRobinSelector.Pick          → 不读 weight          (selector.go:589)
+        FillFirstSelector.Pick           → 不读 weight          (selector.go:787)
+
+    而 round-robin 是**默认**策略（config_types.go:235-236）。也就是说没配
+    `routing.strategy` 的部署里，`weight: 0` 的站照常参与轮询 —— 此时把它当
+    死站会让定档以为「挡住它没代价」，从而把新站插到一批**其实在服务**的站
+    之前。方向正是本模块反复强调的更坏那个：把活站当死站。
+
+    当前部署实测配的是 `weighted-round-robin`，所以旧行为一直是对的；
+    但那是配置的巧合，不是代码的保证。
+    """
+    routing = (cfg or {}).get("routing")
+    if not isinstance(routing, dict):
+        return False                    # 没配 routing = 默认 round-robin
+    raw = str(routing.get("strategy") or "").strip().lower()
+    return raw in _WRR_ALIASES
+
+
 def build_band(cfg: dict, section: str, *, raw: str = "") -> Band:
     """从现有 config.yaml 算出该段的档位谱与每个模型的当前顶层。
 
@@ -642,6 +680,11 @@ def build_band(cfg: dict, section: str, *, raw: str = "") -> Band:
     model_top: dict[str, int] = {}
     model_tiers: dict[str, dict[int, list[str]]] = {}
     dead: set[str] = set()
+    # `weight: 0` 只在 weighted-round-robin 下才真的把凭据逐出调度池。
+    # 默认策略 round-robin 与 fill-first 根本不读 weight —— 那时零权重的站
+    # 照常参与轮询，把它当死站会让新站插到一批**其实在服务**的站之前。
+    # 见 weight_zero_excludes 的说明。
+    wrr = weight_zero_excludes(cfg)
 
     for e in cfg.get(section) or []:
         if not isinstance(e, dict):
@@ -650,11 +693,12 @@ def build_band(cfg: dict, section: str, *, raw: str = "") -> Band:
         if not isinstance(pri, int):
             continue
         host = host_of(str(e.get("base-url") or ""))
-        # weight: 0 是**强信号** —— CPA 的选择器已经把它整个剔除
-        # （selector.go:423-430 positiveWeightAuths），挡住它零代价。
+        # weight: 0 是**强信号** —— weighted-round-robin 下 CPA 的选择器
+        # 已经把它整个剔除（selector.go:650 → 637-644 positiveWeightAuths），
+        # 挡住它零代价。其他策略下不成立，所以先看 wrr。
         # 用 entry_all_zero_weight 而不是 e.get("weight")：compat 段的 weight
         # 在 api-key-entries 里，条目级读不到（自查发现的缺陷）。
-        if host and entry_all_zero_weight(section, e):
+        if wrr and host and entry_all_zero_weight(section, e):
             dead.add(host.lower())
         tiers.setdefault(pri, [])
         if host and host not in tiers[pri]:
@@ -1430,44 +1474,55 @@ def build_plan(
         # 三种来源，可信度递减。model_source 要一路带到界面上 ——
         # 「验证过」和「站方声称有」不能在界面上长一个样，那正是 CPAMP
         # 「模型」列的毛病：显示 config.yaml 里写了几个，看着像测活结果。
+        models: list[str] = []
+        model_source = "probed"
         if forced_models and not v.usable:
             models, model_source = forced_models, "manual"
         elif v.usable:
             models, model_source = list(v.models), "probed"
-        elif v.catalog:
-            # 判死但目录能读到 —— 取目录里通过白名单的名字。
-            # 段族闸再过一遍：v.catalog 正常已被 _stage0_catalog 滤过，但
-            # 形态复用（shape.catalog）与手填路径都能绕开那一步。写进
-            # config.yaml 的模型必须与段协议匹配 —— 纵深防御。
-            models = [m for m in v.catalog
-                      if model_allowed(m)
-                      and model_fits_section(v.section, m)][:MAX_MODELS_PER_SECTION]
-            model_source = "catalog"
         else:
-            # 目录也关了 —— 填「当前市面上最新」的清单。
+            if v.catalog:
+                # 判死但目录能读到 —— 取目录里通过段规则的名字。
+                # 再过一遍闸：v.catalog 正常已被 _stage0_catalog 滤过，但
+                # 形态复用（shape.catalog）与手填路径都能绕开那一步。写进
+                # config.yaml 的模型必须与段协议匹配 —— 纵深防御。
+                models = [m for m in v.catalog
+                          if model_allowed(m)
+                          and model_fits_section(v.section, m)]
+                # 同系列取最新：目录里常同时报 gpt-5.5 与 gpt-5.6，
+                # 两个都写进去等于让 CPA 把请求分给旧版。
+                models = model_catalog.newest_per_series(
+                    models)[:MAX_MODELS_PER_SECTION]
+                if models:
+                    model_source = "catalog"
+            # 目录为空、或目录里的名字**全部**不合规 —— 都要落到市面最新清单。
             #
-            # 2026-09-02 用户要求：「如果无法检测出模型，原则上需要在线检索
-            # 大数据按当前市面上存在最新模型编号直接填写好」。原来只填两个
-            # 写死的种子（SEED_MODELS），现场表现就是截图里 gemini 段那个
-            # 「站方目录也没报模型：手填模型名」的空输入框。
-            #
-            # 三层数据源，见 model_catalog.latest_models：
-            #   1. CPA 权威名录（远程，与 CPA 自己的 model_updater 同源）
-            #   2. 本地 config.yaml 已有的模型名（站方特供型号只在这层）
-            #   3. 内置兜底（用户指定的那批）
-            # 同系列自动取最新版 —— 未来出 gpt-5.7 时旧的 5.6 不再放入。
-            #
-            # remote_names 走的是 model_catalog 自己的缓存（成功 6 小时 /
-            # 失败 10 分钟），所以 79 个凭据串行调用它只有第一次走网络。
-            remote, _why = model_catalog.remote_names()
-            # limit 用 6 而不是 MAX_MODELS_PER_SECTION（4）：那个常数管的是
-            # 「每段最多**验**几个模型」（每个都要发一次推理请求，贵）。
-            # 这里是「写进 config.yaml 几个」—— 不发请求，多写几个只是让
-            # CPA 的模型注册表多几行，而覆盖面更全。
-            # 6 恰好放得下用户指定的 gemini 六个 pro 变体。
-            models, model_src = model_catalog.latest_models(
-                section, cfg=cfg, remote=remote, limit=6)
-            model_source = "seed"
+            # 为什么「全部不合规」也要兜（2026-09-02 自查发现）：原来只判
+            # `elif v.catalog:`，目录非空就进那条分支；规则收紧后一个只报
+            # flash / oss / grok 的站会过滤出空列表，models=[] →
+            # writable=False → **那个段连勾选框都点不动**，正是 2026-09-01
+            # 修过的「判死段勾不上」同一个症状，被新规则重新引入了。
+            if not models:
+                # 2026-09-02 用户要求：「如果无法检测出模型，原则上需要在线
+                # 检索大数据按当前市面上存在最新模型编号直接填写好」。
+                #
+                # 三层数据源，见 model_catalog.latest_models：
+                #   1. CPA 权威名录（远程，与 CPA 自己的 model_updater 同源）
+                #   2. 本地 config.yaml 已有的模型名（站方特供型号只在这层）
+                #   3. 内置兜底（用户指定的那批）
+                # 同系列自动取最新版 —— 未来出 gpt-5.7 时旧的 5.6 不再放入。
+                #
+                # remote_names 走 model_catalog 自己的缓存（成功 6 小时 /
+                # 失败 10 分钟），所以 79 个凭据串行调用只有第一次走网络。
+                remote, _why = model_catalog.remote_names()
+                # limit 用 6 而不是 MAX_MODELS_PER_SECTION（4）：那个常数管的是
+                # 「每段最多**验**几个模型」（每个都要发一次推理请求，贵）。
+                # 这里是「写进 config.yaml 几个」—— 不发请求，多写几个只是让
+                # CPA 的模型注册表多几行，而覆盖面更全。
+                # 6 恰好放得下用户指定的 gemini 六个 pro 变体。
+                models, model_src = model_catalog.latest_models(
+                    section, cfg=cfg, remote=remote, limit=6)
+                model_source = "seed"
 
         score = score_verdict(v)
         pri, reason = suggest_priority(band, score, models=models,
@@ -1516,6 +1571,24 @@ def build_plan(
             existing.setdefault(section, set()).add(fp)
             pairs.setdefault(section, set()).add(pair)
 
+        # 手填被规则丢弃的项 —— **不在 manual 分支里报**。
+        #
+        # 2026-09-02 自查发现：手填的全部不合规时 forced_models 变成空列表，
+        # `if forced_models and not v.usable` 为假 → 落到 seed 分支 →
+        # model_source 是 "seed" 而不是 "manual"，于是这条警告永远不触发。
+        # 用户手填了两个模型、一个都没写进去、界面上一句提示都没有，
+        # 工具悄悄换成了自己那份清单 —— 正是这条警告要防的那件事。
+        if forced_dropped:
+            sp.warnings.append(
+                f"手填的 {len(forced_dropped)} 个模型已丢弃"
+                f"（{', '.join(forced_dropped)}）—— 不符合本段规则："
+                "codex 只收 gpt 系、claude 只收 claude 系、"
+                "gemini 只收 *-pro 且版本 >= 2.5、compat 收四族；"
+                "另外同系列只保留最新版，图像/语音/oss 一律不收"
+                + ("。手填的全部不合规，已改用市面最新清单 —— "
+                   "要指定别的模型请改成符合规则的名字"
+                   if not forced_models else ""))
+
         if model_source == "manual":
             sp.priority_reason = (
                 f"人工接管（探测判「{v.category or '不可用'}」）· {reason}")
@@ -1523,13 +1596,6 @@ def build_plan(
                 f"探测未通过（{v.category or '不可用'} — {v.action or ''}），"
                 f"模型清单由你手工指定：{', '.join(models)}。"
                 "工具没有验证过这些模型能用")
-            if forced_dropped:
-                sp.warnings.append(
-                    f"手填的 {len(forced_dropped)} 个模型已丢弃"
-                    f"（{', '.join(forced_dropped)}）—— 不符合本段规则："
-                    "codex 只收 gpt 系、claude 只收 claude 系、"
-                    "gemini 只收 *-pro 且版本 >= 2.5、compat 收四族；"
-                    "另外同系列只保留最新版，图像/语音/oss 一律不收")
         elif model_source == "catalog":
             sp.priority_reason = (
                 f"未验证（探测判「{v.category or '不可用'}」，模型取自目录）· {reason}")

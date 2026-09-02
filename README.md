@@ -340,6 +340,43 @@ compat   claude-opus-5, gpt-5-codex, kimi-k3, gemini-3.1-pro, …
 比拒绝更糟。实测手填 `gpt-5.6-sol, gpt-image-2, gpt-oss-20b, gpt-5.5,
 claude-opus-5` 时收下前两个合法的，并警告「手填的 3 个模型已丢弃」。
 
+### `weight: 0` 的语义取决于 routing.strategy（2026-09-02）
+
+本项目多处把 `weight: 0` 当「站已被逐出调度池、挡住它零代价」的**强信号**读
+（定档算法据此把新站排到它们之前）。核对 CPA 源码后发现那**只在一种策略下成立**：
+
+| 策略 | 读 weight 吗 | `weight: 0` 的效果 |
+|---|---|---|
+| `weighted-round-robin` | 是 | `positiveWeightAuths` 整个剔除（`selector.go:650` → `637-644`） |
+| `round-robin`（**默认**） | 否 | 照常参与轮询（`selector.go:589`） |
+| `fill-first` | 否 | 照常参与轮询（`selector.go:787`） |
+
+没配 `routing.strategy` 的部署走默认 round-robin —— 此时把零权重站当死站会让
+定档以为「挡住它没代价」，从而把新站插到一批**其实在服务**的站之前。方向正是
+本项目反复强调的更坏那个：把活站当死站。
+
+`weight_zero_excludes(cfg)` 按配置判断策略（认 `weighted-round-robin` /
+`weightedroundrobin` / `wrr` 三种拼法，大小写与空格不敏感，与
+`service_config.go:42-47` 一致），`build_band` 据它决定要不要把零权重站计入
+`dead_hosts`。界面上那句提示也跟着分岔 —— 非 wrr 策略下说「当前策略不读 weight，
+仍参与轮询」，并说明 CPAMP 面板的「未启用」是按 weight 判的、与实际调度不一致。
+
+当前部署实测配的是 `weighted-round-robin`，所以旧行为一直是对的；但那是配置的
+巧合，不是代码的保证。
+
+### 规则收紧不许把段变成「勾不上」（2026-09-02）
+
+新规则上线后自查抓到两处「合理代码合起来出错」：
+
+- `elif v.catalog:` 只判目录**非空**。一个只报 `flash` / `oss` / `grok` 的站，
+  过滤后是空列表 → `models=[]` → `writable=False` → **那个段连勾选框都点不动**,
+  正是 2026-09-01 修过的「判死段勾不上」被新规则重新引入。改成「目录为空**或**
+  过滤后为空」都落到市面最新清单。
+- 手填的**全部**不合规时 `forced_models` 变空 → `if forced_models and not
+  v.usable` 为假 → 落到 seed 分支 → `model_source` 是 `seed` 而非 `manual`，
+  于是那条「已丢弃」警告永远不触发。用户手填了两个、一个都没进去、界面上一句
+  提示都没有。警告挪出 manual 分支，无条件报，并额外说明「已改用市面最新清单」。
+
 ### 上下文上限的下限校验（2026-09-02）
 
 实测日志里一个 compat 站三个条目都拿到 `max-context-length: 10`。CPA 把它直接当
@@ -550,7 +587,7 @@ cpa-upstream-importer/
 ├ .github/workflows/  CI：3 个 Python 版本跑测试 + 多架构镜像发布
 ├ LICENSE             MIT
 ├ CONTRIBUTING.md     贡献指南
-├ tests/              回归测试（九个套件 1028 项，零外网请求，自带最小样本）
+├ tests/              回归测试（九个套件 1039 项，零外网请求，自带最小样本）
 │  ├ run.py           跑全部，退出码 0/1，可接 CI。传 config.yaml 路径可加跑真实用例
 │  ├ fixture_cfg.py   自带的最小 config.yaml（各套件共用；不传路径时就用它）
 │  ├ test_probe.py    解析/判定/指纹/去重/定档/影响面/写回
