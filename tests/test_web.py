@@ -142,6 +142,35 @@ def main() -> int:
     truthy("有渲染函数把它放进 planmeta",
            "planWarnings(d)" in js and "function planWarnings" in js)
 
+    # ── ③c 首屏不能是白屏 ──────────────────────────────────────────
+    #
+    # 2026-09-02 现场：漂移检测在 /api/context 的请求路径里拉 GitHub，国内
+    # VPS 拉不通时干等 15 秒，而 #gate 与 #app 都 hidden —— 那段时间只有页头，
+    # 正文纯空白且没有任何提示，看起来像页面坏了。
+    section("③c 首屏骨架与 pending 状态")
+    truthy("HTML 里有启动骨架 #bootbox", 'id="bootbox"' in html,
+           "/api/context 返回前什么都不显示 = 白屏")
+    truthy("骨架默认可见（不带 hidden）",
+           re.search(r'id="bootbox"[^>]*\shidden', html) is None,
+           "带 hidden 就等于没有骨架")
+    truthy("拿到 ctx 后收起骨架", "hideSkel()" in js)
+    truthy("三条出路都收骨架（无 token / 出错 / 成功）",
+           js.count("hideSkel()") >= 3,
+           "漏一条就会让骨架与正文同时显示")
+    truthy("慢的时候换文案说明原因", "#bootmsg" in js and "bootmsg" in html)
+    truthy("后端给得出 pending 状态", '"pending": True' in srv,
+           "首次核对还没算完时要有明确状态，不能让前端猜")
+    truthy("前端认 pending 并轮询", "d.pending" in js
+           and "scheduleDriftPoll" in js)
+    truthy("轮询有次数上限", "_driftPolls >= 10" in js,
+           "无上限会一直刷 /api/context")
+    truthy("过期结论标出来", "d.refreshing" in js and '"refreshing"' in srv,
+           "旧结论与刚核对的在界面上不能长一个样")
+    truthy("漂移检测走缓存快照而不是直接调",
+           "_drift_snapshot(" in srv
+           and re.search(r"drift\s*=\s*cp\.check_profile_drift", srv) is None,
+           "直接调就回到「拉 GitHub 挡住页面」那个状态")
+
     # 写回响应的关键字段 —— 生效链的可见性全靠它们
     section("③ 写回响应：重载状态必须可见")
     for f in ("reload_ok", "reload_msg", "written", "backup", "diffs"):

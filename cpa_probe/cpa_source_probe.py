@@ -54,7 +54,20 @@ _GH_API = "https://api.github.com/repos/router-for-me/CLIProxyAPI"
 # 网页时都会跑 —— 不缓存会很快撞限额，撞了之后检查静默失效。
 # 6 小时：CPA 不会一天改几次身份头。
 _REMOTE_TTL = 6 * 3600
-_remote_cache: dict = {"at": 0.0, "ident": None, "ref": ""}
+# **失败也要缓存**（2026-09-02 实测）。原来只在成功时写缓存，于是拉不通的
+# 环境每次打开网页都重付一遍超时 —— 国内 VPS 直连 raw.githubusercontent
+# 不通，实测每次干等 15 秒且第二次没有变快。
+#
+# TTL 比成功短得多：网络故障通常是暂时的（代理刚起、DNS 抖动），
+# 不该像成功结论那样压 6 小时。10 分钟足够挡住「反复刷新页面」这个场景。
+_REMOTE_FAIL_TTL = 600
+_remote_cache: dict = {"at": 0.0, "ident": None, "ref": "", "ok": False}
+
+# commit 号也要缓存。原来每次调用都走网络（实测连打三次都是 0.47s），
+# 而它与 extract_remote 打的是同一个 GitHub，同样会在拉不通时干等。
+_COMMIT_TTL = 6 * 3600
+_COMMIT_FAIL_TTL = 600
+_commit_cache: dict = {"at": 0.0, "commit": None, "ref": ""}
 
 
 @dataclass
@@ -162,7 +175,7 @@ def _http_get(url: str, *, timeout: int = 15,
         return 0, f"{type(e).__name__}: {e}"
 
 
-def extract_remote(*, ref: str = "main", timeout: int = 15,
+def extract_remote(*, ref: str = "main", timeout: int = 8,
                    proxy: str | None = None,
                    use_cache: bool = True) -> CpaIdentity:
     """从 GitHub 直接拉那两个 Go 文件并提取常量。
@@ -172,12 +185,17 @@ def extract_remote(*, ref: str = "main", timeout: int = 15,
     额外挂载。
 
     缓存 6 小时：GitHub 未认证请求限 60 次/小时，而这个检查每次打开网页都跑。
+    **失败也缓存**（10 分钟）—— 见 _REMOTE_FAIL_TTL 的说明。
+
+    timeout 默认 8 秒（原 15）：有负缓存兜底后长超时没有收益，而它直接计入
+    第一次打开网页的等待。两个文件串行拉，所以最坏是 2×timeout。
     """
     now = time.time()
-    if (use_cache and _remote_cache["ident"] is not None
-            and _remote_cache["ref"] == ref
-            and now - _remote_cache["at"] < _REMOTE_TTL):
-        return _remote_cache["ident"]
+    if use_cache and _remote_cache["ident"] is not None \
+            and _remote_cache["ref"] == ref:
+        ttl = _REMOTE_TTL if _remote_cache["ok"] else _REMOTE_FAIL_TTL
+        if now - _remote_cache["at"] < ttl:
+            return _remote_cache["ident"]
 
     out = CpaIdentity(source_root=f"github:{ref}")
 
@@ -185,6 +203,8 @@ def extract_remote(*, ref: str = "main", timeout: int = 15,
                                timeout=timeout, proxy=proxy)
     if st != 200:
         out.errors.append(f"拉不到 {_CLAUDE_REQ}：{claude_src}")
+        if use_cache:
+            _remote_cache.update(at=now, ident=out, ref=ref, ok=False)
         return out
 
     consts = _const_map(claude_src)
@@ -221,17 +241,37 @@ def extract_remote(*, ref: str = "main", timeout: int = 15,
         out.errors.append(f"（非致命）拉不到 {_CODEX_REQ}：{codex_src}")
 
     if use_cache and out.claude_betas_unconditional:
-        _remote_cache.update(at=now, ident=out, ref=ref)
+        _remote_cache.update(at=now, ident=out, ref=ref, ok=True)
     return out
 
 
-def remote_commit(*, ref: str = "main", timeout: int = 10,
-                  proxy: str | None = None) -> str:
+def remote_commit(*, ref: str = "main", timeout: int = 8,
+                  proxy: str | None = None,
+                  use_cache: bool = True) -> str:
     """拉 GitHub 上该 ref 的最新 commit（短）。拿不到返回空串。
 
     与本地 .git/HEAD 的作用相同：拿它跟运行中 CPA 的 X-CPA-COMMIT 比，
     发现「上游已更新但你的 CPA 还是旧版」。
+
+    缓存与 extract_remote 同一套策略（成功 6 小时 / 失败 10 分钟）。
+    原来完全不缓存 —— 实测连打三次都走网络，而它与 extract_remote 打的是
+    同一个 GitHub，拉不通时同样干等一个超时。
     """
+    now = time.time()
+    if use_cache and _commit_cache["commit"] is not None \
+            and _commit_cache["ref"] == ref:
+        ttl = _COMMIT_TTL if _commit_cache["commit"] else _COMMIT_FAIL_TTL
+        if now - _commit_cache["at"] < ttl:
+            return _commit_cache["commit"]
+    got = _remote_commit_uncached(ref=ref, timeout=timeout, proxy=proxy)
+    if use_cache:
+        _commit_cache.update(at=now, commit=got, ref=ref)
+    return got
+
+
+def _remote_commit_uncached(*, ref: str = "main", timeout: int = 8,
+                            proxy: str | None = None) -> str:
+    """真正发请求的那一半。缓存判定在 remote_commit 里。"""
     st, body = _http_get(f"{_GH_API}/commits/{ref}", timeout=timeout,
                          proxy=proxy)
     if st != 200:

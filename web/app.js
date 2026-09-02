@@ -144,6 +144,8 @@ function step(n) {
 }
 
 async function boot() {
+  const skel = $('#bootbox');
+  const hideSkel = () => { if (skel) skel.hidden = true; };
   const q = new URLSearchParams(location.search);
   S.token = q.get('token') || sessionStorage.getItem('importer_token') || '';
   if (S.token) {
@@ -151,10 +153,24 @@ async function boot() {
     // 别把 token 留在地址栏 —— 会进浏览器历史
     if (q.get('token')) history.replaceState(null, '', location.pathname);
   }
-  if (!S.token) { $('#gate').hidden = false; return; }
+  if (!S.token) { hideSkel(); $('#gate').hidden = false; return; }
+
+  // 慢的话把原因说出来。骨架已经在显示了，这里只是把文案换掉 ——
+  // 「卡住了」与「还在读」对用户是两件事，而 3 秒是人开始怀疑的时点。
+  const slow = setTimeout(() => {
+    const m = $('#bootmsg');
+    if (m) {
+      m.innerHTML = `仍在等后端响应（已 3 秒）。config.yaml 很大或服务刚启动时
+        会慢一些。<span class="hint">若持续不动，看容器日志：
+        <code>docker compose logs -f cpa-upstream-importer</code></span>`;
+    }
+  }, 3000);
+
   try {
     S.ctx = await api('/api/context');
   } catch (e) {
+    clearTimeout(slow);
+    hideSkel();
     sessionStorage.removeItem('importer_token');
     $('#gate').hidden = false;
     if (e.status !== 401) {
@@ -163,6 +179,8 @@ async function boot() {
     }
     return;
   }
+  clearTimeout(slow);
+  hideSkel();
   $('#app').hidden = false;
   const entries = Object.values(S.ctx.sections).reduce((a, b) => a + b.entries, 0);
   $('#cfgmeta').textContent =
@@ -177,11 +195,59 @@ async function boot() {
 // CPA 升级换了默认头而画像梯没跟上时，探测发的形态与 CPA 实际转发的不一致，
 // 「探测通了但 CPA 不通」或反之都会发生。这里把核对结果显示出来 ——
 // 包括「没能核对」这一种，那比让人以为全都比过了要好。
+
+// pending 时的轮询。后端首次算这个检查要拉 GitHub，算完就进服务端缓存
+// （成功 6 小时）。这里每 3 秒重取一次 /api/context，最多 10 次 —— 30 秒
+// 拿不到就停手并说清，不无限刷。
+//
+// 只重取，不整页重渲染：renderBands / applyResources 都是幂等的，但重复
+// 调用会把用户改过的并发数输入框重置回推荐值。所以只更新 drift 这一块。
+let _driftPolls = 0;
+let _driftTimer = null;
+function scheduleDriftPoll() {
+  if (_driftTimer) return;                 // 已经在轮了
+  if (_driftPolls >= 10) {
+    const box = $('#driftbox');
+    if (box) {
+      box.className = 'note';
+      box.innerHTML = `<b>画像基线核对超时。</b>
+        <span class="hint">后台仍在重试；刷新页面可再看一次。
+        这个检查只是增强信号，不影响探测与写回。</span>`;
+    }
+    return;
+  }
+  _driftTimer = setTimeout(async () => {
+    _driftTimer = null;
+    _driftPolls += 1;
+    try {
+      const ctx = await api('/api/context');
+      // 只挪 drift 那一块，别动别的 —— 见上面「不整页重渲染」的说明
+      if (S.ctx) S.ctx.profile_drift = ctx.profile_drift;
+      else S.ctx = ctx;
+      renderDrift();
+    } catch {
+      scheduleDriftPoll();                 // 网络抖动，下一轮再来
+    }
+  }, 3000);
+}
+
 function renderDrift() {
   const box = $('#driftbox');
   if (!box) return;
   const d = S.ctx && S.ctx.profile_drift;
   if (!d) { box.hidden = true; return; }
+
+  // pending：后端把这个检查挪到后台线程了（远程模式要拉 GitHub，国内 VPS
+  // 拉不通时单次 8 秒起）。首次打开网页时它还没算完 —— 显示进行中并稍后
+  // 自取，绝不让它挡住页面。见 server.py 的 _drift_snapshot。
+  if (d.pending) {
+    box.className = 'note';
+    box.innerHTML = `<span class="spin"></span> <b>正在核对画像基线…</b>
+      <span class="hint">${esc(d.why || '')}</span>`;
+    box.hidden = false;
+    scheduleDriftPoll();
+    return;
+  }
 
   if (!d.checked) {
     box.className = 'note';
@@ -199,10 +265,14 @@ function renderDrift() {
   if (d.source_commit) ver.push(`源码 ${esc(d.source_commit)}`);
   if (d.runtime_commit) ver.push(`运行中 ${esc(d.runtime_commit)}`);
   const verText = ver.length ? ` · ${ver.join(' / ')}` : '';
+  // refreshing：这份结论已过 TTL，后台正在重算。显示出来 —— 否则用户
+  // 无法区分「刚核对过」与「几小时前核对的」。
+  const stale = d.refreshing
+    ? ` <span class="hint">（结论已过期，后台正在重新核对）</span>` : '';
 
   if (!d.drifts.length) {
     box.className = 'note g';
-    let t = `<b>画像基线一致</b>（依据：${esc(d.source)}${verText}）`;
+    let t = `<b>画像基线一致</b>（依据：${esc(d.source)}${verText}）${stale}`;
     if (d.partial) {
       t += `。未覆盖：${esc((d.uncovered || []).join('、'))}`;
     }
@@ -221,7 +291,7 @@ function renderDrift() {
   box.innerHTML =
     `<b>画像基线漂移 ${d.drifts.length} 处</b>`
     + (warns.length ? `（${warns.length} 处需处理）` : '')
-    + `（依据：${esc(d.source)}${verText}）`
+    + `（依据：${esc(d.source)}${verText}）${stale}`
     + `<div style="margin-top:6px">${rows}</div>`
     + `<div class="hint" style="margin-top:6px">漂移意味着探测发的形态与 CPA `
     + `实际转发的不一致 —— 可能出现「探测通了但 CPA 不通」或反之。</div>`;
