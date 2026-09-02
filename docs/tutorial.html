@@ -1407,6 +1407,60 @@ footer code{background:none;padding:0}
      —— 无从比较就不淘汰）；<b>非对话模型一律不收</b>（图像 / 语音 / 嵌入 /
      <code>-oss-</code> / <code>batch-inference</code>，它们走的不是对话协议路径）。</p>
 
+  <h3>「同系列取最新」不够，要按产品线取最高世代</h3>
+  <p>第一版按<b>系列</b>分组，系列是「把版本号换成 <code>*</code>」得到的。
+     现场截图里 codex 段仍勾着 <code>gpt-4o</code> 与 <code>gpt-5.5</code>：</p>
+  <div class="tw"><table>
+    <thead><tr><th style="width:170px">模型</th><th style="width:180px">系列（第一版）</th>
+      <th style="width:110px">版本</th><th>为什么留下</th></tr></thead>
+    <tbody>
+      <tr><td><code>gpt-4o</code></td><td><code>gpt-4o</code></td><td>None</td>
+        <td>旧正则不认 <code>4o</code> 是版本 → 自成一系，永远保留</td></tr>
+      <tr><td><code>gpt-5.1</code></td><td><code>gpt-*</code></td><td>(5,1)</td>
+        <td>被 5.5 挤掉</td></tr>
+      <tr><td><code>gpt-5.5</code></td><td><code>gpt-*</code></td><td>(5,5)</td>
+        <td><b>是 gpt-* 里最新 → 留下</b></td></tr>
+      <tr><td><code>gpt-5.6-luna</code></td><td><code>gpt-*-luna</code></td><td>(5,6)</td>
+        <td>独立系列，无对手</td></tr>
+      <tr><td><code>gpt-5.6-terra</code></td><td><code>gpt-*-terra</code></td><td>(5,6)</td>
+        <td>独立系列，无对手</td></tr>
+    </tbody></table></div>
+  <div class="note b">
+    <div class="t">两件事叠加：4o 不被识别为版本，5.5 与 luna/terra 不同系列</div>
+    <p>每一条单独看都「按规则正确工作」—— 系列分组是对的、版本比较是对的。
+       错在<b>分组的粒度</b>：<code>-luna</code> / <code>-terra</code> 是同一代的
+       三个变体，不该成为三个独立系列。</p>
+  </div>
+  <p>现在按<b>产品线</b>分组：剥掉版本与变体后缀（<code>-sol</code> /
+     <code>-luna</code> / <code>-terra</code> / <code>-high</code> / <code>-low</code> /
+     <code>-preview</code> / <code>-nano</code> / <code>-32k</code> / <code>-codex</code> …）
+     之后剩下的名字就是线名。五个模型全在 <code>gpt</code> 线上，最高世代 (5,6) →
+     只留 luna 与 terra。</p>
+  <p>世代<b>只比版本号前两位</b>：<code>claude-haiku-4-5-20251001</code> 解析出
+     (4,5,20251001)，逐位比较时那个日期戳会让它比 <code>claude-haiku-4-5</code>
+     (4,5) 更新 —— 而它们其实是同一款。截断到 (4,5) 后两者相等、都保留，
+     让 CPA 自己去匹配。缺位补 0，所以 <code>claude-opus-5</code> (5,0) 会被
+     <code>claude-opus-5-1</code> (5,1) 挤掉，与语义一致。</p>
+  <p>整条线都认不出版本时全留（<code>o1</code> / <code>o3-mini</code>）——
+     无从比较不淘汰，宁可多留一个也不因解析不出版本号而丢掉可用模型。</p>
+
+  <h3>无目录时后端填的模型，前端一个都没显示</h3>
+  <div class="note b">
+    <div class="t">警告里列着 6 个模型名，那一格却是空白</div>
+    <p>现场截图：某站 gemini 段「可信模型」完全空白，只有一个提示手填的输入框。
+       而同一行下方的橙色警告写着「模型清单取自『当前市面最新』（CPA 权威名录
+       6 个 + 本地 config.yaml 8 个）：gemini-3.1-pro, gemini-3.1-pro-high, …」。</p>
+    <p>目录为空时前端走 <code>cat.length ? … : …</code> 的 else 分支，只渲染一个
+       空的手填框 —— 它从 <code>S.forced</code> 取值，而那里此刻是空的。方案里的
+       <code>sp.models</code> 从来没被显示，<b>也没写进 <code>S.forced</code></b>。</p>
+    <p>而提交时读的正是 <code>S.forced</code> —— 所以那个段勾上也写不进任何模型。
+       用户问「是不是代表写回后这个上游站一个模型都没有」，判断是对的。</p>
+  </div>
+  <p>修法：else 分支留一个空容器，<code>refreshPlan</code> 拿后端方案的
+     <code>sp.models</code> 填成勾选框、默认全勾、并<b>立刻回写</b>
+     <code>S.forced</code>。全选 / 反选 / 清空按钮跟着出现。容器已填过就不再重填
+     —— 否则每次 <code>refreshPlan</code> 都会把用户的取消勾选覆盖掉。</p>
+
   <h3>三层数据源：为什么不能只写死一份清单</h3>
   <div class="tw"><table>
     <thead><tr><th style="width:60px">层</th><th style="width:230px">来源</th><th>它独有的东西</th></tr></thead>
@@ -1561,7 +1615,7 @@ footer code{background:none;padding:0}
 
   <div class="note w">
     <div class="t">如实说明：验证到哪一步</div>
-    <p><b>已验证</b>：假上游套件、单元测试（1039 项，含真实 config.yaml 用例时 1041 项）、
+    <p><b>已验证</b>：假上游套件、单元测试（1094 项，含真实 config.yaml 用例时 1096 项）、
        端到端演练、以及拿生产 config.yaml 做的重建对账（121 条目 / 79 凭据，
        字段计数与值零差异）。</p>
     <p><b>未验证</b>：没有对这 79 个真实站跑过一次<b>完整的写回流程</b> ——

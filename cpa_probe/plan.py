@@ -1412,7 +1412,7 @@ def build_plan(
         # 显式意图，悄悄改掉它比拒绝更糟 —— 用户会以为写进去了。
         forced_raw = [str(m).strip() for m in (force.get(section) or [])
                       if str(m).strip()]
-        forced_models = model_catalog.newest_per_series(
+        forced_models = model_catalog.newest_generation_per_line(
             [m for m in forced_raw if model_fits_section(section, m)])
         forced_dropped = [m for m in forced_raw if m not in forced_models]
         # 「市面最新清单」的来源说明。只有走到 seed 分支才会被赋值，
@@ -1491,7 +1491,7 @@ def build_plan(
                           and model_fits_section(v.section, m)]
                 # 同系列取最新：目录里常同时报 gpt-5.5 与 gpt-5.6，
                 # 两个都写进去等于让 CPA 把请求分给旧版。
-                models = model_catalog.newest_per_series(
+                models = model_catalog.newest_generation_per_line(
                     models)[:MAX_MODELS_PER_SECTION]
                 if models:
                     model_source = "catalog"
