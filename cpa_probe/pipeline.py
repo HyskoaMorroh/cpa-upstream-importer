@@ -37,45 +37,40 @@ from .classify import body_excerpt as _body_excerpt
 from .classify import classify as _classify
 from .classify import has_error_envelope as _has_error_envelope
 from .classify import time_window as _time_window
-from . import client, fingerprint, profiles, request
+from . import client, fingerprint, model_catalog, profiles, request
 from .parse import SECTIONS, ParsedRow, base_for_section, host_of
 
 # 每段的种子模型。/models 目录拿不到时兜底；拿到目录时用来定验证顺序。
 # 按段分开 —— claude 段问 gpt-5.6-sol 必然 404，那是 CPA 的段语义决定的。
+#
+# 2026-09-02 跟着新规则更新：
+#   · gemini 段去掉 flash（新规则只要 *-pro >= 2.5），换成 3.1-pro 与 2.5-pro
+#     —— 两个版本都探一下：3.1 是最新，但不少站还只开到 2.5
+#   · claude 段加 fable-5，codex 段加 gpt-5.6（用户指定清单里有）
+# 每段仍只放 2-3 个：这是**基线阶段**逐个打的清单，多一个就多一轮请求。
+# 完整的「市面最新清单」在 model_catalog.latest_models，那是写回时用的。
 SEED_MODELS: dict[str, list[str]] = {
-    "gemini-api-key": ["gemini-2.5-pro", "gemini-2.5-flash"],
+    "gemini-api-key": ["gemini-3.1-pro", "gemini-2.5-pro"],
     "codex-api-key": ["gpt-5.6-sol", "gpt-5.6-terra"],
     "claude-api-key": ["claude-opus-5", "claude-sonnet-5"],
-    "openai-compatibility": ["gpt-5.6-sol", "claude-opus-5", "gemini-2.5-pro"],
+    "openai-compatibility": ["gpt-5.6-sol", "claude-opus-5", "gemini-3.1-pro"],
 }
 
-# 只保留这三类 —— 用户 2026-08-29 定的规则：
-# 「模型类型只能是在 gemini、gpt、claude 这三种类型中的才保留」
-MODEL_PREFIX_WHITELIST = ("gemini", "gpt", "claude")
-
-# OpenAI 的推理系列不叫 gpt-*，但它属于上面规则里的「gpt 那一类」。
-# 2026-08-31 实测：o1 / o3-mini 被上面的前缀白名单丢掉 —— 那是规则**想留
-# 却漏掉**的，不是有意排除（deepseek / grok / qwen / glm / kimi 才是有意排除）。
+# 保留的模型族。2026-08-29 定 gemini/gpt/claude 三类，2026-09-02 加 kimi
+# （用户把它列进 compat 段的允许清单）。仍然有意排除 deepseek / grok /
+# qwen / glm / llama。
 #
-# 用正则而不是前缀元组：`o1`、`o3`、`o4-mini` 这类是「字母 o + 数字」开头，
-# 而 `openai-xxx`、`omni-xxx` 不该命中，单纯 startswith("o") 会误收。
-_OPENAI_REASONING_RE = re.compile(r"^o\d+(?:[.\-]|$)")
+# 单一定义在 model_catalog.FAMILIES —— 这里做别名是因为几处调用与测试按
+# 这个名字引用。规则本身**只在那一处**，不许在这里再写一套。
+MODEL_PREFIX_WHITELIST = model_catalog.FAMILIES
 
 def model_family(name: str) -> str:
-    """模型属于哪一族。返回 "gemini" / "gpt" / "claude" / ""（认不出）。
+    """模型属于哪一族。返回 "gemini" / "gpt" / "claude" / "kimi" / ""。
 
     只看名字，不看它挂在哪个段 —— 判据就是名字本身。
+    实现在 model_catalog，这里保留名字是因为测试与几处调用按这个名字引用。
     """
-    n = (name or "").strip().lower()
-    if "/" in n:
-        n = n.split("/")[-1]
-    if n.startswith("gemini"):
-        return "gemini"
-    if n.startswith("claude"):
-        return "claude"
-    if n.startswith("gpt") or _OPENAI_REASONING_RE.match(n):
-        return "gpt"
-    return ""
+    return model_catalog.family(name)
 
 
 # 每段只能探本族的模型。
@@ -108,11 +103,18 @@ SECTION_FAMILY: dict[str, str] = {
 
 
 def model_fits_section(section: str, name: str) -> bool:
-    """这个模型能不能在这个段上探。compat 段一律 True。"""
-    want = SECTION_FAMILY.get(section)
-    if not want:
-        return True
-    return model_family(name) == want
+    """这个模型能不能在这个段上用。
+
+    2026-09-02 起委托给 `model_catalog.section_allows` —— 用户那轮把规则收紧
+    （gemini 只要 *-pro 且 >= 2.5、compat 加 kimi、排除图像/oss 这类非对话
+    模型），而规则原来散在这里、`model_allowed` 与 `web/app.js` 三处，
+    三处不一致的后果就是现场截图那两个问题。判据只留一处。
+
+    **探测与写入共用同一套判据**，不给探测放宽。理由：放宽会让「用 flash 探通、
+    却往 config.yaml 写 pro」成为可能，而那个 pro 从没验证过 —— 正是本工具
+    一直在避免的「未验证当已验证」。
+    """
+    return model_catalog.section_allows(section, name)
 
 
 # 每段最多验几个模型。聚合站声明几百个（relay-m 曾 838 个），
@@ -241,19 +243,36 @@ def _model_specific_dead_end(att) -> bool:
 
 
 def model_allowed(name: str) -> bool:
-    """按用户规则过滤模型名：只留 gemini / gpt / claude 三类。
+    """按用户规则过滤模型名：只留 gemini / gpt / claude / kimi 四类。
 
-    o1 / o3-mini 这类 OpenAI 推理系列也放行 —— 见 _OPENAI_REASONING_RE 的说明：
-    它们属于规则里的「gpt 那一类」，只是 OpenAI 换了命名，2026-08-31 实测
-    被前缀白名单漏掉了。
+    o1 / o3-mini 这类 OpenAI 推理系列也放行 —— 它们属于规则里的「gpt 那一类」，
+    只是 OpenAI 换了命名，2026-08-31 实测被前缀白名单漏掉了。
+
+    kimi 是 2026-09-02 新增：用户把它列进 compat 段的允许清单，而 CPA 的权威
+    名录里确实有 kimi provider（kimi-k2 … kimi-k3-256k）。它只在 compat 段
+    有意义（前三段的段族闸会拦住它），这里放行、由 `model_fits_section` 定段。
+
+    仍然有意排除：deepseek / grok / qwen / glm / llama。
+
+    判据委托给 model_catalog.family —— 与段级规则同一处定义。
     """
-    n = (name or "").strip().lower()
-    # 去掉可能的 provider 前缀（relay-m 会写 Business/gemini-xxx）
-    if "/" in n:
-        n = n.split("/")[-1]
-    if n.startswith(MODEL_PREFIX_WHITELIST):
-        return True
-    return bool(_OPENAI_REASONING_RE.match(n))
+    return model_catalog.family(name) in model_catalog.FAMILIES
+
+
+# 截断反推出的容量低于这个数就**不采信**（2026-09-02 实测发现）。
+#
+# 现场：一个 compat 站三个条目都拿到 `max-context-length: 10`。CPA 把它直接
+# 当 context_window / max_context_window 报给客户端
+# （internal/client/codex/models/models.go:206-211），10 个 token 的窗口 =
+# 那个站的每一次请求都立刻超限。而这个值是 `tok < chars * 0.5` 判成「截断」
+# 后当作真实容量返回的 —— 上游回 `input_tokens: 10`（它根本没统计，或统计的
+# 是别的东西）时，10 就成了「实测容量」。
+#
+# 取 8000：比任何真实模型的窗口都小一个数量级（现役最小的也有 200k），
+# 所以不会误伤真实的小窗口站；又足够大到挡住「上游 token 计数不可信」这类。
+# 低于它就当「测不出」—— 缺这个字段 CPA 会回落内置目录值
+# （service_models.go 各段的 fallback），比写一个荒谬的数安全得多。
+_MIN_TRUSTED_CONTEXT = 8_000
 
 
 @dataclass
@@ -1269,7 +1288,16 @@ class Prober:
                 return False, None
             tok = att.input_tokens
             if tok is not None and tok < chars * 0.5:
-                return False, tok  # 截断：tok 就是真实容量
+                # 截断：tok 就是真实容量 —— **但要先信得过它**。
+                # 低于 _MIN_TRUSTED_CONTEXT 的值不是小窗口，是上游的 token
+                # 计数不可信（实测有站回 input_tokens: 10）。当「测不出」处理。
+                if tok < _MIN_TRUSTED_CONTEXT:
+                    self.on_event("context-untrusted", {
+                        "section": v.section, "model": model, "tokens": tok,
+                        "sent_chars": chars,
+                    })
+                    return False, None
+                return False, tok
             return True, tok
 
         # 先打 hi。**顺序从「先 lo 后 hi」改成「先 hi」**，这是省时间的关键：

@@ -11,39 +11,131 @@ const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
   (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmt = (n) => (n == null ? '—' : Number(n).toLocaleString('en-US'));
 
-// 段 → 该段真正能转发的模型族。与后端 pipeline._SECTION_FAMILY 同源。
+// ── 模型规则（与后端 cpa_probe/model_catalog.py 逐条对齐）──
 //
-// 为什么必须按段分：CPA 每段走各自的协议路径，gemini 段拿 claude-opus-5 去打
-// /v1beta/models/claude-opus-5:generateContent，站方必然报 404 或 500。
-// 聚合站的 /models 目录把三族混在一起报，不按段筛就会把注定失败的模型
-// 注册进 config.yaml —— CPA 每次轮到它都失败，白耗重试预算。
-// compat 段是万能转发口，不筛。
-const SECTION_FAMILY = {
-  'gemini-api-key': /^gemini/i,
-  'codex-api-key': /^(?:gpt|o\d)/i,
-  'claude-api-key': /^claude/i,
-};
+// 用户 2026-09-02 定的四条：
+//   codex   只能 gpt 系
+//   claude  只能 claude 系
+//   gemini  只能 gemini-*-pro，且 * >= 2.5
+//   compat  不限段，但必须是 gpt / claude / gemini / kimi 四族之一
+// 外加：同系列以最新版为准（旧版不放入）；图像 / 语音 / 嵌入 / oss 一律不收。
+//
+// 为什么前端也要有一套：后端 section_allows 是权威，但界面要在**勾选前**就
+// 把不该勾的滤掉。两边不一致的后果就是现场截图那两个问题 —— codex 段勾上了
+// gpt-image-2 / gpt-oss-120b / gpt-oss-20b（都是 gpt 族，旧的段族闸放行），
+// gemini 段目录里列出 flash / batch-inference / pro-agent。
+// 这里的每条规则都在 tests/test_web.py 里与 Python 侧逐条比对，不许单边改。
 
-// 该段默认预勾哪些模型。规则来自现场要求：codex/compat 默认 gpt 系，
-// claude 段默认 claude 系，gemini 段只默认 *-pro（pro 是主力，flash/lite
-// 是降级档，默认全勾会让轮询把请求分到弱模型上）。
-const SECTION_DEFAULT = {
-  'gemini-api-key': /^gemini-.*-pro/i,
-  'codex-api-key': /^(?:gpt|o\d)/i,
-  'claude-api-key': /^claude/i,
-  'openai-compatibility': /^(?:gpt|o\d)/i,
-};
-
-// 这个模型名在这个段里发得出去吗
-function famOk(sec, m) {
-  const re = SECTION_FAMILY[sec];
-  return !re || re.test(String(m || ''));
+// 去掉 provider 前缀。`Business/gemini-2.5-pro` → `gemini-2.5-pro`
+function bareName(m) {
+  const s = String(m || '').trim().toLowerCase();
+  const i = s.lastIndexOf('/');
+  return i >= 0 ? s.slice(i + 1) : s;
 }
 
-// 这个模型该不该默认勾上
+const FAM_RE = {
+  gemini: /^gemini/,
+  claude: /^claude/,
+  kimi: /^kimi/,
+  gpt: /^(?:gpt|o\d+(?:[.\-]|$))/,
+};
+
+function famOf(m) {
+  const n = bareName(m);
+  for (const f of ['gemini', 'claude', 'kimi', 'gpt']) {
+    if (FAM_RE[f].test(n)) return f;
+  }
+  return '';
+}
+
+// 非对话模型：图像 / 语音 / 嵌入 / 批处理 / 开源小模型。写进 config.yaml
+// 不报错，但 CPA 路由过去必然失配 —— 它们走的不是对话协议路径。
+const NON_CHAT = /-image(?:$|[-.])|-tts(?:$|[-.])|^imagen|-oss-|-embedding|-whisper|-moderation|-batch-inference/;
+
+// gemini 段：只要 gemini-<版本>-pro*，版本 >= 2.5。`-pro` 后可带
+// -high / -low / -preview / -preview-search / -preview-customtools。
+const GEMINI_PRO = /^gemini-(\d+(?:\.\d+)?)-pro(?:$|[-.])/;
+const GEMINI_MIN = 2.5;
+
+const SECTION_FAMILY = {
+  'gemini-api-key': 'gemini',
+  'codex-api-key': 'gpt',
+  'claude-api-key': 'claude',
+};
+
+// 这个模型名在这个段里能不能用。**唯一判据** —— 与后端 section_allows 对齐。
+function famOk(sec, m) {
+  const n = bareName(m);
+  if (!n) return false;
+  const f = famOf(n);
+  if (!f) return false;                     // 四族之外（deepseek / grok / glm…）
+  if (NON_CHAT.test(n)) return false;
+  if (sec === 'gemini-api-key') {
+    const mm = GEMINI_PRO.exec(n);
+    return !!mm && parseFloat(mm[1]) >= GEMINI_MIN;
+  }
+  const want = SECTION_FAMILY[sec];
+  return want ? f === want : true;          // compat：四族都行
+}
+
+// 这个模型该不该默认勾上。
+//
+// 规则收紧后「能用」与「该勾」基本重合 —— 段规则本身已经排除了降级档
+// （gemini 只留 pro）与非对话模型。剩下唯一要额外挡的是**同系列旧版**：
+// 目录里同时有 gpt-5.5 与 gpt-5.6 时，只该默认勾 5.6。
+// 那件事需要看整份清单才能判，所以由 pickDefaults 处理，不在这里。
 function defOn(sec, m) {
-  const re = SECTION_DEFAULT[sec];
-  return !!re && re.test(String(m || ''));
+  return famOk(sec, m);
+}
+
+// 版本 token 与 kimi 的 k 前缀。与 Python 侧 _VERSION_RE 同一个模式。
+const VERSION_RE = /(?:^|[^A-Za-z0-9.])(k?)(\d+(?:[.\-]\d+)*)(?![A-Za-z0-9])/;
+
+// 拆成 [系列, 版本数组]。认不出版本时版本为 null。
+function seriesAndVersion(m) {
+  const n = bareName(m);
+  const mm = VERSION_RE.exec(n);
+  if (!mm) return [n, null];
+  // exec 的 index 指向前置分隔符，真正的版本从 mm[1] 起算
+  const start = mm.index + mm[0].length - mm[1].length - mm[2].length;
+  const series = n.slice(0, start) + mm[1] + '*' + n.slice(mm.index + mm[0].length);
+  const nums = mm[2].split(/[.\-]/).map((x) => parseInt(x, 10));
+  if (nums.some((x) => Number.isNaN(x))) return [n, null];
+  return [series, nums];
+}
+
+function verGreater(a, b) {
+  if (!a) return false;
+  if (!b) return true;
+  for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+    const x = a[i] === undefined ? -1 : a[i];
+    const y = b[i] === undefined ? -1 : b[i];
+    if (x !== y) return x > y;
+  }
+  return false;
+}
+
+// 同系列只留最新版。与 Python 侧 newest_per_series 同一套判据。
+function newestPerSeries(names) {
+  const best = new Map();
+  const order = [];
+  (names || []).forEach((n) => {
+    if (!n) return;
+    const [series, ver] = seriesAndVersion(n);
+    if (!best.has(series)) { best.set(series, [ver, n]); order.push(series); return; }
+    const [pv, pn] = best.get(series);
+    if (verGreater(ver, pv)) best.set(series, [ver, n]);
+    else if (JSON.stringify(ver) === JSON.stringify(pv)
+             && String(pn).includes('/') && !String(n).includes('/')) {
+      best.set(series, [ver, n]);           // 同版本时裸名优先
+    }
+  });
+  return order.map((s) => best.get(s)[1]);
+}
+
+// 该段默认勾选哪些：先过段规则，再同系列取最新。
+function pickDefaults(sec, catalog) {
+  return newestPerSeries((catalog || []).filter((m) => defOn(sec, m)));
 }
 
 const SECTION_LABEL = {
@@ -1171,6 +1263,14 @@ function renderStream(events) {
       return `<div class="s2">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
         + `上游自报上限 ${fmt(e.limit)} —— 免掉二分（${esc(e.model)}）</div>`;
     }
+    if (e.kind === 'context-untrusted') {
+      // 上游回了个荒谬的 input_tokens（实测见过 10）。那个数会被当成实测容量
+      // 写进 max-context-length，而 CPA 把它当 context_window 报给客户端 ——
+      // 10 个 token 的窗口等于这个站彻底不可用。丢弃并说明。
+      return `<div class="s3">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
+        + `上游 input_tokens 只有 ${fmt(e.tokens)}（发了 ${fmt(e.sent_chars)} 字符）`
+        + ` —— 计数不可信，不写 max-context-length（${esc(e.model)}）</div>`;
+    }
     if (e.kind === 'section-error') {
       // 某段探测抛异常。另外三段照常跑完，但这一段的失败必须可见 ——
       // 不显示的话它会表现成「这个段莫名不可用」。
@@ -1254,11 +1354,14 @@ function siteCard(r) {
       // 目录按段过滤 —— 混族的名字在这个段发不出去，列出来只会误导
       const cat = (v.catalog || []).filter((m) => m && famOk(sec, m));
       const cut = (v.catalog || []).filter((m) => m && !famOk(sec, m)).length;
-      // 首次渲染：没有人工接管记录时按同族规则预勾，省掉一个一个点。
+      // 首次渲染：没有人工接管记录时按段规则预勾，省掉一个一个点。
       // 已有记录（用户改过）就完全尊重记录，不覆盖。
+      //
+      // pickDefaults 在段规则之上再做「同系列取最新」—— 目录里同时有
+      // gpt-5.5 与 gpt-5.6 时只勾 5.6。这是用户 2026-09-02 的要求，
+      // 现场截图里 codex 段 8 个全勾（含 gpt-4o / gpt-oss-*）就是它缺位的后果。
       const rec = (S.forced[rid] || {})[sec];
-      const picked = new Set(rec !== undefined ? rec
-        : cat.filter((m) => defOn(sec, m)));
+      const picked = new Set(rec !== undefined ? rec : pickDefaults(sec, cat));
       // 预勾的结果要立刻回写 S.forced，否则「勾选即注册」只是视觉上的 ——
       // 提交时读的是 S.forced，不读 DOM。
       if (rec === undefined && picked.size) {

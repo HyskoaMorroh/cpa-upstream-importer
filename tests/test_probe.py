@@ -205,17 +205,20 @@ def test_classify() -> None:
         eq(f"不误伤：{(body[:30] or '<空>')}", _hee(body), False)
 
     section("模型白名单：o 系列不能被漏掉")
-    # 白名单规则是「只留 gemini / gpt / claude 三类」。o1 / o3-mini 属于
+    # 白名单规则是「只留 gemini / gpt / claude / kimi 四类」。o1 / o3-mini 属于
     # 「gpt 那一类」，只是 OpenAI 换了命名 —— 2026-08-31 实测被前缀匹配漏掉。
+    # kimi 是 2026-09-02 加的：用户把它列进 compat 段的允许清单，CPA 的权威
+    # 名录里也确实有 kimi provider。它只在 compat 段有意义，前三段由段族闸拦。
     from cpa_probe.pipeline import model_allowed as _ma
     for m in ("o1", "o1-mini", "o3", "o3-mini", "o4-mini", "o1-2024-12-17",
               "gpt-4o", "claude-opus-5", "gemini-2.5-pro",
-              "Business/gemini-2.5-pro", "anthropic/claude-fable-5"):
+              "Business/gemini-2.5-pro", "anthropic/claude-fable-5",
+              "kimi-k2", "kimi-k3", "kimi-k2.7-code"):
         eq(f"放行 {m}", _ma(m), True)
     # 不能因为放宽 o 系列就误收这些
     for m in ("openai-whisper", "omni-moderation", "o", "ollama-llama3",
               "order-model", "deepseek-chat", "grok-4", "qwen-max",
-              "glm-4", "kimi-k2", "llama-3"):
+              "glm-4", "llama-3"):
         eq(f"排除 {m}", _ma(m), False)
 
     section("处置语义")
@@ -673,12 +676,76 @@ def test_request() -> None:
 
     section("模型白名单")
     from cpa_probe.pipeline import model_allowed
-    # 用户定的规则：只保留 gemini / gpt / claude 三类
+    # 用户定的规则：保留 gemini / gpt / claude / kimi 四类
     for m in ("gemini-2.5-pro", "gpt-5.6-sol", "claude-opus-5",
-              "Business/gemini-flash"):
+              "Business/gemini-flash", "kimi-k3"):
         eq(f"保留 {m}", model_allowed(m), True)
     for m in ("BAAI/bge-large", "DeepSeek-V3", "GLM-4", "42-mini", "grok-4"):
         eq(f"剔除 {m}", model_allowed(m), False)
+
+    # ── 段级模型规则（用户 2026-09-02 定，实现在 model_catalog）──
+    #
+    # 现场两张截图：codex 段勾上了 gpt-4o / gpt-image-2 / gpt-oss-120b /
+    # gpt-oss-20b（都是 gpt 族，旧的段族闸放行），gemini 段目录里列出
+    # flash / batch-inference / pro-agent。规则散在三处（model_allowed、
+    # model_fits_section、web/app.js）且互不一致是根因。
+    section("段级模型规则：四条硬规则")
+    from cpa_probe import model_catalog as _mc
+
+    # codex 只收 gpt 系
+    for m in ("gpt-5.6-sol", "gpt-5.6", "gpt-4o", "o3-mini"):
+        eq(f"codex 收 {m}", _mc.section_allows("codex-api-key", m), True)
+    for m in ("claude-opus-5", "gemini-3.1-pro", "kimi-k3", "deepseek-v4f"):
+        eq(f"codex 拒 {m}", _mc.section_allows("codex-api-key", m), False)
+
+    # claude 只收 claude 系
+    for m in ("claude-opus-5", "claude-fable-5", "claude-sonnet-5"):
+        eq(f"claude 收 {m}", _mc.section_allows("claude-api-key", m), True)
+    eq("claude 拒 gpt-5.6", _mc.section_allows("claude-api-key", "gpt-5.6"), False)
+
+    # gemini 只收 *-pro 且版本 >= 2.5
+    for m in ("gemini-3.1-pro", "gemini-3.1-pro-high", "gemini-3.1-pro-low",
+              "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-search",
+              "gemini-3.1-pro-preview-customtools", "gemini-2.5-pro"):
+        eq(f"gemini 收 {m}", _mc.section_allows("gemini-api-key", m), True)
+    for m in ("gemini-2.0-pro",            # 版本低于 2.5
+              "gemini-3.5-flash",          # flash 不是 pro
+              "gemini-3-pro-image-preview",  # 图像模型
+              "gemini-batch-inference",    # 批处理端点
+              "gemini-pro-agent"):         # 没有版本号，不符合 gemini-<版本>-pro
+        eq(f"gemini 拒 {m}", _mc.section_allows("gemini-api-key", m), False)
+
+    # compat 收四族，拒其余
+    for m in ("gpt-5.6-sol", "claude-opus-5", "gemini-3.1-pro", "kimi-k3",
+              "Business/gemini-2.5-pro"):
+        eq(f"compat 收 {m}", _mc.section_allows("openai-compatibility", m), True)
+    for m in ("deepseek-v4f", "glm-5.2", "grok-4.6", "x-ai/grok-4.6",
+              "opus-5"):                   # 没有 claude 前缀，认不出族
+        eq(f"compat 拒 {m}", _mc.section_allows("openai-compatibility", m), False)
+
+    # 非对话模型一律不收（图像 / 语音 / 嵌入 / 开源小模型 / 批处理）
+    for sec in ("codex-api-key", "openai-compatibility"):
+        for m in ("gpt-image-2", "gpt-oss-120b", "gpt-oss-20b"):
+            eq(f"{sec} 拒非对话 {m}", _mc.section_allows(sec, m), False)
+
+    section("同系列取最新版（旧版不放入）")
+    eq("gpt-5.7 挤掉 gpt-5.6（同一变体线）",
+       _mc.newest_per_series(["gpt-5.6-sol", "gpt-5.7-sol"]), ["gpt-5.7-sol"])
+    eq("opus-5 挤掉 opus-4-8",
+       _mc.newest_per_series(["claude-opus-4-8", "claude-opus-5"]),
+       ["claude-opus-5"])
+    eq("kimi-k3 挤掉 kimi-k2",
+       _mc.newest_per_series(["kimi-k2", "kimi-k3"]), ["kimi-k3"])
+    eq("不同变体线各自保留",
+       _mc.newest_per_series(["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra"]),
+       ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra"])
+    eq("同版本时裸名优先于带前缀的",
+       _mc.newest_per_series(["anthropic/claude-opus-5", "claude-opus-5"]),
+       ["claude-opus-5"])
+    # 认不出版本的自成一系，永远保留 —— 无从比较就不淘汰
+    eq("gpt-4o 与 gpt-5.6 互不淘汰",
+       sorted(_mc.newest_per_series(["gpt-4o", "gpt-5.6"])),
+       ["gpt-4o", "gpt-5.6"])
 
 
 # ==========================================================================
