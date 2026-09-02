@@ -231,6 +231,19 @@ console.log(JSON.stringify(out));
     # 2026-09-02 现场：漂移检测在 /api/context 的请求路径里拉 GitHub，国内
     # VPS 拉不通时干等 15 秒，而 #gate 与 #app 都 hidden —— 那段时间只有页头，
     # 正文纯空白且没有任何提示，看起来像页面坏了。
+    # ── ③d weight:0 的措辞必须跟着调度策略变 ─────────────────────────
+    #
+    # 2026-09-02 核实 CPA 源码：只有 WeightedRoundRobinSelector.Pick 调
+    # positiveWeightAuths 把零权重凭据整个剔除（selector.go:650 → 637-644）；
+    # RoundRobinSelector（:589，**默认**策略）与 FillFirstSelector（:787）
+    # 根本不读 weight。说成「一定不参与调度」在后两种策略下是错的。
+    section("③d weight:0 的含义随 routing.strategy 变")
+    truthy("后端把策略回给前端",
+           '"routing_strategy"' in srv and '"weight_zero_excludes"' in srv)
+    truthy("前端按它分岔措辞", "weight_zero_excludes" in js,
+           "两种策略下同一句话不可能都对")
+    truthy("非 wrr 时说明「仍参与轮询」", "仍参与轮询" in js or "仍会正常参与轮询" in js)
+
     section("③c 首屏骨架与 pending 状态")
     truthy("HTML 里有启动骨架 #bootbox", 'id="bootbox"' in html,
            "/api/context 返回前什么都不显示 = 白屏")

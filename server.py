@@ -592,6 +592,28 @@ def _drift_snapshot(*, runtime_commit_url: str = "", **kw) -> dict:
             "why": "正在核对画像基线（首次要拉 CPA 源码，不阻塞其他功能）"}
 
 
+def _clean_override_models(section: str, raw_models: list) -> list[str]:
+    """用户覆盖的模型清单也要过段规则。
+
+    为什么必须在这里再过一遍（2026-09-02 自查发现）：`build_plan` 里的
+    `force` 路径已经过滤了，但 `overrides["models"]` 是**另一条入口** ——
+    它在 build_plan 之后直接赋值 `sp.models`，绕开全部规则。
+
+    当前前端只用 `forced` 不用 `overrides.models`，所以这条路没被走到。
+    但它是公开的 API 契约（`/api/plan` 收 overrides），curl 直接调就能塞进
+    任意模型名，而写进 config.yaml 的模型必须与段协议匹配 —— 纵深防御，
+    与 `build_plan` 里对 `v.catalog` 再过一遍闸同一个理由。
+
+    全部不合规时**保留原样**并不清空：清空会让这一段 writable=False，
+    用户的显式指定变成「什么都不写」，比拒绝更难排查。由调用方在
+    warnings 里说明。
+    """
+    got = [str(m).strip() for m in raw_models if str(m).strip()]
+    kept = cp.model_catalog.newest_per_series(
+        [m for m in got if cp.model_catalog.section_allows(section, m)])
+    return kept or got
+
+
 def _cpa_runtime_commit(base: str) -> str:
     """读运行中 CPA 的 commit（管理响应头 X-CPA-COMMIT，handler.go:267-269）。
 
@@ -1241,6 +1263,15 @@ class Handler(BaseHTTPRequestHandler):
             "existing_count": existing_count,
             "resources": res.as_dict(),
             "profile_drift": drift,
+            # 调度策略。界面上要说清 `weight: 0` 到底意味着什么 ——
+            # 只有 weighted-round-robin 会把零权重凭据逐出调度池
+            # （selector.go:650 → positiveWeightAuths）；默认的 round-robin
+            # 与 fill-first 根本不读 weight，那时 `weight: 0` 的站照常轮询。
+            # 见 cp.weight_zero_excludes。
+            "routing_strategy": (
+                str(((cfg or {}).get("routing") or {}).get("strategy") or "")
+                if isinstance((cfg or {}).get("routing"), dict) else ""),
+            "weight_zero_excludes": cp.weight_zero_excludes(cfg),
         })
 
     def _api_parse(self, body: dict) -> None:
@@ -1636,7 +1667,7 @@ class Handler(BaseHTTPRequestHandler):
                     if "headers" in ov and isinstance(ov["headers"], dict):
                         sp.headers = {str(k): str(v) for k, v in ov["headers"].items()}
                     if "models" in ov and isinstance(ov["models"], list):
-                        sp.models = [str(m) for m in ov["models"]]
+                        sp.models = _clean_override_models(sec, ov["models"])
                     if "max_context_length" in ov:
                         v = ov["max_context_length"]
                         sp.max_context_length = int(v) if v else None

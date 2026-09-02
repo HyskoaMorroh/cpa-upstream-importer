@@ -813,7 +813,9 @@ function renderDiag(d) {
           <div class="hint">${esc(sp.priority_reason || '')}</div></td>
         <td class="m">${esc(sp.prefix || '—')}
           ${sp.weight === 0
-            ? '<div class="warn b">weight: 0 —— 不参与调度</div>'
+            ? ((S.ctx && S.ctx.weight_zero_excludes)
+                ? '<div class="warn b">weight: 0 —— 不参与调度</div>'
+                : '<div class="warn">weight: 0 —— 当前策略不读 weight，仍参与轮询</div>')
             : (sp.weight != null ? `<div class="hint">weight ${sp.weight}</div>` : '')}</td>
         <td><span class="pill ${st.c}">${st.t}</span>
           <div class="mlist">${esc((sp.models || []).join(', ')) || '—'}</div></td>
@@ -1387,10 +1389,11 @@ function siteCard(r) {
             <button type="button" class="mini cmnone" data-rid="${esc(rid)}" data-host="${esc(host)}"
               data-sec="${esc(sec)}">清空</button>
             <span class="hint">目录 ${cat.length} 个，已勾 <b class="cmn">${picked.size}</b>
-              ${cut ? ` · 已滤掉 ${cut} 个跨族模型（该段发不出去）` : ''}</span>
+              ${cut ? ` · 已滤掉 ${cut} 个不符合本段规则的模型` : ''}</span>
           </div>`
-            : (cut ? `<div class="hint">目录里 ${cut} 个模型都不属于本段协议族，
-              已全部滤掉 —— 写进去 CPA 每次轮到都会失败</div>` : '')}
+            : (cut ? `<div class="hint">目录里 ${cut} 个模型都不符合本段规则
+              （跨族、图像/语音/oss，或 gemini 段的非 pro 档）——
+              后端会改用「当前市面最新」清单，勾选即接管</div>` : '')}
           <div class="pedit"><input type="text" class="fm" style="width:100%"
             data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}"
             value="${esc(fm)}"
@@ -1786,17 +1789,27 @@ async function refreshPlan(silent) {
       if (!tr) return;
       const inp = tr.querySelector('.pi');
       if (inp && !inp.value) inp.value = sp.priority;
-      // weight: 0 必须显眼 —— 它是「这个站被逐出调度池」的唯一表达，而
-      // 全量重探会如实把原值搬回来。CPAMP 面板上表现为「启用」开关是关的，
-      // 而这里若不显示，用户会以为写回后它就参与调度了（2026-09-02 现场问题：
-      // 「一些网站全量写入后是关闭状态是怎么回事」）。
+      // weight: 0 必须显眼 —— 全量重探会如实把原值搬回来。
+      //
+      // 但它的**含义取决于 routing.strategy**（2026-09-02 核实 CPA 源码）：
+      // 只有 weighted-round-robin 会调 positiveWeightAuths 把零权重凭据
+      // 整个剔除（selector.go:650 → 637-644）；默认的 round-robin 与
+      // fill-first 根本不读 weight，那时这个站照常参与轮询。
+      // 说成「一定不参与调度」在后两种策略下是错的。
       if (sp.weight === 0) {
         const pc = tr.querySelector('.prio');
         if (pc && !pc.querySelector('.w0')) {
-          pc.insertAdjacentHTML('beforeend',
-            '<div class="warn b w0">weight: 0 —— 原配置已把它逐出调度池，'
-            + '写回后仍不参与轮询（CPAMP 面板显示为「未启用」）。'
-            + '要解封请手工删掉这一行</div>');
+          const excl = S.ctx && S.ctx.weight_zero_excludes;
+          const strat = (S.ctx && S.ctx.routing_strategy) || '未配置（默认 round-robin）';
+          pc.insertAdjacentHTML('beforeend', excl
+            ? '<div class="warn b w0">weight: 0 —— 原配置已把它逐出调度池，'
+              + '写回后仍不参与轮询（CPAMP 面板显示为「未启用」）。'
+              + '要解封请手工删掉这一行</div>'
+            : `<div class="warn w0">weight: 0 —— 原值搬回。当前
+                <code>routing.strategy = ${esc(strat)}</code> <b>不读 weight</b>，
+                所以这个站仍会正常参与轮询（CPAMP 面板可能显示为「未启用」，
+                那是按 weight 判的，与实际调度不一致）。
+                只有改成 <code>weighted-round-robin</code> 它才真被逐出</div>`);
         }
       }
       // 模型清单的来源 —— 判死段现在也有确定清单，但那清单可能只是种子

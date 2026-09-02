@@ -287,8 +287,13 @@ def main() -> int:
        "xxx" in unhealthy_from_comments(raw3, "claude-api-key"), False)
 
     # ── ⑦ weight: 0 的解析 ──────────────────────────────────────────
-    section("⑦ weight: 0 是强信号（selector 已把它剔除）")
-    cfg_w = {"claude-api-key": [
+    section("⑦ weight: 0 是强信号（weighted-round-robin 下 selector 已剔除）")
+    # routing.strategy 必须显式给 —— 2026-09-02 核实 CPA 源码：只有
+    # WeightedRoundRobinSelector.Pick 调 positiveWeightAuths（selector.go:650），
+    # RoundRobinSelector（:589，也是**默认**）与 FillFirstSelector（:787）
+    # 根本不读 weight。见 weight_zero_excludes。
+    _WRR = {"routing": {"strategy": "weighted-round-robin"}}
+    cfg_w = {**_WRR, "claude-api-key": [
         {"api-key": "a", "base-url": "https://dead.example", "priority": 900,
          "weight": 0},
         {"api-key": "b", "base-url": "https://dead.example", "priority": 900,
@@ -302,6 +307,20 @@ def main() -> int:
     eq("全部 key 都 weight:0 的站算死站", "dead.example" in bw.dead_hosts, True)
     eq("还有活 key 的站不算死站", "mixed.example" in bw.dead_hosts, False)
     eq("没设 weight 的站不算死站", "live.example" in bw.dead_hosts, False)
+
+    # 策略换成默认 round-robin：weight 完全不被读，零权重的站照常轮询，
+    # 此时把它当死站会让新站插到一批**其实在服务**的站之前。
+    cfg_rr = {k: v for k, v in cfg_w.items() if k != "routing"}
+    eq("没配 routing（默认 round-robin）时 weight:0 不算死站",
+       cp.build_band(cfg_rr, "claude-api-key").dead_hosts, set())
+    cfg_ff = {**cfg_rr, "routing": {"strategy": "fill-first"}}
+    eq("fill-first 时也不算死站",
+       cp.build_band(cfg_ff, "claude-api-key").dead_hosts, set())
+    from cpa_probe.plan import weight_zero_excludes as _wze
+    for alias in ("weighted-round-robin", "WeightedRoundRobin", " WRR ", "wrr"):
+        eq(f"策略别名 {alias!r} 认得出",
+           _wze({"routing": {"strategy": alias}}), True)
+    eq("routing 不是 dict 时按默认处理", _wze({"routing": "wrr"}), False)
 
     # ── ⑧ 真实 config.yaml 上的端到端 ──────────────────────────────
     # 不传路径就用自带样本 —— 这一轮验的是「定档不变式在真实形状上成立」，
@@ -430,7 +449,8 @@ def main() -> int:
     eq("未设 weight 记成 None 而非跳过",
        W("openai-compatibility",
          {"api-key-entries": [{"weight": 0}, {"api-key": "d"}]}), [0, None])
-    cfg_c = {"openai-compatibility": [
+    cfg_c = {"routing": {"strategy": "weighted-round-robin"},
+             "openai-compatibility": [
         {"name": "dead", "base-url": "https://dead.example/v1", "priority": 500,
          "api-key-entries": [{"api-key": "a", "weight": 0},
                              {"api-key": "b", "weight": 0}]},
@@ -507,7 +527,8 @@ def main() -> int:
 
     section("⑩ 同站多条目：任一条目有活 key 就不算整站死")
     # build_band 的 alive 集合按条目算，一个站可能有多个条目。
-    cfg_m = {"claude-api-key": [
+    cfg_m = {"routing": {"strategy": "weighted-round-robin"},
+             "claude-api-key": [
         {"api-key": "a", "base-url": "https://multi.example", "priority": 900,
          "weight": 0},
         {"api-key": "b", "base-url": "https://multi.example", "priority": 900,
