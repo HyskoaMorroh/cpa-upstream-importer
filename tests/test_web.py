@@ -250,6 +250,18 @@ console.log(JSON.stringify(out));
     # 文本里也列着那 6 个名字，而那一格只渲染了一个空的手填框 —— 它从
     # S.forced 取值，而 S.forced 此刻是空的。用户看到空白，且提交时读的正是
     # S.forced，所以那个段勾上也写不进任何模型。
+    # ── ③f 落后目录不预勾 + 限频学习要可见 ────────────────────────────
+    section("③f 落后目录不预勾、限频学习可见")
+    truthy("后端回 market_top_gen", '"market_top_gen"' in srv,
+           "前端在勾选前就渲染结果表，那时还没有 /api/plan 的响应")
+    truthy("前端 pickDefaults 用它判落后", "market_top_gen" in js)
+    truthy("落后时返回空（一个都不勾）",
+           "if (top && genGreater(mkt, top)) return [];" in js)
+    truthy("界面说清为什么不勾", "整份目录都落后于市面最新" in js)
+    truthy("后端回 catalog_stale", '"catalog_stale"' in srv)
+    truthy("限频学习有事件", "rate-limit-learned" in js,
+           "自动放慢了却不说，用户会以为探测卡住了")
+
     section("③e 无目录时用后端方案填勾选框")
     truthy("留了 fallback 容器", "cats fallback" in js,
            "没有容器就没地方填，用户只能看到空手填框")
