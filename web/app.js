@@ -1863,6 +1863,21 @@ $('#btnback').onclick = () => {
   step(1);
 };
 
+// 方案级警告（/api/plan 的 warnings）。段级警告在结果表的 wrow 里，
+// 但这些不属于任何单段 —— 「整批下移到更低的空档」「N 个站共用同一档位」
+// 说的是**站与站的相对关系**，只有在这里给一处才看得全。
+//
+// 为什么必须显示（2026-09-02）：后端一直返回它，前端从来不读。定档退化
+// （空档不够、越过现有档位、用户手工改成同值）会改变哪个站先被尝试，
+// 而那正是这一轮要修的东西 —— 悄悄发生等于没修。
+function planWarnings(d) {
+  const ws = Array.isArray(d.warnings) ? d.warnings : [];
+  if (!ws.length) return '';
+  return `<div class="note w"><b>定档提示 ${ws.length} 条</b>
+    —— 影响的是站与站的先后，不影响单个条目能否用
+    <div class="mlist">${ws.map((w) => `· ${esc(w)}`).join('<br>')}</div></div>`;
+}
+
 $('#btnplan').onclick = async () => {
   const d = await refreshPlan(false);
   if (!d) return;
@@ -1879,6 +1894,7 @@ $('#btnplan').onclick = async () => {
       <span>${fmt(d.lines_before)} → <b>${fmt(d.lines_after)}</b> 行</span>
     </div>
     <div class="note ${d.valid ? 'g' : 'b'}">${esc(d.validate_msg)}</div>
+    ${planWarnings(d)}
     ${skipped.length ? `<div class="note">不写入 ${skipped.length} 项：
       <div class="mlist">${skipped.map(esc).join('<br>')}</div></div>` : ''}`;
 

@@ -54,6 +54,7 @@ from .plan import (
     entry_weights,
     host_matches_note,
     name_alias_map,
+    priority_collisions,
     score_verdict,
     suggest_priority,
 )
@@ -117,6 +118,9 @@ __all__ = [
     "SectionPlan",
     "ImportPlan",
     "build_plan",
+    "assign_priorities",
+    "priority_collisions",
+    "owned_sections",
     "Diff",
     "backup",
     "build_diffs",
