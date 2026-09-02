@@ -29,6 +29,7 @@ import re
 from dataclasses import dataclass, field
 
 from .parse import SECTIONS, ParsedRow, base_for_section, host_of
+from . import model_catalog
 # pipeline 不导入 plan，这个方向无环。只取白名单判定与每段模型上限，
 # 目录读回来的名字必须过同一道白名单 —— 不然中转站目录里的
 # embedding / whisper / tts 之类会被注册成对话模型。
@@ -1355,7 +1356,24 @@ def build_plan(
 
     force = force or {}
     for section, v in result.sections.items():
-        forced_models = [m for m in (force.get(section) or []) if str(m).strip()]
+        # 手填清单要过三道：非空、段级规则、同系列取最新。
+        #
+        # 空串过滤原来就有（`if str(m).strip()`），但段级规则没有 ——
+        # 2026-09-02 实测日志里有一次 `Model name not specified, model name
+        # cannot be empty`，而截图里 codex 段手填的 8 个里有 3 个是
+        # gpt-image-2 / gpt-oss-120b / gpt-oss-20b（图像与开源小模型，
+        # CPA 路由过去必失配）。
+        #
+        # 为什么不静默丢而要留 warning（下面 forced_dropped）：手填是用户的
+        # 显式意图，悄悄改掉它比拒绝更糟 —— 用户会以为写进去了。
+        forced_raw = [str(m).strip() for m in (force.get(section) or [])
+                      if str(m).strip()]
+        forced_models = model_catalog.newest_per_series(
+            [m for m in forced_raw if model_fits_section(section, m)])
+        forced_dropped = [m for m in forced_raw if m not in forced_models]
+        # 「市面最新清单」的来源说明。只有走到 seed 分支才会被赋值，
+        # 但要在这里初始化 —— 下面的警告分支无条件读它。
+        model_src = ""
         # 判不可用的段也要生成完整方案 —— 只是默认不勾（recommended=False）。
         # 曾经在这里 continue 掉，后果是界面上判死的段没有 priority / headers /
         # 代理 / 指纹可看，勾选框灰着，不手填模型就无法勾选；而很多站禁止
@@ -1426,9 +1444,29 @@ def build_plan(
                       and model_fits_section(v.section, m)][:MAX_MODELS_PER_SECTION]
             model_source = "catalog"
         else:
-            # 目录也关了 —— 用种子。最低可信度，但保证这一段有确定清单。
-            models = [m for m in SEED_MODELS.get(section, ())
-                      if model_fits_section(section, m)][:MAX_MODELS_PER_SECTION]
+            # 目录也关了 —— 填「当前市面上最新」的清单。
+            #
+            # 2026-09-02 用户要求：「如果无法检测出模型，原则上需要在线检索
+            # 大数据按当前市面上存在最新模型编号直接填写好」。原来只填两个
+            # 写死的种子（SEED_MODELS），现场表现就是截图里 gemini 段那个
+            # 「站方目录也没报模型：手填模型名」的空输入框。
+            #
+            # 三层数据源，见 model_catalog.latest_models：
+            #   1. CPA 权威名录（远程，与 CPA 自己的 model_updater 同源）
+            #   2. 本地 config.yaml 已有的模型名（站方特供型号只在这层）
+            #   3. 内置兜底（用户指定的那批）
+            # 同系列自动取最新版 —— 未来出 gpt-5.7 时旧的 5.6 不再放入。
+            #
+            # remote_names 走的是 model_catalog 自己的缓存（成功 6 小时 /
+            # 失败 10 分钟），所以 79 个凭据串行调用它只有第一次走网络。
+            remote, _why = model_catalog.remote_names()
+            # limit 用 6 而不是 MAX_MODELS_PER_SECTION（4）：那个常数管的是
+            # 「每段最多**验**几个模型」（每个都要发一次推理请求，贵）。
+            # 这里是「写进 config.yaml 几个」—— 不发请求，多写几个只是让
+            # CPA 的模型注册表多几行，而覆盖面更全。
+            # 6 恰好放得下用户指定的 gemini 六个 pro 变体。
+            models, model_src = model_catalog.latest_models(
+                section, cfg=cfg, remote=remote, limit=6)
             model_source = "seed"
 
         score = score_verdict(v)
@@ -1485,6 +1523,13 @@ def build_plan(
                 f"探测未通过（{v.category or '不可用'} — {v.action or ''}），"
                 f"模型清单由你手工指定：{', '.join(models)}。"
                 "工具没有验证过这些模型能用")
+            if forced_dropped:
+                sp.warnings.append(
+                    f"手填的 {len(forced_dropped)} 个模型已丢弃"
+                    f"（{', '.join(forced_dropped)}）—— 不符合本段规则："
+                    "codex 只收 gpt 系、claude 只收 claude 系、"
+                    "gemini 只收 *-pro 且版本 >= 2.5、compat 收四族；"
+                    "另外同系列只保留最新版，图像/语音/oss 一律不收")
         elif model_source == "catalog":
             sp.priority_reason = (
                 f"未验证（探测判「{v.category or '不可用'}」，模型取自目录）· {reason}")
@@ -1497,12 +1542,12 @@ def build_plan(
         elif model_source == "seed":
             sp.priority_reason = (
                 f"未验证（探测判「{v.category or '不可用'}」，"
-                f"目录也读不到，用种子模型）· {reason}")
+                f"目录也读不到，用市面最新清单）· {reason}")
             sp.warnings.append(
                 f"探测未通过（{v.category or '不可用'} — {v.action or ''}），"
-                f"且站方 /models 目录读不到 —— 模型清单是本工具的默认猜测："
-                f"{', '.join(models)}。"
-                "这批名字没有任何实测依据，写进去很可能是死条目。"
+                f"且站方 /models 目录读不到 —— 模型清单取自「当前市面最新」"
+                f"（{model_src or '内置兜底'}）：{', '.join(models)}。"
+                "这批名字没有实测依据，但已按本段规则过滤并取同系列最新版。"
                 "确知该站卖什么模型的话，用右侧输入框改成真实清单")
 
         sp.impacts = compute_impact(band, sp.models, pri)

@@ -230,8 +230,8 @@ def existing_weights(cfg: dict) -> dict[tuple[str, str], int]:
     return out
 
 
-def existing_proxies(cfg: dict) -> dict[tuple[str, str], str]:
-    """既有条目的 proxy-url，按 (host, api_key) 索引。只收非空值。
+def existing_proxies(cfg: dict) -> dict[tuple[str, str, str], str]:
+    """既有条目的 proxy-url，按 **(段, host, api_key)** 索引。只收非空值。
 
     为什么必须搬运（2026-09-02 拿生产 config.yaml 逐字段对账发现）：
     `proxy_url` 只在探测**当场判定需要代理**（IP封/边缘救回）时才有值，
@@ -241,11 +241,19 @@ def existing_proxies(cfg: dict) -> dict[tuple[str, str], str]:
     后果不可见：YAML 合法、validate 报成功，但那些必须走代理的站下次
     请求直连、拿 403，而配置里已经没有任何痕迹说明它本来有代理。
 
-    与 weight 同一套键 (host, api_key) —— base-url 在不同段形态不同。
+    为什么键里必须有段（2026-09-02 二次对账发现）
+    ------------------------------------------
+    原来按 (host, api_key) 索引，跨段共用一个值。实测 kktoken.cc 的 5 把 Key
+    在 compat 段有 `proxy-url: http://mihomo:7890`，在 claude 段**故意没有** ——
+    那个站的 claude 路径直连可用，走代理反而多一跳。按两元组搬运会把 compat
+    的代理灌进 claude 段，实测 claude 段 proxy-url 从 3 条涨到 8 条。
+
+    多一跳不会让请求失败，所以 validate 与写后验证都发现不了 —— 又是一处
+    静默改变行为。段是 proxy-url 的一部分语义，不能跨段共用。
     """
     from .parse import host_of
 
-    out: dict[tuple[str, str], str] = {}
+    out: dict[tuple[str, str, str], str] = {}
     for section in ("gemini-api-key", "codex-api-key", "claude-api-key"):
         for e in cfg.get(section) or []:
             if not isinstance(e, dict):
@@ -256,7 +264,7 @@ def existing_proxies(cfg: dict) -> dict[tuple[str, str], str]:
             h = host_of(str(e.get("base-url") or ""))
             k = str(e.get("api-key") or "")
             if h and k:
-                out[(h, k)] = pu
+                out[(section, h, k)] = pu
 
     # compat 段的 proxy-url 在 api-key-entries 的每一项上，不在 provider 级
     for prov in cfg.get("openai-compatibility") or []:
@@ -269,6 +277,6 @@ def existing_proxies(cfg: dict) -> dict[tuple[str, str], str]:
             pu = str(ke.get("proxy-url") or "").strip()
             k = str(ke.get("api-key") or "")
             if pu and h and k:
-                out[(h, k)] = pu
+                out[("openai-compatibility", h, k)] = pu
 
     return out

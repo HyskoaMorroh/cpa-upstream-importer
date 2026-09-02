@@ -115,6 +115,90 @@ def main() -> int:
            not unhandled,
            f"未处理：{unhandled} —— 这些事件会在日志里静默丢失")
 
+    # ── ②b 模型规则两侧必须一致 ────────────────────────────────────
+    #
+    # 2026-09-02 现场两张截图：codex 段勾上了 gpt-image-2 / gpt-oss-120b /
+    # gpt-oss-20b，gemini 段目录里列出 flash / batch-inference / pro-agent。
+    # 根因是规则散在三处（Python 的 model_allowed、model_fits_section，
+    # 与 web/app.js 的两个正则），三处判据不一致。
+    #
+    # 现在 Python 侧单一实现在 model_catalog.section_allows，前端有一份**必须
+    # 逐条等价**的拷贝（浏览器里跑不了 Python，只能复制规则）。这一项拿同一批
+    # 模型名喂两边，结果不一致就失败 —— 单边改规则会被立刻抓到。
+    section("②b 模型段规则：前端与 Python 逐条等价")
+    import json as _json
+    import shutil
+    import subprocess
+
+    sys.path.insert(0, ROOT)
+    from cpa_probe import model_catalog as _mc     # noqa: E402
+
+    _SAMPLES = [
+        # gpt 族：正牌、老款、推理系列、图像、开源小模型
+        "gpt-5.6-sol", "gpt-5.6", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-4o",
+        "o3-mini", "gpt-image-2", "gpt-oss-120b", "gpt-oss-20b",
+        # claude 族
+        "claude-opus-5", "claude-fable-5", "claude-sonnet-5", "claude-opus-4-8",
+        "anthropic/claude-opus-5",
+        # gemini：pro 变体 / 低版本 / flash / 图像 / 批处理 / 无版本
+        "gemini-3.1-pro", "gemini-3.1-pro-high", "gemini-3.1-pro-low",
+        "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-search",
+        "gemini-3.1-pro-preview-customtools", "gemini-2.5-pro",
+        "gemini-2.0-pro", "gemini-3.5-flash", "gemini-3-pro-image-preview",
+        "gemini-batch-inference", "gemini-pro-agent",
+        "Business/gemini-2.5-pro",
+        # kimi
+        "kimi-k2", "kimi-k3", "kimi-k2.7-code",
+        # 有意排除的族
+        "deepseek-v4f", "glm-5.2", "grok-4.6", "x-ai/grok-4.6", "opus-5",
+        "llama-3", "qwen-max",
+    ]
+    _SECS = ("gemini-api-key", "codex-api-key", "claude-api-key",
+             "openai-compatibility")
+
+    node = shutil.which("node")
+    if not node:
+        print("  --  跳过：没有 node，无法执行前端规则（CI 装了 node）")
+    else:
+        # 只取 app.js 里 SECTION_LABEL 之前那段 —— 规则全在那里，
+        # 后面的代码碰 DOM，在 node 里跑会崩。
+        cut = js.index("const SECTION_LABEL")
+        payload = _json.dumps({"secs": list(_SECS), "models": _SAMPLES})
+        script = js[:cut] + f"""
+const IN = {payload};
+const out = {{allow: {{}}, newest: {{}}}};
+IN.secs.forEach((s) => {{
+  out.allow[s] = IN.models.filter((m) => famOk(s, m));
+}});
+out.newest['gpt'] = newestPerSeries(['gpt-5.6-sol', 'gpt-5.7-sol', 'gpt-5.6']);
+out.newest['claude'] = newestPerSeries(['claude-opus-4-8', 'claude-opus-5']);
+out.newest['kimi'] = newestPerSeries(['kimi-k2', 'kimi-k3']);
+out.newest['prefix'] = newestPerSeries(['anthropic/claude-opus-5', 'claude-opus-5']);
+out.newest['nover'] = newestPerSeries(['gpt-4o', 'gpt-5.6']).sort();
+console.log(JSON.stringify(out));
+"""
+        r = subprocess.run([node, "-e", script], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace")
+        if r.returncode:
+            _fail.append("前端规则脚本执行失败\n      " + (r.stderr or "")[-400:])
+            print("  FAIL 前端规则脚本执行失败")
+        else:
+            got = _json.loads(r.stdout.strip().splitlines()[-1])
+            for s in _SECS:
+                want = [m for m in _SAMPLES if _mc.section_allows(s, m)]
+                eq(f"{s} 放行集合两侧一致", got["allow"][s], want)
+            eq("同系列取最新 · gpt", got["newest"]["gpt"],
+               _mc.newest_per_series(["gpt-5.6-sol", "gpt-5.7-sol", "gpt-5.6"]))
+            eq("同系列取最新 · claude", got["newest"]["claude"],
+               _mc.newest_per_series(["claude-opus-4-8", "claude-opus-5"]))
+            eq("同系列取最新 · kimi", got["newest"]["kimi"],
+               _mc.newest_per_series(["kimi-k2", "kimi-k3"]))
+            eq("同版本裸名优先", got["newest"]["prefix"],
+               _mc.newest_per_series(["anthropic/claude-opus-5",
+                                      "claude-opus-5"]))
+            eq("无版本互不淘汰", got["newest"]["nover"],
+               sorted(_mc.newest_per_series(["gpt-4o", "gpt-5.6"])))
+
     # ── ③ 响应字段契约 ─────────────────────────────────────────────
     section("③ 前端依赖的响应字段，后端真的会给")
     # 前端读 d.xxx（轮询响应）

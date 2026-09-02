@@ -275,6 +275,96 @@ gorouter.app   15 个 Key   priority  985
 一堆死站后面 —— 单站诊断、CLI、网页端因此会给出不同的 priority，现在三条途径
 全部传。
 
+### 模型库：段级规则 + 同系列取最新 + 在线名录（2026-09-02）
+
+现场两张截图暴露的两个问题：
+
+- **模型没填上** —— `gemini` 段目录读不到时只填两个写死的种子，界面上是
+  「站方目录也没报模型：手填模型名」的空输入框
+- **勾上了低级模型** —— `codex` 段 8 个全勾，含 `gpt-4o`、`gpt-image-2`、
+  `gpt-oss-120b`、`gpt-oss-20b`
+
+根因是规则散在三处（`model_allowed`、`model_fits_section`、`web/app.js` 的
+两个正则），三处判据不一致。现在单一实现在 `cpa_probe/model_catalog.py`，
+前端有一份逐条等价的拷贝（浏览器跑不了 Python），`tests/test_web.py` 拿同一批
+模型名喂两边比对 —— 单边改规则会被立刻抓到。
+
+**四条段级规则**：
+
+| 段 | 允许 |
+|---|---|
+| `codex-api-key` | 只 gpt 系（含 `o1` / `o3-mini` 这类推理系列） |
+| `claude-api-key` | 只 claude 系 |
+| `gemini-api-key` | 只 `gemini-<版本>-pro*`，且版本 **>= 2.5** |
+| `openai-compatibility` | gpt / claude / gemini / kimi 四族 |
+
+外加两条贯穿全局的：
+
+- **同系列取最新版，旧版不放入** —— `gpt-5.6` 与将来的 `gpt-5.7` 只留后者，
+  `kimi-k2` 与 `kimi-k3` 只留 `kimi-k3`。版本认不出的（`gpt-4o`）自成一系
+  永远保留 —— 无从比较就不淘汰。
+- **非对话模型一律不收** —— 图像（`gpt-image-2`、`gemini-3-pro-image`）、
+  语音（`-tts`）、嵌入、开源小模型（`-oss-`）、批处理（`gemini-batch-inference`）。
+  它们走的不是对话协议路径，写进去 CPA 路由必失配。
+
+**三层数据源**（探测拿不到模型时填「当前市面最新」，可信度递减）：
+
+1. **CPA 权威名录** —— CPA 自己的 `model_updater.go` 每 3 小时拉的那份 JSON，
+   `models.router-for.me/models.json` 与 GitHub 互为备份。它是 CPA **实际认识**
+   的模型集合，会自动跟进新版本。缓存成功 6 小时 / 失败 10 分钟。
+2. **本地 config.yaml 已有的模型名** —— 最强的本地证据。站方特供型号只在这层：
+   实测 `gemini-3.1-pro-high`、`gemini-3.1-pro-preview-search`、
+   `gemini-3.1-pro-preview-customtools`、`gpt-5.6` 四个都不在 CPA 名录里，
+   但它们就在生产配置里跑着。
+3. **内置兜底** —— 前两层都拿不到时用（国内 VPS 直连 GitHub 不通是常态）。
+
+为什么不能只有第 3 层：写死的清单会过期，而过期的表现是「填进去的模型 CPA
+每次轮到都失败」—— 与缺模型一样坏，却更难发现（界面上看着有值）。
+
+**排序与轮转**：`newest_per_series` 只做同系列去旧，不同系列之间无从取舍，
+所以取前 N 个之前还要 `rank_models`（主力款 → 变体 → 降级档）再按**产品线**
+轮转。实测不轮转时 `claude` 段前四名是 `opus-5` / `opus-5-thinking` /
+`opus-4-8-m-aws` / `fable-5-1` —— 四个里三个是 opus 的写法，把 sonnet 挤出去了。
+`compat` 段按**族**轮转，否则前 N 全是 claude，浪费掉「一个条目转多族」这个价值。
+
+三层齐备时实测输出：
+
+```
+codex    gpt-5-codex, gpt-5.6, gpt-5.3-codex-spark, gpt-5.6-luna, gpt-5.6-sol, gpt-5.6-terra
+claude   claude-opus-5, claude-fable-5-1, claude-sonnet-5, claude-mythos-preview, …
+gemini   gemini-3.1-pro, -pro-high, -pro-preview, -pro-preview-customtools, -pro-preview-search, -pro-low
+compat   claude-opus-5, gpt-5-codex, kimi-k3, gemini-3.1-pro, …
+```
+
+**手填也过同一套规则**，但丢弃项会明确告知 —— 手填是用户的显式意图，悄悄改掉
+比拒绝更糟。实测手填 `gpt-5.6-sol, gpt-image-2, gpt-oss-20b, gpt-5.5,
+claude-opus-5` 时收下前两个合法的，并警告「手填的 3 个模型已丢弃」。
+
+### 上下文上限的下限校验（2026-09-02）
+
+实测日志里一个 compat 站三个条目都拿到 `max-context-length: 10`。CPA 把它直接当
+`context_window` / `max_context_window` 报给客户端
+（`internal/client/codex/models/models.go:206-211`）—— **10 个 token 的窗口**，
+那个站每一次请求都立刻超限。
+
+根因：`_bisect` 的截断判据是 `tok < chars * 0.5` 就把 `tok` 当真实容量，而上游
+回 `input_tokens: 10`（根本没统计）时，10 就成了「实测容量」。
+
+加了下限 `_MIN_TRUSTED_CONTEXT = 8000`：比任何真实模型的窗口都小一个数量级
+（现役最小的也有 200k），不会误伤真实小窗口站；低于它就当「测不出」并发
+`context-untrusted` 事件说明 —— 缺这个字段 CPA 会回落内置目录值，比写一个
+荒谬的数安全得多。
+
+### proxy-url 搬运必须按段（2026-09-02）
+
+`existing_proxies` 原来按 `(host, api_key)` 索引，跨段共用一个值。实测
+`kktoken.cc` 的 5 把 Key 在 compat 段有 `proxy-url: http://mihomo:7890`，
+在 claude 段**故意没有** —— 那个站的 claude 路径直连可用，走代理反而多一跳。
+
+按两元组搬运会把 compat 的代理灌进 claude 段，实测 claude 段 `proxy-url`
+从 3 条涨到 8 条。多一跳不会让请求失败，所以 `validate` 与写后验证都发现不了。
+键改成 `(段, host, api_key)` 后前后各段完全一致。
+
 ### 段族过滤（2026-09-02）
 
 **问题**：聚合站的 `/models` 目录把三族模型混在一起报。探测队列原样接收，
@@ -440,7 +530,7 @@ ETA 只在**并发 ≤ 4** 时给。并发 30 时区间命中率只有 9% ——
 
 ```
 cpa-upstream-importer/
-├ cpa_probe/          共享判定库（11 模块，无第三方依赖，PyYAML 可选）
+├ cpa_probe/          共享判定库（16 模块，无第三方依赖，PyYAML 可选）
 │  ├ parse.py         解析 url,key；按段规范化 base-url
 │  ├ classify.py      响应定性：余额/封号/限流/门禁/IP封/反测活/死路/临时/注入/时段/WAF
 │  ├ request.py       按段构造请求，路径与 CPA executor 对齐（gemini 用 x-goog-api-key 头 / claude 带 ?beta=true）
@@ -448,6 +538,7 @@ cpa-upstream-importer/
 │  ├ fingerprint.py   后端 id 指纹、静默换模判定、截断校验
 │  ├ profiles.py      25 档画像梯 × 4 段，按客户端族分组，族内嵌套超集，headers + body_patch 双层
 │  ├ prefixes.py      站级前缀自动分配（从域名生成、幂等、尊重手工值）、段级别名补充
+│  ├ model_catalog.py 段级模型规则、同系列取最新、CPA 权威名录（三层兜底）
 │  ├ pipeline.py      四阶段探测编排 · 段/候选并行 · single-flight 形态复用 · 画像升级
 │  ├ plan.py          去重、priority 定档（单站上限 + 批量站级分配，读 weight:0 与实测注释）、影响面
 │  └ writeback.py     行级 YAML 编辑（保注释）、备份、diff、重载 CPA + 读回校验
@@ -459,7 +550,7 @@ cpa-upstream-importer/
 ├ .github/workflows/  CI：3 个 Python 版本跑测试 + 多架构镜像发布
 ├ LICENSE             MIT
 ├ CONTRIBUTING.md     贡献指南
-├ tests/              回归测试（九个套件 968 项，零外网请求，自带最小样本）
+├ tests/              回归测试（九个套件 1028 项，零外网请求，自带最小样本）
 │  ├ run.py           跑全部，退出码 0/1，可接 CI。传 config.yaml 路径可加跑真实用例
 │  ├ fixture_cfg.py   自带的最小 config.yaml（各套件共用；不传路径时就用它）
 │  ├ test_probe.py    解析/判定/指纹/去重/定档/影响面/写回

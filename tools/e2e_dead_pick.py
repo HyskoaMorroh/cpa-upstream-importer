@@ -122,9 +122,14 @@ gemini-api-key: []
         assert sp.model_source in ("probed", "catalog", "manual", "seed"), \
             f"{sec} 模型来源不明: {sp.model_source!r}"
         # 但 seed 必须**被标出来**：可信度最低的那一档，界面上不能与实测同形。
+        # 2026-09-02 起 seed 不再是「写死的猜测」而是「当前市面最新清单」
+        # （三层：CPA 权威名录 / 本地 config.yaml / 内置兜底），措辞跟着改了，
+        # 但「没有实测依据」这句必须还在 —— 那是这条警告存在的唯一理由。
         if sp.model_source == "seed":
-            assert any("猜测" in w or "没有任何实测依据" in w for w in sp.warnings), \
-                f"{sec} 用了种子兜底却没有警告 —— 猜的和实测的在界面上一个样"
+            assert any("没有实测依据" in w or "没有任何实测依据" in w
+                       for w in sp.warnings), \
+                f"{sec} 用了市面最新清单却没说「没有实测依据」—— " \
+                "猜的和实测的在界面上一个样"
         # 段族一致性：落进方案的模型必须与本段协议匹配，不论来源是哪一种
         for m in sp.models:
             assert model_fits_section(sec, m), \

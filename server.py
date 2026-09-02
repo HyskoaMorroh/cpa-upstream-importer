@@ -1594,13 +1594,20 @@ class Handler(BaseHTTPRequestHandler):
                 if w is not None:
                     for sp in p.sections.values():
                         sp.weight = w
-                pu = proxies.get((res.row.host, res.row.api_key))
-                if pu:
-                    for sp in p.sections.values():
-                        # 探测判定需要代理时它已有值，不覆盖 —— 那是本次实测
-                        # 结论；只补「原来有、这次没探出来」的情形。
-                        if not sp.proxy_url:
-                            sp.proxy_url = pu
+                pu_by_section = proxies
+                for sec, sp in p.sections.items():
+                    # 探测判定需要代理时它已有值，不覆盖 —— 那是本次实测
+                    # 结论；只补「原来有、这次没探出来」的情形。
+                    #
+                    # 键含段（2026-09-02 修）：kktoken.cc 的 Key 在 compat 段
+                    # 有代理、在 claude 段故意没有（那条路径直连可用）。
+                    # 按 (host, key) 搬会把 compat 的代理灌进 claude ——
+                    # 多一跳不会失败，所以 validate 与写后验证都发现不了。
+                    if not sp.proxy_url:
+                        got = pu_by_section.get(
+                            (sec, res.row.host, res.row.api_key))
+                        if got:
+                            sp.proxy_url = got
                 all_plans[(res.row.bare, res.row.api_key)] = p
 
             # 批量定档：站与站之间不同值、同站所有 Key 同值。

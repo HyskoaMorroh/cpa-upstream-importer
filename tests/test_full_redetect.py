@@ -1213,16 +1213,46 @@ openai-compatibility:
         alias: ""
 """)
     P = existing_proxies(cfg)
-    assert P.get(("g.example.com", "g1")) == "http://mihomo:7890", P
+    # 键含段（2026-09-02 二次对账后改）：实测 kktoken.cc 的 5 把 Key 在
+    # compat 段有 proxy-url、在 claude 段**故意没有**（那条路径直连可用）。
+    # 按 (host, key) 两元组搬运会把 compat 的代理灌进 claude 段 ——
+    # 实测 claude 段 proxy-url 从 3 条涨到 8 条。多一跳不会让请求失败，
+    # 所以 validate 与写后验证都发现不了，又是一处静默改变行为。
+    assert P.get(("gemini-api-key", "g.example.com", "g1")) \
+        == "http://mihomo:7890", P
     # 没写的与空串都不该进表 —— 空串与「没这个键」语义相同（都不走代理），
     # 收进来会让重建凭空写出 `proxy-url: ""`
-    assert ("g.example.com", "g2") not in P, P
-    assert ("g.example.com", "g3") not in P, P
+    assert ("gemini-api-key", "g.example.com", "g2") not in P, P
+    assert ("gemini-api-key", "g.example.com", "g3") not in P, P
     # compat 段的 proxy-url 在 api-key-entries 上，不在 provider 级
-    assert P.get(("o.example.com", "k1")) == "http://mihomo:7890", P
-    assert ("o.example.com", "k2") not in P, P
+    assert P.get(("openai-compatibility", "o.example.com", "k1")) \
+        == "http://mihomo:7890", P
+    assert ("openai-compatibility", "o.example.com", "k2") not in P, P
 
-    print("[OK] Proxy preserved: 有值的搬回，空串与未写的不凭空添加")
+    # 同一个 (host, key) 在两段一有一无时，不许互相污染
+    cfg2 = yaml.safe_load("""
+claude-api-key:
+  - api-key: "same"
+    base-url: "https://both.example"
+
+openai-compatibility:
+  - name: "both"
+    base-url: "https://both.example/v1"
+    api-key-entries:
+      - api-key: "same"
+        proxy-url: "http://mihomo:7890"
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+""")
+    P2 = existing_proxies(cfg2)
+    assert ("claude-api-key", "both.example", "same") not in P2, (
+        "claude 段本来没有代理，不该从 compat 段继承过来")
+    assert P2.get(("openai-compatibility", "both.example", "same")) \
+        == "http://mihomo:7890", P2
+
+    print("[OK] Proxy preserved: 有值的搬回，空串与未写的不凭空添加，"
+          "段与段之间不互相污染")
 
 
 def test_rebuild_skips_dedup():
@@ -1465,6 +1495,193 @@ openai-compatibility:
     assert "weight:" not in "\n".join(render_entry(sp2, "  ", "    ", "x"))
 
     print("[OK] Weight preserved: weight:0 搬回，未写的不凭空添加")
+
+
+def test_model_catalog_three_layers():
+    """目录读不到时填「当前市面最新」，三层数据源都要能单独兜住。
+
+    2026-09-02 用户要求：「如果无法检测出模型，原则上需要在线检索大数据按
+    当前市面上存在最新模型编号直接填写好」。原来只填两个写死的种子，现场
+    截图里 gemini 段就是那个「站方目录也没报模型：手填模型名」的空输入框。
+
+    三层（可信度递减）：
+      1. CPA 权威名录（远程，与 CPA 自己的 model_updater.go 同源）
+      2. 本地 config.yaml 已有的模型名 —— 站方特供型号只在这层
+      3. 内置兜底（用户指定的那批）
+
+    这一项**不发网络请求**：remote 参数由测试直接喂，走的正是产品代码里
+    `remote_names()` 拿到结果后的那条路。
+    """
+    import yaml
+    from cpa_probe import model_catalog as mc
+
+    # ── ① 只有远程 ──
+    remote = ["gpt-5.6-sol", "gpt-5.6-terra", "claude-opus-5", "claude-fable-5",
+              "gemini-3.1-pro-preview", "kimi-k3", "grok-4.6", "gpt-oss-120b"]
+    got, src = mc.latest_models("codex-api-key", cfg=None, remote=remote)
+    assert got == ["gpt-5.6-sol", "gpt-5.6-terra"], got
+    assert "CPA 权威名录" in src, src
+    # 跨族与非对话的都不该进来
+    assert "grok-4.6" not in got and "gpt-oss-120b" not in got
+
+    # ── ② 远程拿不到，落到本地 config.yaml ──
+    #    站方特供型号（远程名录里没有）必须能通过这一层进来 —— 实测用户的
+    #    config.yaml 里有 gemini-3.1-pro-high / -preview-search /
+    #    -preview-customtools / gpt-5.6，四个都不在 CPA 名录里。
+    cfg = yaml.safe_load("""
+gemini-api-key:
+  - api-key: "g1"
+    base-url: "https://g.example"
+    models:
+      - name: "gemini-3.1-pro-high"
+        alias: ""
+      - name: "gemini-3.5-flash"
+        alias: ""
+""")
+    got, src = mc.latest_models("gemini-api-key", cfg=cfg, remote=[])
+    assert got == ["gemini-3.1-pro-high"], got
+    assert "本地 config.yaml" in src, src
+    assert "gemini-3.5-flash" not in got, "flash 不符合 gemini 段规则"
+
+    # ── ③ 两层都空，落到内置兜底 ──
+    for sec, want in (
+            ("codex-api-key", "gpt-5.6"),
+            ("claude-api-key", "claude-opus-5"),
+            ("gemini-api-key", "gemini-3.1-pro"),
+            ("openai-compatibility", "claude-opus-5")):
+        got, src = mc.latest_models(sec, cfg=None, remote=[])
+        assert got, f"{sec} 兜底也是空的 —— 那就成了「待定」"
+        assert "内置兜底" in src, src
+        assert want in got, f"{sec} 兜底里缺 {want}：{got}"
+        # 兜底清单自己也必须过段规则 —— 写死的值同样会过期
+        for m in got:
+            assert mc.section_allows(sec, m), f"{sec} 兜底里有违规项 {m}"
+
+    # ── ④ 用户 2026-09-02 指定的清单必须都能出现 ──
+    #    这是验收判据：三层齐备时那些名字一个都不能缺。
+    full_remote = ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra",
+                   "claude-opus-5", "claude-sonnet-5", "claude-fable-5",
+                   "gemini-3.1-pro-preview", "gemini-3.1-pro-low"]
+    full_cfg = yaml.safe_load("""
+codex-api-key:
+  - api-key: "c1"
+    base-url: "https://c.example"
+    models: [{name: "gpt-5.6", alias: ""}]
+gemini-api-key:
+  - api-key: "g1"
+    base-url: "https://g.example"
+    models:
+      - name: "gemini-3.1-pro"
+        alias: ""
+      - name: "gemini-3.1-pro-high"
+        alias: ""
+      - name: "gemini-3.1-pro-preview-search"
+        alias: ""
+      - name: "gemini-3.1-pro-preview-customtools"
+        alias: ""
+""")
+    want = {
+        "codex-api-key": ["gpt-5.6-sol", "gpt-5.6", "gpt-5.6-luna",
+                          "gpt-5.6-terra"],
+        "claude-api-key": ["claude-opus-5", "claude-fable-5",
+                           "claude-sonnet-5"],
+        "gemini-api-key": ["gemini-3.1-pro", "gemini-3.1-pro-high",
+                           "gemini-3.1-pro-preview",
+                           "gemini-3.1-pro-preview-search",
+                           "gemini-3.1-pro-preview-customtools",
+                           "gemini-3.1-pro-low"],
+    }
+    for sec, names in want.items():
+        got, _src = mc.latest_models(sec, cfg=full_cfg, remote=full_remote,
+                                     limit=12)
+        missing = [n for n in names if n not in got]
+        assert not missing, f"{sec} 缺用户指定的 {missing}：{got}"
+
+    # ── ⑤ 幂等：同一批输入两次结果一致（diff 要可复核）──
+    a = mc.latest_models("openai-compatibility", cfg=full_cfg,
+                         remote=full_remote)[0]
+    b = mc.latest_models("openai-compatibility", cfg=full_cfg,
+                         remote=full_remote)[0]
+    assert a == b, (a, b)
+
+    # ── ⑥ compat 按族轮转，不能前 N 个全是同一族 ──
+    #    compat 的价值是「一个条目转多族」，只注册 claude 等于浪费这个段。
+    many = (["claude-opus-5", "claude-sonnet-5", "claude-fable-5",
+             "claude-opus-4-8"] + ["gpt-5.6-sol", "kimi-k3", "gemini-3.1-pro"])
+    got, _src = mc.latest_models("openai-compatibility", cfg=None,
+                                 remote=many, limit=4)
+    fams = {mc.family(m) for m in got}
+    assert len(fams) >= 3, f"compat 前 4 个只覆盖 {fams}：{got}"
+
+    # ── ⑦ 失败也缓存 ——「拉不通的环境每次都慢」那个坑不许回来 ──
+    mc._cache.update(at=0.0, names=None, ok=False, why="")
+    names, why = mc.remote_names(timeout=1, proxy="http://10.255.255.1:9")
+    assert names == [] and why, (names, why)
+    assert mc._cache["names"] is not None, "失败必须写缓存"
+    assert mc._cache["ok"] is False
+    t0 = time.time()
+    again, _why2 = mc.remote_names(timeout=1, proxy="http://10.255.255.1:9")
+    assert again == [] and time.time() - t0 < 0.5, "命中负缓存该是瞬时的"
+    assert mc._TTL_BAD < mc._TTL_OK
+    mc._cache.update(at=0.0, names=None, ok=False, why="")
+
+    print("[OK] Model catalog: 三层各自兜住、用户指定清单全覆盖、"
+          "compat 按族轮转、失败进负缓存")
+
+
+def test_context_limit_lower_bound():
+    """截断反推出的荒谬小值不许写进 config.yaml。
+
+    2026-09-02 现场（123.txt 日志）：一个 compat 站三个条目都拿到
+    `上下文上限 10 · 截断反推`。CPA 把它直接当 context_window /
+    max_context_window 报给客户端（internal/client/codex/models/models.go:
+    206-211），10 个 token 的窗口 = 那个站每一次请求都立刻超限。
+
+    根因：`tok < chars * 0.5` 判成「截断」后就把 tok 当真实容量，而上游回
+    `input_tokens: 10`（根本没统计）时，10 就成了「实测容量」。
+    """
+    from cpa_probe import pipeline as pl
+    from cpa_probe.pipeline import Attempt, SectionVerdict
+
+    assert pl._MIN_TRUSTED_CONTEXT >= 8000, (
+        "阈值太低挡不住 input_tokens: 10 这类")
+    # 也不能太高 —— 会误伤真实的小窗口站。现役最小的也有 200k。
+    assert pl._MIN_TRUSTED_CONTEXT <= 100_000
+
+    prober = Prober(gap=0.0, probe_context=True, swap_samples=0)
+    row = cp.parse_lines("https://ctx.example,sk-ctx").valid[0]
+
+    state = {"tokens": 10}
+
+    def fake_call(section, base, key, model, **kw):
+        att = Attempt(section=section, model=model, combo=kw.get("combo", ""),
+                      status="200", category="可用", action="", elapsed_ms=1,
+                      input_tokens=state["tokens"],
+                      sent_chars=len(kw.get("text") or ""))
+        return att
+
+    prober._call = fake_call        # type: ignore[assignment]
+
+    # ① 荒谬小值：丢弃（返回 None），且发事件说明
+    events: list[tuple] = []
+    prober.on_event = lambda k, d: events.append((k, d))
+    v = SectionVerdict(section="openai-compatibility", usable=True,
+                       base_url="https://ctx.example/v1", models=["m"])
+    prober._stage4_context(row, v)
+    assert v.max_context_length is None, (
+        f"input_tokens=10 不该成为上限，实得 {v.max_context_length}")
+    assert any(k == "context-untrusted" for k, _d in events), events
+
+    # ② 可信的小窗口：照常采信
+    events.clear()
+    state["tokens"] = 60_000
+    v2 = SectionVerdict(section="openai-compatibility", usable=True,
+                        base_url="https://ctx.example/v1", models=["m"])
+    prober._stage4_context(row, v2)
+    assert v2.max_context_length == 60_000, v2.max_context_length
+    assert v2.context_untrusted is True, "截断反推的值仍要标不可信"
+
+    print("[OK] Context floor: input_tokens=10 被丢弃、60k 正常采信")
 
 
 def test_assign_priorities_site_level():
@@ -1880,6 +2097,8 @@ if __name__ == "__main__":
         ("条目守恒与未勾不删", test_rebuild_entry_conservation),
         ("重建保留 weight", test_rebuild_keeps_weight),
         ("批量定档站级差异", test_assign_priorities_site_level),
+        ("模型库三层兜底", test_model_catalog_three_layers),
+        ("上下文上限下限校验", test_context_limit_lower_bound),
         ("批量键含 api_key", test_batch_key_includes_api_key),
         ("批量记录异常站", test_batch_records_errors),
         ("cgroup 异常值降级", test_cgroup_bad_values),

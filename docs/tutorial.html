@@ -1374,6 +1374,101 @@ footer code{background:none;padding:0}
       在覆盖之后再查一遍</li>
   </ul>
 
+  <h3>模型清单：段级规则 + 同系列取最新 + 在线名录</h3>
+  <p>现场两张截图暴露两个问题：<b>模型没填上</b>（gemini 段目录读不到时只填两个
+     写死的种子，界面上是一个空输入框）、<b>勾上了低级模型</b>（codex 段 8 个全勾，
+     含 <code>gpt-4o</code>、<code>gpt-image-2</code>、<code>gpt-oss-120b</code>、
+     <code>gpt-oss-20b</code>）。</p>
+  <div class="note b">
+    <div class="t">根因：同一条规则写在三处，三处不一致</div>
+    <p><code>pipeline.model_allowed</code>（三族白名单）、
+       <code>pipeline.model_fits_section</code>（段族闸）、
+       <code>web/app.js</code> 的两个正则。段族闸只判「是不是 gpt 族」——
+       <code>gpt-image-2</code> 是 gpt 族，所以放行；前端的默认预勾正则
+       <code>/^(?:gpt|o\d)/i</code> 同样放行。两处都「按自己的规则正确工作」。</p>
+  </div>
+  <p>现在单一实现在 <code>cpa_probe/model_catalog.py</code>，前端有一份**逐条等价**的
+     拷贝（浏览器里跑不了 Python）。<code>tests/test_web.py</code> 拿同一批 36 个模型名
+     喂两边、逐段比对放行集合 —— 单边改规则会被立刻抓到。</p>
+
+  <div class="tw"><table>
+    <thead><tr><th style="width:210px">段</th><th>允许</th></tr></thead>
+    <tbody>
+      <tr><td><code>codex-api-key</code></td><td>只 gpt 系（含 <code>o1</code> /
+        <code>o3-mini</code> 这类推理系列）</td></tr>
+      <tr><td><code>claude-api-key</code></td><td>只 claude 系</td></tr>
+      <tr><td><code>gemini-api-key</code></td><td>只 <code>gemini-&lt;版本&gt;-pro*</code>，
+        且版本 <b>&gt;= 2.5</b></td></tr>
+      <tr><td><code>openai-compatibility</code></td><td>gpt / claude / gemini / kimi 四族</td></tr>
+    </tbody></table></div>
+
+  <p>外加两条贯穿全局：<b>同系列取最新版，旧版不放入</b>（<code>gpt-5.6</code> 与将来的
+     <code>gpt-5.7</code> 只留后者；版本认不出的如 <code>gpt-4o</code> 自成一系永远保留
+     —— 无从比较就不淘汰）；<b>非对话模型一律不收</b>（图像 / 语音 / 嵌入 /
+     <code>-oss-</code> / <code>batch-inference</code>，它们走的不是对话协议路径）。</p>
+
+  <h3>三层数据源：为什么不能只写死一份清单</h3>
+  <div class="tw"><table>
+    <thead><tr><th style="width:60px">层</th><th style="width:230px">来源</th><th>它独有的东西</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>CPA 权威名录（远程）</td>
+        <td>CPA <b>实际认识</b>的模型集合。与 CPA 自己的
+          <code>model_updater.go</code> 同源（每 3 小时拉），所以会自动跟进新版本。
+          缓存成功 6 小时 / 失败 10 分钟</td></tr>
+      <tr><td>2</td><td>本地 <code>config.yaml</code> 已有的模型名</td>
+        <td><b>站方特供型号</b>。实测 <code>gemini-3.1-pro-high</code>、
+          <code>-pro-preview-search</code>、<code>-pro-preview-customtools</code>、
+          <code>gpt-5.6</code> 四个都不在 CPA 名录里，但就在生产配置里跑着</td></tr>
+      <tr><td>3</td><td>内置兜底</td>
+        <td>前两层都拿不到时（国内 VPS 直连 GitHub 不通是常态）</td></tr>
+    </tbody></table></div>
+  <p>为什么不能<b>只有</b>第 3 层：写死的清单会过期，而过期的表现是「填进 config.yaml
+     的模型 CPA 每次轮到都失败」—— 与缺模型一样坏，却更难发现（界面上看着有值）。</p>
+
+  <div class="note w">
+    <div class="t">排序与轮转：去重之后还有一步</div>
+    <p><code>newest_per_series</code> 只做「同系列去旧」，<b>不同系列之间它无从取舍</b>。
+       取前 N 个时若按输入顺序，拿到的是「CPA 名录 JSON 里排得靠前」的那些 ——
+       与「哪个模型更该用」无关。实测 claude 段不排序时前三名是
+       haiku / sonnet / opus，正好倒过来。</p>
+    <p>所以先 <code>rank_models</code>（主力款 → 变体 → 降级档），再按<b>产品线</b>轮转。
+       不轮转时 claude 段前四名是 <code>opus-5</code> / <code>opus-5-thinking</code> /
+       <code>opus-4-8-m-aws</code> / <code>fable-5-1</code> —— 四个里三个是 opus 的写法，
+       把 sonnet 挤出去了。</p>
+    <p><code>compat</code> 段按<b>族</b>轮转：它的价值正是「一个条目转多族」，
+       前 N 全是 claude 等于浪费掉这个段。</p>
+  </div>
+
+  <p><b>手填也过同一套规则</b>，但丢弃项会明确告知 —— 手填是用户的显式意图，
+     悄悄改掉比拒绝更糟（用户会以为写进去了）。实测手填
+     <code>gpt-5.6-sol, gpt-image-2, gpt-oss-20b, gpt-5.5, claude-opus-5</code>
+     时收下前两个合法的，并警告「手填的 3 个模型已丢弃」。</p>
+
+  <h3>上下文上限：10 个 token 的窗口</h3>
+  <div class="note b">
+    <div class="t">这个值会让整个站不可用，而 validate 报成功</div>
+    <p>实测日志里一个 compat 站三个条目都拿到 <code>max-context-length: 10</code>。
+       CPA 把它直接当 <code>context_window</code> / <code>max_context_window</code> 报给
+       客户端（<code>models.go:206-211</code>）—— 客户端按 10 个 token 定压缩点，
+       那个站每一次请求都立刻超限。</p>
+    <p>根因：<code>_bisect</code> 的截断判据是 <code>tok &lt; chars * 0.5</code> 就把
+       <code>tok</code> 当真实容量。上游回 <code>input_tokens: 10</code>（它根本没统计，
+       或统计的是别的东西）时，10 就成了「实测容量」。</p>
+  </div>
+  <p>加了下限 <code>_MIN_TRUSTED_CONTEXT = 8000</code>：比任何真实模型的窗口都小一个
+     数量级（现役最小的也有 200k），不会误伤真实小窗口站；低于它就当「测不出」
+     并发 <code>context-untrusted</code> 事件说明 —— 缺这个字段 CPA 会回落内置目录值，
+     比写一个荒谬的数安全得多。</p>
+
+  <h3>proxy-url 搬运必须按段</h3>
+  <p><code>existing_proxies</code> 原来按 <code>(host, api_key)</code> 索引，跨段共用一个值。
+     实测 <code>kktoken.cc</code> 的 5 把 Key 在 compat 段有
+     <code>proxy-url: http://mihomo:7890</code>，在 claude 段<b>故意没有</b> ——
+     那个站的 claude 路径直连可用，走代理反而多一跳。</p>
+  <p>按两元组搬运会把 compat 的代理灌进 claude 段，实测 claude 段 proxy-url 从 3 条
+     涨到 8 条。<b>多一跳不会让请求失败</b>，所以 validate 与写后验证都发现不了 ——
+     又是一处静默改变行为。键改成 <code>(段, host, api_key)</code> 后前后各段完全一致。</p>
+
   <h3>警告与算法必须同口径</h3>
   <p>「挡住了谁」这条警告原来只报总数，不分活死。演练实测输出：</p>
   <div class="note b">
@@ -1417,7 +1512,7 @@ footer code{background:none;padding:0}
 
   <div class="note w">
     <div class="t">如实说明：验证到哪一步</div>
-    <p><b>已验证</b>：假上游套件、单元测试（968 项，含真实 config.yaml 用例时 970 项）、
+    <p><b>已验证</b>：假上游套件、单元测试（1028 项，含真实 config.yaml 用例时 1030 项）、
        端到端演练、以及拿生产 config.yaml 做的重建对账（121 条目 / 79 凭据，
        字段计数与值零差异）。</p>
     <p><b>未验证</b>：没有对这 79 个真实站跑过一次<b>完整的写回流程</b> ——
