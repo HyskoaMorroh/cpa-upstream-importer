@@ -1629,6 +1629,198 @@ gemini-api-key:
           "compat 按族轮转、失败进负缓存")
 
 
+def test_usable_but_empty_models():
+    """usable=True 但模型清单为空时也要落到市面最新清单。
+
+    2026-09-02 现场截图（第三次修同一处）：某站 compat 段四个标记连起来是
+    「可用 + 实测 + 无可信模型 + 不可写入」。`_accept()` 在静默换模或
+    「200 包错误体」时拒收模型，段仍算可用（端点确实响应、凭证有效），
+    但清单一个都没进。而前两版把兜底写在 `else:` 分支里，`elif v.usable:`
+    这条路直接绕过它。
+
+    判据必须是「清单空不空」，不是「走了哪条分支」—— 用户的要求是
+    「实测不可用就填充成对应类型的最高级别模型」。
+    """
+    import yaml
+    import cpa_probe as cpa
+    from cpa_probe import model_catalog
+    from cpa_probe.pipeline import CandidateResult, SectionVerdict
+
+    cfg = yaml.safe_load("""
+claude-api-key:
+  - api-key: "old"
+    base-url: "https://old.example"
+    priority: 500
+    models: [{name: "claude-opus-5", alias: ""}]
+""")
+
+    def plan(usable):
+        row = cpa.parse_lines("https://t.example,sk-t").valid[0]
+        res = CandidateResult(row=row)
+        for s in cpa.SECTIONS:
+            res.sections[s] = SectionVerdict(
+                section=s, usable=usable, base_url=row.base_for(s),
+                models=[], catalog=[],
+                category=("可用" if usable else "死路"), action="x")
+        return cpa.build_plan(row, res, cfg, bands={},
+                              seen=cpa.existing_fingerprints(cfg),
+                              probation=True)
+
+    for usable in (True, False):
+        p = plan(usable)
+        for s in cpa.SECTIONS:
+            sp = p.sections[s]
+            assert sp.models, (
+                f"usable={usable} 的 {s} 清单为空 —— 那个段勾上也写不进模型")
+            assert sp.writable, f"usable={usable} 的 {s} writable=False"
+            assert sp.model_source == "seed", sp.model_source
+            for m in sp.models:
+                assert model_catalog.section_allows(s, m), f"{s} 有违规 {m}"
+
+    # compat 段要覆盖四族 —— 用户明确要求「把 openai、gemini、claude、kimi
+    # 四种的最高版本全部填上」
+    sp = plan(True).sections["openai-compatibility"]
+    fams = {model_catalog.family(m) for m in sp.models}
+    assert len(fams) >= 3, f"compat 只覆盖 {fams}：{sp.models}"
+
+    # 两种处境的措辞必须分开 —— 说错一种就是误导
+    w_usable = " ".join(plan(True).sections["openai-compatibility"].warnings)
+    w_dead = " ".join(plan(False).sections["openai-compatibility"].warnings)
+    assert "端点响应正常" in w_usable, w_usable[:200]
+    assert "探测未通过" in w_dead, w_dead[:200]
+
+    print("[OK] Usable-but-empty: usable=True 且模型空时也填市面清单，"
+          "compat 覆盖多族，两种处境措辞分开")
+
+
+def test_stale_catalog_not_recommended():
+    """站方目录整体落后一个世代以上时列出但不建议勾。
+
+    2026-09-02 现场：runanytime.hxi.me 的 codex 段目录只有 gpt-4 /
+    gpt-4-32k / gpt-4o / gpt-4o-mini —— 四个都是世代 (4,0)，「同产品线取
+    最高世代」把四个全留下并默认全勾，违反用户「最新是 gpt-5.6 时 gpt-4o
+    不该默认勾选」的要求。
+
+    为什么不换成市面最新清单：那个站的目录里确实没有 5.6 系的名字，写进去
+    CPA 路由不到，把「有老模型可用」变成死条目 —— 比默认勾错更糟。
+    所以只降级 recommended，清单照旧列出。
+    """
+    import yaml
+    import cpa_probe as cpa
+    from cpa_probe import model_catalog
+    from cpa_probe.pipeline import CandidateResult, SectionVerdict
+
+    cfg = yaml.safe_load("""
+codex-api-key:
+  - api-key: "old"
+    base-url: "https://old.example/v1"
+    priority: 500
+    models: [{name: "gpt-5.6-sol", alias: ""}]
+""")
+    # 市面最新固定成 5.6，不依赖远程名录（测试零外网）
+    remote = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+
+    def plan(catalog):
+        row = cpa.parse_lines("https://t.example,sk-t").valid[0]
+        res = CandidateResult(row=row)
+        for s in cpa.SECTIONS:
+            res.sections[s] = SectionVerdict(
+                section=s, usable=False, base_url=row.base_for(s),
+                models=[], catalog=(list(catalog) if s == "codex-api-key"
+                                    else []),
+                category="死路", action="x")
+        return cpa.build_plan(row, res, cfg, bands={},
+                              seen=cpa.existing_fingerprints(cfg),
+                              probation=True).sections["codex-api-key"]
+
+    # ── 落后：清单保留，但不建议勾 ──
+    stale, why = model_catalog.catalog_is_stale(
+        "codex-api-key", ["gpt-4", "gpt-4-32k", "gpt-4o", "gpt-4o-mini"],
+        remote=remote)
+    assert stale, "目录全是 gpt-4 系而市面到 5.6，该判落后"
+    assert "4.0" in why and "5.6" in why, why
+
+    sp = plan(["gpt-4", "gpt-4-32k", "gpt-4o", "gpt-4o-mini"])
+    assert sp.models, "清单不该被清空 —— 那会让段勾不上"
+    assert sp.writable, "仍要能手工勾"
+    assert sp.catalog_stale is True, "落后标记没传到方案上"
+    assert not sp.recommended, "落后目录不该默认勾"
+    assert "老款" in sp.recommend_reason, sp.recommend_reason
+
+    # ── 不落后：照常（recommended 仍受 model_source != probed 约束）──
+    fresh = plan(["gpt-4o", "gpt-5.1", "gpt-5.5", "gpt-5.6-luna",
+                  "gpt-5.6-terra"])
+    assert fresh.catalog_stale is False, "含 5.6 的目录不该判落后"
+    assert fresh.models == ["gpt-5.6-luna", "gpt-5.6-terra"], fresh.models
+
+    # ── 边界：目录里全是认不出版本的名字 → 不判落后（无从比较）──
+    st2, _w2 = model_catalog.catalog_is_stale(
+        "codex-api-key", ["o1", "o3-mini"], remote=remote)
+    assert st2 is False, "认不出版本不该被判落后"
+    # 空目录同理
+    assert model_catalog.catalog_is_stale(
+        "codex-api-key", [], remote=remote)[0] is False
+
+    print("[OK] Stale catalog: 落后目录列出但不勾、清单不清空、"
+          "认不出版本与空目录都不误判")
+
+
+def test_rate_limit_learned():
+    """限频正文里的阈值要被学走，下一次请求自动放慢。
+
+    2026-09-02 现场：一个站在 79 凭据那轮里 46 次撞上 `bulk probe guard`，
+    判定「限频」→ 处置写着「加大探测间隔重试」→ 然后**什么都没做**，
+    接着用同样的节奏打下一个模型，于是 46 次全撞。
+
+    那句正文里带着确切阈值（4 个模型 / 60 秒），工具读得出来却没用上。
+    """
+    from cpa_probe.pipeline import Prober
+
+    p = Prober(gap=0.05, probe_context=False, swap_samples=0)
+    evs: list[tuple] = []
+    p.on_event = lambda k, d: evs.append((k, d))
+
+    body = ('{"error":{"message":"该ip已被封禁，原因：bulk probe guard: '
+            'ip 1.2.3.4 requested 4 distinct models in 60s (last_use ...)"}}')
+    assert p._note_rate_limit("x.example", body) is True
+    # 60/4 * 1.1 = 16.5 —— 平均间隔加 10% 余量（滑动窗口，贴着阈值仍会命中）
+    assert abs(p._host_gap["x.example"] - 16.5) < 0.01, p._host_gap
+    learned = [d for k, d in evs if k == "rate-limit-learned"]
+    assert learned and learned[0]["models"] == 4 and learned[0]["window"] == 60
+
+    # 更严的阈值要覆盖，更松的不许覆盖 —— 否则一次宽松的响应会把已学到的
+    # 严格节奏冲掉，接着又开始撞
+    assert p._note_rate_limit(
+        "x.example", "requested 2 distinct models in 60s") is True
+    assert abs(p._host_gap["x.example"] - 33.0) < 0.01
+    assert p._note_rate_limit(
+        "x.example", "requested 10 distinct models in 60s") is False
+    assert abs(p._host_gap["x.example"] - 33.0) < 0.01, "更松的覆盖了严的"
+
+    # 荒谬窗口要钳住 —— 见过站方报 3600s，照抄会让整批探测卡死
+    p._note_rate_limit("y.example", "requested 1 distinct models in 3600s")
+    assert p._host_gap["y.example"] == p._MAX_LEARNED_GAP
+
+    # 没有阈值的限频正文不学（不能凭空放慢）
+    assert p._note_rate_limit("z.example", "bulk probe guard 请稍后") is False
+    assert "z.example" not in p._host_gap
+
+    # 学到之后 _throttle 要真的用它，且整站合用一个桶（那类 guard 按账号
+    # 全局计数，按段分桶会让瞬时并发变成 4 倍）
+    p2 = Prober(gap=0.01, probe_context=False, swap_samples=0)
+    p2.on_event = lambda k, d: None
+    p2._note_rate_limit("h.example", "requested 60 distinct models in 60s")
+    assert abs(p2._host_gap["h.example"] - 1.1) < 0.01, p2._host_gap
+    t0 = time.time()
+    p2._throttle("h.example", "gemini-api-key")
+    p2._throttle("h.example", "codex-api-key")     # 不同段，仍要等
+    dt = time.time() - t0
+    assert dt >= 1.0, f"学到的 gap 没生效（两段合桶应等 ~1.1s），实测 {dt:.2f}s"
+
+    print("[OK] Rate limit: 阈值被学走、只收紧不放松、荒谬值钳住、"
+          "四段合用一个节奏桶")
+
+
 def test_model_rules_no_dead_end():
     """规则收紧不许把段变成「勾不上」—— 那是 2026-09-01 修过的老症状。
 
@@ -2188,6 +2380,9 @@ if __name__ == "__main__":
         ("批量定档站级差异", test_assign_priorities_site_level),
         ("模型库三层兜底", test_model_catalog_three_layers),
         ("规则收紧不留死角", test_model_rules_no_dead_end),
+        ("端点通但模型空也要兜底", test_usable_but_empty_models),
+        ("落后目录不默认勾", test_stale_catalog_not_recommended),
+        ("限频阈值自动学习", test_rate_limit_learned),
         ("上下文上限下限校验", test_context_limit_lower_bound),
         ("批量键含 api_key", test_batch_key_includes_api_key),
         ("批量记录异常站", test_batch_records_errors),

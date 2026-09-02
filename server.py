@@ -393,6 +393,11 @@ def plan_json(p) -> dict:
                 # probed / catalog / manual —— 界面要标清模型是实测跑通的、
                 # 站方目录报的，还是操作员手填的，三者可信度差一截
                 "model_source": sp.model_source,
+                # 站方目录整体落后市面最新一个世代以上（如目录只有 gpt-4 系
+                # 而市面已到 5.6）。清单照旧列出，但默认不勾 —— 界面要说清
+                # 为什么，否则「有模型却不建议勾」看着像 bug。
+                "catalog_stale": sp.catalog_stale,
+                "catalog_stale_why": sp.catalog_stale_why,
                 "priority": sp.priority,
                 "priority_reason": sp.priority_reason,
                 "proxy_url": sp.proxy_url,
@@ -612,6 +617,35 @@ def _clean_override_models(section: str, raw_models: list) -> list[str]:
     kept = cp.model_catalog.newest_generation_per_line(
         [m for m in got if cp.model_catalog.section_allows(section, m)])
     return kept or got
+
+
+def _market_top_gen(cfg: dict) -> dict:
+    """各段「当前市面最新」的最高世代，如 {"codex-api-key": [5, 6]}。
+
+    前端拿它判断「站方目录是不是整体落后」—— 落后一个世代以上时不预勾
+    （2026-09-02 现场：某站 codex 目录只有 gpt-4 系而市面已到 5.6，
+    「取最高世代」把四个老款全留下还默认全勾）。
+
+    后端在 build_plan 里判同一件事（catalog_is_stale），但结果表在勾选**之前**
+    就渲染了，那时还没有 /api/plan 的响应 —— 所以两边都要能判。
+
+    走 model_catalog 自己的缓存（成功 6 小时 / 失败 10 分钟），不会拖慢
+    /api/context；拉不到时返回空 dict，前端退化成「不判落后、照常预勾」。
+    """
+    out: dict[str, list[int]] = {}
+    try:
+        remote, _why = cp.model_catalog.remote_names()
+        for sec in cp.SECTIONS:
+            names, _src = cp.model_catalog.latest_models(
+                sec, cfg=cfg, remote=remote, limit=12)
+            top = cp.model_catalog.top_generation(names)
+            if top:
+                out[sec] = [top[0], top[1]]
+    except Exception:                                    # noqa: BLE001
+        # 这只是个增强信号，绝不能让它影响 /api/context 的可用性 ——
+        # 与漂移检测同一条原则（那次它把首屏卡成了白屏）。
+        return {}
+    return out
 
 
 def _cpa_runtime_commit(base: str) -> str:
@@ -1272,6 +1306,16 @@ class Handler(BaseHTTPRequestHandler):
                 str(((cfg or {}).get("routing") or {}).get("strategy") or "")
                 if isinstance((cfg or {}).get("routing"), dict) else ""),
             "weight_zero_excludes": cp.weight_zero_excludes(cfg),
+            # 各段「当前市面最新」的最高世代，形如 {"codex-api-key": [5, 6]}。
+            #
+            # 前端要它做首屏预勾判断：目录整体落后一个世代以上时不预勾
+            # （如目录只有 gpt-4 系而市面已到 5.6）。后端在 build_plan 里
+            # 也判同一件事，但那要等 /api/plan 回来 —— 而结果表在勾选之前
+            # 就渲染了，两边都需要这个数。
+            #
+            # 走 model_catalog 自己的缓存（成功 6 小时 / 失败 10 分钟），
+            # 所以不会因为它拖慢 /api/context。
+            "market_top_gen": _market_top_gen(cfg),
         })
 
     def _api_parse(self, body: dict) -> None:

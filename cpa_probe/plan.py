@@ -1190,6 +1190,18 @@ class SectionPlan:
     # 是对象数组），重新序列化既要处理缩进又要处理引号风格，而原文行拿来就能
     # 用、且逐字保真。键序也跟着原文，diff 干净。
     carry_lines: list[str] = field(default_factory=list)
+    # 站方目录的最高世代已落后市面最新一个世代以上。
+    #
+    # 2026-09-02 现场：runanytime.hxi.me 的 codex 段目录只有 gpt-4 /
+    # gpt-4-32k / gpt-4o / gpt-4o-mini，四个都是世代 (4,0)，于是「同产品线
+    # 取最高世代」把四个全留下并默认全勾 —— 而用户要的是「最新是 gpt-5.6 时
+    # gpt-4o 不该默认勾选」。
+    #
+    # 只降级 recommended，不动 models：那个站的目录里确实没有 5.6 系的名字，
+    # 换成市面清单会写出 CPA 路由不到的模型，把「有老模型可用」变成死条目。
+    # 确知可用的人仍可手工勾。
+    catalog_stale: bool = False
+    catalog_stale_why: str = ""
 
     @property
     def hijacked(self) -> list[Impact]:
@@ -1229,14 +1241,18 @@ class SectionPlan:
         if not self.models:
             return "无可信模型，写进去等于死条目"
         if self.model_source == "catalog":
+            if self.catalog_stale:
+                return (f"模型取自站方目录（{len(self.models)} 个），但"
+                        f"{self.catalog_stale_why} —— 整份目录都是老款，"
+                        "默认不勾。确知该站只卖这些且够用，可手工勾上")
             return (f"推理未通过，模型取自站方目录（{len(self.models)} 个）"
                     " —— 参数已按试用期算全，确知可用再勾")
         if self.model_source == "manual":
             return f"手填 {len(self.models)} 个模型，工具未验证 —— 参数已算全"
         if self.model_source == "seed":
-            return ("推理未通过且目录读不到，模型是默认猜测"
-                    f"（{len(self.models)} 个）—— 参数已按试用期算全，"
-                    "但清单大概率要改")
+            return ("推理未验证到可用模型（探测未通过，或端点通但返回的模型"
+                    f"对不上），清单取自「当前市面最新」（{len(self.models)} 个）"
+                    " —— 参数已按试用期算全，勾选前请确认这些名字该站真有")
         if any("换模" in w for w in self.warnings):
             return "检测到静默换模 —— 计费却拿不到要的模型，默认不勾"
         if self.hijacked:
@@ -1476,53 +1492,80 @@ def build_plan(
         # 「模型」列的毛病：显示 config.yaml 里写了几个，看着像测活结果。
         models: list[str] = []
         model_source = "probed"
+        # 目录是否整体落后市面最新一个世代以上。只影响「建不建议勾」，
+        # 不影响清单内容。见下面 catalog 分支与 SectionPlan.catalog_stale。
+        catalog_stale, stale_why = False, ""
         if forced_models and not v.usable:
             models, model_source = forced_models, "manual"
         elif v.usable:
             models, model_source = list(v.models), "probed"
-        else:
-            if v.catalog:
-                # 判死但目录能读到 —— 取目录里通过段规则的名字。
-                # 再过一遍闸：v.catalog 正常已被 _stage0_catalog 滤过，但
-                # 形态复用（shape.catalog）与手填路径都能绕开那一步。写进
-                # config.yaml 的模型必须与段协议匹配 —— 纵深防御。
-                models = [m for m in v.catalog
-                          if model_allowed(m)
-                          and model_fits_section(v.section, m)]
-                # 同系列取最新：目录里常同时报 gpt-5.5 与 gpt-5.6，
-                # 两个都写进去等于让 CPA 把请求分给旧版。
-                models = model_catalog.newest_generation_per_line(
-                    models)[:MAX_MODELS_PER_SECTION]
-                if models:
-                    model_source = "catalog"
-            # 目录为空、或目录里的名字**全部**不合规 —— 都要落到市面最新清单。
+        elif v.catalog:
+            # 判死但目录能读到 —— 取目录里通过段规则的名字。
+            # 再过一遍闸：v.catalog 正常已被 _stage0_catalog 滤过，但
+            # 形态复用（shape.catalog）与手填路径都能绕开那一步。写进
+            # config.yaml 的模型必须与段协议匹配 —— 纵深防御。
+            models = [m for m in v.catalog
+                      if model_allowed(m)
+                      and model_fits_section(v.section, m)]
+            # 同产品线取最高世代：目录里常同时报 gpt-5.5 与 gpt-5.6，
+            # 两个都写进去等于让 CPA 把请求分给旧版。
+            models = model_catalog.newest_generation_per_line(
+                models)[:MAX_MODELS_PER_SECTION]
+            if models:
+                model_source = "catalog"
+                # 目录整体落后市面最新一个世代以上 —— 列出来但**不建议勾**。
+                #
+                # 2026-09-02 现场：runanytime.hxi.me 的 codex 段目录只有
+                # gpt-4 / gpt-4-32k / gpt-4o / gpt-4o-mini，四个都是世代
+                # (4,0)，于是「取最高世代」四个全留并默认全勾 —— 违反用户
+                # 「gpt-4o 不该默认勾选」的意图。
+                #
+                # 为什么不改用市面最新清单：那个站的目录里没有 gpt-5.6-sol
+                # 这些名字，写进去 CPA 路由过去大概率 404，把一个「有老模型
+                # 可用」的站变成死条目，比默认勾错更糟。
+                # 所以只降级默认勾选，清单本身照旧 —— 确知可用的人仍可手工勾。
+                catalog_stale, stale_why = model_catalog.catalog_is_stale(
+                    section, list(v.catalog), cfg=cfg,
+                    remote=model_catalog.remote_names()[0])
+
+        # 兜底放在**所有分支之外** —— 只要最终清单为空就填「当前市面最新」。
+        #
+        # 为什么必须在外面（2026-09-02 现场截图，第三次修同一处）：
+        # 前两版把兜底写在 `else:` 里，于是两条路绕过它：
+        #
+        #   ① v.usable=True 但 v.models 为空 —— 真实存在的状态。`_accept()`
+        #      在「静默换模」或「200 但正文是错误体」时拒收模型，段仍算可用
+        #      （端点确实响应、凭证有效），但清单一个都没进。截图里那行的
+        #      四个标记连起来正是它：可用 + 实测 + 无可信模型 + 不可写入。
+        #   ② v.catalog 非空但过滤后为空 —— 上一轮已补，但补在 else 里面，
+        #      对 ① 无效。
+        #
+        # 用户的要求是「实测不可用就填充成对应类型的最高级别模型」——
+        # 判据是**清单空不空**，不是「走了哪条分支」。
+        if not models:
+            # 2026-09-02 用户要求：「如果无法检测出模型，原则上需要在线
+            # 检索大数据按当前市面上存在最新模型编号直接填写好」。
             #
-            # 为什么「全部不合规」也要兜（2026-09-02 自查发现）：原来只判
-            # `elif v.catalog:`，目录非空就进那条分支；规则收紧后一个只报
-            # flash / oss / grok 的站会过滤出空列表，models=[] →
-            # writable=False → **那个段连勾选框都点不动**，正是 2026-09-01
-            # 修过的「判死段勾不上」同一个症状，被新规则重新引入了。
-            if not models:
-                # 2026-09-02 用户要求：「如果无法检测出模型，原则上需要在线
-                # 检索大数据按当前市面上存在最新模型编号直接填写好」。
-                #
-                # 三层数据源，见 model_catalog.latest_models：
-                #   1. CPA 权威名录（远程，与 CPA 自己的 model_updater 同源）
-                #   2. 本地 config.yaml 已有的模型名（站方特供型号只在这层）
-                #   3. 内置兜底（用户指定的那批）
-                # 同系列自动取最新版 —— 未来出 gpt-5.7 时旧的 5.6 不再放入。
-                #
-                # remote_names 走 model_catalog 自己的缓存（成功 6 小时 /
-                # 失败 10 分钟），所以 79 个凭据串行调用只有第一次走网络。
-                remote, _why = model_catalog.remote_names()
-                # limit 用 6 而不是 MAX_MODELS_PER_SECTION（4）：那个常数管的是
-                # 「每段最多**验**几个模型」（每个都要发一次推理请求，贵）。
-                # 这里是「写进 config.yaml 几个」—— 不发请求，多写几个只是让
-                # CPA 的模型注册表多几行，而覆盖面更全。
-                # 6 恰好放得下用户指定的 gemini 六个 pro 变体。
-                models, model_src = model_catalog.latest_models(
-                    section, cfg=cfg, remote=remote, limit=6)
-                model_source = "seed"
+            # 三层数据源，见 model_catalog.latest_models：
+            #   1. CPA 权威名录（远程，与 CPA 自己的 model_updater 同源）
+            #   2. 本地 config.yaml 已有的模型名（站方特供型号只在这层）
+            #   3. 内置兜底（用户指定的那批）
+            # 同产品线自动取最高世代 —— 出 gpt-5.7 时旧的 5.6 不再放入。
+            #
+            # remote_names 走 model_catalog 自己的缓存（成功 6 小时 /
+            # 失败 10 分钟），所以 79 个凭据串行调用只有第一次走网络。
+            remote, _why = model_catalog.remote_names()
+            # limit 用 6 而不是 MAX_MODELS_PER_SECTION（4）：那个常数管的是
+            # 「每段最多**验**几个模型」（每个都要发一次推理请求，贵）。
+            # 这里是「写进 config.yaml 几个」—— 不发请求，多写几个只是让
+            # CPA 的模型注册表多几行，而覆盖面更全。
+            # 6 恰好放得下用户指定的 gemini 六个 pro 变体。
+            models, model_src = model_catalog.latest_models(
+                section, cfg=cfg, remote=remote, limit=6)
+            # usable 段落到这里 = 端点通但模型全被拒收（换模/错误体）。
+            # 那和「判死且目录读不到」是同一种处境：清单没有实测依据。
+            # 记成 seed 让界面照实说，别让它顶着「实测」的徽标。
+            model_source = "seed"
 
         score = score_verdict(v)
         pri, reason = suggest_priority(band, score, models=models,
@@ -1542,6 +1585,8 @@ def build_plan(
             context_model=v.context_model,
             score=score,
             model_source=model_source,
+            catalog_stale=catalog_stale,
+            catalog_stale_why=stale_why,
         )
 
         # 全量重探不判重：输入就是既有条目，撞上是必然而非异常。
@@ -1606,14 +1651,24 @@ def build_plan(
                 "站方目录只说明「声称有」，不等于这把 Key 的分组能用 —— "
                 "很多站禁止推理测活却确实可用，确知可用再勾")
         elif model_source == "seed":
+            # 走到这里有两种处境，措辞要分开 —— 说错一种就是误导：
+            #   · v.usable=False：探测没通过（判死/门禁/限频…），目录也读不到
+            #   · v.usable=True ：端点通、凭证有效，但返回的模型对不上
+            #     （静默换模，或 200 包错误体），`_accept` 把它们全拒了
+            # 第二种在截图里表现为「可用 + 实测 + 无可信模型」，那三个标记
+            # 并存看着自相矛盾，必须一句话讲清是怎么回事。
+            why = (f"探测未通过（{v.category or '不可用'}"
+                   f" — {v.action or ''}），且站方 /models 目录读不到"
+                   if not v.usable else
+                   "端点响应正常、凭证有效，但每次返回的模型都与请求不一致"
+                   "（静默换模或 200 包错误体），实测到的模型清单为空")
             sp.priority_reason = (
-                f"未验证（探测判「{v.category or '不可用'}」，"
-                f"目录也读不到，用市面最新清单）· {reason}")
+                f"未验证（{'探测判「%s」' % (v.category or '不可用') if not v.usable else '端点通但模型对不上'}"
+                f"，用市面最新清单）· {reason}")
             sp.warnings.append(
-                f"探测未通过（{v.category or '不可用'} — {v.action or ''}），"
-                f"且站方 /models 目录读不到 —— 模型清单取自「当前市面最新」"
+                f"{why} —— 模型清单取自「当前市面最新」"
                 f"（{model_src or '内置兜底'}）：{', '.join(models)}。"
-                "这批名字没有实测依据，但已按本段规则过滤并取同系列最新版。"
+                "这批名字没有实测依据，但已按本段规则过滤并取同产品线最高世代。"
                 "确知该站卖什么模型的话，用右侧输入框改成真实清单")
 
         sp.impacts = compute_impact(band, sp.models, pri)

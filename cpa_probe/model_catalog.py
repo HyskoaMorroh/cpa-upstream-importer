@@ -518,6 +518,55 @@ FALLBACK_MODELS: dict[str, list[str]] = {
 
 # ---------------- 三层合并 ----------------
 
+def top_generation(names: list[str]) -> tuple[int, int] | None:
+    """这批名字里的最高世代。全都认不出版本时返回 None。"""
+    gens = [generation(series_and_version(n)[1]) for n in names if n]
+    known = [g for g in gens if g is not None]
+    return max(known) if known else None
+
+
+def catalog_is_stale(section: str, catalog: list[str], *,
+                     cfg: dict | None = None,
+                     remote: list[str] | None = None) -> tuple[bool, str]:
+    """站方目录的最高世代是否已落后于市面最新。返回 (是否落后, 说明)。
+
+    为什么需要这个判断（2026-09-02 现场）
+    ---------------------------------
+    `runanytime.hxi.me` 的 codex 段目录只有 `gpt-4` / `gpt-4-32k` / `gpt-4o` /
+    `gpt-4o-mini` —— **四个都是世代 (4,0)**，于是「取最高世代」把四个全留下、
+    还默认全勾。规则本身没错（那条线里 (4,0) 就是最高），但违反用户的意图：
+    「最新模型如果探测出来是 gpt-5.6，那 gpt-4o、gpt-5.5 都不应该默认勾选」。
+
+    为什么不直接改用市面最新清单（否决 A 方案）
+    ------------------------------------
+    那个站的目录里**没有** `gpt-5.6-sol` 这些名字。写进去 CPA 路由过去大概率
+    404，等于把一个「有老模型可用」的站变成死条目 —— 比默认勾错更糟。
+
+    所以判断只用于**降级默认勾选**（B 方案）：目录项照常列出（用户确知可用
+    可以手工勾），但不预勾、`recommended` 为假。写回时那个段没有模型 →
+    不写入，而不是写一批猜的名字。
+
+    「落后」的判据是**世代**而非名字：只要目录最高世代低于市面最新，就算
+    落后。不比较具体名字 —— 站方特供型号（`gpt-5.6-preview-xyz`）不在市面
+    名录里，按名字比会把它误判成落后。
+    """
+    if not catalog:
+        return False, ""
+    fit = [m for m in catalog if section_allows(section, m)]
+    if not fit:
+        return False, ""
+    cat_top = top_generation(fit)
+    if cat_top is None:
+        return False, ""          # 目录里全是认不出版本的名字，无从比较
+    latest, _src = latest_models(section, cfg=cfg, remote=remote, limit=12)
+    mkt_top = top_generation(latest)
+    if mkt_top is None or cat_top >= mkt_top:
+        return False, ""
+    return True, (
+        f"站方目录最高世代 {cat_top[0]}.{cat_top[1]}，"
+        f"市面最新已到 {mkt_top[0]}.{mkt_top[1]}")
+
+
 def latest_models(section: str, *, cfg: dict | None = None,
                   remote: list[str] | None = None,
                   limit: int = 6) -> tuple[list[str], str]:

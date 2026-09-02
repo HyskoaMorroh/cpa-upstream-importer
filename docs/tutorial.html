@@ -1547,6 +1547,64 @@ footer code{background:none;padding:0}
     <p>警告挪出 manual 分支无条件报，并额外说明「已改用市面最新清单」。</p>
   </div>
 
+  <h3>兜底放在 else 里，两条路绕过它</h3>
+  <div class="note b">
+    <div class="t">「可用 + 实测 + 无可信模型 + 不可写入」四个标记同时出现</div>
+    <p>现场截图里某站 compat 段就是这四个。<code>_accept()</code> 在静默换模或
+       「200 包错误体」时拒收模型，<b>段仍算可用</b>（端点确实响应、凭证有效），
+       但清单一个都没进。</p>
+    <p>而前两版把兜底写在 <code>else:</code> 分支里：</p>
+    <p><code>elif v.usable: models = list(v.models)</code> —— 空列表也照抄，
+       不进兜底；<code>else: … if not models: 兜底</code>。</p>
+    <p><b>这是第三次修同一处</b>。前两次都只补了自己当时看到的那条路：
+       第一次补「目录为空」，第二次补「目录非空但全不合规」，都在 else 里面 ——
+       对 <code>v.usable=True</code> 那条路无效。</p>
+  </div>
+  <p>判据必须是<b>清单空不空</b>，不是「走了哪条分支」。兜底移到所有分支之外，
+     三条入口（单站诊断 / 增量导入 / 全量重探）实测都填 6 个。两种处境的措辞
+     也分开写 —— <code>usable=True</code> 那种说「端点响应正常、凭证有效，但每次
+     返回的模型都与请求不一致」，不再和「探测未通过」混同。</p>
+
+  <h3>整份目录都是老款时，列出但不预勾</h3>
+  <p>某站 codex 段目录只有 <code>gpt-4</code> / <code>gpt-4-32k</code> /
+     <code>gpt-4o</code> / <code>gpt-4o-mini</code> —— <b>四个都是世代 (4,0)</b>，
+     于是「同产品线取最高世代」把四个全留下还默认全勾。规则本身没错
+     （那条线里 (4,0) 就是最高），但违反「最新是 gpt-5.6 时 gpt-4o 不该默认勾选」。</p>
+  <div class="note w">
+    <div class="t">为什么不换成市面最新清单</div>
+    <p>那个站的目录里确实<b>没有</b> 5.6 系的名字。写进去 CPA 路由不到，把一个
+       「有老模型可用」的站变成死条目 —— 比默认勾错更糟。</p>
+    <p>所以只降级默认勾选：清单照旧列出（确知可用可手工勾），
+       <code>recommended</code> 为假，界面说明「整份目录都落后于市面最新
+       （本段最新已到 5.6）」。</p>
+  </div>
+  <p>判据是<b>世代</b>而非名字 —— 站方特供型号不在市面名录里，按名字比会把它误判成
+     落后。<code>/api/context</code> 回 <code>market_top_gen</code>，因为结果表在勾选
+     <b>之前</b>就渲染了，那时还没有 <code>/api/plan</code> 的响应，两边都要能判。</p>
+
+  <h3>限频：站方把阈值写在正文里，工具却没用上</h3>
+  <div class="note b">
+    <div class="t">同一个站撞了 46 次，每次都用同样的节奏再打一遍</div>
+    <p><code>bulk probe guard: ip 1.2.3.4 requested 4 distinct models in 60s</code></p>
+    <p>判定「限频」→ 处置写着「加大探测间隔重试」→ 然后<b>什么都没做</b>。
+       那句正文里带着确切阈值（4 个模型 / 60 秒），读得出来却没用上，等于让用户
+       去看日志、猜一个 <code>--gap</code>、再重跑十几分钟。</p>
+  </div>
+  <p><code>_note_rate_limit</code> 解析出 <code>N 个模型 / M 秒</code>，取平均间隔
+     × 1.1（滑动窗口，贴着阈值走仍会偶发命中），对该站生效并<b>整站合用一个 gap 桶</b>
+     —— 这类 guard 按账号/IP 全局计数，按 <code>(host, section)</code> 分桶会让瞬时
+     并发变成 4 倍，那正是 46 次全撞的原因（第 07.5 章那条「风险与取舍」注释预判过
+     这件事，只是当时留给用户手工调）。</p>
+  <p>只收紧不放松（更松的响应不覆盖已学到的严格值），荒谬窗口钳在 60 秒 ——
+     见过站方报 3600s，照抄会让整批探测卡死。</p>
+  <div class="note g">
+    <div class="t">为什么换代理不是解法</div>
+    <p>站方数的是「<b>这个 IP</b> 在 60 秒里问了几个不同模型」。换到代理出口后
+       同样的节奏立刻又触发一次，只是白烧一次请求并把代理 IP 也搭进去。</p>
+    <p><code>_PROXY_POINTLESS</code> 里「限频」那条早就写着「探测节奏问题，
+       加大 gap 而非换 IP」—— 那张表存在的意义正是让「为什么不试代理」可追溯。</p>
+  </div>
+
   <h3>上下文上限：10 个 token 的窗口</h3>
   <div class="note b">
     <div class="t">这个值会让整个站不可用，而 validate 报成功</div>
@@ -1615,7 +1673,7 @@ footer code{background:none;padding:0}
 
   <div class="note w">
     <div class="t">如实说明：验证到哪一步</div>
-    <p><b>已验证</b>：假上游套件、单元测试（1094 项，含真实 config.yaml 用例时 1096 项）、
+    <p><b>已验证</b>：假上游套件、单元测试（1103 项，含真实 config.yaml 用例时 1105 项）、
        端到端演练、以及拿生产 config.yaml 做的重建对账（121 条目 / 79 凭据，
        字段计数与值零差异）。</p>
     <p><b>未验证</b>：没有对这 79 个真实站跑过一次<b>完整的写回流程</b> ——

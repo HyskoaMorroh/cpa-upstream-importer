@@ -185,8 +185,30 @@ function newestGenerationPerLine(names) {
 }
 
 // 该段默认勾选哪些：先过段规则，再每条产品线取最高世代。
+//
+// 目录整体落后市面最新一个世代以上时**一个都不勾**（2026-09-02 现场）：
+// 某站 codex 目录只有 gpt-4 / gpt-4-32k / gpt-4o / gpt-4o-mini，四个都是
+// 世代 (4,0)，「取最高世代」把四个全留下并默认全勾 —— 而用户要的是
+// 「最新是 gpt-5.6 时 gpt-4o 不该默认勾选」。
+//
+// 为什么不换成市面最新清单：那个站的目录里没有 5.6 系的名字，写进去
+// CPA 路由不到，把「有老模型可用」变成死条目。所以只降级预勾，清单照旧
+// 列出，确知可用的人仍可手工勾。与后端 catalog_is_stale 同一套判据。
 function pickDefaults(sec, catalog) {
-  return newestGenerationPerLine((catalog || []).filter((m) => defOn(sec, m)));
+  const fit = (catalog || []).filter((m) => defOn(sec, m));
+  const keep = newestGenerationPerLine(fit);
+  const mkt = (S.ctx && S.ctx.market_top_gen && S.ctx.market_top_gen[sec]) || null;
+  if (mkt && keep.length) {
+    let top = null;
+    keep.forEach((m) => {
+      const g = generationOf(m);
+      if (g && (!top || genGreater(g, top))) top = g;
+    });
+    // 只有「目录最高世代确实低于市面最新」才不勾。认不出版本时照常勾 ——
+    // 无从比较不该惩罚它。
+    if (top && genGreater(mkt, top)) return [];
+  }
+  return keep;
 }
 
 const SECTION_LABEL = {
@@ -1316,6 +1338,14 @@ function renderStream(events) {
       return `<div class="s2">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
         + `上游自报上限 ${fmt(e.limit)} —— 免掉二分（${esc(e.model)}）</div>`;
     }
+    if (e.kind === 'rate-limit-learned') {
+      // 站方在正文里自报了探测节奏阈值（N 个模型 / M 秒），工具据此自动
+      // 放慢该站的请求间隔。这件事必须可见：它解释了为什么这个站后面的
+      // 尝试变慢了，也让「限频撞 46 次」那种情形不再需要人去看日志猜 --gap。
+      return `<div class="s3">${esc(tag(e.host))} ${pad('限频', 8)} `
+        + `站方自报 ${e.models} 个模型 / ${e.window}s —— 本站探测间隔 `
+        + `${e.was}s → <b>${e.gap}s</b>，四段合用一个节奏桶</div>`;
+    }
     if (e.kind === 'context-untrusted') {
       // 上游回了个荒谬的 input_tokens（实测见过 10）。那个数会被当成实测容量
       // 写进 max-context-length，而 CPA 把它当 context_window 报给客户端 ——
@@ -1441,6 +1471,10 @@ function siteCard(r) {
               data-sec="${esc(sec)}">清空</button>
             <span class="hint">目录 ${cat.length} 个，已勾 <b class="cmn">${picked.size}</b>
               ${cut ? ` · 已滤掉 ${cut} 个不符合本段规则的模型` : ''}</span>
+            ${picked.size === 0 && cat.length ? `<div class="hint">
+              整份目录都落后于市面最新（本段最新已到
+              ${(S.ctx && S.ctx.market_top_gen && S.ctx.market_top_gen[sec] || []).join('.')}）
+              —— 默认不勾。确知该站只卖这些且够用，手工勾上即可</div>` : ''}
           </div>`
             // 目录读不到（或目录里的名字全被规则滤掉）—— 这里**留一个空容器**，
             // 由 refreshPlan 用后端方案里的 sp.models 填成勾选框。

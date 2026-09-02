@@ -436,6 +436,10 @@ class Prober:
         # 节流按 **host** 分开记。原来是全局一个时间戳，探 A 站要等 B 站的
         # gap —— 不同站之间没有任何理由互相等。反测活是站方行为，只对同站生效。
         self._last_call: dict[tuple[str, str], float] = {}
+        # 从限频正文里学到的「该站最小探测间隔」。见 _note_rate_limit。
+        # 命中后该站整站共用一个 gap 桶（不再按段分），因为那类 guard
+        # 通常按账号/IP 全局计数，按段分桶会让瞬时并发变成 4 倍。
+        self._host_gap: dict[str, float] = {}
         # (host, section) -> 已学到的段形态。同一主机的第 2..N 个 Key 直接复用，
         # 只补一次凭证确认。见 _reuse_shape 的说明。
         self._shape: dict[tuple[str, str], SectionVerdict] = {}
@@ -517,8 +521,18 @@ class Prober:
         # section 虽然是内部常量，也没有理由留这个坑。
         bucket = (host, section)
         with self._lock:
+            # 站方自报的节奏阈值优先（见 _note_rate_limit）。它是从 429/403
+            # 正文里读出来的实测值，比命令行的 --gap 准 —— 而且撞上 guard 的
+            # 那个站往往是**按账号全局**计数，此时按 (host, section) 分桶反而
+            # 让瞬时并发变成 4 倍。命中后整站共用一个桶。
+            forced = self._host_gap.get(host)
+            if forced is not None:
+                bucket = (host, "")
+                gap = max(self.gap, forced)
+            else:
+                gap = self.gap
             last = self._last_call.get(bucket, 0.0)
-            wait = self.gap - (time.monotonic() - last)
+            wait = gap - (time.monotonic() - last)
             if wait > 0:
                 # 记成「即将发出」，避免同桶并发时多个线程一起放行
                 self._last_call[bucket] = time.monotonic() + wait
@@ -526,6 +540,52 @@ class Prober:
                 self._last_call[bucket] = time.monotonic()
         if wait > 0:
             time.sleep(wait)
+
+    # 站方自报的探测节奏阈值。形如
+    #   bulk probe guard: ip 1.2.3.4 requested 4 distinct models in 60s
+    # 两个数都要：N 个模型 / M 秒 —— 平均间隔 M/N 才是它真正的阈值。
+    _RATE_HINT = re.compile(
+        r"requested\s+(\d+)\s+distinct\s+models?\s+in\s+(\d+)\s*s", re.I)
+
+    # 阈值上限。站方偶尔报出荒谬的窗口（见过 3600s），照抄会让整批探测卡死。
+    # 60 秒/次已经足够慢，再大不如让用户看到警告后自己决定。
+    _MAX_LEARNED_GAP = 60.0
+
+    def _note_rate_limit(self, host: str, excerpt: str) -> bool:
+        """从限频正文里学出该站的探测节奏，返回是否学到了新值。
+
+        为什么必须自动学（2026-09-02 现场）：一个站在 79 凭据那轮里 46 次
+        撞上 `bulk probe guard`，判定「限频」→ 处置写着「加大探测间隔重试」
+        → 然后**什么都没做**，接着用同样的节奏打下一个模型，于是 46 次全撞。
+
+        那句正文里带着确切阈值（4 个模型 / 60 秒），工具读得出来却没用上，
+        等于让用户去看日志、猜一个 --gap、再重跑十几分钟。
+
+        为什么换代理不是解法：站方数的是「**这个 IP** 在 60 秒里问了几个
+        不同模型」。换到代理出口后同样的节奏立刻又触发一次，只是白烧一次
+        请求并把代理 IP 也搭进去。见 _PROXY_POINTLESS 里「限频」那条。
+        """
+        m = self._RATE_HINT.search(excerpt or "")
+        if not m:
+            return False
+        try:
+            n_models, window = int(m.group(1)), int(m.group(2))
+        except ValueError:
+            return False
+        if n_models <= 0 or window <= 0:
+            return False
+        # 平均间隔 + 10% 余量。站方计的是滑动窗口，贴着阈值走仍会偶发命中。
+        learned = min(window / n_models * 1.1, self._MAX_LEARNED_GAP)
+        with self._lock:
+            prev = self._host_gap.get(host)
+            if prev is not None and prev >= learned:
+                return False
+            self._host_gap[host] = learned
+        self.on_event("rate-limit-learned", {
+            "host": host, "models": n_models, "window": window,
+            "gap": round(learned, 1), "was": round(prev or self.gap, 1),
+        })
+        return True
 
     def _call(
         self,
@@ -592,6 +652,11 @@ class Prober:
                 "elapsed_ms": resp.elapsed_ms,
             },
         )
+        # 限频：从正文里学出该站的探测节奏，下一次请求起自动放慢。
+        # 放在事件之后 —— 学习本身会发自己的事件，顺序上「先看到撞了什么、
+        # 再看到学到了多少」更好读。
+        if category == "限频":
+            self._note_rate_limit(host_of(base), att.excerpt)
         return att
 
     # ---------- ① 段归属 + ③ 处置 ----------
