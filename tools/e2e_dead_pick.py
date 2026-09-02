@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import yaml
 import cpa_probe as cp
-from cpa_probe.pipeline import Prober
+from cpa_probe.pipeline import Prober, model_fits_section
 from cpa_probe.writeback import apply_diffs, build_diffs, validate
 
 
@@ -113,8 +113,22 @@ gemini-api-key: []
         assert sp.priority_reason, f"{sec} priority 没有理由"
         assert sp.headers, f"{sec} headers 为空 —— 门禁站少了门票必然废掉"
         assert sp.models, f"{sec} 没有模型名"
-        assert sp.model_source in ("probed", "catalog", "manual"), \
+        # 四种来源都是**确定值**，本用例查的是「不许待定」，不是「必须实测过」。
+        #
+        # 2026-09-02：这条原来排除 seed，而段族过滤（09b77cf）之后 codex 段
+        # 必然走到 seed —— 假门禁站的目录只报 claude/gemini 模型，段族闸把它们
+        # 从 codex 段全部滤掉是**正确的**（拿 claude 模型名打 /responses 是 CPA
+        # 永不会发的形态）。断言比行为旧了一轮。
+        assert sp.model_source in ("probed", "catalog", "manual", "seed"), \
             f"{sec} 模型来源不明: {sp.model_source!r}"
+        # 但 seed 必须**被标出来**：可信度最低的那一档，界面上不能与实测同形。
+        if sp.model_source == "seed":
+            assert any("猜测" in w or "没有任何实测依据" in w for w in sp.warnings), \
+                f"{sec} 用了种子兜底却没有警告 —— 猜的和实测的在界面上一个样"
+        # 段族一致性：落进方案的模型必须与本段协议匹配，不论来源是哪一种
+        for m in sp.models:
+            assert model_fits_section(sec, m), \
+                f"{sec} 收下了跨族模型 {m} —— CPA 永远不会这样发"
         assert sp.prefix is not None, f"{sec} prefix 未定"
         print(f"   {sec}: priority={sp.priority} "
               f"headers={len(sp.headers)}项 models={len(sp.models)}个 "

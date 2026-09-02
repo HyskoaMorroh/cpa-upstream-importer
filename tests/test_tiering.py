@@ -64,6 +64,7 @@ from cpa_probe.plan import (                             # noqa: E402
     Band,
     _dead_shadowed,
     _shadow_count,
+    _shadow_warning,
     unhealthy_from_comments,
 )
 
@@ -169,6 +170,38 @@ def main() -> int:
     vz, nz = cp.suggest_priority(b_zero, 100, models=["m1"])
     eq("零代价档（300）胜过挡 1 站的更高档（750）", vz, 300)
     truthy("理由标明不挡在用站", "不挡任何**在用**的站" in nz, nz)
+
+    # ── ③b 警告与算法必须同口径 ────────────────────────────────────
+    #
+    # 2026-09-02 演练发现：警告只报「挡了几个现有站」，不分活死。实测输出
+    # 「priority 280 会把 2 个现有站挡在其后（ai.hybgzs.com、muyuan.do）」，
+    # 而那两个站注释里都记着实测不可用，算法数出的在用站是 0。
+    # 同一件事，警告说挡 2 个、算法说无代价 —— 用户看前者，去调低一个本来
+    # 最优的档位。README 那时已经写着「这条警告会区分活站死站」，代码没做。
+    section("③b 挡站警告与定档算法同口径（活站/死站要分开）")
+    warn_dead = _shadow_warning(b_all_dead, ["m1"], 600,
+                                {"d1.example": ["m1"], "d2.example": ["m1"]})
+    truthy("下层全是死站时不说「会把 N 个站挡在其后」",
+           "挡在其后" not in warn_dead, warn_dead)
+    truthy("明说无代价", "无代价" in warn_dead, warn_dead)
+    truthy("提醒死站恢复后不会自动重算", "不会自动重算" in warn_dead, warn_dead)
+
+    warn_live = _shadow_warning(b_alive, ["m1"], 700,
+                                {"alive2.example": ["m1"],
+                                 "alive3.example": ["m1"]})
+    truthy("有活站时报的是**在用**站数", "2 个**在用**站" in warn_live, warn_live)
+    truthy("给出更低档的确切值而不是「手工调低」",
+           "改成 300" in warn_live, warn_live)
+
+    # 混合：一活一死 —— 报活站数，死站单独一句
+    b_mixed = mkband("claude-api-key",
+                     {1000: ["top.example"], 500: ["alive2.example"],
+                      100: ["dead.example"]},
+                     "m1", dead={"dead.example"})
+    warn_mix = _shadow_warning(b_mixed, ["m1"], 700,
+                               {"alive2.example": ["m1"], "dead.example": ["m1"]})
+    truthy("混合时只把活站计入主句", "1 个**在用**站" in warn_mix, warn_mix)
+    truthy("死站另说一句", "另有 1 个已不可用的站" in warn_mix, warn_mix)
 
     # ── ④ 不劫持顶层 ────────────────────────────────────────────────
     section("④ 不劫持顶层（层级隔离下抢顶层=完全取代）")

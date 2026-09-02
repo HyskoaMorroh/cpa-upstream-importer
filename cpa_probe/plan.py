@@ -1041,6 +1041,45 @@ def gentler_option(
     return None
 
 
+def _shadow_warning(band: Band, models: list[str], priority: int,
+                    shadow: dict[str, list[str]]) -> str:
+    """「挡住了谁」这条警告的正文。
+
+    为什么要分开活站与死站（2026-09-02 演练发现）：原来只报总数，
+    实测输出是「priority 280 会把 2 个现有站挡在其后（ai.hybgzs.com、
+    muyuan.do）」—— 而那两个站在注释里都记着实测不可用，定档算法数出来的
+    在用站是 **0**。同一件事，警告说「挡 2 个」、算法说「挡 0 个、无代价」。
+
+    用户看到的是前者，于是会去调低一个本来最优的档位。README 早就写着
+    「这条警告还会区分被挡的是活站还是死站」，但代码里没做 —— 文档超前于实现。
+    """
+    hosts = sorted(shadow)
+    dead = _dead_shadowed(band, models, priority)
+    live = [h for h in hosts if h.lower() not in dead]
+
+    if not live:
+        head = "、".join(hosts[:5]) + ("…" if len(hosts) > 5 else "")
+        return (f"priority {priority} 排在 {len(hosts)} 个现有站之前"
+                f"（{head}）—— 它们**全部**已实测不可用或 weight:0，"
+                f"挡住它们无代价。注意：这些站若日后恢复，本档位不会自动重算")
+
+    head = "、".join(live[:5]) + ("…" if len(live) > 5 else "")
+    msg = (f"priority {priority} 会把 {len(live)} 个**在用**站挡在其后"
+           f"（{head}）—— 它们只在本站也不可用时才被尝试。")
+    if len(hosts) > len(live):
+        msg += f"另有 {len(hosts) - len(live)} 个已不可用的站，挡住无代价。"
+    # 空档内取任何值效果都一样（465 与 200、890 挡的是同一批站），
+    # 真正的选择是「插哪个空档」。所以不说「手工调低」，直接给下一档
+    # 的具体值和代价，省掉用户自己试的那一轮。
+    alt = gentler_option(band, models, priority)
+    if alt:
+        alt_pri, now_n, alt_n = alt
+        msg += f"改成 {alt_pri} 则只挡 {alt_n} 个在用站（现 {now_n} 个）"
+    else:
+        msg += "已是挡在用站最少的可插档，再低要手工指定"
+    return msg
+
+
 # ---------------- 方案 ----------------
 
 
@@ -1484,22 +1523,7 @@ def build_plan(
             for host in imp.shadowed_hosts:
                 shadow.setdefault(host, []).append(imp.model)
         if shadow:
-            hosts = sorted(shadow)
-            head = "、".join(hosts[:5]) + ("…" if len(hosts) > 5 else "")
-            msg = (
-                f"priority {sp.priority} 会把 {len(hosts)} 个现有站挡在其后"
-                f"（{head}）—— 它们只在本站也不可用时才被尝试。"
-            )
-            # 空档内取任何值效果都一样（465 与 200、890 挡的是同一批站），
-            # 真正的选择是「插哪个空档」。所以不说「手工调低」，直接给下一档
-            # 的具体值和代价，省掉用户自己试的那一轮。
-            alt = gentler_option(band, sp.models, sp.priority)
-            if alt:
-                alt_pri, now_n, alt_n = alt
-                msg += f"改成 {alt_pri} 则只挡 {alt_n} 站（现 {now_n} 站）"
-            else:
-                msg += "已是最低可插档，再低要手工指定"
-            sp.warnings.append(msg)
+            sp.warnings.append(_shadow_warning(band, sp.models, sp.priority, shadow))
         if v.swap_detected:
             sw = v.swap
             detail = f"{sw.get('rate_pct', 0)}%（{sw.get('swap')}/{sw.get('same', 0) + sw.get('swap', 0)} 次）"
@@ -1719,8 +1743,10 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
                 # 劫持警告由 build_plan 按旧值加过，这里换了值必须**先清后加**，
                 # 否则界面上会留一条指向旧 priority 的陈述。同理，挡站那条
                 # 警告里写着具体数值，也要按新值重写。
-                sp.warnings = [w for w in sp.warnings
-                               if "抢走" not in w and "挡在其后" not in w]
+                sp.warnings = [
+                    w for w in sp.warnings
+                    if "抢走" not in w and "挡在其后" not in w
+                    and "排在 " not in w]
                 if sp.hijacked:
                     names = ", ".join(i.model for i in sp.hijacked[:4])
                     sp.warnings.append(
@@ -1732,11 +1758,8 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
                         for h in imp.shadowed_hosts:
                             shadow.setdefault(h, []).append(imp.model)
                     if shadow:
-                        hosts = sorted(shadow)
-                        head = "、".join(hosts[:5]) + ("…" if len(hosts) > 5 else "")
                         sp.warnings.append(
-                            f"priority {v} 会把 {len(hosts)} 个现有站挡在其后"
-                            f"（{head}）—— 它们只在本站也不可用时才被尝试")
+                            _shadow_warning(band, sp.models, v, shadow))
 
         if dropped:
             head = "、".join(dropped[:4]) + ("…" if len(dropped) > 4 else "")

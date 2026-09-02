@@ -262,16 +262,27 @@ def main() -> int:
         probe_context=True, swap_samples=3, on_event=on_event,
     )
 
-    bands = {s: cp.build_band(cfg, s, raw=raw) for s in cp.SECTIONS}
+    # raw=real_raw 而不是 raw：那个名字要到 ⑤ 才被赋值（读临时副本），
+    # 在这里引用它就是 UnboundLocalError —— 本脚本自建仓起就是坏的，
+    # 因为它不在 tests/run.py 的套件里，没人跑到过这一行。
+    # 定档要读注释里的「实测不可用」结论，档位差得很远（claude 段实测 175 vs 500）。
+    bands = {s: cp.build_band(cfg, s, raw=real_raw) for s in cp.SECTIONS}
     seen = cp.existing_fingerprints(cfg)
     results, plans = [], []
     for row in parsed.valid:
         res = prober.probe(row)
         results.append(res)
-        plans.append(cp.build_plan(row, res, cfg, bands=bands, seen=seen))
+        plans.append(cp.build_plan(row, res, cfg, bands=bands, seen=seen,
+                                   raw=real_raw))
+
+    # 批量定档 —— 与 server.py 的 _api_plan、cli.py 同一个函数。演练要走
+    # 完整链路，漏了它这里给出的 priority 就与真实落盘不一致。
+    prio_warns = cp.assign_priorities(plans, cfg, raw=real_raw)
 
     # ---------------- ④ 判定 ----------------
     print(f"\n{C_CYAN}④ 判定与定档{C_END}")
+    for w in prio_warns:
+        print(f"  {C_WARN}⚠{C_END} {w}")
     for res, plan in zip(results, plans):
         print(f"\n  {C_CYAN}{res.row.host}{C_END}  "
               f"{res.row.masked()}  {res.total_calls} 次请求")
