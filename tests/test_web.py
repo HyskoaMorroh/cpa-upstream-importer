@@ -185,9 +185,10 @@ def main() -> int:
                                "gen": _GEN_CASES})
         script = js[:cut] + f"""
 const IN = {payload};
-const out = {{allow: {{}}, gen: {{}}, line: {{}}}};
+const out = {{allow: {{}}, proto: {{}}, gen: {{}}, line: {{}}}};
 IN.secs.forEach((s) => {{
   out.allow[s] = IN.models.filter((m) => famOk(s, m));
+  out.proto[s] = IN.models.filter((m) => protoOk(s, m));
 }});
 Object.keys(IN.gen).forEach((k) => {{
   out.gen[k] = newestGenerationPerLine(IN.gen[k]);
@@ -205,6 +206,25 @@ console.log(JSON.stringify(out));
             for s in _SECS:
                 want = [m for m in _SAMPLES if _mc.section_allows(s, m)]
                 eq(f"{s} 放行集合两侧一致", got["allow"][s], want)
+                # 手填那条路走的是更宽的 protocol_ok —— 两侧也要一致，
+                # 否则「界面手填能写、后端拒收」或反过来（2026-09-03）。
+                want_p = [m for m in _SAMPLES
+                          if _mc.section_protocol_ok(s, m)]
+                eq(f"{s} 手填放行集合两侧一致", got["proto"][s], want_p)
+            # 两者的差别必须**只在四族之外**，且只在 compat 段放开。
+            # 写死这条不变式：将来任一侧改了族判定，这里立刻炸。
+            for s in _SECS:
+                extra = [m for m in got["proto"][s] if m not in got["allow"][s]]
+                if s == "openai-compatibility":
+                    truthy(f"{s} 手填多放行的全是四族之外",
+                           all(_mc.family(_mc.bare_name(m)) not in _mc.FAMILIES
+                               for m in extra),
+                           f"实得 {extra}")
+                    truthy(f"{s} 手填确实放开了四族之外（grok/glm 这类）",
+                           len(extra) > 0,
+                           "放不开就等于操作员没法写回已知可用的 grok-4.6")
+                else:
+                    eq(f"{s} 手填与工具选型同集合（前三段按族拒）", extra, [])
             for k, ms in _GEN_CASES.items():
                 eq(f"取最高世代 · {k}", got["gen"][k],
                    _mc.newest_generation_per_line(ms))
