@@ -184,8 +184,8 @@ def extract_existing_entries(cfg: dict) -> list[tuple[str, str, str, str]]:
     return entries
 
 
-def existing_weights(cfg: dict) -> dict[tuple[str, str], int]:
-    """既有条目的 weight，按 (host, api_key) 索引。只收显式写了的。
+def existing_weights(cfg: dict) -> dict[tuple[str, str, str], int]:
+    """既有条目的 weight，按 **(段, host, api_key)** 索引。只收显式写了的。
 
     为什么单独一个函数而不塞进 extract_existing_entries 的返回值：那个函数的
     四元组已被调用方与测试依赖，改结构要连带改几处；而这里只需要一张查表。
@@ -194,12 +194,24 @@ def existing_weights(cfg: dict) -> dict[tuple[str, str], int]:
     逐出调度池」的唯一手段，CPA 缺这个字段时默认 1。全量重建不搬运它 =
     手工封禁的站全部复活，且没有任何提示。
 
+    为什么键里必须有段（2026-09-03 对账发现，与 existing_proxies 同一个成因）
+    ------------------------------------------------------------------
+    原来按 (host, api_key) 索引、跨段共用一个值。实测生产 config.yaml：
+    facai 的 3 把 Key 在 codex 与 claude 段是 `weight: 0`（那两条路径实测
+    静默换模，已封），在 compat 段**故意没写**（那条路径可用）；100xlabs 的
+    3 把 Key 同样只在 claude 段封。按两元组搬运会把 0 灌进 compat 段 ——
+    6 个 (凭据, 段) 组合被无声封禁。
+
+    `weight: 0` 的后果比多一跳代理重得多：weighted-round-robin 下
+    positiveWeightAuths（selector.go:637-644）把它整个剔出候选，那个站在
+    那一段直接不参与调度，而 YAML 合法、validate 报成功、写后验证也发现不了。
+
     键用 host 而非 base_url：同一个站在不同段的 base-url 形态不同
     （codex/compat 带 /v1），用 base_url 查不到。
     """
     from .parse import host_of
 
-    out: dict[tuple[str, str], int] = {}
+    out: dict[tuple[str, str, str], int] = {}
     for section in ("gemini-api-key", "codex-api-key", "claude-api-key"):
         for e in cfg.get(section) or []:
             if not isinstance(e, dict):
@@ -210,7 +222,7 @@ def existing_weights(cfg: dict) -> dict[tuple[str, str], int]:
             h = host_of(str(e.get("base-url") or ""))
             k = str(e.get("api-key") or "")
             if h and k:
-                out[(h, k)] = w
+                out[(section, h, k)] = w
 
     # compat 段的 weight 在 api-key-entries 的每一项上，不在 provider 级
     for prov in cfg.get("openai-compatibility") or []:
@@ -225,7 +237,7 @@ def existing_weights(cfg: dict) -> dict[tuple[str, str], int]:
                 continue
             k = str(ke.get("api-key") or "")
             if h and k:
-                out[(h, k)] = w
+                out[("openai-compatibility", h, k)] = w
 
     return out
 

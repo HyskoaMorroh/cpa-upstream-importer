@@ -269,6 +269,10 @@ console.log(JSON.stringify(out));
            ".cats.fallback" in js and "sp.models.map" in js)
     truthy("填完立刻回写 S.forced", "S.forced[p.line_no] = S.forced[p.line_no]" in js,
            "提交时读的是 S.forced 不是 DOM —— 不回写就是「勾着但没接管」")
+    truthy("seed 猜测**不**回写 S.forced",
+           "sp.model_source !== 'seed'" in js,
+           "回写会让后端把猜测当手填：徽标不再提示无依据，且跨段新增那道闸"
+           "按 model_source 判、manual 放行 —— 猜测清单能凭空新增条目")
     truthy("已有用户记录时不覆盖", "rec !== undefined ? rec : sp.models" in js)
     truthy("容器已填过就不重填", "!fb.querySelector('.cm')" in js,
            "每次 refreshPlan 都重填会把用户的取消勾选覆盖掉")
@@ -276,6 +280,68 @@ console.log(JSON.stringify(out));
     truthy("placeholder 不再说「手填模型名」",
            "站方目录也没报模型：手填模型名" not in js,
            "模型已经填好了，再让用户手填是误导")
+
+    # ── ③f 可用行也要能改模型清单（2026-09-03 现场） ────────────────────
+    #
+    # 那一格原来只渲染 `v.models.join(', ')` 纯文本，三处后果：
+    #   ① v.models 为空（静默换模 / 200 包错误体，`_accept` 全拒）时显示
+    #      「无可信模型」，而后端方案里 sp.models 已经有 6 个（seed 兜底）——
+    #      判死行有 .cats.fallback 容器接住它，可用行连容器都没有。
+    #   ② 可用行完全没有手填入口，操作员想改清单只能去改 config.yaml。
+    #   ③ 探测只验 max_models（默认 4）个就停，站方目录里其余名字看不见。
+    section("③f 可用行的模型格：勾选框 + 手填 + 目录补充")
+    truthy("可用行不再是纯文本 join",
+           "esc(v.models.join(', ')) || '<span class=\"hint\">无可信模型" not in js,
+           "纯文本没有勾选框也没有手填框，实测清单为空时只能显示「无可信模型」")
+    truthy("实测清单做成勾选框", "const uProbed" in js and "uPick.has(m)" in js)
+    truthy("目录里探测没验到的也列出来（默认不勾）",
+           "const uExtra" in js and "!uProbed.includes(m)" in js,
+           "探测只验前几个就停，其余名字看不见等于选不了")
+    truthy("预勾结果**不**回写 S.forced",
+           "if (uRec === undefined && uPick.size)" not in js,
+           "forced 非空会让 build_plan 走 manual 分支：徽标从「实测」变「手填」、"
+           "recommended 翻假，而 seed 猜测被洗成 manual 正好绕过新增段那道闸")
+    truthy("可用行也有手填框", "const uFm" in js)
+    truthy("实测为空时留 fallback 容器给 refreshPlan 填",
+           js.count("cats fallback") >= 2,
+           "可用行没有容器 = 后端填的 6 个模型无处显示（现场截图那一条）")
+    truthy("后端 verdict 带 catalog", '"catalog"' in srv,
+           "前端要用它列出探测没验到的名字")
+    # 手填框与勾选框是同一个段的两个入口，任一侧变化都要**合并**另一侧
+    truthy("手填框写入时合并勾选框的选中项",
+           "const chosen = tr" in js and "chosen.concat(typed)" in js,
+           "只取手填值整份覆盖 = 勾了 3 个再手填 1 个，前 3 个静默丢失")
+
+    # ── ③g 落盘那层的闸必须反映到界面 ──────────────────────────────────
+    #
+    # 2026-09-03 现场：跨段新增的闸只存在于 rebuild_config_full 内部，界面按
+    # 「没有闸」渲染 —— writable / recommended 都是 True，显示「建议写入」并
+    # 默认勾上，勾了写不进，只在 warnings 里留一句话。
+    section("③g 界面三态与落盘一致")
+    truthy("后端回 write_blocked", '"write_blocked"' in srv)
+    truthy("后端回 new_section", '"new_section"' in srv)
+    truthy("writable 把 write_blocked 算进去",
+           "not self.write_blocked" in
+           io.open(os.path.join(ROOT, "cpa_probe", "plan.py"),
+                   encoding="utf-8").read(),
+           "界面显示可写而落盘拒收 = 勾了没反馈")
+    truthy("前端按它显示「不写入」", "sp.write_blocked ? '不写入'" in js)
+    truthy("被拦下的段不进「全勾」",
+           "if (sp.write_blocked) { blocked += 1; return; }" in js,
+           "勾了也写不进，界面上勾着就是在骗人")
+    truthy("新增段在行内标出来", "new_section && !sp.write_blocked" in js,
+           "它改变的是条目数而不只是某个字段，diff 里不显眼")
+    truthy("来源徽标每轮重建而不是追加",
+           "ml.innerHTML = bits.join(' ')" in js,
+           "追加式写法在 model_source 变化后会留着上一轮的徽标")
+
+    # ── ③h 全量重探也要读 selected ──────────────────────────────────
+    #
+    # 那条路原来完全不读 `selected`，于是操作员取消勾选的段照样被重写。
+    section("③h 全量重探尊重勾选")
+    truthy("full_redetect 分支里有 write_plans",
+           "write_plans" in srv and "shallow.sections = keep" in srv,
+           "不剪选择集 = 取消勾选的段仍被改写")
 
     # ── ③d weight:0 的措辞必须跟着调度策略变 ─────────────────────────
     #

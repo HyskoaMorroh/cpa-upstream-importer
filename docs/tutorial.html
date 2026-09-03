@@ -1068,6 +1068,50 @@ footer code{background:none;padding:0}
        另两段不带），用后者会把同一个凭据判成两个。</p>
   </div>
 
+  <h3>探到原上游在别的段也能用：加进去，并算进整体</h3>
+  <p>上面那个数字还有另一面：79 × 4 = 316 个 <code>(凭据, 段)</code> 组合里，
+     实占 177，<b>空着 139 个</b>。而全量重探对每个凭据的四段都发探测，所以中转站
+     「先只卖 claude、后来加开 codex」这类新能力它是能发现的。</p>
+  <div class="note b">
+    <div class="t">上一版把这件事整个挡掉了，而界面按「没有闸」渲染</div>
+    <p>2026-09-02 那次事故（条目从 121 变 246）的修法是
+       <code>owned_sections</code> + <code>only_owned</code>：「原来没配这一段就
+       跳过」。它挡住了事故，也挡住了这个需求 —— 而那 139 个空位里，探测跑通的正是
+       最该新增的条目。</p>
+    <p>更糟的是那道闸只存在于 <code>rebuild_config_full</code> 内部：
+       <code>build_plan</code> 给那些段的 <code>writable</code> 与
+       <code>recommended</code> 都是 True，界面显示「建议写入」并默认勾上，勾了写
+       不进，只在写回后的 warnings 里留一句话。<b>代码里有闸、界面按没闸渲染</b>，
+       是这一类缺陷的通用形态。</p>
+  </div>
+  <p>现在判据换成「<b>这一段这次有没有依据</b>」，而不是「原来配过没有」：</p>
+  <table>
+    <thead><tr><th style="width:210px">模型清单来自</th><th style="width:110px">落盘</th>
+      <th>界面</th></tr></thead>
+    <tbody>
+      <tr><td><code>probed</code> 实测跑通推理</td><td>作为新条目写入</td>
+        <td>「新增段」徽标 + 建议写入</td></tr>
+      <tr><td><code>manual</code> 你手填的清单</td><td>写入</td>
+        <td>「手填」徽标</td></tr>
+      <tr><td><code>catalog</code> 站方目录声称有</td><td>写入，默认不勾</td>
+        <td>「目录」徽标 + 需人工确认</td></tr>
+      <tr><td><code>seed</code> 工具兜底猜的</td><td><b>不写</b></td>
+        <td>「不写入」，并说明手填真实清单即可放行</td></tr>
+    </tbody>
+  </table>
+  <p>最后一档是硬闸，它挡的正是 121 变 246 那次事故：那些新增段的清单只是猜测，
+     凭据在那一段没有任何依据可用，写进去只让 CPA 每次轮到它吃一次失败，耗掉
+     <code>request-retry × max-retry-credentials</code> 的预算。</p>
+  <p><code>catalog</code> 与 <code>seed</code> 的差别不是「可信度高一档」这么模糊：
+     目录里的名字是<b>这个站自己报的</b>，种子清单是本工具写死的猜测，与这个站没有
+     任何关系。</p>
+  <p>放行判定（<code>mark_new_sections</code>）必须跑在<b>批量定档之前</b>：被拦下的
+     段不落盘，让它参与定档会白占一个档位（<code>taken</code> 被污染，各站被挤得更
+     低），影响面也会把不存在的条目算进遮挡关系。而模型清单的用户覆盖要跑在它<b>之
+     前</b> —— 那道闸按 <code>model_source</code> 判，手填的清单必须先落进方案，
+     否则「手填了真实模型」仍会被当成猜测拦下。三步的顺序是：覆盖模型 → 放行判定 →
+     批量定档 → 覆盖 priority。</p>
+
   <h3>再省画像：门票是站+段的属性，与模型无关</h3>
   <p>画像梯的调用点在<b>种子模型循环内部</b>：第一个种子全败后，循环走到下一个
      种子，整梯重跑。而每段有 2-3 个种子 —— claude 段 7 档 × 2、compat 6 档 × 3。</p>
@@ -1187,11 +1231,19 @@ footer code{background:none;padding:0}
      那些）按「第一个 <code>*-api-key</code> 段之前」整段原样保留，不参与重建。</p>
 
   <div class="note b">
-    <div class="t">文件里的排序与 CPA 的优先级方向相反</div>
-    <p>重建后的条目按 <code>priority</code> <b>降序</b>排列，而 CPA 侧的语义是
-       <b>数值小的优先</b>（<code>scheduler.go:1085</code> 升序排序）。所以文件里
-       排在前面的是数值大的、也就是优先级低的。</p>
-    <p>这个顺序只影响阅读，不影响 CPA 的选择——它按数值排，不按文件位置。</p>
+    <div class="t">文件里的排序与 CPA 的优先级方向一致（此前这里写反了）</div>
+    <p>重建后的条目按 <code>priority</code> <b>降序</b>排列，而 CPA 的语义是
+       <b>数值大的先被尝试</b>：<code>priorityOrder</code> 按降序排
+       （<code>scheduler.go:1197-1199</code>），取候选时取数值最大的那一层
+       （<code>scheduler.go:402</code> 与 <code>selector.go:541-543</code> 都是
+       <code>priority &gt; bestPriority</code>）。所以文件里排在前面的正是先被
+       尝试的。</p>
+    <p>缺这个字段时 <code>authPriority</code> 返回 0
+       （<code>selector.go:365-372</code>）—— 那是<b>最低</b>优先而不是最高，
+       所以「不写 priority」等于排在所有显式写了正数的条目之后。</p>
+    <p>此前本文与 README、DESIGN 都写成「数值小的优先，<code>scheduler.go:1085</code>
+       升序排序」。那个行号上根本不是排序代码，结论也与源码相反 —— 立论依据不成立
+       的判断，改的时候要连依据一起换掉。</p>
   </div>
 
   <h3>写回链一步没少</h3>
@@ -1236,6 +1288,44 @@ footer code{background:none;padding:0}
     <p>讽刺的是工具本来就理解这个语义：定档算法把 <code>weight: 0</code> 当作
        「挡住它零代价」的强信号读。读得懂，写的时候丢了。</p>
   </div>
+  <p><b>它的查表键必须含段</b>（2026-09-03 对账发现，与 <code>proxy-url</code> 同一个
+     成因）：原来按 <code>(host, api_key)</code> 索引、跨段共用一个值。实测 facai 的
+     3 把 Key 在 codex 与 claude 段是 <code>weight: 0</code>（那两条路径静默换模，
+     已封），在 compat 段<b>故意没写</b>（那条路径可用）；100xlabs 的 3 把同样只封
+     claude 段。按两元组搬会把 0 灌进那些没封的段 —— 6 个 <code>(凭据, 段)</code>
+     组合被无声逐出调度池，而 YAML 合法、写后验证也发现不了。</p>
+  <p>还有一处只在 compat 段出现：它的 <code>weight</code> 挂在
+     <code>api-key-entries</code> 的<b>每一项</b>上，而 <code>render_entry</code> 的
+     compat 分支从来不写这个字段 —— 那把 <code>weight: 0</code> 一直只靠 carry 原文行
+     侥幸活着。组内孤儿 Key 与新增的 Key 都没有原文行可搬，于是照样复活。</p>
+
+  <h3>compat 段：组内的 Key 会整把消失</h3>
+  <div class="note b">
+    <div class="t">前三段有孤儿兜底，compat 段没有</div>
+    <p>compat 段的结构是「一个 provider 条目 = 一个站，多把 Key 挂在它的
+       <code>api-key-entries</code> 下」。<code>_orphan_provider_lines</code> 只保留
+       「<b>整个</b> provider 都没被碰到」的条目 —— 被碰到的 provider 整条重写，
+       组内少一把 Key 就少一把。前三段有 <code>_orphan_entry_lines</code> 兜这件事，
+       这一段没有。</p>
+    <p>而「没进方案」有三种完全无害的成因：用户只勾了一部分、那个段判不可写、探测抛
+       异常（<code>BatchProber</code> 会把那个凭据整个从 results 里去掉）。实测生产
+       配置 gorouter.app 15 把、tabitoken.com 14 把 —— 一把出问题就丢一把。</p>
+    <p>同一处还藏着第二个缺陷：per-key 的 <code>proxy-url</code> 被统一成组内
+       <code>head</code> 那把的值。实测 kktoken.cc 5 把、ai.hybgzs.com 3 把带 per-key
+       代理，组内不一致时全组按 head 写 —— 多一跳不会失败，所以
+       <code>validate</code> 与写后验证都发现不了。</p>
+  </div>
+  <p>修法是新增 <code>compat_key_blocks()</code>：把每把 Key 自己的续行按
+     <code>(host, api-key)</code> 索引出来，渲染时按<b>键</b>合并 —— 原文有
+     <code>proxy-url</code> 就尊重原文（那是操作员的显式配置），原文没有才补方案里的。
+     不是二选一：只搬不补会吞掉本次实测结论（某把 Key 原来只有
+     <code>weight: 0</code>、这次探测判定它需要代理，那条 proxy-url 就再也写不进去）。</p>
+  <p>连带修掉一处分组键的问题：compat 组原来按 <code>(host, base_url)</code> 归并，
+     而同一个站的 base-url 可能有两种拼写（尾斜杠、<code>/v1</code>、scheme 大小写）。
+     那会分成两组、渲染出两个同 host 的 provider，而 <code>key_blocks</code> 与
+     <code>_orphan_provider_lines</code> 都只按 host 索引 —— 同一批孤儿 Key 被灌进
+     两个条目，同一把 Key 在池子里占两个位。改成只按 host 归并，并在拼写不一致时
+     给出警告说明采用了哪一种。</p>
 
   <h3>白名单渲染抹掉了 106 个条目的字段</h3>
   <p><code>render_entry</code> 是<b>白名单式</b>渲染 —— 只写它认识的 10 个字段。
@@ -1457,9 +1547,58 @@ footer code{background:none;padding:0}
        用户问「是不是代表写回后这个上游站一个模型都没有」，判断是对的。</p>
   </div>
   <p>修法：else 分支留一个空容器，<code>refreshPlan</code> 拿后端方案的
-     <code>sp.models</code> 填成勾选框、默认全勾、并<b>立刻回写</b>
-     <code>S.forced</code>。全选 / 反选 / 清空按钮跟着出现。容器已填过就不再重填
-     —— 否则每次 <code>refreshPlan</code> 都会把用户的取消勾选覆盖掉。</p>
+     <code>sp.models</code> 填成勾选框、默认全勾。全选 / 反选 / 清空按钮跟着出现。
+     容器已填过就不再重填 —— 否则每次 <code>refreshPlan</code> 都会把用户的取消
+     勾选覆盖掉。</p>
+  <p><b>回写 <code>S.forced</code> 只在清单有依据时做</b>（2026-09-03 补）：
+     <code>forced</code> 非空会让后端走 <code>manual</code> 分支，于是 seed 猜测
+     被洗成「手填」—— 徽标不再提示这批名字没有依据，而跨段新增那道闸按
+     <code>model_source</code> 判、<code>manual</code> 放行，猜测清单因此能凭空
+     新增条目，正是 121 条目变 246 那条老路。不回写也不会丢：后端本来就写它自己
+     算出的 <code>sp.models</code>，界面显示的是同一份。用户真的动了勾选框时
+     change 事件会写 <code>S.forced</code> —— 那时记成手填是对的，操作员显式做了
+     决定。</p>
+
+  <h3>可用行的模型格：只读文本 → 勾选框 + 手填 + 目录补充</h3>
+  <div class="note b">
+    <div class="t">「可用 + 实测」的行反而最没法改</div>
+    <p>可用行的模型格原来只渲染 <code>v.models.join(', ')</code> 纯文本，
+       三处后果同时存在：</p>
+    <p>① <code>v.models</code> 为空时显示「无可信模型」，而后端方案里
+       <code>sp.models</code> 已经有 6 个。<code>_accept()</code> 在静默换模或
+       「200 包错误体」时拒收模型，段仍算可用（端点确实响应、凭证有效），清单一个
+       都没进。判死行有 <code>.cats.fallback</code> 容器接住这种情形，可用行连容器
+       都没有 —— 于是 <code>refreshPlan</code> 无处可填。</p>
+    <p>② 可用行完全没有手填入口。操作员知道这个站还卖别的模型，也只能去改
+       config.yaml。</p>
+    <p>③ 探测收够 <code>max_models</code>（默认 4）个就停，站方目录里其余名字在这
+       一格看不见 —— 而那些名字往往正是要写进去的。</p>
+  </div>
+  <p>现在可用行与判死行用同一套 DOM 约定（<code>.cats</code> / <code>.cm</code> /
+     <code>.fm</code> / <code>.mtools</code>），所以事件绑定与 fallback 填充无需
+     分叉。实测清单打勾、目录里探测没验到的名字列出但**默认不勾**（实测过的才有
+     依据，目录只是站方声称），并标一个「目录」小字。</p>
+  <p>连带修掉一处不对称：<code>.cm</code>（勾选框）的处理器一直会合并手填框里目录
+     外的名字，而 <code>.fm</code>（手填框）的处理器只取自己的值就整份覆盖
+     <code>S.forced</code> —— 「勾了目录里 3 个再手填 1 个」的结果是只剩那 1 个，
+     而 3 个勾选框在界面上还勾着。又是一处「界面勾着、实际没接管」。</p>
+
+  <h3>手填无条件优先，不看探测是否通过</h3>
+  <div class="note b">
+    <div class="t">判据写成 <code>forced_models and not v.usable</code> 堵死两条路</div>
+    <p>① <code>usable=True</code> 但 <code>v.models</code> 为空：手填的清单落不
+       进来，反而掉进 seed 分支 —— 界面上「手填」变成「猜测」。</p>
+    <p>② <code>usable=True</code> 且清单非空：操作员想把探到的 4 个换成自己知道的
+       8 个，<code>probed</code> 直接盖掉手填，一条警告都没有。</p>
+    <p>手填是操作员的显式意图，探测判定是工具的推测。推测盖掉显式意图在任何处境下
+       都是错的 —— 与 <code>force</code> 参数的设计意图一致（它只绕过 usable 判定，
+       去重 / 定档 / 影响面一道不少）。</p>
+  </div>
+  <p>改成 <code>if forced_models:</code> 之后要连带改两处措辞，否则说反了就是误导：
+     覆盖实测清单时说「探测判『可用』（实测到 X），但已按你手填的清单写入」，判死段
+     照旧说「探测未通过」；手填**全部**不合规时的兜底说法按实际落到哪儿写 ——
+     可用段落回 <code>probed</code>（本次实测到的清单），判死段才落到目录或市面
+     最新，原来写死成「市面最新清单」在前一种情形下是假话。</p>
 
   <h3>三层数据源：为什么不能只写死一份清单</h3>
   <div class="tw"><table>
@@ -1673,12 +1812,19 @@ footer code{background:none;padding:0}
 
   <div class="note w">
     <div class="t">如实说明：验证到哪一步</div>
-    <p><b>已验证</b>：假上游套件、单元测试（1103 项，含真实 config.yaml 用例时 1105 项）、
-       端到端演练、以及拿生产 config.yaml 做的重建对账（121 条目 / 79 凭据，
-       字段计数与值零差异）。</p>
-    <p><b>未验证</b>：没有对这 79 个真实站跑过一次<b>完整的写回流程</b> ——
-       对账用的是「重建产物与原文比对」，没真的落盘到生产。第一次实跑建议看完
-       diff 再决定是否写回，备份是唯一的回滚手段。</p>
+    <p><b>已验证</b>：假上游套件、单元测试（1137 项，含真实 config.yaml 用例时
+       1153 项）、端到端演练、以及拿生产 config.yaml 做的重建对账
+       （<code>tests/rehearse_real_rebuild.py</code>，33 项全对上：121 条目 /
+       79 凭据 / 177 个 <code>(凭据, 段)</code> 槽位，字段计数与值零差异）。</p>
+    <p>那份对账值得单独说，因为它抓到的三处缺陷单元测试全绿：compat 段组内没进方案
+       的 Key 会消失（生产配置 gorouter.app 15 把、tabitoken.com 14 把）、per-key
+       的 <code>proxy-url</code> 与 <code>weight</code> 被统一成组内 head 那把的值
+       （8 把带 per-key 代理）、同一个站两种 base-url 写法会写出两个同名 provider。
+       合成样本一个都碰不到 —— 13 个 provider、69 把 compat Key 这种形状只有真实
+       文件有。</p>
+    <p><b>未验证</b>：没有对这 79 个真实站跑过一次<b>真实探测</b>，也没落盘到生产 ——
+       对账用的是「把既有条目原样当探测结果」，验的是写回链的守恒性，不是探测本身。
+       第一次实跑建议看完 diff 再决定是否写回，备份是唯一的回滚手段。</p>
   </div>
 </div></section>
 

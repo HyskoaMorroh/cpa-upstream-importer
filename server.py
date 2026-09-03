@@ -414,6 +414,14 @@ def plan_json(p) -> dict:
                 "duplicate": sp.duplicate,
                 "duplicate_note": sp.duplicate_note,
                 "writable": sp.writable,
+                # 这一段落盘时是「新增」还是「更新既有条目」。
+                # 探测发现原上游在别的段也能用时，那一段是新增 —— 界面要标出来，
+                # 因为它改变的是 config.yaml 的条目数，而不只是某个字段。
+                "new_section": sp.new_section,
+                # 非空 = 这一段不会写入，值就是原因。界面必须显示它 ——
+                # 上一版这道闸只在写盘那层，界面显示「建议写入」并默认勾上，
+                # 勾了写不进（2026-09-03 现场）。
+                "write_blocked": sp.write_blocked,
                 # 「能写」与「建议写」分开：recommended 决定 UI 默认勾选，
                 # writable 决定用户手工勾上后能不能真写。换模/抢顶层/截断反推
                 # 三类仍可写，但默认不勾 —— 见 SectionPlan.recommended。
@@ -1643,9 +1651,15 @@ class Handler(BaseHTTPRequestHandler):
             bands: dict = {}
             seen = cp.existing_fingerprints(cfg)
             all_plans = {}  # {(base_url, api_key): ImportPlan}
-            # 既有条目的 weight，按 (host, api_key) 查。`weight: 0` 是「把这个站
-            # 逐出调度池」的唯一表达，而 CPA 缺这个字段时默认 1 —— 不搬运它
-            # 等于让手工封禁的站全部复活。
+            # 既有条目的 weight，按 (段, host, api_key) 查。`weight: 0` 是
+            # 「把这个站逐出调度池」的唯一表达，而 CPA 缺这个字段时默认 1 ——
+            # 不搬运它等于让手工封禁的站全部复活。
+            #
+            # 键含段（2026-09-03 对账发现，与 proxy-url 同一个成因）：实测
+            # facai 的 3 把 Key 在 codex/claude 段是 weight:0（那两条路径静默
+            # 换模，已封），compat 段**故意没写**；100xlabs 同理只封 claude。
+            # 按 (host, key) 搬会把 0 灌进那些没封的段 —— 6 个 (凭据, 段)
+            # 组合被无声逐出调度池，而 YAML 合法、写后验证也发现不了。
             weights = existing_weights(cfg)
             # proxy-url 同理。它只在探测当场判定「需要代理」时才有值，而重探时
             # 那个站可能这次直连就通 —— 方案里 proxy_url 为空，整段重写就把原有
@@ -1665,12 +1679,13 @@ class Handler(BaseHTTPRequestHandler):
                                   probation=probation, rebuild=True, raw=raw,
                                   force={str(k): [str(m) for m in (v or [])]
                                          for k, v in fh.items()} if fh else None)
-                w = weights.get((res.row.host, res.row.api_key))
-                if w is not None:
-                    for sp in p.sections.values():
-                        sp.weight = w
-                pu_by_section = proxies
                 for sec, sp in p.sections.items():
+                    # weight 与 proxy-url 都按 (段, host, key) 搬 —— 同一个
+                    # 凭据在不同段的这两个字段是**独立配置**，跨段共用会
+                    # 静默改行为（见 existing_weights / existing_proxies）。
+                    w = weights.get((sec, res.row.host, res.row.api_key))
+                    if w is not None:
+                        sp.weight = w
                     # 探测判定需要代理时它已有值，不覆盖 —— 那是本次实测
                     # 结论；只补「原来有、这次没探出来」的情形。
                     #
@@ -1679,11 +1694,49 @@ class Handler(BaseHTTPRequestHandler):
                     # 按 (host, key) 搬会把 compat 的代理灌进 claude ——
                     # 多一跳不会失败，所以 validate 与写后验证都发现不了。
                     if not sp.proxy_url:
-                        got = pu_by_section.get(
+                        got = proxies.get(
                             (sec, res.row.host, res.row.api_key))
                         if got:
                             sp.proxy_url = got
                 all_plans[(res.row.bare, res.row.api_key)] = p
+
+            # 用户覆盖分**两批**应用，中间夹着新增段判定与批量定档。
+            #
+            # 为什么必须分开（2026-09-03）：
+            #   · 模型清单覆盖要在 mark_new_sections **之前** —— 那道闸按
+            #     model_source 判，手填的清单必须先落进方案，否则「手填了
+            #     真实模型」仍会被当成工具猜测拦下。
+            #   · priority 覆盖要在 assign_priorities **之后** —— 那个函数
+            #     会给每个站重新定值，先覆盖就被它冲掉。
+            # 上一版把两批放在一起、全放在定档之后，于是第一条不成立。
+            for (base_url, api_key), p in all_plans.items():
+                ov_host = _by_row(overrides, p)
+                for sec, sp in list(p.sections.items()):
+                    ov = ov_host.get(sec) or {}
+                    if "proxy_url" in ov:
+                        sp.proxy_url = str(ov["proxy_url"] or "")
+                    if "headers" in ov and isinstance(ov["headers"], dict):
+                        sp.headers = {str(k): str(v)
+                                      for k, v in ov["headers"].items()}
+                    if "models" in ov and isinstance(ov["models"], list):
+                        sp.models = _clean_override_models(sec, ov["models"])
+                        # 显式给了清单 = 操作员的手填意图，与 forced 同权。
+                        sp.model_source = "manual"
+                    if "max_context_length" in ov:
+                        v = ov["max_context_length"]
+                        sp.max_context_length = int(v) if v else None
+
+            # 新增段的放行判定 —— **必须在定档之前**。
+            #
+            # 探测发现某个凭据在原本没配的段也能用时，那一段该作为新条目加进去
+            # 并参与整体计算（用户 2026-09-03 的要求）。放行标准是「有没有实测
+            # 依据」：probed / manual / catalog 放行，seed（工具猜测）不放行 ——
+            # 后者正是 121 条目变 246 那次事故的成因。
+            #
+            # 为什么在定档之前：被拦下的段不会落盘，让它参与 assign_priorities
+            # 会白占一个档位（taken 被污染，各站被挤得更低），影响面也会把不
+            # 存在的条目算进遮挡关系。
+            blocked_new = cp.mark_new_sections(cfg, list(all_plans.values()))
 
             # 批量定档：站与站之间不同值、同站所有 Key 同值。
             #
@@ -1692,13 +1745,12 @@ class Handler(BaseHTTPRequestHandler):
             # 串行调用它、每个都拿到同一个答案 —— 落盘后 claude 段 74 个条目
             # 全是 175，站与站之间毫无区分，而 priority 的唯一作用就是区分先后。
             #
-            # 用户覆盖在这之后应用，所以手工改的 priority 不会被它冲掉。
             # raw 必传：定档的安全上限要读注释里的「实测不可用」结论，不传会把
             # 可用新站压到一堆死站后面（claude 段实测 500 → 175）。
             prio_warns = cp.assign_priorities(
                 list(all_plans.values()), cfg, probation=probation, raw=raw)
 
-            # 应用用户覆盖
+            # 第二批覆盖：priority。放在定档之后，手工值不会被冲掉。
             for (base_url, api_key), p in all_plans.items():
                 ov_host = _by_row(overrides, p)
                 for sec, sp in list(p.sections.items()):
@@ -1706,24 +1758,64 @@ class Handler(BaseHTTPRequestHandler):
                     if "priority" in ov:
                         sp.priority = int(ov["priority"])
                         sp.priority_reason = "用户手工指定"
-                    if "proxy_url" in ov:
-                        sp.proxy_url = str(ov["proxy_url"] or "")
-                    if "headers" in ov and isinstance(ov["headers"], dict):
-                        sp.headers = {str(k): str(v) for k, v in ov["headers"].items()}
-                    if "models" in ov and isinstance(ov["models"], list):
-                        sp.models = _clean_override_models(sec, ov["models"])
-                    if "max_context_length" in ov:
-                        v = ov["max_context_length"]
-                        sp.max_context_length = int(v) if v else None
+                        # 影响面按新值重算 —— 旧值算出来的遮挡关系会误导。
+                        # 增量路径一直这么做，这条路上一版漏了。
+                        band = bands.get(sec) or cp.build_band(cfg, sec, raw=raw)
+                        sp.impacts = cp.compute_impact(
+                            band, sp.models, sp.priority)
+                        sp.warnings = [w for w in sp.warnings
+                                       if "抢走" not in w]
+                        if sp.hijacked:
+                            names = ", ".join(i.model for i in sp.hijacked[:4])
+                            sp.warnings.append(
+                                f"会抢走 {len(sp.hijacked)} 个模型的顶层"
+                                f"（{names}）—— 你已手工确认")
+
+            # 选择集过滤 —— 全量重探这条路原来**完全不读 selected**（2026-09-03）。
+            #
+            # 后果：操作员取消勾选的段照样被重写。而取消勾选的成因往往是
+            # 「这一段我不想动」——「重探顺手把它改了」正好相反。
+            #
+            # 剪的是送进 rebuild_config_full 的副本，不是 all_plans 本身：
+            # 界面要靠完整的 plans 渲染每一段的参数与勾选框（与增量路径同一条
+            # 规则）。没进 write 集的既有条目由 keep_unplanned 原样保留，
+            # 不会因为没勾就被删。
+            if selected is None:
+                # 首次拉取（前端为读 recommended）—— 取工具建议的集合，
+                # 与增量路径同一个判据。绝不默认「全写」。
+                want = {(str(p.line_no), sec)
+                        for p in all_plans.values()
+                        for sec, sp in p.sections.items() if sp.recommended}
+            else:
+                want = {(str(h), str(s)) for h, s in selected}
+
+            write_plans: dict = {}
+            for k, p in all_plans.items():
+                keep = {sec: sp for sec, sp in p.sections.items()
+                        if (str(p.line_no), sec) in want or (p.host, sec) in want}
+                if not keep:
+                    continue
+                shallow = copy.copy(p)
+                shallow.sections = keep
+                write_plans[k] = shallow
 
             # 全量重建
-            preview, warnings = cp.rebuild_config_full(cfg, all_plans, raw.splitlines(keepends=True))
+            preview, warnings = cp.rebuild_config_full(
+                cfg, write_plans, raw.splitlines(keepends=True))
+            if blocked_new:
+                warnings.append(
+                    f"{blocked_new} 个 (凭据, 段) 组合原本不在 config.yaml 里，"
+                    f"且模型清单只是工具猜测 —— 界面已标成「不写入」并说明原因。"
+                    f"确知可用的话手填模型清单即可放行")
             # 覆盖之后再查同值：assign_priorities 保证站与站不同，但用户手工
             # 改 priority 是在它之后应用的 —— 改成邻站的值就同层了。同层按
             # weight 轮询是合法配置，但它取消的正是「不同网站不同优先级」，
             # 必须报出来而不是默默照写。
+            #
+            # 只查真会落盘的那批（write_plans）：没勾的段不写进去，报它们
+            # 同层是无中生有的警告。
             prio_warns = list(prio_warns) + cp.priority_collisions(
-                list(all_plans.values()))
+                list(write_plans.values()))
             warnings = list(prio_warns) + list(warnings)
 
             # 生成完整 diff（整个文件）
@@ -1731,7 +1823,9 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg = validate(preview)
 
             pid = secrets.token_hex(8)
-            STORE.add_plan(pid, {"plans": list(all_plans.values()), "diffs": diffs,
+            # 存 write_plans 而不是 all_plans：写后验证按 entry["plans"] 挑目标，
+            # 存全量会去验根本没写进去的段（与增量路径同一条规则）。
+            STORE.add_plan(pid, {"plans": list(write_plans.values()), "diffs": diffs,
                                  "preview": preview, "base_raw": raw,
                                  "created": time.time(),
                                  "full_redetect": True})
@@ -1767,6 +1861,28 @@ class Handler(BaseHTTPRequestHandler):
                                      for k, v in fh.items()} if fh else None)
             plans.append(p)
 
+        # 模型清单覆盖要在 mark_new_sections **之前** —— 那道闸按 model_source
+        # 判，手填的清单必须先落进方案，否则「手填了真实模型」仍会被当成工具
+        # 猜测拦下。与全量重探那条路同一个顺序。
+        for p in plans:
+            ov_host = _by_row(overrides, p)
+            for sec, sp in list(p.sections.items()):
+                ov = ov_host.get(sec) or {}
+                if "models" in ov and isinstance(ov["models"], list):
+                    # 过段规则（全量重探那条路早就过了，这条原来直接
+                    # `str(m)` 塞进去，绕开全部规则），并把来源记成 manual。
+                    sp.models = _clean_override_models(sec, ov["models"])
+                    sp.model_source = "manual"
+
+        # 新增段的放行判定，与全量重探同一套闸（2026-09-03）。
+        #
+        # 增量导入的多数行是全新凭据 —— `is_new_section` 对它们返回 False，
+        # 这一步什么也不做。真正被它管住的是「粘贴的 Key 其实已经在
+        # config.yaml 里配过某一段」：那时探测在别的段拿到 seed 猜测清单，
+        # 写进去就是凭空多一个必失败的条目。两条路径判据必须一致，否则
+        # 同一个凭据走增量与走重探得到不同结果。
+        blocked_new = cp.mark_new_sections(cfg, plans)
+
         # 增量导入也批量定档 —— 同一个 bug 的同一个修法。
         #
         # 一次粘贴 15 个站时，build_plan 里的 suggest_priority 同样会给它们
@@ -1774,7 +1890,8 @@ class Handler(BaseHTTPRequestHandler):
         # 不同、同站多 Key 同值，与 config.yaml 既有的规律一致。
         prio_warns = cp.assign_priorities(plans, cfg, probation=probation, raw=raw)
 
-        # 应用用户覆盖（优先级 / 代理 / 头 / 模型 / 是否写入）
+        # 其余覆盖（优先级 / 代理 / 头 / 上下文上限）—— 定档之后应用，
+        # 手工改的 priority 不会被 assign_priorities 冲掉。
         for p in plans:
             ov_host = _by_row(overrides, p)
             for sec, sp in list(p.sections.items()):
@@ -1793,8 +1910,6 @@ class Handler(BaseHTTPRequestHandler):
                     sp.proxy_url = str(ov["proxy_url"] or "")
                 if "headers" in ov and isinstance(ov["headers"], dict):
                     sp.headers = {str(k): str(v) for k, v in ov["headers"].items()}
-                if "models" in ov and isinstance(ov["models"], list):
-                    sp.models = [str(m) for m in ov["models"]]
                 if "max_context_length" in ov:
                     v = ov["max_context_length"]
                     sp.max_context_length = int(v) if v else None
@@ -1856,7 +1971,10 @@ class Handler(BaseHTTPRequestHandler):
             # 造成的同层。全都会影响站与站的先后，必须让人看到。
             # 只查真正写进去的那些段（for_write）—— 未勾选的段不落盘，
             # 报它们同值只是噪声。
-            "warnings": list(prio_warns) + cp.priority_collisions(for_write),
+            "warnings": list(prio_warns) + cp.priority_collisions(for_write)
+            + ([f"{blocked_new} 个 (凭据, 段) 组合的模型清单只是工具猜测，"
+                f"而这个凭据原本没配那一段 —— 界面已标成「不写入」并说明原因。"
+                f"确知可用的话手填模型清单即可放行"] if blocked_new else []),
         })
 
     def _cpa_password_for(self, body: dict) -> str:

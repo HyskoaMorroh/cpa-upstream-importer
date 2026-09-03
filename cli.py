@@ -108,11 +108,21 @@ def _print_result(res, plan) -> None:
                 if sp.duplicate:
                     mark = f"{C_WARN}={C_END}"
                     extra = f" {C_WARN}已存在，跳过{C_END}"
+                elif sp.write_blocked:
+                    # 探测通过但落盘那层会拒 —— CLI 也必须说出来。
+                    # 只在网页端显示、CLI 静默跳过，就是同一份输入两条途径
+                    # 表现不一致（2026-09-03）。
+                    mark = f"{C_WARN}○{C_END}"
+                    extra = f" {C_WARN}不写入{C_END}"
+                elif sp.new_section:
+                    extra += f" {C_OK}[新增段]{C_END}"
             print(f"    {mark} {section:<22} {v.summary()}{extra}")
             if sp:
                 print(f"        {C_DIM}{sp.priority_reason}{C_END}")
                 if sp.duplicate:
                     print(f"        {C_WARN}{sp.duplicate_note}{C_END}")
+                if sp.write_blocked:
+                    print(f"        {C_WARN}{sp.write_blocked}{C_END}")
                 for w in sp.warnings:
                     print(f"        {C_WARN}⚠ {w}{C_END}")
                 if sp.models:
@@ -134,6 +144,11 @@ def _print_result(res, plan) -> None:
         else:
             reason = plan.skipped.get(section, v.summary())
             print(f"    {C_BAD}✗{C_END} {section:<22} {reason}")
+            # 判死段现在也有完整方案（种子兜底、参数算全），落盘那层可能拒它。
+            # 网页端会显示原因，CLI 不显示就是两条途径不一致。
+            sp = plan.sections.get(section)
+            if sp is not None and sp.write_blocked:
+                print(f"        {C_WARN}不写入：{sp.write_blocked}{C_END}")
             bad = [a for a in v.attempts if not a.ok]
             if bad and bad[-1].excerpt:
                 print(f"        {C_DIM}{bad[-1].status} · {bad[-1].excerpt[:110]}{C_END}")
@@ -289,6 +304,23 @@ def main() -> None:
                              probation=not args.by_score, raw=raw)
         results.append(res)
         plans.append(plan)
+
+    # 新增段的放行判定 —— 与网页端两条路同一套闸（2026-09-03）。
+    #
+    # CLI 的输入多是全新凭据，`is_new_section` 对它们返回 False，这一步什么也
+    # 不做。真正被它管住的是「粘贴的 Key 其实已经在 config.yaml 里配过某一段」：
+    # 那时探测在别的段拿到 seed 猜测清单，写进去就是凭空多一个必失败的条目。
+    #
+    # 必须在 assign_priorities **之前**：被拦下的段不落盘，让它参与定档会白占
+    # 一个档位。而 build_diffs 按 writable 筛，write_blocked 会让 writable
+    # 翻假 —— 所以拦下的段自动不进 diff，无需在这里再筛一遍。
+    #
+    # 三条途径判据必须一致，否则同一份输入走 CLI 与走网页落盘结果不同。
+    blocked_new = cp.mark_new_sections(cfg, plans)
+    if blocked_new:
+        print(f"  {C_WARN}⚠{C_END} {blocked_new} 个 (凭据, 段) 组合原本不在 "
+              f"config.yaml 里，且模型清单只是工具猜测 —— 不写入。"
+              f"确知可用的话去网页端手填该段的模型清单（CLI 没有手填入口）")
 
     # 批量定档 —— 与网页端（server.py 的 /api/plan）同一个函数。
     #

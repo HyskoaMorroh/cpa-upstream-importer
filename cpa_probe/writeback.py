@@ -106,6 +106,15 @@ _SECTION_KEYS = (
     "openai-compatibility",
 )
 
+# model_source 的人话标签。只用于 warnings 文案 —— 操作员要能一眼看出
+# 「新增这一段的依据有多硬」，而 `probed` / `catalog` 这类内部值看不出来。
+_SRC_LABEL = {
+    "probed": "本次实测通过",
+    "catalog": "站方目录声称有",
+    "manual": "你手填的清单",
+    "seed": "工具猜测",
+}
+
 
 def backup(path: str, *, backup_dir: str | None = None) -> str:
     """写前备份。返回备份路径。
@@ -365,7 +374,9 @@ def find_compat_provider(lines: list[str], base_url: str) -> dict | None:
 
 
 def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
-                 extra_keys: list[str] | None = None) -> list[str]:
+                 extra_keys: list[str] | None = None,
+                 key_lines: dict[str, list[str]] | None = None,
+                 key_plans: dict[str, SectionPlan] | None = None) -> list[str]:
     """生成一个条目的 YAML 行。
 
     字段顺序与现有文件一致（api-key, base-url, prefix, priority, models…），
@@ -376,6 +387,20 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
     同站不同模型窗口能差一个数量级；把 opus 的实测值抄给 haiku，客户端
     会按错的窗口定压缩点 —— 那正是第 08 章那条 400 的成因。未实测的模型
     留空，CPA 回落内置目录值（service_models.go 各段的 fallback）。
+
+    per-key 字段（compat 段，2026-09-03）：`proxy-url` 与 `weight` 挂在
+    `api-key-entries` 的**每一项**上（CPA 的 OpenAICompatibilityAPIKey 只有这
+    三个字段：api-key / weight / proxy-url，config_types.go:691-701），所以逐把
+    Key 各自决定，绝不跨 Key 套用：
+
+      key_lines  {api_key: [该 Key 原有的续行]} —— 操作员的显式配置，最高优先
+      key_plans  {api_key: 该 Key 自己的 SectionPlan} —— 本次探测对它的结论
+      两者都没有就不写 —— CPA 侧 proxy 回落全局、weight 默认 1
+
+    实测 kktoken.cc 5 把、ai.hybgzs.com 3 把带 per-key `proxy-url`，而同站
+    claude 段那几把故意不带。拿 head 那把的值套给全组会多一跳（不会失败，所以
+    validate 与写后验证都发现不了）；weight 更糟，0 会把那把 Key 整个逐出调度池。
+    见 compat_key_blocks。
     """
     out: list[str] = []
     note = f"# {stamp} 批量导入 · 得分 {sp.score} · {sp.priority_reason}"
@@ -419,8 +444,34 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
         out.append(f"{field}api-key-entries:")
         for key in [sp.api_key] + list(extra_keys or []):
             out.append(f"{field}  - api-key: {_yaml_str(key)}")
-            if sp.proxy_url:
-                out.append(f"{field}    proxy-url: {_yaml_str(sp.proxy_url)}")
+            # per-key 字段（proxy-url / weight）逐把 Key 决定，**绝不跨 Key 套用**。
+            #
+            # 三个来源，优先级递减：
+            #   ① 原文里这把 Key 自己的续行（key_lines）—— 操作员的显式配置
+            #   ② 这把 Key 自己的方案（key_plans）—— 本次探测对它的结论
+            #   ③ 什么都没有就不写 —— CPA 侧 proxy 回落全局、weight 默认 1
+            #
+            # 为什么必须逐把（2026-09-03，同一个缺陷改两次）：第一版只搬原文、
+            # 原文非空就 `elif` 掉新值；第二版改成合并，但补的是 `sp.proxy_url`
+            # —— 那是 **head 那把**的代理，于是组内所有没有原文行的 Key 都被灌上
+            # head 的出口。实测 kktoken.cc 5 把带 per-key 代理、claude 段那几把
+            # 故意不带，跨 Key 套用会多一跳；weight 更糟，0 会把那把 Key 整个
+            # 逐出调度池。多一跳不会失败，所以 validate 与写后验证都发现不了。
+            own = list((key_lines or {}).get(key) or [])
+            out.extend(ln.rstrip("\n") for ln in own)
+            # 这把 Key 自己的方案。head 就是 sp 本身；其余成员由调用方给
+            # （build_diffs / rebuild_config_full 都按段归组，拿得到每把的方案）。
+            mine = (key_plans or {}).get(key) or (sp if key == sp.api_key else None)
+            if not any(re.match(r"^\s*proxy-url\s*:", ln) for ln in own):
+                pu = mine.proxy_url if mine is not None else ""
+                if pu:
+                    out.append(f"{field}    proxy-url: {_yaml_str(pu)}")
+            if not any(re.match(r"^\s*weight\s*:", ln) for ln in own):
+                w = mine.weight if mine is not None else None
+                if w is not None:
+                    why = ("   # 原值搬运（weight: 0 = 已逐出调度池）"
+                           if w == 0 else "")
+                    out.append(f"{field}    weight: {w}{why}")
         if sp.headers:
             out.append(f"{field}headers:")
             for k, v in sp.headers.items():
@@ -578,11 +629,19 @@ def build_diffs(raw: str, plans: list[ImportPlan]) -> list[Diff]:
                 if not fresh:
                     continue        # 全都已存在，无事可做
                 ki = found["keys_indent"]
+                by_key = {g.api_key: g for g in group}
                 add_lines = []
                 for k in fresh:
                     add_lines.append(f"{ki}  - api-key: {_yaml_str(k)}")
-                    if head.proxy_url:
-                        add_lines.append(f"{ki}    proxy-url: {_yaml_str(head.proxy_url)}")
+                    # per-key 的 proxy-url 取**这把 Key 自己**的探测结论，
+                    # 不是 head 的（2026-09-03）。组内出口不一致是常态：
+                    # 实测同站有的 Key 走 mihomo、有的直连可用，套用 head
+                    # 会给不需要代理的 Key 多加一跳 —— 不失败，所以 validate
+                    # 与写后验证都发现不了。
+                    mine = by_key.get(k)
+                    if mine is not None and mine.proxy_url:
+                        add_lines.append(
+                            f"{ki}    proxy-url: {_yaml_str(mine.proxy_url)}")
                 add_lines.append(
                     f"{ki}  # {stamp} 批量导入追加 {len(fresh)} 个 Key"
                     f"（provider {found['name']} 已存在，"
@@ -604,7 +663,9 @@ def build_diffs(raw: str, plans: list[ImportPlan]) -> list[Diff]:
                     section="openai-compatibility",
                     insert_at=end,
                     lines=render_entry(head, dash, field, stamp,
-                                       extra_keys=keys[1:]),
+                                       extra_keys=keys[1:],
+                                       key_plans={g.api_key: g
+                                                  for g in group}),
                     host=host,
                     rewrite=_empty_literal_rewrite(
                         lines, start, "openai-compatibility"),
@@ -1033,12 +1094,14 @@ def _orphan_provider_lines(lines: list[str], span: tuple[int, int],
                            touched_hosts: set[str]) -> list[str]:
     """compat 段里**本次方案没碰到**的 provider 的原文行。
 
+    `touched_hosts` 里放的是 `compat_provider_key()` 的结果（归一化 base-url，
+    含路径），不是主机名 —— 同一台主机可以按路径挂多个互不相干的上游，按
+    host 判会把没碰到的那个也当成已覆盖然后丢掉。
+
     与 _orphan_entry_lines 分开写，因为 compat 的结构不同：一个 provider
-    条目含多个 api-key-entries，「未覆盖」只能按 provider 主机判，不能按
+    条目含多个 api-key-entries，「未覆盖」只能按 provider 判，不能按
     单个 Key 判 —— 按 Key 判会把同一个 provider 撕成两半。
     """
-    from .parse import host_of
-
     start, end = span
     item_indent: int | None = None
     blocks: list[tuple[list[str], str]] = []
@@ -1072,7 +1135,7 @@ def _orphan_provider_lines(lines: list[str], span: tuple[int, int],
         # 底下的行更深，不会误取。
         m = re.match(r"^\s*(?:-\s+)?base-url\s*:(.*)$", line)
         if m and item_indent is not None and ind <= item_indent + 2:
-            cur_host = host_of(_scalar_value(m.group(1)))
+            cur_host = compat_provider_key(_scalar_value(m.group(1)))
     flush()
 
     out: list[str] = []
@@ -1083,6 +1146,196 @@ def _orphan_provider_lines(lines: list[str], span: tuple[int, int],
     return out
 
 
+def compat_provider_key(base_url: str) -> str:
+    """compat provider 的归并身份：归一化后的 base-url（**含路径**）。
+
+    为什么不能用 host（2026-09-03 端到端演练抓到）：同一台主机上可以挂多个
+    互不相干的上游，靠路径区分 —— `tools/e2e_redetect.py` 的假上游正是
+    `127.0.0.1:PORT/good` 与 `.../gate` 两个 provider。按 host 归并会把它们
+    合成一条，一个站的 Key 被灌进另一个站。
+
+    为什么不能用原始 base_url：同一个 provider 的写法可能有多种（尾斜杠、
+    带不带 `/v1`、scheme 大小写）。按原文归并会分成两组、渲染出两个同站
+    provider —— 而 CPA 按 `name` 索引冷却、模型能力与执行路由，两个同名
+    provider 会让这三处对同一个 Key 命中两套配置，同一把 Key 还会在轮询池
+    里占两个位。
+
+    归一化：剥 scheme、转小写、去尾斜杠、去尾 `/v1`。剥 scheme 是因为
+    `http://` 与 `https://` 同路径在实践中是同一个上游的两种写法，分开写
+    两条 provider 属于配置错误而不是意图。
+    """
+    s = (base_url or "").strip().lower()
+    s = re.sub(r"^https?://", "", s).rstrip("/")
+    if s.endswith("/v1"):
+        s = s[:-3].rstrip("/")
+    return s
+
+
+def compat_key_blocks(lines: list[str]) -> dict[str, dict[str, list[str]]]:
+    """compat 段每个 provider 下**每把 Key 自己的**续行，按 (provider, api-key) 索引。
+
+    provider 键是 `compat_provider_key(base-url)` —— 含路径，见那个函数的说明。
+
+    返回 {provider_key: {api_key: [该 Key 的续行原文, ...]}}。续行**不含**
+    `- api-key:` 那一行本身（调用方要重新渲染它），也就是 per-key 的
+    `proxy-url` / `weight` 之类。
+
+    为什么必须有（2026-09-03，两处缺陷共用一个成因）
+    ---------------------------------------------
+    render_entry 渲染 compat 条目时，`api-key-entries` 下只写 `- api-key: X`
+    加上一个**全组共用**的 proxy-url。而 compat 段的结构是「一个 provider
+    条目 = 一个站，多把 Key 挂在它下面」，per-key 字段是真实存在的：
+
+      ① 组内没进方案的 Key 会消失。`_orphan_provider_lines` 只保留「整个
+         provider 都没被碰到」的条目，被碰到的 provider 整条重写 —— 组内
+         少一把 Key 就少一把。实测生产配置 gorouter.app 15 把、
+         tabitoken.com 14 把，只要一把探测抛异常（BatchProber 会把它整个
+         凭据从 results 里去掉）就丢一把。前三段有 `_orphan_entry_lines`
+         兜这个，compat 段没有。
+      ② per-key 的 proxy-url 被统一。实测 kktoken.cc 5 把、ai.hybgzs.com
+         3 把带 per-key `proxy-url: http://mihomo:7890`，组内不一致时
+         全组按 head 那把写 —— 多一跳不会失败，所以 validate 与写后验证
+         都发现不了，又是一处静默改行为。
+
+    与 extract_carry_lines 的分工：那个函数抓的是**条目级**（provider 级）
+    的未知字段，它对 api-key-entries 整块是跳过的 —— 这里补的正是那一块。
+    """
+    out: dict[str, dict[str, list[str]]] = {}
+    span = _section_span(lines, "openai-compatibility")
+    if not span:
+        return out
+    start, end = span
+
+    item_indent: int | None = None
+    cur_host = ""
+    # api-key-entries 块内的状态
+    in_keys = False
+    keys_dash_indent: int | None = None
+    cur_key = ""
+    cur_lines: list[str] = []
+
+    def flush_key() -> None:
+        nonlocal cur_key, cur_lines
+        if cur_host and cur_key:
+            out.setdefault(cur_host, {})[cur_key] = list(cur_lines)
+        cur_key, cur_lines = "", []
+
+    for i in range(start + 1, end):
+        line = lines[i]
+        st = line.strip()
+        if not st or st.startswith("#"):
+            # 注释与空行归属当前 Key（如果正在收集一把 Key）
+            if in_keys and cur_key:
+                cur_lines.append(line)
+            continue
+        ind = len(line) - len(line.lstrip())
+        is_dash = bool(re.match(r"^\s*-\s+\S", line))
+
+        if is_dash and item_indent is None:
+            item_indent = ind
+        # 新的 provider 条目
+        if is_dash and item_indent is not None and ind == item_indent:
+            flush_key()
+            in_keys = False
+            keys_dash_indent = None
+            cur_host = ""
+
+        # provider 级 base-url（缩进 <= item_indent + 2）
+        m = re.match(r"^\s*(?:-\s+)?base-url\s*:(.*)$", line)
+        if m and item_indent is not None and ind <= item_indent + 2:
+            cur_host = compat_provider_key(_scalar_value(m.group(1)))
+
+        # 进入 / 离开 api-key-entries 块
+        if re.match(r"^\s*api-key-entries\s*:", line):
+            flush_key()
+            in_keys = True
+            keys_dash_indent = None
+            continue
+        if in_keys:
+            # 缩进退回到 api-key-entries 同级或更浅 = 这一块结束
+            if not is_dash and keys_dash_indent is not None and ind < keys_dash_indent:
+                flush_key()
+                in_keys = False
+                keys_dash_indent = None
+                # 这一行属于 provider 级，继续走下面的通用逻辑
+            elif is_dash and (keys_dash_indent is None or ind == keys_dash_indent):
+                if keys_dash_indent is None:
+                    keys_dash_indent = ind
+                flush_key()
+                km = re.match(r"^\s*-\s+api-key\s*:(.*)$", line)
+                cur_key = _scalar_value(km.group(1)) if km else ""
+                continue
+            elif cur_key:
+                # 当前 Key 的续行（per-key proxy-url / weight …）
+                cur_lines.append(line)
+                continue
+    flush_key()
+    return out
+
+
+# 新增段（凭据原本没配这一段）放不放行，**只看模型清单有没有依据**。
+# probed / manual / catalog 放行，seed 不放行 —— 见 rebuild_config_full 第 2 步
+# 的完整说明。
+#
+# 单独抽出来是因为有**三个调用方**必须给出同一个答案（2026-09-03）：
+#   · rebuild_config_full —— 真正决定写不写
+#   · server 的 /api/plan —— 决定界面上这一段显示成「建议写入」还是「不写入」
+#   · 前端                —— 决定默认勾不勾
+# 上一版只有第一个有闸，另两个按「没有闸」渲染，于是界面显示建议写入并默认
+# 勾上，勾了写不进，只在 warnings 里留一句话。
+_NEW_SECTION_SOURCES = frozenset({"probed", "manual", "catalog"})
+
+
+def new_section_admitted(model_source: str) -> bool:
+    """这个 model_source 够不够格新增一个原本不存在的 (凭据, 段) 条目。"""
+    return model_source in _NEW_SECTION_SOURCES
+
+
+def is_new_section(cfg: dict, sp: SectionPlan,
+                   owned: dict[tuple[str, str], set[str]] | None = None) -> bool:
+    """这个方案落盘时是「新增段」还是「更新既有条目」。
+
+    owned 可复用（一次重探要问几百次，别每次重扫 cfg）。
+    """
+    from .parse import host_of
+
+    table = owned if owned is not None else owned_sections(cfg)
+    have = table.get((host_of(sp.base_url), sp.api_key))
+    # have 为 None = 整个凭据都是新的（增量导入），那是「新凭据」而不是
+    # 「已有凭据新增一段」—— 走原有的新增路径，不受这道闸约束。
+    return have is not None and sp.section not in have
+
+
+def mark_new_sections(cfg: dict, plans: list[ImportPlan]) -> int:
+    """给每个方案打上 new_section / write_blocked，返回被拦下的段数。
+
+    **必须在 assign_priorities 之前调用。** 定档与影响面都按「有哪些段要写」
+    算，而被拦下的段不会落盘 —— 让它们参与定档会白占档位（`taken` 被污染，
+    各站被挤得更低），影响面也会把不存在的条目算进遮挡关系。
+
+    为什么单独一步而不是在 rebuild_config_full 里顺手做（2026-09-03）：
+    那个函数是**整条链的最后一步**，在它内部判就意味着界面拿到的
+    writable / recommended 与落盘结果不一致 —— 上一版正是如此，界面显示
+    「建议写入」、默认勾上，勾了写不进。
+    """
+    owned = owned_sections(cfg)
+    blocked = 0
+    for plan in plans:
+        for sp in plan.sections.values():
+            # 每次 /api/plan 都重建方案对象，理论上无残留；显式清零是为了
+            # 让复用同一批对象的调用方（测试、脚本）也拿到干净结果。
+            sp.new_section = is_new_section(cfg, sp, owned)
+            sp.write_blocked = ""
+            if sp.new_section and not new_section_admitted(sp.model_source):
+                sp.write_blocked = (
+                    f"原本没配这一段，而本次模型清单是"
+                    f"{_SRC_LABEL.get(sp.model_source, sp.model_source)}"
+                    f"（没有实测依据）—— 不新增。确知该站这一段可用的话，"
+                    f"在模型格里手填真实清单，它就会作为新条目写入")
+                blocked += 1
+    return blocked
+
+
 def owned_sections(cfg: dict) -> dict[tuple[str, str], set[str]]:
     """每个凭据 (host, api_key) **原本占了哪几个段**。
 
@@ -1091,9 +1344,15 @@ def owned_sections(cfg: dict) -> dict[tuple[str, str], set[str]]:
     自己那几段：实测 79 个凭据里跨四段的只有 9 个，跨两段 49 个、单段 10 个，
     合计 177 个 (凭据, 段) 组合。
 
-    凭空多出来的条目不是「多配一点没坏处」：那个凭据在那一段本来就不通
-    （否则原来就配了），写进去只会让 CPA 每次轮到它吃一次失败，耗掉
-    request-retry × max-retry-credentials 的预算。
+    凭空多出来的条目不是「多配一点没坏处」：那个凭据在那一段**没有依据可用**，
+    写进去只会让 CPA 每次轮到它吃一次失败，耗掉 request-retry ×
+    max-retry-credentials 的预算（实测配置：1 轮额外重试 × 12 个凭据）。
+
+    但这张表**不是**「不许新增段」的意思（2026-09-03 修正）：原来的用法是
+    「不在这张表里就跳过」，把「探测发现原来没配的段也能用」一起挡掉了 ——
+    那正是最该新增的条目。中转站常先只卖 claude，后来加开 codex，而配置里
+    没人回头补。现在这张表只回答「这是更新还是新增」，新增放不放行由
+    `model_source` 定（见 rebuild_config_full 第 2 步）。
 
     键与 existing_weights / existing_proxies 同一套 —— base-url 在不同段
     形态不同（codex/compat 带 /v1），只有 host 稳定。
@@ -1170,6 +1429,11 @@ def rebuild_config_full(
     #     整段重写会把它们抹掉，所以按原文行搬回去 —— 见 extract_carry_lines。
     carry_map = extract_carry_lines(original_lines)
 
+    # 1c. compat 段 per-key 的续行（proxy-url / weight …），按 (host, Key) 索引。
+    #     extract_carry_lines 抓的是 provider 级字段，对 api-key-entries 整块
+    #     是跳过的 —— 这一份补那一块。见 compat_key_blocks 的两处成因说明。
+    key_blocks = compat_key_blocks(original_lines)
+
     def attach_carry(sp: SectionPlan) -> None:
         """给方案补上该条目原有的 carry 行。已经有了就不动（用户覆盖优先）。"""
         if sp.carry_lines:
@@ -1191,10 +1455,36 @@ def rebuild_config_full(
     # 2. 按段归集可写方案。section 用的是**完整 YAML 段名** ——
     #    pipeline 与 build_plan 一路如此，不做短名映射。
     #
-    # only_owned：只更新凭据**原本占有**的段。见 owned_sections 的说明 ——
-    # 不设这道闸时 79 个凭据 × 4 段全部写进去，121 条目变 246。
+    # only_owned 的判据（2026-09-03 重写）：**这一段这次有没有实测依据**，
+    # 而不是「原来配过没有」。
+    #
+    # 原来的判据是后者，起因是 2026-09-02 的事故：探测给每个凭据的四段都生成
+    # 方案，整段重写全写进去，121 条目变 246。那时四段无条件都算可写。
+    #
+    # 但「原来配过没有」把用户要的能力一起挡掉了：探测发现某个凭据在原来没配
+    # 的段也能用时，那正是最该新增的条目 —— 中转站常常先只卖 claude，后来加开
+    # codex，而配置里没人回头补。实测生产配置：79 个凭据 × 4 段 = 316，实占
+    # 177，139 个空位全被这道闸挡住。
+    #
+    # 更糟的是界面按「没有这道闸」渲染：build_plan 给那些段的 writable 与
+    # recommended 都是 True，界面显示「建议写入」并默认勾上 —— 勾了写不进，
+    # 只在 warnings 里留一句话。
+    #
+    # 新判据按证据强弱分档（model_source，见 SectionPlan 的说明）：
+    #   · 已占有的段  —— 照写。条目本来就在，这是「更新」而不是「新增」，
+    #                    它存在本身就是先前的依据。
+    #   · probed      —— 本次实测跑通了推理。新增它有实测依据，写。
+    #   · manual      —— 操作员显式手填了模型清单。显式意图优先于工具推测，写。
+    #   · catalog     —— 只有站方目录声称有，推理没通过。recommended=False，
+    #                    默认不勾；操作员勾了就是显式意图，写。
+    #   · seed        —— 工具写死的猜测，没有任何依据。**不写** —— 那正是
+    #                    121 → 246 那次事故的成因。
+    #
+    # catalog 与 seed 的差别不在「可信度高一档」这么模糊的地方：catalog 的名字
+    # 是这个站自己报的，seed 的名字是本工具猜的，后者与这个站没有任何关系。
     owned = owned_sections(cfg) if only_owned else {}
     skipped_unowned = 0
+    added_unowned: list[str] = []
 
     sections_data: dict[str, list[SectionPlan]] = {s: [] for s in _SECTION_KEYS}
     for (base_url, api_key), plan in all_plans.items():
@@ -1208,23 +1498,54 @@ def rebuild_config_full(
             if only_owned:
                 have = owned.get((_host_of(sp.base_url), sp.api_key))
                 # have 为 None = 这是个新凭据（增量导入混进重探），照写。
-                # have 非空但不含本段 = 原来没配这一段，跳过。
+                # have 非空但不含本段 = 原来没配这一段 —— 按证据强弱决定。
                 if have is not None and sp.section not in have:
-                    skipped_unowned += 1
-                    continue
+                    if not new_section_admitted(sp.model_source):
+                        skipped_unowned += 1
+                        continue
+                    # 身份用 base_url 而不是 plan.host —— 同一台主机可以按
+                    # 路径挂多个上游（假上游的 /good 与 /gate），只报 host
+                    # 会出现「同一行文本重复几遍」而看不出是哪一个。
+                    added_unowned.append(
+                        f"{sp.base_url} · {sp.section}"
+                        f"（{_SRC_LABEL.get(sp.model_source, sp.model_source)}）")
             sections_data[sp.section].append(sp)
 
     if skipped_unowned:
         warnings.append(
             f"{skipped_unowned} 个 (凭据, 段) 组合原本不在 config.yaml 里，"
-            f"已跳过 —— 全量重探只更新既有条目，不新增段")
+            f"且本次探测没有实测依据（模型清单只是工具猜测）—— 已跳过。"
+            f"确知可用的话在结果表里手填模型清单，就会作为新条目写入")
+    if added_unowned:
+        shown = "、".join(added_unowned[:8])
+        warnings.append(
+            f"新增 {len(added_unowned)} 个原本不在 config.yaml 里的 (凭据, 段)："
+            f"{shown}{'…' if len(added_unowned) > 8 else ''} —— "
+            f"这些段本次探测通过或由你手填，已按新档位一并计入定档与影响面")
 
-    # 3. compat 段按 (host, base_url) 归并 —— 一个条目 = 一个上游站，多个 Key
-    #    挂在 api-key-entries 下。重名 provider 会让冷却、模型能力、执行路由
-    #    三处对同一个 Key 命中两套配置。与 build_diffs 同一套分组。
-    compat_groups: dict[tuple[str, str], list[SectionPlan]] = {}
+    # 3. compat 段按**归一化后的 base-url**（含路径）归并 —— 一个条目 =
+    #    一个上游站，多个 Key 挂在 api-key-entries 下。
+    #
+    #    键的选择见 compat_provider_key：不能用 host（同一主机可用路径挂多个
+    #    互不相干的上游，实测假上游 `.../good` 与 `.../gate`），也不能用原始
+    #    base_url（同一个 provider 的写法可能有尾斜杠 / `/v1` / scheme 之差，
+    #    分组会裂成两条，渲染出两个同站 provider —— CPA 按 name 索引冷却、
+    #    模型能力与执行路由，重名会让这三处对同一个 Key 命中两套配置，同一把
+    #    Key 还在轮询池里占两个位）。
+    compat_groups: dict[str, list[SectionPlan]] = {}
     for sp in sections_data["openai-compatibility"]:
-        compat_groups.setdefault((_host_of(sp.base_url), sp.base_url), []).append(sp)
+        compat_groups.setdefault(compat_provider_key(sp.base_url), []).append(sp)
+    for pkey, group in compat_groups.items():
+        spellings = {sp.base_url for sp in group}
+        if len(spellings) > 1:
+            # 取 priority 最高那个的写法（下面 head 用的就是它），并说出来 ——
+            # 静默选一个会让另一种拼写的段悄悄换了 base-url。
+            keep = max(group, key=lambda x: x.priority).base_url
+            warnings.append(
+                f"段 openai-compatibility · {pkey}：本次方案里有 "
+                f"{len(spellings)} 种 base-url 写法（{'、'.join(sorted(spellings))}）"
+                f"—— 已合并成一个 provider 并采用 {keep}，"
+                f"否则会写出两个同站条目、同一把 Key 占两个轮询位")
 
     # 4. 排序：前三段按 priority 降序；compat 按组内最高的 priority
     #    （用 head 的会让「head 恰好是低档那个」的组被错误定位）
@@ -1246,25 +1567,48 @@ def rebuild_config_full(
                            if span else ("  ", "    "))
             out: list[str] = []
             used: set[str] = set()
-            for (host, base), group in compat_ordered:
+            for pkey, group in compat_ordered:
                 # head 取组内 priority 最高的那个，不是插入顺序的第一个 ——
                 # 组的其余成员只贡献 api-key，所以 head 的选择决定了整组用
                 # 哪一套 headers/priority/models。
                 head = max(group, key=lambda x: x.priority)
                 extra = [g.api_key for g in group if g is not head]
+                # 组内**没进方案**的 Key 也要保留（2026-09-03）。
+                #
+                # 前三段有 _orphan_entry_lines 兜这件事，compat 段没有 ——
+                # _orphan_provider_lines 只保留「整个 provider 都没被碰到」
+                # 的条目，被碰到的 provider 整条重写，组内少一把 Key 就少
+                # 一把。而「没进方案」有无害成因：探测抛异常（BatchProber
+                # 会把那个凭据整个从 results 去掉）、用户没勾、该段判不可写。
+                # 实测生产配置 gorouter.app 15 把、tabitoken.com 14 把。
+                own_keys = key_blocks.get(pkey) or {}
+                planned_keys = {sp.api_key for sp in group}
+                orphan_keys = ([k for k in own_keys if k not in planned_keys]
+                               if keep_unplanned else [])
+                if orphan_keys:
+                    extra = extra + orphan_keys
+                    warnings.append(
+                        f"段 {section} · {pkey}：{len(orphan_keys)} 把 Key 不在本次"
+                        f"方案内（探测异常 / 未勾选 / 判不可写）—— 已原样保留在"
+                        f"这个 provider 下，不会因整条重写而丢失")
                 attach_carry(head)
                 for c in _comments_for(comments_map, section, head, used, _host_of):
                     out.append(c if c.endswith("\n") else c + "\n")
+                # 每把 Key 自己的方案 —— per-key 的 proxy-url / weight 逐把取，
+                # 不拿 head 的值套给全组（见 render_entry 的 per-key 一节）。
                 for line in render_entry(head, dash, field, stamp,
-                                         extra_keys=extra):
+                                         extra_keys=extra,
+                                         key_lines=own_keys,
+                                         key_plans={g.api_key: g
+                                                    for g in group}):
                     out.append(line + "\n")
 
-            # compat 段的「未覆盖」按 **provider 主机**判 —— 它的结构是
+            # compat 段的「未覆盖」按 **provider 身份**判 —— 它的结构是
             # provider 级 + api-key-entries，一个条目含多个 Key。本次方案
             # 没碰到的 provider 整条原样保留，否则「只勾了 1 个站」会把另外
             # 12 个 provider 全删掉（2026-09-02 实测 13 → 1）。
             if keep_unplanned and span:
-                touched = {h for (h, _b), _g in compat_ordered}
+                touched = {p for p, _g in compat_ordered}
                 kept = _orphan_provider_lines(original_lines, span, touched)
                 if kept:
                     out.extend(kept)

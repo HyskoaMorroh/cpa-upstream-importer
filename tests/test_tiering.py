@@ -286,6 +286,80 @@ def main() -> int:
     eq("「实测 200」不判为不可用",
        "xxx" in unhealthy_from_comments(raw3, "claude-api-key"), False)
 
+    # ── ⑥b 括号形态（2026-09-03） ────────────────────────────────────
+    #
+    # 生产 config.yaml 的 claude 段与 compat 段的死站结论**全部**是这个形态：
+    #     # 同时压过 123nhh（分组无渠道，实测 503）与 100xlabs、hybgzs。
+    #     # 990 仍高于 950 的 100xlabs（实测超时 90 秒），所以它仍轮不到。
+    # 严格路（`# 站名：结论`）一条都抓不到 —— 于是那两段的 unhealthy_hosts
+    # 恒为空集，「读注释拿健康度」在真实文件上完全失效，而且不报错。
+    section("⑥b 站名后紧跟括号、括号里是失败依据")
+    _KN = {"123nhh", "api.123nhh.com", "100xlabs", "sub.100xlabs.space",
+           "live", "live.example"}
+    paren_yes = [
+        "# 同时压过 123nhh（分组无渠道，实测 503）与别的站。",
+        "# 990 仍高于 950 的 100xlabs（实测超时 90 秒），所以它仍轮不到。",
+        "# 123nhh（实测 403 WAF）已降档。",
+        "# 100xlabs(超时 90 秒) 半角括号也要认。",
+    ]
+    for f in paren_yes:
+        raw4 = f"claude-api-key:\n{f}\nother: 1"
+        got = unhealthy_from_comments(raw4, "claude-api-key", known=_KN)
+        truthy(f"认得「{f[2:34]}…」",
+               bool(got & {"123nhh", "100xlabs"}), f"实得 {got}")
+
+    # 不给 known 就不启用这一路 —— 老调用方的行为一字不变
+    eq("不传 known 时括号路不生效",
+       unhealthy_from_comments(
+           "claude-api-key:\n# 压过 123nhh（实测 503）\nother: 1",
+           "claude-api-key"),
+       set())
+
+    # 三类反例。前两类是这一路特有的误判风险，第三类是共有的。
+    paren_no = [
+        # ① 括号内没有失败结论 —— 整行有 503 也不能算到它头上
+        ("# live（实测 200，3.6 秒）比 123nhh 快，后者实测 503", "live",
+         "括号内是正常结论，不该因为同一行提到别人的 503 就判它死"),
+        # ② 站名不在本段真实主机名里 —— 认不出的一律丢弃
+        ("# priority（实测 503）", "priority", "YAML 键名不是站名"),
+        ("# deepseek-v4-flash-202605（印证永久排除结论）", "deepseek-v4-flash-202605",
+         "模型名不是站名"),
+        # ③ 括号内已恢复
+        ("# 123nhh（实测 503，已于 2026-09-01 恢复正常）", "123nhh",
+         "括号内说已恢复就不算当前不可用"),
+    ]
+    for note, name, hint in paren_no:
+        raw5 = f"claude-api-key:\n{note}\nother: 1"
+        got = unhealthy_from_comments(raw5, "claude-api-key", known=_KN)
+        eq(f"不误判「{note[2:30]}…」", name in got, False)
+
+    # 括号内「已恢复但又挂了」仍算不可用 —— 与严格路同一条转折规则
+    raw6 = ("claude-api-key:\n"
+            "# 123nhh（实测 503，站方称已恢复，实测仍 503）\nother: 1")
+    truthy("括号内带转折时仍判不可用",
+           "123nhh" in unhealthy_from_comments(
+               raw6, "claude-api-key", known=_KN))
+
+    # 括号路抓到的名字必然在 known 里，所以不该落进 unmatched_notes
+    # （那个字段是给严格路的漏判信号，混进来就成了噪声）
+    _cfgp = {"claude-api-key": [
+        {"api-key": "k", "base-url": "https://api.123nhh.com", "priority": 200,
+         "models": [{"name": "claude-opus-5"}]},
+        {"api-key": "k2", "base-url": "https://live.example", "priority": 900,
+         "models": [{"name": "claude-opus-5"}]},
+    ]}
+    _rawp = ("claude-api-key:\n"
+             "# 压过 123nhh（分组无渠道，实测 503）\n"
+             '  - api-key: "k"\n'
+             '    base-url: "https://api.123nhh.com"\n'
+             "    priority: 200\n"
+             "other: 1\n")
+    _bp = cp.build_band(_cfgp, "claude-api-key", raw=_rawp)
+    truthy(f"build_band 用得上括号路（{sorted(_bp.unhealthy_hosts)}）",
+           "123nhh" in _bp.unhealthy_hosts,
+           "括号路没接进 build_band 等于只改了函数没改行为")
+    eq("括号路的命中不进 unmatched_notes", _bp.unmatched_notes, [])
+
     # ── ⑦ weight: 0 的解析 ──────────────────────────────────────────
     section("⑦ weight: 0 是强信号（weighted-round-robin 下 selector 已剔除）")
     # routing.strategy 必须显式给 —— 2026-09-02 核实 CPA 源码：只有

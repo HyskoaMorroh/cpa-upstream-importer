@@ -311,6 +311,36 @@ _DEAD_NOTE = re.compile(
 _HOST_IN_NOTE = re.compile(
     r"#\s*([A-Za-z0-9][A-Za-z0-9.\-]{2,})\s*(?:[:：]|\s+(?=永久排除|站点级不可用))")
 
+# 第三种位置：站名后面**紧跟一对括号，括号里就是失败依据**。
+#   `# 同时压过 123nhh（分组无渠道，实测 503）与 100xlabs、hybgzs。`
+#   `# 990 仍高于 950 的 100xlabs（实测超时 90 秒），所以它仍轮不到。`
+#
+# 为什么必须认（2026-09-03 拿生产 config.yaml 实测）：claude 与 compat 两段
+# 的死站结论**全部**是这个形态，`_HOST_IN_NOTE` 一个都抓不到 —— 于是那两段的
+# `unhealthy_hosts` 恒为空集，「读注释拿健康度」这件事在实际配置上完全失效，
+# 而它不报错、不警告，只是让定档偏保守（新站被压到一堆死站后面）。
+#
+# 这一路的误判风险比冒号形态高得多：括号在中文注释里到处都是。所以它比
+# 严格路多两道闸（见 unhealthy_from_comments 的 known 参数）：
+#   ① 括号**内部**必须命中失败关键词 —— 不看整行，避免「A（正常）与 B 实测 503」
+#      把 A 也算进去
+#   ② 站名必须是本段真实出现过的主机名或它的点分标签 —— 认不出的一律丢弃，
+#      不进 unmatched_notes（那是给严格路的信号，混进来会变成噪声）
+_HOST_PAREN_NOTE = re.compile(
+    r"([A-Za-z0-9][A-Za-z0-9.\-]{2,})\s*[（(]([^）)]{0,80})[）)]")
+
+# 「超时」也是不可用结论，但只在括号路里认。
+#
+# 为什么不并进 `_DEAD_NOTE`：那个模式作用于**整行**，而「超时」在正文里
+# 出现得比状态码随意得多（讲 CPA 的 timeout 配置、讲探测超时设定）。
+# 括号路已经把范围收到「站名紧跟的括号内」，那里出现「实测超时 90 秒」
+# 就是在说这个站。实测：并进严格路对这份 config.yaml 的结果零变化，
+# 但那只是这一份文件的巧合，不是保证。
+_DEAD_NOTE_PAREN = re.compile(
+    _DEAD_NOTE.pattern
+    + r"|实测\s*超时|超时\s*\d+\s*秒|无可用渠道|分组无渠道"
+)
+
 # 绝不可能是站名的词。全部是 config.yaml 里真实出现在 `# xxx:` 位置的东西 ——
 # 注释掉的 YAML 键、日期、正文里的字段名。
 #
@@ -410,7 +440,8 @@ _REVERSAL = re.compile(
 )
 
 
-def unhealthy_from_comments(raw: str, section: str) -> set[str]:
+def unhealthy_from_comments(raw: str, section: str,
+                            known: set[str] | None = None) -> set[str]:
     """从 config.yaml 原文里解析该段被实测判为不可用的站。
 
     为什么要读注释：`Band` 原本只看 priority 与 base-url，于是把「实测全挂
@@ -422,6 +453,15 @@ def unhealthy_from_comments(raw: str, section: str) -> set[str]:
 
     只在**本段范围内**匹配：同一个站在不同段的结论完全不同
     （foxtrot 在 claude 段实测 200，在 gemini 段是 503）。
+
+    known：本段真实出现过的主机名与它们的点分标签。给了才启用**括号路**
+    （`# … 123nhh（分组无渠道，实测 503）…`）—— 那一路的站名位置比冒号形态
+    随意得多，必须拿真实主机名兜住，否则任何「词（…503…）」都会被当成站名。
+    不给 known 时行为与从前完全一致，只走严格路。
+
+    为什么必须有括号路（2026-09-03 拿生产 config.yaml 实测）：那份配置的
+    claude 段与 compat 段的死站结论全是这个形态，严格路一条都抓不到 ——
+    两段的 unhealthy_hosts 恒为空集，读注释这件事在真实文件上完全失效。
     """
     lines = raw.splitlines()
     st = None
@@ -439,20 +479,31 @@ def unhealthy_from_comments(raw: str, section: str) -> set[str]:
             en = i
             break
 
+    kn = {k.lower() for k in (known or set())}
     out: set[str] = set()
     for i in range(st, en):
         l = lines[i]
         if not l.lstrip().startswith("#"):
             continue
-        if not _DEAD_NOTE.search(l):
-            continue
-        if _RECOVERED.search(l) and not _REVERSAL.search(l):
-            # 提到已恢复、且没有转折词否决它 —— 不算当前不可用。
-            # 带转折的（「已恢复但又挂了」）仍按不可用处理。
-            continue
-        m = _HOST_IN_NOTE.search(l)
-        if m and _looks_like_host(m.group(1)):
-            out.add(m.group(1).lower())
+        recovered = _RECOVERED.search(l) and not _REVERSAL.search(l)
+        # 提到已恢复、且没有转折词否决它 —— 不算当前不可用。
+        # 带转折的（「已恢复但又挂了」）仍按不可用处理。
+        if _DEAD_NOTE.search(l) and not recovered:
+            m = _HOST_IN_NOTE.search(l)
+            if m and _looks_like_host(m.group(1)):
+                out.add(m.group(1).lower())
+        # 括号路。同一行可以有多处（`A（实测 503）与 B（正常）`），逐个判 ——
+        # 判据是**括号内部**有没有失败结论，不是整行。
+        if kn and not recovered:
+            for m in _HOST_PAREN_NOTE.finditer(l):
+                name, inner = m.group(1).lower(), m.group(2)
+                if name not in kn or not _looks_like_host(name):
+                    continue
+                if not _DEAD_NOTE_PAREN.search(inner):
+                    continue
+                if _RECOVERED.search(inner) and not _REVERSAL.search(inner):
+                    continue
+                out.add(name)
     return out
 
 
@@ -736,7 +787,20 @@ def build_band(cfg: dict, section: str, *, raw: str = "") -> Band:
     alias_conflicts: list[str] = []
     band.alias = name_alias_map(cfg, conflicts=alias_conflicts)
     if raw:
-        band.unhealthy_hosts = unhealthy_from_comments(raw, section)
+        # 本段真实出现过的主机名与它们的点分标签。两个用途：
+        #   ① 传给 unhealthy_from_comments 启用括号路（那一路必须靠真实
+        #      主机名兜住，否则任何「词（…503…）」都会被当成站名）
+        #   ② 下面判 unmatched_notes
+        # 必须在解析注释**之前**算好 —— 上一版是解析完再算，于是括号路
+        # 拿不到它。
+        known = set(band.alias)
+        all_labels: set[str] = set()
+        for hosts in band.hosts_at.values():
+            for h in hosts:
+                all_labels |= set(h.lower().split("."))
+                all_labels.add(h.lower())
+        band.unhealthy_hosts = unhealthy_from_comments(
+            raw, section, known=known | all_labels)
         # 记下「注释里提到、但既不在别名表、也不与任何域名的标签相等」的短名。
         #
         # 为什么要记（2026-08-30 自查）：别名表只能从 openai-compatibility 段的
@@ -749,12 +813,9 @@ def build_band(cfg: dict, section: str, *, raw: str = "") -> Band:
         # 但那是巧合，不是保证 —— 加个站到 claude 段而不加到 compat 段就会踩到。
         # 静默漏判最难发现，所以这里把它变成**可见的**：
         # 服务端会把它塞进 /api/context 的响应，前端能显示出来。
-        known = set(band.alias)
-        all_labels: set[str] = set()
-        for hosts in band.hosts_at.values():
-            for h in hosts:
-                all_labels |= set(h.lower().split("."))
-                all_labels.add(h.lower())
+        #
+        # 括号路抓到的名字必然在 known|all_labels 里（那是它的入场条件），
+        # 所以只有严格路的短名会落进这里 —— 与从前一致。
         band.unmatched_notes = sorted(
             n for n in band.unhealthy_hosts
             if n not in known and n not in all_labels)
@@ -1202,6 +1263,19 @@ class SectionPlan:
     # 确知可用的人仍可手工勾。
     catalog_stale: bool = False
     catalog_stale_why: str = ""
+    # 落盘时这一段是「新增」还是「更新既有条目」，以及新增有没有被放行。
+    #
+    # 为什么要放在方案对象上而不是只在 writeback 里判（2026-09-03）：
+    # 上一版那道闸只存在于 rebuild_config_full 内部，界面按「没有闸」渲染 ——
+    # `writable` 与 `recommended` 都是 True，显示「建议写入」并默认勾上，
+    # 勾了写不进，只在 warnings 里留一句话。代码里有闸、界面按没闸渲染，
+    # 是这一类缺陷的通用形态。
+    #
+    # 由 rebuild_config_full 回填（它是唯一知道 cfg 里原本有什么的地方），
+    # plan_json 直接读 —— 界面显示的就是写盘那一刻的判定，不是另算一遍。
+    new_section: bool = False
+    # 非空 = 这一段不会被写入，值就是原因（直接显示给操作员）。
+    write_blocked: str = ""
 
     @property
     def hijacked(self) -> list[Impact]:
@@ -1209,7 +1283,10 @@ class SectionPlan:
 
     @property
     def writable(self) -> bool:
-        return not self.duplicate and bool(self.models)
+        # write_blocked 非空 = 落盘那一层会拒掉它。界面必须与落盘一致 ——
+        # 显示「可写」而实际写不进，操作员勾了也没有反馈，是 2026-09-03
+        # 现场那一类缺陷的成因。
+        return not self.duplicate and bool(self.models) and not self.write_blocked
 
     @property
     def recommended(self) -> bool:
@@ -1238,6 +1315,8 @@ class SectionPlan:
         """为什么建议 / 不建议。UI 直接显示这句，让勾选可复核。"""
         if self.duplicate:
             return "已存在，跳过"
+        if self.write_blocked:
+            return self.write_blocked
         if not self.models:
             return "无可信模型，写进去等于死条目"
         if self.model_source == "catalog":
@@ -1495,7 +1574,21 @@ def build_plan(
         # 目录是否整体落后市面最新一个世代以上。只影响「建不建议勾」，
         # 不影响清单内容。见下面 catalog 分支与 SectionPlan.catalog_stale。
         catalog_stale, stale_why = False, ""
-        if forced_models and not v.usable:
+        # 手填**无条件优先**，不看 usable（2026-09-03 现场，第二次改这一处）。
+        #
+        # 原来的判据是 `forced_models and not v.usable`，两条路因此被堵死：
+        #
+        #   ① v.usable=True 但 v.models 为空（静默换模 / 200 包错误体，
+        #      `_accept` 把模型全拒了）—— 手填的 1 个模型落不进来，
+        #      反而掉进下面的 seed 分支，界面上「手填」变成「猜测」。
+        #   ② v.usable=True 且 v.models 非空 —— 操作员想把探到的清单换成
+        #      自己那份（探测只验了 4 个，站方实际卖 8 个），probed 直接
+        #      盖掉手填，且一条警告都没有。
+        #
+        # 手填是操作员的显式意图，探测判定是工具的推测。推测盖掉显式意图
+        # 在任何处境下都是错的 —— 这与 force 参数的设计意图一致（见
+        # docstring：force 只绕过 usable 判定，去重/定档/影响面一道不少）。
+        if forced_models:
             models, model_source = forced_models, "manual"
         elif v.usable:
             models, model_source = list(v.models), "probed"
@@ -1619,28 +1712,49 @@ def build_plan(
         # 手填被规则丢弃的项 —— **不在 manual 分支里报**。
         #
         # 2026-09-02 自查发现：手填的全部不合规时 forced_models 变成空列表，
-        # `if forced_models and not v.usable` 为假 → 落到 seed 分支 →
-        # model_source 是 "seed" 而不是 "manual"，于是这条警告永远不触发。
-        # 用户手填了两个模型、一个都没写进去、界面上一句提示都没有，
-        # 工具悄悄换成了自己那份清单 —— 正是这条警告要防的那件事。
+        # 于是走不到 manual 分支，这条警告永远不触发。用户手填了两个模型、
+        # 一个都没写进去、界面上一句提示都没有，工具悄悄换成了自己那份清单 ——
+        # 正是这条警告要防的那件事。
+        #
+        # 「全部不合规之后改用了什么」取决于探测结论，2026-09-03 起手填不再
+        # 只在判死段生效，所以这句话不能写死成「市面最新清单」：可用段落回
+        # probed（实测清单），判死段才落到 catalog / seed。
         if forced_dropped:
+            fallback_note = ""
+            if not forced_models:
+                whence = {"probed": "本次实测到的清单",
+                          "catalog": "站方目录",
+                          "seed": "市面最新清单"}.get(model_source, "工具兜底清单")
+                fallback_note = (f"。手填的全部不合规，已改用{whence} —— "
+                                 "要指定别的模型请改成符合规则的名字")
             sp.warnings.append(
                 f"手填的 {len(forced_dropped)} 个模型已丢弃"
                 f"（{', '.join(forced_dropped)}）—— 不符合本段规则："
                 "codex 只收 gpt 系、claude 只收 claude 系、"
                 "gemini 只收 *-pro 且版本 >= 2.5、compat 收四族；"
                 "另外同系列只保留最新版，图像/语音/oss 一律不收"
-                + ("。手填的全部不合规，已改用市面最新清单 —— "
-                   "要指定别的模型请改成符合规则的名字"
-                   if not forced_models else ""))
+                + fallback_note)
 
         if model_source == "manual":
-            sp.priority_reason = (
-                f"人工接管（探测判「{v.category or '不可用'}」）· {reason}")
-            sp.warnings.append(
-                f"探测未通过（{v.category or '不可用'} — {v.action or ''}），"
-                f"模型清单由你手工指定：{', '.join(models)}。"
-                "工具没有验证过这些模型能用")
+            # 手填现在也可能发生在**探测通过**的段上（2026-09-03）：操作员把
+            # 实测到的 4 个换成自己知道的 8 个。两种处境的措辞必须分开，
+            # 说反了就是误导 —— 一个是「探测没通、你来定」，另一个是
+            # 「探测通了、但你的清单覆盖了它」。
+            if v.usable:
+                sp.priority_reason = f"人工接管（覆盖实测清单）· {reason}"
+                probed_note = (f"（实测到 {', '.join(v.models)}）"
+                               if v.models else "（实测清单为空）")
+                sp.warnings.append(
+                    f"探测判「{v.category or '可用'}」{probed_note}，"
+                    f"但已按你手填的清单写入：{', '.join(models)}。"
+                    "工具没有验证过手填的这些模型能用")
+            else:
+                sp.priority_reason = (
+                    f"人工接管（探测判「{v.category or '不可用'}」）· {reason}")
+                sp.warnings.append(
+                    f"探测未通过（{v.category or '不可用'} — {v.action or ''}），"
+                    f"模型清单由你手工指定：{', '.join(models)}。"
+                    "工具没有验证过这些模型能用")
         elif model_source == "catalog":
             sp.priority_reason = (
                 f"未验证（探测判「{v.category or '不可用'}」，模型取自目录）· {reason}")
