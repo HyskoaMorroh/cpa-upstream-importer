@@ -137,6 +137,10 @@ def section_allows(section: str, name: str) -> bool:
 
     这是**唯一**判据 —— 探测队列、目录落盘、方案生成、界面预勾全都问它，
     不许各处再自己写一套（那正是截图里两个问题的成因）。
+
+    注意它管的是「**工具自己**要不要挑这个模型」。操作员显式手填的走
+    `section_protocol_ok` —— 那一层只挡协议层不可能成立的，不挡族。
+    见 build_plan 里 forced_kept 的说明。
     """
     n = bare_name(name)
     if not n:
@@ -152,6 +156,39 @@ def section_allows(section: str, name: str) -> bool:
     if want:
         return fam == want
     # compat：四族都行，走 /chat/completions 万能口
+    return True
+
+
+def section_protocol_ok(section: str, name: str) -> bool:
+    """这个模型在这个段上**协议层**成不成立。给手填用，比 section_allows 宽。
+
+    两者的差别只有一处：四族之外（grok / glm / deepseek / qwen / llama）。
+    `section_allows` 拒它们 —— 那是本工具的选型偏好，用于「工具自己该挑什么」。
+    这里放行 —— 那是操作员的显式指定，而 compat 段确实能跑它们。
+
+    为什么必须分开（2026-09-03 拿真实配置核实）：
+      · compat 段走 `/chat/completions`（openai_compat_executor.go:107），
+        CPA 对模型名零校验（buildOpenAICompatibilityConfigModels 照单注册，
+        service_models.go:713-739）—— 能不能用只取决于上游认不认。
+        实测 runanytime 的 compat 段**唯一端到端验证过的就是 grok-4.6**，
+        facai 段有 grok-4.6 + glm-5.2。按族拒掉手填，操作员就再也没办法把
+        这些已知可用的模型写回去。
+      · 前三段仍按族拒：claude 段走 Anthropic 原生 `/v1/messages`
+        （claude_executor_execute.go:23），gemini 段走 generateContent ——
+        往那里发 grok 上游必失配，放行只会制造死条目。
+      · 非对话模型（图像/语音/嵌入/批处理）四段都拒：协议不同，必失配。
+    """
+    n = bare_name(name)
+    if not n:
+        return False
+    if not is_chat_model(n):
+        return False
+    if section == "gemini-api-key":
+        return gemini_pro_ok(n)
+    want = SECTION_FAMILY.get(section)
+    if want:
+        return family(n) == want
+    # compat：不限族。四族之外的由 build_plan 单独给一条警告。
     return True
 
 

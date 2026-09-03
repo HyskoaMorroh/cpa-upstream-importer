@@ -318,6 +318,37 @@ gorouter.app   15 个 Key   priority  985
   语音（`-tts`）、嵌入、开源小模型（`-oss-`）、批处理（`gemini-batch-inference`）。
   它们走的不是对话协议路径，写进去 CPA 路由必失配。
 
+### 手填走更宽的一套判据
+
+上面那张表管的是「**工具自己**要不要挑这个模型」。操作员在结果表里手填的清单
+走另一条：`section_protocol_ok`，只挡**协议层不可能成立的**。
+
+两者唯一的差别是四族之外（`grok` / `glm` / `deepseek` / `qwen` / `llama`）：
+
+| | 工具选型（`section_allows`） | 手填（`section_protocol_ok`） |
+|---|---|---|
+| 段协议不匹配（往 claude 段填 gpt） | 拒 | 拒 |
+| 非对话模型（图像 / 语音 / 嵌入） | 拒 | 拒 |
+| gemini 段的非 pro 档 | 拒 | 拒 |
+| 四族之外，compat 段 | 拒 | **放行**，带一条警告 |
+| 四族之外，前三段 | 拒 | 拒 |
+
+**为什么必须放行**（2026-09-03 拿生产 config.yaml 核实）：compat 段走
+`/chat/completions`（`openai_compat_executor.go:107`），CPA 侧对模型名零校验
+（`buildOpenAICompatibilityConfigModels` 照单注册，`service_models.go:713-739`）——
+能不能用只取决于上游认不认。而那份配置里 `runanytime` 的 compat 段**唯一通过
+端到端验证的模型就是 `grok-4.6`**（注释原文：「整个 vip 分组当前只有 grok-4.6
+有渠道，已通过端到端验证的只有它」），`facai` 段还有 `grok-4.6` + `glm-5.2`。
+
+按族拒掉手填，操作员就再也没有办法把这个**已知可用**的模型写回去 —— 那一段会从
+「有一个确认可用的模型」变成「只剩两个确认 503 的」。「本工具不主动推荐四族之外」
+是选型偏好，把它升级成「操作员显式指定也不许」就越权了。
+
+放行时界面会给一条警告说清「不在四族清单里、已按你的指定写入、工具没验证过」，
+不让它看起来像工具推荐的。前端 `protoOk` 与后端 `section_protocol_ok` 由
+`tests/test_web.py` 拿同一批模型名喂两边比对，并写死「两者的差别只在四族之外、
+且只在 compat 段放开」这条不变式。
+
 **三层数据源**（探测拿不到模型时填「当前市面最新」，可信度递减）：
 
 1. **CPA 权威名录** —— CPA 自己的 `model_updater.go` 每 3 小时拉的那份 JSON，
@@ -677,7 +708,7 @@ cpa-upstream-importer/
 ├ .github/workflows/  CI：3 个 Python 版本跑测试 + 多架构镜像发布
 ├ LICENSE             MIT
 ├ CONTRIBUTING.md     贡献指南
-├ tests/              回归测试（九个套件 1137 项，零外网请求，自带最小样本）
+├ tests/              回归测试（九个套件 1149 项，零外网请求，自带最小样本）
 │  ├ run.py           跑全部，退出码 0/1，可接 CI。传 config.yaml 路径可加跑真实用例
 │  ├ fixture_cfg.py   自带的最小 config.yaml（各套件共用；不传路径时就用它）
 │  ├ test_probe.py    解析/判定/指纹/去重/定档/影响面/写回
@@ -2189,17 +2220,29 @@ headers 与 body 形态，不看模型名。假上游实测（全 403）：
 
 ### 一件要如实说明的事
 
-全量重探在假上游、单元测试（`tests/test_full_redetect.py` 37 项）、一次端到端
-演练（`tools/e2e_redetect.py`）和一次拿真实 config.yaml 的重建对账
-（`tests/rehearse_real_rebuild.py`，33 项全对上）上验证过，但**没有对这 79 个
+全量重探在假上游、单元测试（`tests/test_full_redetect.py` 40 项）、一次端到端
+演练（`tools/e2e_redetect.py`）和两次拿真实 config.yaml 的重建对账
+（`tests/rehearse_real_rebuild.py`，各 39 项全对上）上验证过，但**没有对这 79 个
 真实凭据发过一次真实探测请求**——对账用的是「把既有条目原样当探测结果」，验的是
 写回链的守恒性，不是探测本身。
 
-那份对账值得单独说，因为它抓到的三处缺陷单元测试全绿：compat 段组内没进方案的
-Key 会消失（生产配置 gorouter.app 15 把、tabitoken.com 14 把）、per-key 的
-`proxy-url` 与 `weight` 被统一成组内 head 那把的值（8 把带 per-key 代理）、
-同一个站两种 base-url 写法会写出两个同名 provider。合成样本一个都碰不到——
-13 个 provider、69 把 compat Key 这种形状只有真实文件有。
+那份对账值得单独说，因为它抓到的六处缺陷单元测试全绿：
+
+| 缺陷 | 实测影响 |
+|---|---|
+| compat 段组内没进方案的 Key 会消失 | gorouter.app 15 把、tabitoken.com 14 把 |
+| per-key `proxy-url` / `weight` 被统一成 head 那把的值 | 8 把带 per-key 代理 |
+| 同一个站两种 base-url 写法写出两个同名 provider | 同一把 Key 占两个轮询位 |
+| **`prefix` 被 `dominant_prefix` 猜的值覆盖** | 121/121 条目，`ANT/xxx` 别名全失效 |
+| **compat 的 `name` 被改成 host** | 12/13 provider 改名，冷却与能力缓存作废 |
+| 注释索引把模型名当条目键、base-url 行尾注释没剥 | 4676 行注释里 118 行彻底丢失 |
+
+后三处是**逐字段 deep-equal** 才抓到的：之前只比字段的出现次数
+（`text.count("prefix:")`），而「121 个条目的 prefix 全被抹掉、同时注释里多出
+121 处提到 prefix」这种情况两边都数得对 —— 计数相等，值全错。
+
+合成样本一个都碰不到这些 —— 13 个 provider、69 把 compat Key、4676 行注释这种
+形状只有真实文件有。
 
 跑它：
 
@@ -2207,9 +2250,18 @@ Key 会消失（生产配置 gorouter.app 15 把、tabitoken.com 14 把）、per
 python3 tests/rehearse_real_rebuild.py /opt/deploy/config.yaml
 ```
 
-它不改任何文件，只在内存里重建一遍再逐项对账：段条目数、`(凭据, 段)` 槽位数、
-顶层键数、注释行数、七个白名单外字段的出现次数、compat per-key 续行逐条一致，
-外加「只勾一个段」「compat 只勾组内一把 Key」「跨段新增按证据放行」三种情形。
+它不改任何文件，只在内存里重建一遍再逐项对账：
+
+- 段条目数、`(凭据, 段)` 槽位数、顶层键数
+- **四段之外的全局键逐个 deep-equal**（第一版事故是 `api-keys` 整段消失）
+- **每个条目的每个字段 deep-equal**，只豁免本次有意改的 priority / models /
+  headers 三个
+- 注释按**种类**比：零丢失、零多余（行数不比 —— 同一份注释在原文里被手工复制到
+  同站 15 个条目上，重建后按站挂一次，行数必然减少且应该减少）
+- `weight` / `proxy-url` 逐 `(段, host, key)` 比值（行数相等还不够，跨段串了值
+  行数也不变）
+- compat per-key 续行逐条一致
+- 外加「只勾一个段」「compat 只勾组内一把 Key」「跨段新增按证据放行」三种情形
 
 第一次实跑仍建议看完 diff 再决定是否写回——如果某个站此刻恰好在临时维护，探测会
 把它判成不可用，而 diff 里能看出来。

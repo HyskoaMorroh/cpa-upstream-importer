@@ -1477,7 +1477,7 @@ footer code{background:none;padding:0}
        <code>gpt-image-2</code> 是 gpt 族，所以放行；前端的默认预勾正则
        <code>/^(?:gpt|o\d)/i</code> 同样放行。两处都「按自己的规则正确工作」。</p>
   </div>
-  <p>现在单一实现在 <code>cpa_probe/model_catalog.py</code>，前端有一份**逐条等价**的
+  <p>现在单一实现在 <code>cpa_probe/model_catalog.py</code>，前端有一份<b>逐条等价</b>的
      拷贝（浏览器里跑不了 Python）。<code>tests/test_web.py</code> 拿同一批 36 个模型名
      喂两边、逐段比对放行集合 —— 单边改规则会被立刻抓到。</p>
 
@@ -1576,7 +1576,7 @@ footer code{background:none;padding:0}
   </div>
   <p>现在可用行与判死行用同一套 DOM 约定（<code>.cats</code> / <code>.cm</code> /
      <code>.fm</code> / <code>.mtools</code>），所以事件绑定与 fallback 填充无需
-     分叉。实测清单打勾、目录里探测没验到的名字列出但**默认不勾**（实测过的才有
+     分叉。实测清单打勾、目录里探测没验到的名字列出但<b>默认不勾</b>（实测过的才有
      依据，目录只是站方声称），并标一个「目录」小字。</p>
   <p>连带修掉一处不对称：<code>.cm</code>（勾选框）的处理器一直会合并手填框里目录
      外的名字，而 <code>.fm</code>（手填框）的处理器只取自己的值就整份覆盖
@@ -1596,7 +1596,7 @@ footer code{background:none;padding:0}
   </div>
   <p>改成 <code>if forced_models:</code> 之后要连带改两处措辞，否则说反了就是误导：
      覆盖实测清单时说「探测判『可用』（实测到 X），但已按你手填的清单写入」，判死段
-     照旧说「探测未通过」；手填**全部**不合规时的兜底说法按实际落到哪儿写 ——
+     照旧说「探测未通过」；手填<b>全部</b>不合规时的兜底说法按实际落到哪儿写 ——
      可用段落回 <code>probed</code>（本次实测到的清单），判死段才落到目录或市面
      最新，原来写死成「市面最新清单」在前一种情形下是假话。</p>
 
@@ -1632,10 +1632,34 @@ footer code{background:none;padding:0}
        前 N 全是 claude 等于浪费掉这个段。</p>
   </div>
 
-  <p><b>手填也过同一套规则</b>，但丢弃项会明确告知 —— 手填是用户的显式意图，
-     悄悄改掉比拒绝更糟（用户会以为写进去了）。实测手填
+  <p><b>手填走更宽的一套判据</b>（2026-09-03 修正）。上面那四条管的是「<b>工具
+     自己</b>要不要挑这个模型」；操作员手填的走 <code>section_protocol_ok</code>，
+     只挡<b>协议层不可能成立的</b>。两者唯一的差别是四族之外
+     （<code>grok</code> / <code>glm</code> / <code>deepseek</code> …）：
+     compat 段放行、前三段照旧拒。</p>
+  <div class="note b">
+    <div class="t">按族拒掉手填，会让操作员没法写回已知可用的模型</div>
+    <p>compat 段走 <code>/chat/completions</code>
+       （<code>openai_compat_executor.go:107</code>），CPA 侧对模型名<b>零校验</b>
+       （<code>buildOpenAICompatibilityConfigModels</code> 照单注册，
+       <code>service_models.go:713-739</code>）—— 能不能用只取决于上游认不认。</p>
+    <p>而生产 config.yaml 里 <code>runanytime</code> 的 compat 段<b>唯一通过端到端
+       验证的模型就是 <code>grok-4.6</code></b>（注释原文：「整个 vip 分组当前只有
+       grok-4.6 有渠道，已通过端到端验证的只有它」），<code>facai</code> 段还有
+       <code>grok-4.6</code> + <code>glm-5.2</code>。</p>
+    <p>按族拒掉手填，那一段会从「有一个确认可用的模型」变成「只剩两个确认 503 的
+       <code>gpt-5.6-*</code>」，而操作员没有任何办法纠正。「本工具不主动推荐四族
+       之外」是选型偏好，把它升级成「操作员显式指定也不许」就越权了。</p>
+  </div>
+  <p>放行时给一条警告说清「不在四族清单里、已按你的指定写入、工具没验证过」，
+     不让它看起来像工具推荐的。丢弃项照旧明确告知 —— 手填是显式意图，悄悄改掉比
+     拒绝更糟。实测手填
      <code>gpt-5.6-sol, gpt-image-2, gpt-oss-20b, gpt-5.5, claude-opus-5</code>
-     时收下前两个合法的，并警告「手填的 3 个模型已丢弃」。</p>
+     时收下合法的那些，并警告「手填的 N 个模型已丢弃」（图像与 oss 属于非对话
+     模型，四段都拒）。</p>
+  <p>前端 <code>protoOk</code> 与后端 <code>section_protocol_ok</code> 由
+     <code>tests/test_web.py</code> 拿同一批模型名喂两边比对，并写死「两者的差别
+     只在四族之外、且只在 compat 段放开」这条不变式 —— 单边改判定会被立刻抓到。</p>
 
   <h3>weight: 0 的含义取决于 routing.strategy</h3>
   <p>本项目多处把 <code>weight: 0</code> 当「站已被逐出调度池、挡住它零代价」的
@@ -1812,16 +1836,24 @@ footer code{background:none;padding:0}
 
   <div class="note w">
     <div class="t">如实说明：验证到哪一步</div>
-    <p><b>已验证</b>：假上游套件、单元测试（1137 项，含真实 config.yaml 用例时
-       1153 项）、端到端演练、以及拿生产 config.yaml 做的重建对账
-       （<code>tests/rehearse_real_rebuild.py</code>，33 项全对上：121 条目 /
-       79 凭据 / 177 个 <code>(凭据, 段)</code> 槽位，字段计数与值零差异）。</p>
-    <p>那份对账值得单独说，因为它抓到的三处缺陷单元测试全绿：compat 段组内没进方案
+    <p><b>已验证</b>：假上游套件、单元测试（1147 项，含真实 config.yaml 用例时
+       1149 项）、端到端演练、以及拿两份生产 config.yaml 做的重建对账
+       （<code>tests/rehearse_real_rebuild.py</code>，各 39 项全对上：121 条目 /
+       79 凭据 / 177 个 <code>(凭据, 段)</code> 槽位，逐字段值零差异）。</p>
+    <p>那份对账值得单独说，因为它抓到的六处缺陷单元测试全绿：compat 段组内没进方案
        的 Key 会消失（生产配置 gorouter.app 15 把、tabitoken.com 14 把）、per-key
        的 <code>proxy-url</code> 与 <code>weight</code> 被统一成组内 head 那把的值
-       （8 把带 per-key 代理）、同一个站两种 base-url 写法会写出两个同名 provider。
-       合成样本一个都碰不到 —— 13 个 provider、69 把 compat Key 这种形状只有真实
-       文件有。</p>
+       （8 把带 per-key 代理）、同一个站两种 base-url 写法会写出两个同名 provider、
+       <code>prefix</code> 被 <code>dominant_prefix</code> 猜的值覆盖（121/121 条目，
+       <code>ANT/xxx</code> 别名全失效）、compat 的 <code>name</code> 被改成 host
+       （12/13 个 provider 改名，那是 CPA 的 provider 身份，改名作废冷却状态与能力
+       缓存）、注释索引把模型名当条目键且 base-url 行尾注释没剥（4676 行注释里
+       118 行彻底丢失）。</p>
+    <p>后三处是<b>逐字段 deep-equal</b> 才抓到的：之前只比字段的<b>出现次数</b>
+       （<code>text.count("prefix:")</code>），而「121 个条目的 prefix 全被抹掉、
+       同时注释里多出 121 处提到 prefix」这种情况两边都数得对 —— 计数相等，值全错。
+       合成样本一个都碰不到 —— 13 个 provider、69 把 compat Key、4676 行注释这种
+       形状只有真实文件有。</p>
     <p><b>未验证</b>：没有对这 79 个真实站跑过一次<b>真实探测</b>，也没落盘到生产 ——
        对账用的是「把既有条目原样当探测结果」，验的是写回链的守恒性，不是探测本身。
        第一次实跑建议看完 diff 再决定是否写回，备份是唯一的回滚手段。</p>

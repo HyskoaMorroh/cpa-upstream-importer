@@ -292,3 +292,73 @@ def existing_proxies(cfg: dict) -> dict[tuple[str, str, str], str]:
                 out[("openai-compatibility", h, k)] = pu
 
     return out
+
+
+def existing_prefixes(cfg: dict) -> dict[tuple[str, str, str], str]:
+    """既有条目的 prefix，按 **(段, host, api_key)** 索引。含空串。
+
+    为什么必须逐条搬运而不是靠 `dominant_prefix` 猜（2026-09-03 逐字段
+    deep-equal 才抓到）：那个函数只在该段 70% 以上统一时才给值，是给**新条目**
+    用的默认值。全量重探更新的是既有条目 —— 它自己写的 prefix 才是真的。
+
+    `force-model-prefix: false` 下 prefix 是**额外注册一个命名空间别名**
+    （applyModelPrefixes，service_models.go:600-614 对每个模型同时注册
+    `claude-opus-5` 与 `ANT/claude-opus-5`）。抹掉它不会让站不可用，但所有按
+    `ANT/xxx` 发的请求会命中不到 —— 而客户端侧的模型名往往就是那个别名。
+
+    收空串：`prefix: ""` 与不写在 CPA 侧等价（normalizeModelPrefix 会 trim），
+    但「原来显式写了空」与「原来没写」在 diff 上有区别，照原样更干净。
+    """
+    from .parse import host_of
+
+    out: dict[tuple[str, str, str], str] = {}
+    for section in ("gemini-api-key", "codex-api-key", "claude-api-key"):
+        for e in cfg.get(section) or []:
+            if not isinstance(e, dict) or "prefix" not in e:
+                continue
+            h = host_of(str(e.get("base-url") or ""))
+            k = str(e.get("api-key") or "")
+            if h and k:
+                out[(section, h, k)] = str(e.get("prefix") or "")
+
+    # compat 段的 prefix 在 provider 级，组内所有 Key 共用
+    for prov in cfg.get("openai-compatibility") or []:
+        if not isinstance(prov, dict) or "prefix" not in prov:
+            continue
+        h = host_of(str(prov.get("base-url") or ""))
+        val = str(prov.get("prefix") or "")
+        for ke in prov.get("api-key-entries") or []:
+            if not isinstance(ke, dict):
+                continue
+            k = str(ke.get("api-key") or "")
+            if h and k:
+                out[("openai-compatibility", h, k)] = val
+
+    return out
+
+
+def existing_provider_names(cfg: dict) -> dict[str, str]:
+    """compat 段每个 provider 的 `name`，按 host 索引。
+
+    `name` 就是 CPA 的 provider 身份 ——
+    `util.OpenAICompatibleProviderKey(name)` 的结果写进 Auth 的
+    `provider_key`，而冷却（conductor_cooldown.go:73）、模型能力
+    （api_key_model_capabilities.go:186）、执行路由（conductor_execution.go:1619）
+    三处都按它索引。
+
+    实测生产配置里 12/13 个 provider 的 name 是人读短名（`runanytime`、
+    `chma`、`facai`），与 host 不同。用 host 现编会把它们全部改名：冷却状态
+    与能力缓存作废，而且本项目自己的 `name_alias_map`（注释里的短名 → 域名）
+    也跟着失效 —— 下一轮读注释拿健康度就大面积漏判。
+    """
+    from .parse import host_of
+
+    out: dict[str, str] = {}
+    for prov in cfg.get("openai-compatibility") or []:
+        if not isinstance(prov, dict):
+            continue
+        h = host_of(str(prov.get("base-url") or ""))
+        nm = str(prov.get("name") or "").strip()
+        if h and nm:
+            out[h] = nm
+    return out

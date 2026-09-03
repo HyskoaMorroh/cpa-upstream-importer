@@ -63,7 +63,8 @@ const SECTION_FAMILY = {
   'claude-api-key': 'claude',
 };
 
-// 这个模型名在这个段里能不能用。**唯一判据** —— 与后端 section_allows 对齐。
+// 这个模型名在这个段里**工具要不要挑它**。与后端 section_allows 对齐。
+// 用于：目录候选过滤、默认勾选。
 function famOk(sec, m) {
   const n = bareName(m);
   if (!n) return false;
@@ -76,6 +77,24 @@ function famOk(sec, m) {
   }
   const want = SECTION_FAMILY[sec];
   return want ? f === want : true;          // compat：四族都行
+}
+
+// 这个模型在这个段上**协议层**成不成立。与后端 section_protocol_ok 对齐。
+// 用于：手填框的校验提示 —— 那是操作员的显式指定，只挡协议层不可能成立的。
+//
+// 与 famOk 的唯一差别是四族之外：compat 段走 /chat/completions、CPA 对模型名
+// 零校验，实测 runanytime 唯一验证过的模型就是 grok-4.6。按族拒掉手填等于让
+// 操作员没法把已知可用的模型写回去（2026-09-03）。
+function protoOk(sec, m) {
+  const n = bareName(m);
+  if (!n) return false;
+  if (NON_CHAT.test(n)) return false;
+  if (sec === 'gemini-api-key') {
+    const mm = GEMINI_PRO.exec(n);
+    return !!mm && parseFloat(mm[1]) >= GEMINI_MIN;
+  }
+  const want = SECTION_FAMILY[sec];
+  return want ? famOf(n) === want : true;   // compat：不限族
 }
 
 // 这个模型该不该默认勾上。

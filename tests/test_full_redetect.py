@@ -370,6 +370,88 @@ claude-api-key:
     print(f"[OK] rebuild_config_full: comments preserved, {len(warnings)} warnings")
 
 
+def test_comment_index_boundaries():
+    """注释索引的四条边界。每一条都是 2026-09-03 实测踩到的。
+
+    这个函数是全量重建保注释的唯一入口，而它踩过的坑全是「键算错了」——
+    键错了不会报错，只会让注释静默丢失或跟着错误的站被复制。
+    """
+    from cpa_probe.writeback import _extract_entry_comments, _comments_for
+    from cpa_probe.plan import SectionPlan
+    from cpa_probe.parse import host_of
+
+    src = '''claude-api-key:
+  # A 的结论：实测 200
+  - api-key: "kA"
+    base-url: "https://a.example.com" # 注意不带 /v1
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+  # B 的结论：实测 503
+  - api-key: "kB"
+    base-url: "https://b.example.com"
+    models:
+      # 模型级注释：这一款静默换模
+      - name: "claude-opus-5"
+        alias: ""
+  - api-key: "kC"
+    base-url: "https://c.example.com"
+    # 夹在条目中间的依据
+    priority: 300
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+other: 1
+'''
+    cm = _extract_entry_comments(src.splitlines(keepends=True))
+    d = cm["claude-api-key"]
+
+    # ① base-url 带行尾注释时，host 键必须算得出来。
+    #    `.strip().strip("\"'")` 只剥前引号，剩下的字符串 host_of 解析不出 ——
+    #    实测那份文件 45 种注释因此挂在永远查不到的垃圾键上。
+    assert "a.example.com" in d, f"带行尾注释的 base-url 没算出 host 键：{sorted(d)}"
+    assert any("A 的结论" in x for x in d["a.example.com"]), d["a.example.com"]
+
+    # ② models: 底下的 `- name:` 是模型名，不是条目键。
+    #    实测那份文件里 `claude-opus-5` 这个「键」被覆盖 57 次，每次丢一整块。
+    assert "claude-opus-5" not in d, f"模型名被当成条目键：{sorted(d)}"
+
+    # ③ models 块内的注释是模型级的，不该提到条目级 —— 否则它会跟着整个站走。
+    assert not any("模型级注释" in x for x in d.get("b.example.com", [])), \
+        d.get("b.example.com")
+
+    # ④ 夹在条目中间的注释要挂到本条目上（后面没有 name/base-url 来认领）。
+    #    这一支必须**只**在条目内部生效：放宽到「缩进不深于字段层」时，
+    #    下一个条目的前置注释会被误判成上一个条目的中段注释，实测重建后
+    #    多出 107 行重复。
+    assert any("夹在条目中间" in x for x in d.get("c.example.com", [])), \
+        d.get("c.example.com")
+    # 而它不能溜到别的条目上
+    for k in ("a.example.com", "b.example.com"):
+        assert not any("夹在条目中间" in x for x in d.get(k, [])), \
+            f"C 的中段注释挂到了 {k} 上"
+
+    # ⑤ 每一块注释只挂给它自己的条目 —— B 的结论不能出现在 A 或 C 上。
+    assert any("B 的结论" in x for x in d.get("b.example.com", []))
+    for k in ("a.example.com", "c.example.com"):
+        assert not any("B 的结论" in x for x in d.get(k, [])), f"串到 {k}"
+
+    # ⑥ _comments_for 要**合并**两个候选键，不是先命中就返回 —— 段尾那块只挂
+    #    在 host 键上（base-url 原文键早已用过）。同时同一份不能输出两次。
+    sp = SectionPlan(section="claude-api-key",
+                     base_url="https://c.example.com", api_key="kC",
+                     models=["claude-opus-5"], priority=300)
+    used: set = set()
+    got = _comments_for(cm, "claude-api-key", sp, used, host_of)
+    assert any("夹在条目中间" in x for x in got), got
+    assert len(got) == len({x.strip() for x in got}), f"输出了重复行：{got}"
+    # 同站第二个 Key 再查：已经挂过了，不能再挂一遍
+    assert _comments_for(cm, "claude-api-key", sp, used, host_of) == []
+
+    print("[OK] Comment index: 行尾注释、模型名、模型级注释、中段块归属、"
+          "候选合并六条边界都对")
+
+
 def test_rebuild_config_priority_order():
     """测试全量重建后 priority 从高到低排序"""
     from cpa_probe.writeback import rebuild_config_full
@@ -1245,6 +1327,120 @@ codex-api-key:
           " / websockets / fingerprint-profile 逐字保真，同站不同 Key 不染色")
 
 
+def test_rebuild_keeps_prefix_and_provider_name():
+    """prefix 与 compat 的 provider `name` 必须搬原值，不能现编。
+
+    2026-09-03 拿真实文件做**逐字段 deep-equal** 才抓到 —— 之前的对账只比
+    字段的出现次数（`text.count("prefix:")`），而「121 个条目的 prefix 全被
+    抹掉、同时注释里多出 121 处提到 prefix」这种情况两边都数得对：
+    计数相等，值全错。
+
+    两处各自的后果：
+
+      · prefix —— `dominant_prefix` 只在该段 70% 以上统一时给值，那是给
+        **新条目**猜的默认。既有条目自己写的才是真的。
+        `force-model-prefix: false` 下 prefix 额外注册一个命名空间别名
+        （applyModelPrefixes，service_models.go:600-614 同时注册
+        `claude-opus-5` 与 `ANT/claude-opus-5`），抹掉它让所有按 `ANT/xxx`
+        发的请求命中不到。实测 121/121 被抹。
+
+      · compat 的 name —— 它就是 CPA 的 provider 身份：
+        `util.OpenAICompatibleProviderKey(name)` 写进 Auth 的 `provider_key`，
+        冷却（conductor_cooldown.go:73）、模型能力
+        （api_key_model_capabilities.go:186）、执行路由三处都按它索引。
+        render_entry 原来用 `host_of(base_url)` 现编，实测 12/13 个 provider
+        被改名（`runanytime` → `runanytime.hxi.me`）—— 冷却状态与能力缓存
+        全部作废，而且本项目自己的 `name_alias_map`（注释里的人读短名 →
+        域名）也跟着失效，下一轮读注释拿健康度就大面积漏判。
+    """
+    import yaml
+    from cpa_probe.batch import existing_prefixes, existing_provider_names
+    from cpa_probe.writeback import rebuild_config_full, render_entry, validate
+    from cpa_probe.plan import SectionPlan, ImportPlan
+
+    orig = """host: "127.0.0.1"
+
+claude-api-key:
+  - api-key: "kA"
+    base-url: "https://a.example.com"
+    prefix: "ANT"
+    priority: 500
+    models: [{name: "claude-opus-5", alias: ""}]
+  - api-key: "kB"
+    base-url: "https://b.example.com"
+    priority: 400
+    models: [{name: "claude-opus-5", alias: ""}]
+
+openai-compatibility:
+  - name: "shortname"
+    base-url: "https://a.example.com/v1"
+    prefix: "CHMA"
+    priority: 300
+    api-key-entries:
+      - api-key: "kA"
+    models: [{name: "claude-opus-5", alias: ""}]
+"""
+    lines = orig.splitlines(keepends=True)
+    cfg = yaml.safe_load(orig)
+
+    pf = existing_prefixes(cfg)
+    assert pf[("claude-api-key", "a.example.com", "kA")] == "ANT", pf
+    # kB 没写 prefix —— 键不该存在（与「写了空串」要能区分）
+    assert ("claude-api-key", "b.example.com", "kB") not in pf, pf
+    # compat 的 prefix 在 provider 级，组内每把 Key 都查得到
+    assert pf[("openai-compatibility", "a.example.com", "kA")] == "CHMA", pf
+
+    pn = existing_provider_names(cfg)
+    assert pn == {"a.example.com": "shortname"}, pn
+
+    # render_entry：给了 provider_name 就用它，没给才回落到 host
+    sp = SectionPlan(section="openai-compatibility",
+                     base_url="https://a.example.com/v1", api_key="kA",
+                     models=["claude-opus-5"], priority=300,
+                     prefix="CHMA", provider_name="shortname")
+    rows = render_entry(sp, "  ", "    ", "x")
+    assert any('- name: "shortname"' in r for r in rows), rows
+    sp2 = SectionPlan(section="openai-compatibility",
+                      base_url="https://a.example.com/v1", api_key="kA",
+                      models=["claude-opus-5"], priority=300)
+    assert any('- name: "a.example.com"' in r
+               for r in render_entry(sp2, "  ", "    ", "x")), "回落该用 host"
+
+    # 整链：原样重建后 prefix 与 name 逐字段一致
+    def plan_for(host, key, sec, base, prio, prefix="", pname=""):
+        p = ImportPlan(host=host, masked_key=key, line_no=1)
+        p.sections[sec] = SectionPlan(
+            section=sec, base_url=base, api_key=key,
+            models=["claude-opus-5"], priority=prio, model_source="probed",
+            prefix=prefix, provider_name=pname)
+        return p
+
+    plans = {
+        ("https://a.example.com", "kA"): plan_for(
+            "a.example.com", "kA", "claude-api-key",
+            "https://a.example.com", 500, prefix="ANT"),
+        ("https://b.example.com", "kB"): plan_for(
+            "b.example.com", "kB", "claude-api-key",
+            "https://b.example.com", 400),
+        ("https://a.example.com/v1", "kA-c"): plan_for(
+            "a.example.com", "kA", "openai-compatibility",
+            "https://a.example.com/v1", 300, prefix="CHMA",
+            pname="shortname"),
+    }
+    new, _w = rebuild_config_full(cfg, plans, lines)
+    ok, msg = validate(new)
+    assert ok, msg
+    n2 = yaml.safe_load(new)
+    got = {e["api-key"]: e.get("prefix") for e in n2["claude-api-key"]}
+    assert got["kA"] == "ANT", f"prefix 丢了：{got}"
+    assert not got.get("kB"), f"kB 原本没 prefix，被猜出来一个：{got}"
+    prov = n2["openai-compatibility"][0]
+    assert prov["name"] == "shortname", f"provider 被改名：{prov['name']}"
+    assert prov.get("prefix") == "CHMA", prov
+
+    print("[OK] Prefix & name: 逐条搬原值，未写的不凭空补，provider 不改名")
+
+
 def test_rebuild_keeps_proxy():
     """proxy-url 必须搬回。
 
@@ -1972,7 +2168,40 @@ claude-api-key:
     assert "端点响应正常" in w_usable, w_usable[:200]
     assert "探测未通过" in w_dead, w_dead[:200]
 
-    print("[OK] Usable-but-empty: usable=True 且模型空时也填市面清单，"
+    # usable=True 且实测清单为空、但**站方目录有**：清单要取目录，不是种子。
+    #
+    # 2026-09-03 真实探测抓到：123nhh 的 compat 段正是这个状态，站方目录报了
+    # 16 个名字，而方案里写的是 6 个种子猜测 —— 界面列目录那 16 个（一个没勾）、
+    # 落盘写种子那 6 个，两个集合不相交。成因是分支判据写的是 `elif v.usable:`
+    # 而不是「实测清单空不空」，与「兜底放在 else 里」是同一类错误。
+    #
+    # 目录里的名字是这个站自己报的，种子是本工具猜的、与这个站无关 ——
+    # 写后者进去，CPA 路由过去大概率 404。
+    def plan_cat(usable, catalog):
+        row = cpa.parse_lines("https://t.example,sk-t").valid[0]
+        res = CandidateResult(row=row)
+        for s in cpa.SECTIONS:
+            res.sections[s] = SectionVerdict(
+                section=s, usable=usable, base_url=row.base_for(s),
+                models=[], catalog=list(catalog),
+                category=("可用" if usable else "死路"), action="x")
+        return cpa.build_plan(row, res, cfg, bands={},
+                              seen=cpa.existing_fingerprints(cfg),
+                              probation=True)
+
+    CAT = ["gpt-5.6-luna", "gpt-5.6-terra", "kimi-k3", "gpt-4o"]
+    for usable in (True, False):
+        sp = plan_cat(usable, CAT).sections["openai-compatibility"]
+        assert sp.model_source == "catalog", (
+            f"usable={usable} 且目录非空时清单该取目录，实得 {sp.model_source}"
+            f"：{sp.models}")
+        assert set(sp.models) <= set(CAT), (
+            f"清单混进了目录之外的名字：{sp.models}")
+    # 可用那一种的措辞不能说「推理请求未通过」—— 它通了，只是模型对不上
+    wc = " ".join(plan_cat(True, CAT).sections["openai-compatibility"].warnings)
+    assert "端点响应正常" in wc and "推理请求未通过" not in wc, wc[:220]
+
+    print("[OK] Usable-but-empty: usable=True 且模型空时按目录 > 种子取，"
           "compat 覆盖多族，两种处境措辞分开")
 
 
@@ -2801,6 +3030,7 @@ if __name__ == "__main__":
         ("统计分类", test_batch_prober_stats),
         ("单站异常隔离", test_batch_prober_exception_handling),
         ("全量重建保注释", test_rebuild_config_preserves_comments),
+        ("注释索引的六条边界", test_comment_index_boundaries),
         ("priority 降序", test_rebuild_config_priority_order),
         ("段字段结构与 compat 归并", test_rebuild_config_section_structure),
         ("凭据去重", test_credential_dedup),
@@ -2816,6 +3046,7 @@ if __name__ == "__main__":
         ("重建保留其余内容", test_rebuild_preserves_everything_else),
         ("未知字段搬运", test_rebuild_keeps_unknown_fields),
         ("proxy-url 搬运", test_rebuild_keeps_proxy),
+        ("prefix 与 provider name 搬运", test_rebuild_keeps_prefix_and_provider_name),
         ("重探不判重", test_rebuild_skips_dedup),
         ("compat 组内 Key 与 per-key 字段", test_compat_group_key_preservation),
         ("条目守恒与未勾不删", test_rebuild_entry_conservation),

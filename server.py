@@ -48,7 +48,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cpa_probe as cp  # noqa: E402
 from cpa_probe.pipeline import Prober, SEED_MODELS  # noqa: E402
 from cpa_probe.batch import (  # noqa: E402
-    BatchProber, existing_proxies, existing_weights,
+    BatchProber, existing_prefixes, existing_provider_names,
+    existing_proxies, existing_weights,
     extract_existing_entries,
 )
 from cpa_probe.writeback import (  # noqa: E402
@@ -622,8 +623,14 @@ def _clean_override_models(section: str, raw_models: list) -> list[str]:
     warnings 里说明。
     """
     got = [str(m).strip() for m in raw_models if str(m).strip()]
+    # 判据与 build_plan 的 forced 路径**必须同一个**（2026-09-03）：
+    # `section_protocol_ok` 只挡协议层不可能成立的（段协议不匹配、非对话模型），
+    # 不挡四族之外 —— 那是操作员的显式指定，而 compat 段确实能跑 grok / glm
+    # （实测 runanytime 唯一验证过的模型就是 grok-4.6）。
+    # 这里用 section_allows 会让「界面手填能写、curl 覆盖写不进」，两条入口
+    # 对同一个名字给出不同结果。
     kept = cp.model_catalog.newest_generation_per_line(
-        [m for m in got if cp.model_catalog.section_allows(section, m)])
+        [m for m in got if cp.model_catalog.section_protocol_ok(section, m)])
     return kept or got
 
 
@@ -1665,6 +1672,16 @@ class Handler(BaseHTTPRequestHandler):
             # 那个站可能这次直连就通 —— 方案里 proxy_url 为空，整段重写就把原有
             # 的 26 条 mihomo 代理全抹掉。见 existing_proxies 的说明。
             proxies = existing_proxies(cfg)
+            # prefix 与 compat 的 provider name 同样必须搬原值。
+            #
+            # 2026-09-03 拿真实文件逐字段 deep-equal 才抓到（之前只比字段
+            # **出现次数**，两处都数得对、值全错）：
+            #   · prefix 121/121 被抹掉 —— dominant_prefix 只是给新条目猜的
+            #     默认值，既有条目自己写的才是真的
+            #   · compat 的 name 12/13 被改成 host —— 那是 CPA 的 provider
+            #     身份（provider_key），改名作废冷却状态与能力缓存
+            prefixes = existing_prefixes(cfg)
+            pnames = existing_provider_names(cfg)
 
             for res in job.results:
                 fh = _by_row(forced, res.row)
@@ -1698,6 +1715,15 @@ class Handler(BaseHTTPRequestHandler):
                             (sec, res.row.host, res.row.api_key))
                         if got:
                             sp.proxy_url = got
+                    # prefix：既有条目自己写的优先于 dominant_prefix 猜的。
+                    # `"" in prefixes` 与「键不存在」要分开 —— 前者是操作员
+                    # 显式写了空串，也该照原样。
+                    pk_ = (sec, res.row.host, res.row.api_key)
+                    if pk_ in prefixes:
+                        sp.prefix = prefixes[pk_]
+                    # compat 的 provider name（按 host，组内共用）
+                    if sec == "openai-compatibility":
+                        sp.provider_name = pnames.get(res.row.host, "")
                 all_plans[(res.row.bare, res.row.api_key)] = p
 
             # 用户覆盖分**两批**应用，中间夹着新增段判定与批量定档。

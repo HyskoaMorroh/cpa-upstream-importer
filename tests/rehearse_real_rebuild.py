@@ -15,8 +15,10 @@
 
 from __future__ import annotations
 
+import collections
 import io
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -30,6 +32,7 @@ for _s in (sys.stdout, sys.stderr):
 import yaml                                             # noqa: E402
 import cpa_probe as cp                                  # noqa: E402
 from cpa_probe.plan import ImportPlan, SectionPlan      # noqa: E402
+from cpa_probe.writeback import _scalar_value as _scalar  # noqa: E402
 
 SECS = ("gemini-api-key", "codex-api-key", "claude-api-key",
         "openai-compatibility")
@@ -106,10 +109,13 @@ def build_plans(cfg: dict, *, source: str = "probed",
     existing_proxies）。不搬的话这份演练自己就把它们丢了，对不上账不是产品
     的问题而是演练的问题 —— 而那正好会掩盖真实的丢字段缺陷。
     """
-    from cpa_probe.batch import existing_proxies, existing_weights
+    from cpa_probe.batch import (existing_prefixes, existing_provider_names,
+                                 existing_proxies, existing_weights)
 
     weights = existing_weights(cfg)
     proxies = existing_proxies(cfg)
+    prefixes = existing_prefixes(cfg)
+    pnames = existing_provider_names(cfg)
 
     plans: dict = {}
     for short, base, key, orig in cp.extract_existing_entries(cfg):
@@ -125,13 +131,18 @@ def build_plans(cfg: dict, *, source: str = "probed",
         models = [str(m.get("name")) for m in (orig.get("models") or [])
                   if isinstance(m, dict) and m.get("name")]
         h = cp.host_of(base)
-        p.sections[sec] = SectionPlan(
+        sp = SectionPlan(
             section=sec, base_url=base, api_key=key,
             models=models or ["claude-opus-5"],
             priority=int(orig.get("priority") or 100),
             weight=weights.get((sec, h, key)),
             proxy_url=proxies.get((sec, h, key), ""),
             model_source=source)
+        if (sec, h, key) in prefixes:
+            sp.prefix = prefixes[(sec, h, key)]
+        if sec == "openai-compatibility":
+            sp.provider_name = pnames.get(h, "")
+        p.sections[sec] = sp
     return plans
 
 
@@ -159,12 +170,137 @@ def main() -> int:
         check(f"{s} 条目数", len(n2.get(s) or []), len(cfg.get(s) or []))
     check("(凭据, 段) 槽位总数", slots(n2), slots(cfg))
     check("顶层键数", len(n2), len(cfg))
-    check("注释行数",
-          sum(1 for l in new.splitlines() if l.lstrip().startswith("#")),
-          sum(1 for l in lines if l.lstrip().startswith("#")))
+
+    # 全局键逐个 deep-equal —— 四段之外的一切必须**逐字节**没动过。
+    # 第一版事故就是「排在第一个段之后的全局键全部消失」（api-keys 丢了
+    # 所有客户端立刻断连），而那次 validate 报的是成功。
+    check("四段之外的全局键全部一致",
+          [k for k in cfg if k not in SECS and cfg[k] != n2.get(k)], [])
+
+    # 每个条目的**每个字段** deep-equal，只豁免本次有意改的三个。
+    #
+    # 为什么必须逐字段比值（2026-09-03）：上一版只比字段的**出现次数**
+    # （`text.count("prefix:")`），于是「121 个条目的 prefix 全被抹掉、
+    # 同时注释里多出 121 处提到 prefix」这种情况两边都数得对 —— 计数相等，
+    # 值全错。实测这一关抓到两处：prefix 121/121 被 dominant_prefix 覆盖、
+    # compat 的 provider name 12/13 被改成 host（那是 CPA 的 provider 身份）。
+    INTENT = {"priority", "models", "headers"}
+    # 这两个字段「显式写空串」与「不写」在 CPA 侧完全等价：synthesizer 存的是
+    # `strings.TrimSpace(...)`，proxy 判 `!= ""` 才建 transport
+    # （proxy_helpers.go:34-42），prefix 走 normalizeModelPrefix 也 trim。
+    # 所以比值时把 None 与 "" 归一 —— 否则 10 处 `proxy-url: ""` 会报成差异，
+    # 而那是假报警（行为零差异，且紧邻的注释说明照旧保留）。
+    # 其余字段不做这个归一：models 空与缺失不等价（compat 段必填），
+    # weight 缺失默认 1 而不是 0。
+    EMPTY_OK = {"proxy-url", "prefix"}
+
+    def fval(entry: dict, field: str):
+        v = entry.get(field)
+        if field in EMPTY_OK and (v is None or (isinstance(v, str) and not v.strip())):
+            return None
+        return v
+
+    def entries(c: dict) -> dict:
+        out = {}
+        for s in SECS[:3]:
+            for e in c.get(s) or []:
+                if isinstance(e, dict):
+                    out[(s, cp.host_of(str(e.get("base-url") or "")),
+                         str(e.get("api-key") or ""))] = e
+        for pr in c.get("openai-compatibility") or []:
+            if isinstance(pr, dict):
+                out[("openai-compatibility",
+                     cp.host_of(str(pr.get("base-url") or "")), "")] = pr
+        return out
+
+    ea, eb = entries(cfg), entries(n2)
+    check("条目键集合一致", sorted(ea) == sorted(eb), True)
+    fdiff = collections.Counter()
+    fex: dict = {}
+    for k in set(ea) & set(eb):
+        for f in set(ea[k]) | set(eb[k]):
+            if f in INTENT:
+                continue
+            if fval(ea[k], f) != fval(eb[k], f):
+                fdiff[f] += 1
+                fex.setdefault(f, (k[1], k[0], ea[k].get(f), eb[k].get(f)))
+    check("非预期字段差异（priority/models/headers 之外）", dict(fdiff), {})
+    for f, (h, s, a, b) in fex.items():
+        print(f"       {f} @ {h}/{s}: {str(a)[:52]} → {str(b)[:52]}")
+
+    # 注释：判据是「**每一种**注释都还在」，不是「行数相等」。
+    #
+    # 行数不可能相等，而且不该相等（2026-09-03 拿注释最全的那份文件才看清）：
+    # 注释按 (段, 站) 索引，同一个站在前三段每个 Key 各占一条目 —— 原文那块
+    # 说明在 gorouter 的 15 条里被复制了 15 遍（作者手工粘的），重建后按站
+    # 挂一次。实测 4676 → 2452 行，其中 2224 行全是这种复制。
+    #
+    # 真正要守的是「有没有哪一种结论整个消失」：那才是不可逆的损失。
+    # 反方向也要守 —— 重建不该让任何一种注释比原文出现得更多（那说明按站
+    # 挂载写错了，同一份被复制到多个条目上）。
+    cm_before = collections.Counter(l.strip() for l in lines
+                                   if l.lstrip().startswith("#"))
+    cm_after = collections.Counter(l.strip() for l in new.splitlines()
+                                   if l.lstrip().startswith("#"))
+    gone = [k for k in cm_before if k not in cm_after]
+    dup = [k for k in cm_after if cm_after[k] > cm_before.get(k, 0)]
+    check("完全消失的注释种类", len(gone), 0)
+    if gone:
+        for k in gone[:6]:
+            print(f"       丢: {k[:96]}")
+    check("被复制出多余份数的注释种类", len(dup), 0)
+    if dup:
+        for k in dup[:6]:
+            print(f"       多: {cm_before.get(k,0)}→{cm_after[k]} {k[:88]}")
+    print(f"  ·  注释 {sum(cm_before.values())} → {sum(cm_after.values())} 行"
+          f"（{len(cm_before)} 种全部保留；减少的全是同一份被复制到同站多个"
+          f"条目上的重复）")
+
+    # 白名单外字段：按**生效行**数比，不按 `count(字段名 + ":")` 比。
+    #
+    # 上一版用后者，于是注释里提到这个字段名也被算进去（原文有 139 行
+    # `# weight: 0` 这类注释掉的示例）—— 注释按站去重之后计数自然变，
+    # 而那与「字段有没有丢」无关。weight/proxy-url 的生效项另有
+    # existing_weights / existing_proxies 两张表逐项对账，见下面。
+    def live(text: str, field: str) -> int:
+        return sum(1 for l in text.splitlines()
+                   if re.match(rf"^\s*{re.escape(field)}\s*:", l))
+
+    def live_nonempty(text: str, field: str) -> int:
+        """生效且**值非空**的行数。"""
+        n = 0
+        for l in text.splitlines():
+            m = re.match(rf"^\s*{re.escape(field)}\s*:(.*)$", l)
+            if m and _scalar(m.group(1)):
+                n += 1
+        return n
+
     for f in ("request-scoped-errors", "excluded-models", "websockets",
-              "fingerprint-profile", "disabled", "proxy-url", "weight"):
-        check(f"{f} 出现次数", new.count(f + ":"), raw.count(f + ":"))
+              "fingerprint-profile", "disabled", "weight"):
+        check(f"{f} 生效行数", live(new, f), live(raw, f))
+    # proxy-url 只比**非空**的。
+    #
+    # `proxy-url: ""` 与不写这个字段在 CPA 侧完全等价：synthesizer 存的是
+    # `strings.TrimSpace(entry.ProxyURL)`，而 NewProxyAwareHTTPClient
+    # （proxy_helpers.go:34-42）判 `proxyURL != ""` 才建代理 transport，否则回落
+    # 全局 `cfg.ProxyURL`（这份文件里也是 `""`）。指纹里那一位也同样是空串。
+    #
+    # 实测原文有 10 行 `proxy-url: ""`（操作员显式记录「这个站探过 93 个节点、
+    # 走代理无效」），重建后不写 —— 行为零差异，而那条结论本身在紧邻的注释里
+    # 保住了。比总行数会把这 10 行算成丢失，那是假报警。
+    check("proxy-url 非空生效行数",
+          live_nonempty(new, "proxy-url"), live_nonempty(raw, "proxy-url"))
+    empty_before = live(raw, "proxy-url") - live_nonempty(raw, "proxy-url")
+    empty_after = live(new, "proxy-url") - live_nonempty(new, "proxy-url")
+    if empty_before != empty_after:
+        print(f'  ·  `proxy-url: ""` 空值行 {empty_before} → {empty_after}'
+              f"（与不写该字段在 CPA 侧等价，行为零差异）")
+
+    # weight / proxy-url 的**值**逐 (段, host, key) 对账 —— 行数相等还不够，
+    # 跨段或跨 Key 串了值行数也不变（2026-09-03 实测踩到两次）。
+    from cpa_probe.batch import existing_proxies as _ep, existing_weights as _ew
+    check("weight 逐项一致", _ew(n2), _ew(cfg))
+    check("proxy-url 逐项一致", _ep(n2), _ep(cfg))
 
     # per-key proxy-url：compat 段每把 Key 自己那条必须原样在
     kb = cp.compat_key_blocks(lines)

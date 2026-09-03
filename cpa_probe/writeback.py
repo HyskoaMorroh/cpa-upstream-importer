@@ -436,7 +436,12 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
         #
         # 所以这里接收的是**同主机同段的一组 key**（extra_keys），
         # 由 build_diffs 先按 (host, section) 归并后传入。
-        out.append(f"{dash}- name: {_yaml_str(sp.base_url.split('//')[-1].split('/')[0])}")
+        # provider `name` 就是 CPA 的身份（provider_key 由它算），必须搬回
+        # 原值 —— 用 host 现编会给 12 个 provider 全部改名，作废它们的冷却
+        # 状态与能力缓存，并让本项目自己的短名→域名别名表失效。
+        # 见 SectionPlan.provider_name。
+        pname = sp.provider_name or sp.base_url.split("//")[-1].split("/")[0]
+        out.append(f"{dash}- name: {_yaml_str(pname)}")
         out.append(f"{field}base-url: {_yaml_str(sp.base_url)}")
         if sp.prefix:
             out.append(f"{field}prefix: {_yaml_str(sp.prefix)}")
@@ -1714,16 +1719,42 @@ def _comments_for(comments_map: dict, section: str, sp: SectionPlan,
     多候选是因为 sp.base_url 是 base_for_section() 的产物（codex/compat 补了
     /v1），与原文件里写的未必一致。去重是因为前三段每个 Key 各占一条，
     按 host 匹配会让原文件里只出现一次的注释在重建后出现 N 次。
+
+    两个候选要**合并**，不是「第一个命中就返回」（2026-09-03）
+    ------------------------------------------------------
+    `_extract_entry_comments` 给同一个条目建两个键（base-url 原文与 host），
+    但两者的内容会分叉 —— 段尾那块未被认领的注释只挂在 host 键上（那时
+    base-url 原文键早已用过），实测 kktoken.cc 的 host 键 26 行、
+    base-url 键 20 行，差的 6 行正是它提档到 550 的唯一依据。
+    上一版先试 base-url、命中就 return，那 6 行永远出不来。
     """
     sec = comments_map.get(section, {})
+    out: list[str] = []
+    seen: set[str] = set()
+    mine: set[str] = set()      # 本次调用已消费的候选
+    hit = False
     for cand in (sp.base_url, host_of_fn(sp.base_url)):
         if not cand or cand not in sec:
             continue
+        if cand in mine:
+            # 两个候选算出同一个键（base-url 本来就是裸主机名时）——
+            # 已经收过了，跳过而不是放弃。上一版在这里 `return []`，于是
+            # 那种条目的注释全丢（test_rebuild_config_preserves_comments 抓到）。
+            continue
         if cand in used:
+            # 这一份已经挂给同站的另一个 Key 了 —— 整条跳过，
+            # 不能只跳这个候选（那会让同一批行输出两次）。
             return []
         used.add(cand)
-        return sec[cand]
-    return []
+        mine.add(cand)
+        hit = True
+        for line in sec[cand]:
+            k = line.strip()
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(line)
+    return out if hit else []
 
 
 # render_entry 自己会写的字段。搬运原字段时要跳过它们 —— 否则同一个键会
@@ -1935,12 +1966,43 @@ def _extract_entry_comments(lines: list[str]) -> dict[str, dict[str, list[str]]]
     取 host 做键绕开这个问题：协议、路径、尾部 /v1 都不参与比较，
     而同一个站在同一段里只会有一个条目（多 Key 走 compat 的
     api-key-entries，不是多条目）。
+
+    两条修正（2026-09-03，拿注释最全的那份 config.yaml 对账才暴露）
+    ----------------------------------------------------------
+    ① `models:` 底下的 `- name: <模型名>` 也匹配 `m_name`，于是**模型名被
+       当成条目键**。实测那份文件里 `claude-opus-5` 这个「键」被覆盖 57 次、
+       `claude-opus-4-8` 48 次 —— 每次覆盖都把上一块注释整个丢掉，合计 13271
+       行注释被反复顶掉，其中 118 行是**任何键都不再指向**的孤儿（包括
+       「hybgzs：实测 403 WAF 按 IP 拦截」「weight: 0（为压 Cloudflare 524
+       加的）」这类唯一的排障结论）。
+       修法：只认**条目级**的 name —— 缩进不深于 base-url 那一层，且
+       不在 `models:` 块内。
+
+    ② 同一个键第二次出现时直接 `=` 覆盖。前三段每个 Key 各占一条目、
+       同站多条目是常态（gorouter 15 条），后一条的注释会顶掉前一条的。
+       改成**累加**（去重后 extend）：`_comments_for` 那边按 host 查、
+       同一份只挂一次，多挂几行不会重复输出，而丢掉就再也找不回来。
     """
     from .parse import host_of
 
     comments: dict[str, dict[str, list[str]]] = {}
     current_section = None
     pending: list[str] = []
+    # models: 块的缩进。进入后 `- name:` 是模型名而不是条目名。
+    models_indent: int | None = None
+
+    def add(section: str, key: str, block: list[str]) -> None:
+        """把一块注释挂到键上。已有内容就累加，绝不覆盖。"""
+        if not key or not block:
+            return
+        cur = comments[section].setdefault(key, [])
+        have = {x.strip() for x in cur}
+        cur.extend(x for x in block if x.strip() not in have)
+
+    # 当前条目的键，以及「是否正处在一个条目内部」。
+    # 用于接住**夹在条目中间**的注释块 —— 见循环末尾那一支。
+    last_key = ""
+    entry_open = False
 
     for line in lines:
         # 段头：顶层键
@@ -1950,6 +2012,9 @@ def _extract_entry_comments(lines: list[str]) -> dict[str, dict[str, list[str]]]
             current_section = m.group(1)
             comments.setdefault(current_section, {})
             pending = []
+            models_indent = None
+            last_key = ""
+            entry_open = False
             continue
 
         if current_section is None:
@@ -1970,21 +2035,74 @@ def _extract_entry_comments(lines: list[str]) -> dict[str, dict[str, list[str]]]
         if re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]*\s*:", line):
             current_section = None
             pending = []
+            models_indent = None
+            last_key = ""
+            entry_open = False
             continue
+
+        indent = len(line) - len(line.lstrip())
+        # 进入 / 离开 models: 块。块内的 `- name:` 是模型名，不是条目名。
+        if re.match(r"^\s*models\s*:", line):
+            models_indent = indent
+            continue
+        if models_indent is not None and indent <= models_indent:
+            models_indent = None
 
         m_name = re.match(r"^\s*-?\s*name:\s*(.+)$", line)
         m_base = re.match(r"^\s*-?\s*base-url:\s*(.+)$", line)
+        is_dash = line.lstrip().startswith("-")
 
-        if m_name and pending:
-            key = m_name.group(1).strip().strip("\"'")
-            comments[current_section][key] = pending
+        if m_name and pending and models_indent is None:
+            add(current_section, _scalar_value(m_name.group(1)), pending)
             # 不清空 —— 同一条目的 base-url 可能在下一行，两个键都要能查到
         elif m_base and pending:
-            raw_base = m_base.group(1).strip().strip("\"'")
+            # 必须用 _scalar_value 剥行尾注释（2026-09-03，与 2026-09-02 的
+            # carry 索引同一个成因，同一个 bug 修在两处）。生产文件里有
+            # `base-url: "https://api.123nhh.com" # 注意不带 /v1`，
+            # `.strip().strip("\"'")` 只剥得掉前引号 —— 剩下
+            # `https://api.123nhh.com" # 注意不带 /v1`，host_of 解析不出主机名，
+            # 于是整条目的注释挂在一个**永远查不到**的垃圾键上。
+            # 实测那份文件 45 种注释因此丢失，含「hybgzs：实测 403 WAF 按 IP
+            # 拦截」这类唯一的排障结论。
+            raw_base = _scalar_value(m_base.group(1))
             h = host_of(raw_base)
             if h:
-                comments[current_section][h] = pending
-            comments[current_section][raw_base] = pending
+                add(current_section, h, pending)
+            add(current_section, raw_base, pending)
             pending = []
+        elif (pending and entry_open and last_key
+                and not is_dash and models_indent is None):
+            # 注释块**夹在条目中间** —— 不在 name / base-url 之前，后面也不会
+            # 再有它们来认领。
+            #
+            # 实测那份 config.yaml 的 compat 段最后一个 provider 就是这个形状：
+            #     - name: "kktoken.cc"
+            #       base-url: "https://kktoken.cc/v1"
+            #       # priority 25 -> 530（2026-08-30 深夜，实测可用后提档）
+            #       # …5 行依据…
+            #       priority: 550
+            # base-url 已经把 pending 清空，这一块攒在它之后，到下一个条目时
+            # 被 `pending = []` 丢掉。那 6 行是它提档到 550 的唯一依据。
+            #
+            # 三道闸缺一不可：
+            #   · `entry_open` —— 必须真的在某个条目内部（本段见过 base-url
+            #     之后、下一个 `-` 之前）。段头到第一个条目之间那些「字段说明」
+            #     注释不属于任何条目，挂上去会让它们跟着那个站被复制 N 遍
+            #     （实测放开后多出 107 行重复）。
+            #   · 不是 `-` 开头 —— 那是下一个条目的起点，它的前置注释归它。
+            #   · `models_indent is None` —— 不在 models 块内。块内的注释是
+            #     **模型级**的（`# 这一款静默换模` 之类），提到条目级会让它
+            #     跟着整个站走。自测抓到：`models:` 底下的注释被挂到条目上。
+            add(current_section, last_key, pending)
+            pending = []
+
+        # 条目边界：见到 base-url 就认为进入了一个条目（四段都有这个字段），
+        # 见到下一个 `-` 起头的行就认为上一个条目已经结束。
+        if m_base and models_indent is None:
+            _rb = _scalar_value(m_base.group(1))
+            last_key = host_of(_rb) or _rb or last_key
+            entry_open = True
+        elif is_dash and models_indent is None and not m_name:
+            entry_open = False
 
     return comments

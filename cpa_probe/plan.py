@@ -1276,6 +1276,28 @@ class SectionPlan:
     new_section: bool = False
     # 非空 = 这一段不会被写入，值就是原因（直接显示给操作员）。
     write_blocked: str = ""
+    # compat 段的 provider `name`，以及本条目原有的 `prefix`。
+    #
+    # 为什么必须搬运（2026-09-03 拿真实文件做逐字段 deep-equal 才抓到；
+    # 之前只比字段**出现次数**，两处都数得对，值全错）：
+    #
+    #   · name —— 它就是 CPA 的 provider 身份：
+    #     `util.OpenAICompatibleProviderKey(name)` 的结果写进 Auth 的
+    #     `provider_key`，而冷却（conductor_cooldown.go:73）、模型能力
+    #     （api_key_model_capabilities.go:186）、执行路由三处都按它索引。
+    #     render_entry 原来用 `host_of(base_url)` 现编一个，于是实测 12 个
+    #     provider 全部改名（`runanytime` → `runanytime.hxi.me`）——
+    #     改名等于把它们的冷却状态与能力缓存全部作废，而且本项目自己的
+    #     `name_alias_map`（注释里的人读短名 → 域名）也跟着失效，
+    #     下一轮读注释拿健康度就大面积漏判。
+    #
+    #   · prefix —— `dominant_prefix` 只在 70% 以上统一时才给值，那是给
+    #     **新条目**猜的默认值。全量重探是在更新既有条目，那一条自己写的
+    #     prefix 才是真的。实测 121 个条目的 prefix 全被抹掉：
+    #     `force-model-prefix: false` 下 prefix 额外注册一个 `ANT/xxx`
+    #     命名空间别名（service_models.go:600-614），抹掉等于让所有按
+    #     `ANT/claude-opus-5` 发的请求命中不到。
+    provider_name: str = ""
 
     @property
     def hijacked(self) -> list[Impact]:
@@ -1495,21 +1517,43 @@ def build_plan(
 
     force = force or {}
     for section, v in result.sections.items():
-        # 手填清单要过三道：非空、段级规则、同系列取最新。
+        # 手填清单的过滤：**只挡协议层不可能成立的**，不挡族。
         #
-        # 空串过滤原来就有（`if str(m).strip()`），但段级规则没有 ——
-        # 2026-09-02 实测日志里有一次 `Model name not specified, model name
-        # cannot be empty`，而截图里 codex 段手填的 8 个里有 3 个是
-        # gpt-image-2 / gpt-oss-120b / gpt-oss-20b（图像与开源小模型，
-        # CPA 路由过去必失配）。
+        # 分两类，判据完全不同（2026-09-03 拿真实配置核实后区分开）：
+        #
+        #   ① 段协议不匹配 —— 真的挡。claude 段走 Anthropic 原生
+        #      `/v1/messages`（claude_executor_execute.go:23），往那里发
+        #      `gpt-5.6-sol` 上游必失配；gemini 段走 generateContent 同理。
+        #      非对话模型（图像/语音/嵌入）也挡：2026-09-02 实测手填的 8 个里
+        #      有 gpt-image-2 / gpt-oss-*，路由过去必失配。
+        #
+        #   ② 四族之外（grok / glm / deepseek / qwen / llama）——**不挡**。
+        #      这类模型在 compat 段是完全合法的：那一段走
+        #      `/chat/completions`（openai_compat_executor.go:107），CPA 侧
+        #      对模型名零校验（buildOpenAICompatibilityConfigModels 照单注册，
+        #      service_models.go:713-739），能不能用只取决于上游认不认。
+        #
+        #      为什么必须放行（真实配置的反例）：runanytime 的 compat 段
+        #      **唯一端到端验证过的模型就是 grok-4.6**（配置注释：「整个 vip
+        #      分组当前只有 grok-4.6 有渠道，已通过端到端验证的只有它」），
+        #      facai 段同样有 grok-4.6 + glm-5.2。按族挡掉手填，操作员就
+        #      再也没有办法把这个**已知可用**的模型写回去 —— 那一段会从
+        #      「有一个确认可用的模型」变成「只剩两个确认 503 的」。
+        #
+        #      「本工具的模型库不主动推荐四族之外」是选型偏好，把它升级成
+        #      「操作员显式指定也不许」就越权了。
         #
         # 为什么不静默丢而要留 warning（下面 forced_dropped）：手填是用户的
         # 显式意图，悄悄改掉它比拒绝更糟 —— 用户会以为写进去了。
         forced_raw = [str(m).strip() for m in (force.get(section) or [])
                       if str(m).strip()]
-        forced_models = model_catalog.newest_generation_per_line(
-            [m for m in forced_raw if model_fits_section(section, m)])
+        forced_kept = [m for m in forced_raw
+                       if model_catalog.section_protocol_ok(section, m)]
+        forced_models = model_catalog.newest_generation_per_line(forced_kept)
         forced_dropped = [m for m in forced_raw if m not in forced_models]
+        # 四族之外但被放行的手填项 —— 界面要说清「工具不推荐但已按你说的写」。
+        forced_offfamily = [m for m in forced_models
+                            if not model_catalog.section_allows(section, m)]
         # 「市面最新清单」的来源说明。只有走到 seed 分支才会被赋值，
         # 但要在这里初始化 —— 下面的警告分支无条件读它。
         model_src = ""
@@ -1590,13 +1634,23 @@ def build_plan(
         # docstring：force 只绕过 usable 判定，去重/定档/影响面一道不少）。
         if forced_models:
             models, model_source = forced_models, "manual"
-        elif v.usable:
+        elif v.usable and v.models:
             models, model_source = list(v.models), "probed"
         elif v.catalog:
-            # 判死但目录能读到 —— 取目录里通过段规则的名字。
-            # 再过一遍闸：v.catalog 正常已被 _stage0_catalog 滤过，但
-            # 形态复用（shape.catalog）与手填路径都能绕开那一步。写进
-            # config.yaml 的模型必须与段协议匹配 —— 纵深防御。
+            # 目录能读到 —— 取目录里通过段规则的名字。
+            #
+            # 判据是「实测清单空不空」，**不是** usable（2026-09-03 现场，
+            # 与「兜底放在 else 分支」是同一类错误，第四次踩同一个形态）。
+            # 原来写 `elif v.usable: ... elif v.catalog:`，于是
+            # usable=True 且 v.models 为空（静默换模 / 200 包错误体，
+            # `_accept` 把模型全拒了）时，这一支根本走不到 —— 直接掉进下面的
+            # 种子兜底。
+            #
+            # 后果在真实探测里看得很清楚：123nhh 的 compat 段实测就是这个状态，
+            # 站方目录报了 16 个名字，而方案里写的是 6 个种子猜测 ——
+            # 界面列出目录那 16 个（一个没勾），落盘写种子那 6 个，两个集合
+            # 不相交。而目录里的名字是**这个站自己报的**，种子是本工具猜的、
+            # 与这个站没有任何关系：把后者写进去，CPA 路由过去大概率 404。
             models = [m for m in v.catalog
                       if model_allowed(m)
                       and model_fits_section(v.section, m)]
@@ -1729,11 +1783,23 @@ def build_plan(
                                  "要指定别的模型请改成符合规则的名字")
             sp.warnings.append(
                 f"手填的 {len(forced_dropped)} 个模型已丢弃"
-                f"（{', '.join(forced_dropped)}）—— 不符合本段规则："
-                "codex 只收 gpt 系、claude 只收 claude 系、"
-                "gemini 只收 *-pro 且版本 >= 2.5、compat 收四族；"
-                "另外同系列只保留最新版，图像/语音/oss 一律不收"
+                f"（{', '.join(forced_dropped)}）—— 这个段的协议接不了它们："
+                "codex 段走 OpenAI Responses、claude 段走 Anthropic "
+                "/v1/messages、gemini 段走 generateContent（且只收 *-pro 且"
+                "版本 >= 2.5）；图像/语音/嵌入类模型四段都不收；"
+                "另外同系列只保留最新版"
                 + fallback_note)
+
+        # 四族之外但被放行的手填项。工具自己不会挑它们（section_allows 拒），
+        # 但操作员显式指定就照写 —— compat 段走 /chat/completions，CPA 对模型名
+        # 零校验，能不能用只看上游。说清这一点，别让它看起来像工具推荐的。
+        if forced_offfamily:
+            sp.warnings.append(
+                f"手填的 {', '.join(forced_offfamily)} 不在本工具的四族清单"
+                "（gemini / gpt / claude / kimi）里 —— 已按你的指定写入。"
+                "compat 段走 /chat/completions，CPA 侧对模型名零校验，"
+                "能不能用完全取决于上游认不认；本工具不会主动推荐这类模型，"
+                "也没有验证过它")
 
         if model_source == "manual":
             # 手填现在也可能发生在**探测通过**的段上（2026-09-03）：操作员把
@@ -1756,14 +1822,29 @@ def build_plan(
                     f"模型清单由你手工指定：{', '.join(models)}。"
                     "工具没有验证过这些模型能用")
         elif model_source == "catalog":
-            sp.priority_reason = (
-                f"未验证（探测判「{v.category or '不可用'}」，模型取自目录）· {reason}")
-            sp.warnings.append(
-                f"推理请求未通过（{v.category or '不可用'} — {v.action or ''}），"
-                f"但目录 GET 读到 {len(v.catalog)} 个模型，已取前 {len(models)} 个："
-                f"{', '.join(models)}。"
-                "站方目录只说明「声称有」，不等于这把 Key 的分组能用 —— "
-                "很多站禁止推理测活却确实可用，确知可用再勾")
+            # 两种处境，措辞要分开（2026-09-03）：
+            #   · usable=False —— 推理没通过，目录是唯一线索
+            #   · usable=True 且 v.models 为空 —— 端点通、凭证有效，但返回的
+            #     模型对不上（静默换模 / 200 包错误体），`_accept` 全拒了。
+            #     说「推理请求未通过」在这一种下是错的。
+            if v.usable:
+                sp.priority_reason = (
+                    f"未验证（端点通但返回的模型对不上，清单取自目录）· {reason}")
+                sp.warnings.append(
+                    f"端点响应正常、凭证有效，但每次返回的模型都与请求不一致"
+                    f"（静默换模或 200 包错误体），实测清单为空 —— "
+                    f"已改用站方 /models 目录报的 {len(v.catalog)} 个里通过本段"
+                    f"规则的前 {len(models)} 个：{', '.join(models)}。"
+                    "这些名字是站方自己报的，比工具猜测可靠，但仍未经推理验证")
+            else:
+                sp.priority_reason = (
+                    f"未验证（探测判「{v.category or '不可用'}」，模型取自目录）· {reason}")
+                sp.warnings.append(
+                    f"推理请求未通过（{v.category or '不可用'} — {v.action or ''}），"
+                    f"但目录 GET 读到 {len(v.catalog)} 个模型，已取前 {len(models)} 个："
+                    f"{', '.join(models)}。"
+                    "站方目录只说明「声称有」，不等于这把 Key 的分组能用 —— "
+                    "很多站禁止推理测活却确实可用，确知可用再勾")
         elif model_source == "seed":
             # 走到这里有两种处境，措辞要分开 —— 说错一种就是误导：
             #   · v.usable=False：探测没通过（判死/门禁/限频…），目录也读不到
