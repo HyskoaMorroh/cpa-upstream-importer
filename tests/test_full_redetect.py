@@ -1327,6 +1327,148 @@ codex-api-key:
           " / websockets / fingerprint-profile 逐字保真，同站不同 Key 不染色")
 
 
+def test_rebuild_keeps_model_context_length():
+    """每个模型自己的 `max-context-length` 必须搬回。
+
+    2026-09-03 逐字段对账才抓到，它落在一个三方都不管的空档里：
+
+      · `extract_carry_lines` **有意跳过** models 整块 —— 模型清单由方案重新
+        生成，搬原文行会与新清单打架。
+      · 方案只带**一个**值（`max_context_length` + `context_model`），那是本次
+        探测实测的那一个模型。
+      · 于是本次没探上下文（`--no-context`、或那个模型没被验、或探测判死）时，
+        历史实测值全部消失。实测生产配置 8 处，kktoken.cc 的 987500 与
+        zzzcoding 的 15515 都在其中。
+
+    丢了不会让站不可用，而是**客户端按错的窗口定压缩点**：CPA 把它写进
+    `/v1/models` 的 `context_length`（model_registry.go:1437-1438）与 Codex 的
+    `max_context_window`（internal/client/codex/models/models.go:208-210）；
+    没有它就回落 CPA 内置目录值，那对中转站往往偏大 —— 客户端塞满才发现被
+    上游截断。
+
+    优先级：本次实测 > 原值搬运 > 不写。
+    """
+    import yaml
+    from cpa_probe.batch import existing_model_context
+    from cpa_probe.writeback import render_entry
+    from cpa_probe.plan import SectionPlan
+
+    cfg = yaml.safe_load('''
+claude-api-key:
+  - api-key: "kA"
+    base-url: "https://a.example.com"
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+        max-context-length: 987500
+      - name: "claude-sonnet-5"
+        alias: ""
+openai-compatibility:
+  - name: "p"
+    base-url: "https://a.example.com/v1"
+    api-key-entries:
+      - api-key: "kA"
+      - api-key: "kB"
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+        max-context-length: 531667
+''')
+    mc = existing_model_context(cfg)
+    assert mc[("claude-api-key", "a.example.com", "kA", "claude-opus-5")] == 987500, mc
+    # 没写窗口的模型不该出现在表里（与「写了 0」区分）
+    assert ("claude-api-key", "a.example.com", "kA", "claude-sonnet-5") not in mc, mc
+    # compat 的 models 在 provider 级 —— 组内每把 Key 都查得到
+    for k in ("kA", "kB"):
+        assert mc[("openai-compatibility", "a.example.com", k,
+                   "claude-opus-5")] == 531667, mc
+
+    # 渲染：本次没探上下文 → 搬原值，且标「原值搬运」
+    sp = SectionPlan(section="claude-api-key", base_url="https://a.example.com",
+                     api_key="kA", models=["claude-opus-5", "claude-sonnet-5"],
+                     priority=500,
+                     prior_context={"claude-opus-5": 987500})
+    rows = render_entry(sp, "  ", "    ", "x")
+    txt = "\n".join(rows)
+    assert "max-context-length: 987500" in txt, txt
+    assert txt.count("max-context-length") == 1, (
+        f"只有 claude-opus-5 有窗口值，不该外推给 sonnet：{txt}")
+    assert "原值搬运" in txt, txt
+
+    # 本次实测优先：同一个模型两边都有值时用实测的，且标「实测值」
+    sp2 = SectionPlan(section="claude-api-key", base_url="https://a.example.com",
+                      api_key="kA", models=["claude-opus-5"], priority=500,
+                      max_context_length=1_100_000,
+                      context_model="claude-opus-5",
+                      prior_context={"claude-opus-5": 987500})
+    t2 = "\n".join(render_entry(sp2, "  ", "    ", "x"))
+    assert "max-context-length: 1100000" in t2 and "实测值" in t2, t2
+    assert "987500" not in t2, f"实测值该盖掉原值：{t2}"
+
+    # 本次实测的是**另一个**模型：两个各自写自己的值，不互相外推
+    sp3 = SectionPlan(section="claude-api-key", base_url="https://a.example.com",
+                      api_key="kA",
+                      models=["claude-opus-5", "claude-sonnet-5"], priority=500,
+                      max_context_length=200_000,
+                      context_model="claude-sonnet-5",
+                      prior_context={"claude-opus-5": 987500})
+    t3 = "\n".join(render_entry(sp3, "  ", "    ", "x"))
+    assert "max-context-length: 987500" in t3 and "max-context-length: 200000" in t3, t3
+    assert t3.count("max-context-length") == 2, t3
+
+    # 模型级白名单外字段：CPA 支持另外七个（display-name / force-mapping /
+    # image / input-modalities / output-modalities / is-compat / thinking，
+    # 见 config_types.go 的四个 *Model 结构体），而 render_entry 只写三个、
+    # carry 又跳过整个 models 块 —— 七个字段没有任何人接。
+    # 当前生产配置一个都没用到，所以这是补闸而不是修已发生的事故。
+    from cpa_probe.batch import existing_model_extras
+    cfg2 = yaml.safe_load('''
+claude-api-key:
+  - api-key: "kA"
+    base-url: "https://a.example.com"
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+        display-name: "Opus 5"
+        force-mapping: true
+        thinking:
+          levels: ["low", "high"]
+      - name: "claude-haiku-4-5"
+        alias: ""
+        image: false
+        input-modalities: ["text", "image"]
+''')
+    ex = existing_model_extras(cfg2)
+    k5 = ("claude-api-key", "a.example.com", "kA", "claude-opus-5")
+    assert ex[k5] == {"display-name": "Opus 5", "force-mapping": True,
+                     "thinking": {"levels": ["low", "high"]}}, ex[k5]
+    sp4 = SectionPlan(section="claude-api-key", base_url="https://a.example.com",
+                      api_key="kA",
+                      models=["claude-opus-5", "claude-haiku-4-5"], priority=500,
+                      prior_model_extras={
+                          k[3]: v for k, v in ex.items()})
+    t4 = "claude-api-key:\n" + "\n".join(
+        render_entry(sp4, "  ", "    ", "x")) + "\n"
+    from cpa_probe.writeback import validate as _v
+    ok4, msg4 = _v(t4)
+    assert ok4, msg4
+    back = {m["name"]: m
+            for m in yaml.safe_load(t4)["claude-api-key"][0]["models"]}
+    assert back["claude-opus-5"]["display-name"] == "Opus 5", back
+    assert back["claude-opus-5"]["force-mapping"] is True, back
+    assert back["claude-opus-5"]["thinking"] == {"levels": ["low", "high"]}, back
+    assert back["claude-haiku-4-5"]["image"] is False, back
+    assert back["claude-haiku-4-5"]["input-modalities"] == ["text", "image"], back
+    # 认不出的形状**整个跳过**，不写半截 —— 写出合法但语义错的 YAML 比丢掉更糟，
+    # 而 validate() 只看语法。
+    from cpa_probe.writeback import _yaml_field
+    assert _yaml_field("  ", "x", object()) == []
+    assert _yaml_field("  ", "x", [{"deep": [object()]}]) == []
+
+    print("[OK] Model context: 逐模型搬原值，实测优先，绝不把 A 的窗口外推给 B；"
+          "白名单外的模型字段也搬回，认不出的形状整个跳过")
+
+
 def test_rebuild_keeps_prefix_and_provider_name():
     """prefix 与 compat 的 provider `name` 必须搬原值，不能现编。
 
@@ -1953,6 +2095,24 @@ openai-compatibility:
                       api_key="g2", models=["m"], priority=500)
     assert "weight:" not in "\n".join(render_entry(sp2, "  ", "    ", "x"))
 
+    # 行尾说明按 CPA 的**实际**语义判，不只判 `== 0`
+    # （credentialweight/weight.go:21-28 + selector.go:380-396）：
+    #   <= 0        Normalize 归零 → positiveWeightAuths 剔除
+    #   > 1000000   Normalize 报错 → authWeight 也返回 0 → 同样被剔除
+    # 只给 0 加说明会让 -1 与超上限值看着像正常权重。
+    def wline(w):
+        s = SectionPlan(section="gemini-api-key", base_url="g.example.com",
+                        api_key="g", models=["m"], priority=500, weight=w)
+        return next(r for r in render_entry(s, "  ", "    ", "x")
+                    if "weight:" in r)
+
+    assert "已逐出调度池" in wline(0), wline(0)
+    assert "已逐出调度池" in wline(-1), wline(-1)
+    assert "已逐出调度池" in wline(1_000_001), wline(1_000_001)
+    assert "上限 1000000" in wline(1_000_001), wline(1_000_001)
+    for ok_w in (1, 999_999, 1_000_000):
+        assert "逐出" not in wline(ok_w), wline(ok_w)
+
     # compat 段的 weight 挂在**每把 Key** 上，不在 provider 级。
     # 2026-09-03 发现：render_entry 的 compat 分支从来不写 weight —— 那把
     # `weight: 0` 只靠 carry 原文行侥幸活着，而组内孤儿 Key 与新增的 Key
@@ -2279,6 +2439,92 @@ claude-api-key:
 
     print("[OK] Manual wins: 手填无条件优先，覆盖实测时措辞分开，"
           "全不合规的兜底说法跟着实际来源")
+
+
+def test_offfamily_manual_and_catalog():
+    """四族之外的模型：手填要放行，目录里只剩它们时也要收下。
+
+    2026-09-03 核实 CPA 源码 + 真实配置后改。原来 `section_allows`（工具的
+    选型偏好：只挑 gemini / gpt / claude / kimi）被当成硬闸用在三条路上，
+    于是操作员没有任何办法把一个**已知可用**的四族之外模型写回去。
+
+    真实反例：runanytime 的 compat 段唯一端到端验证过的模型就是 grok-4.6
+    （配置注释：「整个 vip 分组当前只有 grok-4.6 有渠道，已通过端到端验证的
+    只有它」），facai 段有 grok-4.6 + glm-5.2。按族拒掉之后那两段会从
+    「有一个确认可用的模型」变成「只剩两个确认 503 的」。
+
+    而 compat 段确实能跑它们：走 `/chat/completions`
+    （openai_compat_executor.go:107），CPA 对模型名零校验
+    （buildOpenAICompatibilityConfigModels 照单注册，service_models.go:713-739）。
+    前三段仍按族拒 —— claude 段走 Anthropic 原生 `/v1/messages`，往那里发 grok
+    上游必失配，放行只会制造死条目。
+    """
+    import yaml
+    import cpa_probe as cpa
+    from cpa_probe import model_catalog as mc
+    from cpa_probe.pipeline import CandidateResult, SectionVerdict
+
+    # section_protocol_ok 与 section_allows 的差别只有四族之外这一处
+    for m in ("grok-4.6", "glm-5.2", "deepseek-v4f"):
+        assert not mc.section_allows("openai-compatibility", m), m
+        assert mc.section_protocol_ok("openai-compatibility", m), m
+        for s in ("gemini-api-key", "codex-api-key", "claude-api-key"):
+            assert not mc.section_protocol_ok(s, m), (s, m)
+    # 非对话模型两者都拒，四段都拒
+    for s in cpa.SECTIONS:
+        assert not mc.section_protocol_ok(s, "gpt-image-2"), s
+
+    cfg = yaml.safe_load(
+        'claude-api-key:\n'
+        '  - api-key: "old"\n'
+        '    base-url: "https://old.example"\n'
+        '    priority: 500\n'
+        '    models: [{name: "claude-opus-5", alias: ""}]\n')
+
+    def plan(*, forced=None, catalog=()):
+        row = cpa.parse_lines("https://t.example,sk-t").valid[0]
+        res = CandidateResult(row=row)
+        for s in cpa.SECTIONS:
+            res.sections[s] = SectionVerdict(
+                section=s, usable=False, base_url=row.base_for(s),
+                models=[], catalog=list(catalog), category="未知", action="x")
+        kw = {}
+        if forced:
+            kw["force"] = {s: list(forced) for s in cpa.SECTIONS}
+        return cpa.build_plan(row, res, cfg, bands={},
+                              seen=cpa.existing_fingerprints(cfg),
+                              probation=True, **kw)
+
+    # ① 手填 grok-4.6：compat 段收下并给警告，前三段丢弃
+    p = plan(forced=["grok-4.6"])
+    sp = p.sections["openai-compatibility"]
+    assert sp.models == ["grok-4.6"], sp.models
+    assert sp.model_source == "manual", sp.model_source
+    w = " ".join(sp.warnings)
+    assert "不在本工具的四族清单" in w and "零校验" in w, w[:220]
+    for s in ("gemini-api-key", "codex-api-key", "claude-api-key"):
+        assert p.sections[s].model_source == "seed", s
+        assert "grok-4.6" not in p.sections[s].models, s
+        assert "已丢弃" in " ".join(p.sections[s].warnings), s
+
+    # ② 目录里**只有**四族之外的名字：compat 段收下站方报的，不写工具猜的
+    p2 = plan(catalog=["grok-4.6", "glm-5.2"])
+    sp2 = p2.sections["openai-compatibility"]
+    assert sp2.model_source == "catalog", sp2.model_source
+    assert set(sp2.models) == {"grok-4.6", "glm-5.2"}, sp2.models
+    w2 = " ".join(sp2.warnings)
+    assert "没有本工具四族清单" in w2 and "从没报过" in w2, w2[:240]
+    for s in ("gemini-api-key", "codex-api-key", "claude-api-key"):
+        assert p2.sections[s].model_source == "seed", s
+
+    # ③ 目录里**有**四族的名字时，四族之外的不进清单（选型偏好照旧生效）
+    p3 = plan(catalog=["grok-4.6", "claude-opus-5"])
+    sp3 = p3.sections["openai-compatibility"]
+    assert sp3.models == ["claude-opus-5"], sp3.models
+    assert "从没报过" not in " ".join(sp3.warnings)
+
+    print("[OK] Off-family: 手填放行、目录只剩它们时收下、有四族时仍按偏好挑，"
+          "前三段一律按族拒")
 
 
 def test_stale_catalog_not_recommended():
@@ -3047,6 +3293,7 @@ if __name__ == "__main__":
         ("未知字段搬运", test_rebuild_keeps_unknown_fields),
         ("proxy-url 搬运", test_rebuild_keeps_proxy),
         ("prefix 与 provider name 搬运", test_rebuild_keeps_prefix_and_provider_name),
+        ("模型级 max-context-length 搬运", test_rebuild_keeps_model_context_length),
         ("重探不判重", test_rebuild_skips_dedup),
         ("compat 组内 Key 与 per-key 字段", test_compat_group_key_preservation),
         ("条目守恒与未勾不删", test_rebuild_entry_conservation),
@@ -3056,6 +3303,7 @@ if __name__ == "__main__":
         ("规则收紧不留死角", test_model_rules_no_dead_end),
         ("端点通但模型空也要兜底", test_usable_but_empty_models),
         ("手填无条件优先", test_manual_beats_probed),
+        ("四族之外的手填与目录", test_offfamily_manual_and_catalog),
         ("落后目录不默认勾", test_stale_catalog_not_recommended),
         ("限频阈值自动学习", test_rate_limit_learned),
         ("上下文上限下限校验", test_context_limit_lower_bound),

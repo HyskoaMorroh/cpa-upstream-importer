@@ -298,6 +298,77 @@ def _yaml_str(v: str) -> str:
     return '"' + s + '"'
 
 
+def _weight_note(w: int) -> str:
+    """weight 行尾该加什么说明。按 CPA 的**实际**语义判，不只判 `== 0`。
+
+    核对 internal/credentialweight/weight.go:21-28 与 selector.go:380-396：
+      · `<= 0`        Normalize 返回 0 → positiveWeightAuths 把它整个剔除
+      · `> 1000000`   Normalize 返回**错误** → authWeight 走 `errParse != nil`
+                      那一支也返回 0 → 同样被剔除
+      · 其余          正常权重，不加说明
+
+    只给 `0` 加说明会让 `-1` 与超上限的值看着像正常权重 —— 而它们的效果
+    与 0 完全相同。这两种值都不是本工具生成的（只在原值搬运时出现），
+    但既然搬回来就得把语义说对。
+
+    注意这一切只在 `routing.strategy = weighted-round-robin` 下成立：
+    round-robin（默认）与 fill-first 根本不读 weight。界面那条警告按
+    `weight_zero_excludes(cfg)` 分岔措辞，这里的行尾注释是给读文件的人看的，
+    所以写「已逐出调度池」时不重复策略前提 —— 上方的段级注释里有。
+    """
+    if w <= 0:
+        return "   # 原值搬运（<= 0：加权轮询下已逐出调度池）"
+    if w > 1_000_000:
+        return ("   # 原值搬运（超过上限 1000000，CPA 解析失败按 0 处理"
+                "：加权轮询下已逐出调度池）")
+    return ""
+
+
+def _yaml_field(indent: str, key: str, val) -> list[str]:
+    """把一个已解析的 YAML 值渲染回行。只支持模型条目里会出现的形状。
+
+    用途是搬运 render_entry 白名单外的**模型级**字段（display-name /
+    thinking / image / force-mapping / is-compat / input-modalities /
+    output-modalities）—— 见 existing_model_extras。
+
+    形状有限是有意的：这些字段在 CPA 的结构体里只有标量、字符串数组与
+    一层浅映射（thinking 的 `levels: [...]`）。遇到认不出的形状**整个跳过**
+    而不是硬塞 —— 写出半个结构比丢掉更糟，那会让 YAML 变成合法但语义错误的
+    东西，而 validate() 只看语法。跳过至少是可见的（diff 里那几行不在了）。
+    """
+    if isinstance(val, bool):
+        return [f"{indent}{key}: {'true' if val else 'false'}"]
+    if isinstance(val, int):
+        return [f"{indent}{key}: {val}"]
+    if isinstance(val, float):
+        return [f"{indent}{key}: {val!r}"]
+    if isinstance(val, str):
+        return [f"{indent}{key}: {_yaml_str(val)}"]
+    if isinstance(val, (list, tuple)):
+        if not val:
+            return [f"{indent}{key}: []"]
+        if all(isinstance(x, (str, int, float, bool)) for x in val):
+            rows = [f"{indent}{key}:"]
+            for x in val:
+                rows.append(f"{indent}  - " + (
+                    ("true" if x else "false") if isinstance(x, bool)
+                    else (str(x) if isinstance(x, (int, float))
+                          else _yaml_str(str(x)))))
+            return rows
+        return []
+    if isinstance(val, dict):
+        if not val:
+            return [f"{indent}{key}: {{}}"]
+        rows = [f"{indent}{key}:"]
+        for k2 in sorted(val):
+            sub = _yaml_field(f"{indent}  ", str(k2), val[k2])
+            if not sub:
+                return []       # 子结构认不出 —— 整个字段跳过，别写半截
+            rows.extend(sub)
+        return rows
+    return []
+
+
 def find_compat_provider(lines: list[str], base_url: str) -> dict | None:
     """在 compat 段里按 base-url 找已存在的 provider，返回它的行位置与 name。
 
@@ -419,9 +490,26 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
             # 全量重建把 459 行原本是 `""` 的行全改掉 —— diff 里 459 处
             # 无意义改动，掩盖真正要看的 priority 变化。
             rows.append(f'{indent}  alias: ""')
+            # 每个模型自己的窗口值。三档，优先级递减：
+            #   ① 本次实测的那一个（context_model）—— 最新的实测依据
+            #   ② 原条目里这个模型自己的值（prior_context）—— 历史实测依据
+            #   ③ 都没有就不写，CPA 回落内置目录值
+            #
+            # 为什么必须有 ②（2026-09-03 逐字段对账）：这个值在 models 块里，
+            # extract_carry_lines 有意跳过那一块，而方案只带一个实测值 ——
+            # 本次没探上下文时历史值全丢。实测生产配置 8 处，客户端会按 CPA
+            # 内置目录的偏大值定压缩点，塞满才发现被上游截断。
             if sp.max_context_length and m == sp.context_model:
                 rows.append(f"{indent}  max-context-length: {sp.max_context_length}"
                             f"   # 实测值")
+            elif sp.prior_context.get(m):
+                rows.append(f"{indent}  max-context-length: "
+                            f"{sp.prior_context[m]}   # 原值搬运")
+            # 白名单外的模型级字段（display-name / thinking / image /
+            # force-mapping / is-compat / *-modalities）—— 原样搬回。
+            # carry 跳过整个 models 块，这七个字段没有别人接。
+            for k, v in sorted((sp.prior_model_extras.get(m) or {}).items()):
+                rows.extend(_yaml_field(f"{indent}  ", k, v))
         return rows
 
     if sp.section == "openai-compatibility":
@@ -474,9 +562,7 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
             if not any(re.match(r"^\s*weight\s*:", ln) for ln in own):
                 w = mine.weight if mine is not None else None
                 if w is not None:
-                    why = ("   # 原值搬运（weight: 0 = 已逐出调度池）"
-                           if w == 0 else "")
-                    out.append(f"{field}    weight: {w}{why}")
+                    out.append(f"{field}    weight: {w}{_weight_note(w)}")
         if sp.headers:
             out.append(f"{field}headers:")
             for k, v in sp.headers.items():
@@ -498,8 +584,7 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
     # 「把这个站逐出调度池」的唯一表达，而 CPA 缺这个字段时默认 1，
     # 丢掉等于让手工封禁的站全部复活（2026-09-01 审计发现）。
     if sp.weight is not None:
-        why = "   # 原值搬运（weight: 0 = 已逐出调度池）" if sp.weight == 0 else ""
-        out.append(f"{field}weight: {sp.weight}{why}")
+        out.append(f"{field}weight: {sp.weight}{_weight_note(sp.weight)}")
     if sp.proxy_url:
         out.append(f"{field}proxy-url: {_yaml_str(sp.proxy_url)}")
     if sp.headers:

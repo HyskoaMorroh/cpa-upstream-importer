@@ -396,6 +396,82 @@ def main() -> int:
            _wze({"routing": {"strategy": alias}}), True)
     eq("routing 不是 dict 时按默认处理", _wze({"routing": "wrr"}), False)
 
+    # ── ⑦b 探测全灭的站不该与实测通过的站同档 ────────────────────────
+    #
+    # 2026-09-03 真实探测暴露：`score_verdict` 对 usable=False 一律返回 0，
+    # 于是「四段全灭」与「探测通过但扣满分」排在同一档，之后只按主机名排 ——
+    # 字母序在前的就上去了。实测 hybgzs 四段全灭（WAF ×12）却在 claude 段拿到
+    # 该段第 2 名，claude-sonnet-5 的顶层因此换到一个刚被判死的站上；
+    # 顶层站不可用时那一层整个白撞一轮（层级隔离，scheduler.go:402 只取最高桶）。
+    #
+    # 判据用 model_source（这一段这次有没有依据）而不是 score（探测质量）。
+    section("⑦b 定档先按证据分档，再按分数")
+    cfg_ev = {"claude-api-key": [
+        {"api-key": "old", "base-url": "https://old.example", "priority": 900,
+         "models": [{"name": "claude-opus-5"}]},
+    ]}
+    from cpa_probe.plan import ImportPlan as _IP, SectionPlan as _SP
+
+    def _mk(host, src, score):
+        p = _IP(host=host, masked_key="m", line_no=1)
+        p.sections["claude-api-key"] = _SP(
+            section="claude-api-key", base_url=f"https://{host}",
+            api_key=f"k-{host}", models=["claude-opus-5"], priority=0,
+            model_source=src, score=score)
+        return p
+
+    # aaa 全灭（seed，得分 0）、zzz 实测通过（probed，得分 90）
+    # 字母序 aaa 在前 —— 上一版会让它排在 zzz 之前
+    ps = [_mk("aaa.example", "seed", 0), _mk("zzz.example", "probed", 90)]
+    cp.assign_priorities(ps, cfg_ev, probation=True)
+    pa = ps[0].sections["claude-api-key"].priority
+    pz = ps[1].sections["claude-api-key"].priority
+    truthy(f"实测通过的站排在全灭的站之前（zzz={pz} > aaa={pa}）", pz > pa,
+           "score 对 usable=False 一律 0，只按分数排会让字母序决定顶层归属")
+
+    # 同一档内仍按分数、再按主机名 —— 稳定性不能丢
+    ps2 = [_mk("bbb.example", "probed", 50), _mk("aaa.example", "probed", 90)]
+    cp.assign_priorities(ps2, cfg_ev, probation=True)
+    truthy("同档内高分在前",
+           ps2[1].sections["claude-api-key"].priority
+           > ps2[0].sections["claude-api-key"].priority)
+    # 可重复：同一批输入两次运行结果相同
+    ps3 = [_mk("bbb.example", "probed", 50), _mk("aaa.example", "probed", 90)]
+    cp.assign_priorities(ps3, cfg_ev, probation=True)
+    eq("定档可重复",
+       [x.sections["claude-api-key"].priority for x in ps3],
+       [x.sections["claude-api-key"].priority for x in ps2])
+
+    # catalog / manual 排在 probed 之后、seed 之前
+    ps4 = [_mk("a.example", "seed", 0), _mk("b.example", "catalog", 0),
+           _mk("c.example", "probed", 0)]
+    cp.assign_priorities(ps4, cfg_ev, probation=True)
+    got = [x.sections["claude-api-key"].priority for x in ps4]
+    truthy(f"probed > catalog > seed（{got}）", got[2] > got[1] > got[0])
+
+    # 组内证据不一致时要在 priority_reason 里点出来 —— 档位不改（同站同档是
+    # 对的），但「这一档由谁的实测撑起来」必须可见。实测 agentrouter 的
+    # claude 段 7 把里 6 把实测通过、1 把余额耗尽走种子，那一把把 3 个自己
+    # 都没验过的模型顶上了顶层。
+    pm = _IP(host="mix.example", masked_key="m", line_no=1)
+    pm.sections["claude-api-key"] = _SP(
+        section="claude-api-key", base_url="https://mix.example",
+        api_key="k1", models=["claude-opus-5"], priority=0,
+        model_source="probed", score=90)
+    pm2 = _IP(host="mix.example", masked_key="m2", line_no=2)
+    pm2.sections["claude-api-key"] = _SP(
+        section="claude-api-key", base_url="https://mix.example",
+        api_key="k2", models=["claude-fable-5"], priority=0,
+        model_source="seed", score=0)
+    cp.assign_priorities([pm, pm2], cfg_ev, probation=True)
+    a, b = (pm.sections["claude-api-key"], pm2.sections["claude-api-key"])
+    eq("同站同档不变", a.priority, b.priority)
+    truthy("走猜测的那把点出证据来源",
+           "工具猜测" in b.priority_reason
+           and "其他 Key 的实测" in b.priority_reason,
+           b.priority_reason[:120])
+    truthy("实测那把不加这句", "工具猜测" not in a.priority_reason)
+
     # ── ⑧ 真实 config.yaml 上的端到端 ──────────────────────────────
     # 不传路径就用自带样本 —— 这一轮验的是「定档不变式在真实形状上成立」，
     # 样本的形状是按这些不变式凑的，不需要真实凭据。

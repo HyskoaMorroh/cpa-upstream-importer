@@ -328,6 +328,34 @@ console.log(JSON.stringify(out));
     truthy("后端 verdict 带 catalog", '"catalog"' in srv,
            "前端要用它列出探测没验到的名字")
     # 手填框与勾选框是同一个段的两个入口，任一侧变化都要**合并**另一侧
+    # ── ③i 目录里一个四族的都没有时收站方自己报的 ──────────────────────
+    #
+    # 2026-09-03：runanytime 与 facai 的 compat 段目录里只有 grok-4.6 /
+    # glm-5.2，而 grok-4.6 是那个站唯一端到端验证过的模型。按族过滤后目录变空
+    # → 前端只显示手填框、后端写工具猜的名字（这个站从没报过它们）。
+    # 前后端要用同一条规则退这一步。
+    section("③i 目录全是四族之外时退一步收下")
+    truthy("前端按 famOk 优先、protoOk 兜底",
+           "const catFam = (v.catalog || []).filter((m) => m && famOk(sec, m))" in js
+           and "const cat = catFam.length ? catFam : catProto;" in js,
+           "只按 famOk 过滤会让这类站的目录整份变空")
+    truthy("「已滤掉」只算协议层发不出去的",
+           "const cut = (v.catalog || []).filter((m) => m && !protoOk(sec, m)).length" in js,
+           "四族之外那批被收下了，不该再报成滤掉")
+    truthy("界面说清为什么退这一步", "catOff ?" in js and "从没报过它们" in js)
+    truthy("后端同一条规则",
+           "catalog_offfamily" in io.open(
+               os.path.join(ROOT, "cpa_probe", "plan.py"),
+               encoding="utf-8").read(),
+           "前端列出来、后端却写猜测清单 = 两边不一致")
+
+    truthy("手填框旁有即时校验提示位", 'class="fmhint"' in js,
+           "协议层不成立的手填要当场标出来，不用等一次 /api/plan 往返")
+    truthy("校验用 protoOk 而不是 famOk",
+           "const bad = typed.filter((m) => !protoOk(sc, m))" in js,
+           "famOk 会把 grok-4.6 标成红的，而 compat 段那恰恰是唯一验证过的模型")
+    truthy("四族之外单独给一句说明（不是报错）",
+           "const off = typed.filter((m) => protoOk(sc, m) && !famOk(sc, m))" in js)
     truthy("手填框写入时合并勾选框的选中项",
            "const chosen = tr" in js and "chosen.concat(typed)" in js,
            "只取手填值整份覆盖 = 勾了 3 个再手填 1 个，前 3 个静默丢失")

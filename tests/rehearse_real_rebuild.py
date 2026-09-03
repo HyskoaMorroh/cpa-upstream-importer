@@ -109,13 +109,17 @@ def build_plans(cfg: dict, *, source: str = "probed",
     existing_proxies）。不搬的话这份演练自己就把它们丢了，对不上账不是产品
     的问题而是演练的问题 —— 而那正好会掩盖真实的丢字段缺陷。
     """
-    from cpa_probe.batch import (existing_prefixes, existing_provider_names,
-                                 existing_proxies, existing_weights)
+    from cpa_probe.batch import (existing_model_context,
+                                 existing_model_extras, existing_prefixes,
+                                 existing_provider_names, existing_proxies,
+                                 existing_weights)
 
     weights = existing_weights(cfg)
     proxies = existing_proxies(cfg)
     prefixes = existing_prefixes(cfg)
     pnames = existing_provider_names(cfg)
+    mctx = existing_model_context(cfg)
+    mextra = existing_model_extras(cfg)
 
     plans: dict = {}
     for short, base, key, orig in cp.extract_existing_entries(cfg):
@@ -142,6 +146,12 @@ def build_plans(cfg: dict, *, source: str = "probed",
             sp.prefix = prefixes[(sec, h, key)]
         if sec == "openai-compatibility":
             sp.provider_name = pnames.get(h, "")
+        sp.prior_context = {name: val
+                            for (s2, h2, k2, name), val in mctx.items()
+                            if s2 == sec and h2 == h and k2 == key}
+        sp.prior_model_extras = {name: dict(val)
+                                 for (s2, h2, k2, name), val in mextra.items()
+                                 if s2 == sec and h2 == h and k2 == key}
         p.sections[sec] = sp
     return plans
 
@@ -227,6 +237,20 @@ def main() -> int:
     check("非预期字段差异（priority/models/headers 之外）", dict(fdiff), {})
     for f, (h, s, a, b) in fex.items():
         print(f"       {f} @ {h}/{s}: {str(a)[:52]} → {str(b)[:52]}")
+
+    # models 块内的 max-context-length 逐 (段, host, key, 模型) 对账。
+    #
+    # 上面那一轮把 models 整个划进「有意改动」跳过了，而窗口值藏在里面 ——
+    # 它既不在 carry（那一块被有意跳过）也不在方案的单值字段里（方案只带
+    # 本次实测的那一个）。实测生产配置 8 处，本次没探上下文时会全丢，
+    # 客户端因此按 CPA 内置目录的偏大值定压缩点。
+    from cpa_probe.batch import existing_model_context as _emc
+    from cpa_probe.batch import existing_model_extras as _eme
+    check("模型级 max-context-length 逐项一致", _emc(n2), _emc(cfg))
+    # 模型级白名单外字段（display-name / thinking / image / force-mapping /
+    # is-compat / *-modalities）。当前生产配置一个都没用到，所以这一项现在
+    # 是「两边都空」—— 它守的是「将来手工加了之后不会被整段重写抹掉」。
+    check("模型级白名单外字段逐项一致", _eme(n2), _eme(cfg))
 
     # 注释：判据是「**每一种**注释都还在」，不是「行数相等」。
     #

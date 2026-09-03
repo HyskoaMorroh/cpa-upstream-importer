@@ -39,6 +39,16 @@ from .pipeline import (MAX_MODELS_PER_SECTION, SEED_MODELS, model_allowed,
 # 只有 gemini 段在配置层去重（静默丢弃）
 _DEDUP_SECTIONS = {"gemini-api-key"}
 
+# model_source 的人话标签。用在写进 config.yaml 的行尾注释里 ——
+# 读文件的人看不懂 `probed` / `seed` 这类内部值。
+# 与 writeback._SRC_LABEL 措辞一致（那份用在写回警告里）。
+_SRC_LABEL_CN = {
+    "probed": "本次实测通过",
+    "catalog": "站方目录声称有",
+    "manual": "手填",
+    "seed": "工具猜测",
+}
+
 
 # ---------------- 去重 ----------------
 
@@ -1210,6 +1220,29 @@ class SectionPlan:
     # 上限实测于哪个模型。写回时只给这一个模型加 max-context-length，
     # 其余模型留空（CPA 会回落内置目录值），不把 A 的实测值外推到 B。
     context_model: str = ""
+    # 原条目里**每个模型自己**的 max-context-length，{模型名: 值}。
+    #
+    # 为什么要单独一份（2026-09-03 逐字段对账发现）：这个值在 `models:` 块里，
+    # 而 extract_carry_lines 有意跳过整个 models 块（清单由方案重新生成）。
+    # 于是它落进空档 —— carry 不搬，方案只带本次实测的那**一个**
+    # （max_context_length + context_model）。本次没探上下文时，历史实测值
+    # 全部消失。实测生产配置 8 处，kktoken.cc 的 987500 就在其中。
+    #
+    # 优先级：本次实测（context_model 那一个）> 原值搬运 > 不写。
+    # 见 render_entry 的 model_lines。
+    prior_context: dict[str, int] = field(default_factory=dict)
+    # 原条目里每个模型的**白名单外字段**，{模型名: {字段: 值}}。
+    #
+    # render_entry 的 model_lines 只写 name / alias / max-context-length，
+    # 而 CPA 的模型条目还支持 display-name / force-mapping / image /
+    # input-modalities / output-modalities / is-compat / thinking
+    # （config_types.go 的四个 *Model 结构体）。carry 跳过整个 models 块，
+    # 所以这七个字段没有任何人接 —— 手工加一个 `thinking:` 之后整段重写就
+    # 静默抹掉它，而 YAML 合法、validate 报成功。
+    #
+    # 当前生产 config.yaml 一个都没用到（实测 extras 表为空），所以这是
+    # 补上闸而不是修一个已发生的事故。见 existing_model_extras。
+    prior_model_extras: dict[str, dict] = field(default_factory=dict)
     score: int = 0
     # 模型清单从哪来，可信度递减：
     #   probed  —— 推理请求实测通过，返回的 model 字段与请求一致
@@ -1615,6 +1648,9 @@ def build_plan(
         # 「模型」列的毛病：显示 config.yaml 里写了几个，看着像测活结果。
         models: list[str] = []
         model_source = "probed"
+        # 目录里被收下的四族之外的名字。只在「目录里一个四族的都没有」时非空 ——
+        # 那时收站方自己报的名字比写工具猜的更可靠。见下面 catalog 分支。
+        catalog_offfamily: list[str] = []
         # 目录是否整体落后市面最新一个世代以上。只影响「建不建议勾」，
         # 不影响清单内容。见下面 catalog 分支与 SectionPlan.catalog_stale。
         catalog_stale, stale_why = False, ""
@@ -1654,6 +1690,25 @@ def build_plan(
             models = [m for m in v.catalog
                       if model_allowed(m)
                       and model_fits_section(v.section, m)]
+            # 目录里**只有**四族之外的名字时，退一步收下它们
+            # （2026-09-03，与上面那条同一个形态、第二次踩）。
+            #
+            # 「不主动推荐四族之外」是本工具的选型偏好，用于「同时有 gpt-5.6
+            # 与 grok-4.6 时挑哪个」。但目录里一个四族的都没有时，这条偏好把
+            # 选择变成了：
+            #   (a) 写工具猜的名字 —— 这个站**从没报过**它们，CPA 路由过去 404
+            #   (b) 写站方自己报的名字 —— 未验证，但至少是这个站说它有的
+            # (b) 严格更好。实测 runanytime 与 facai 的 compat 段目录里
+            # grok-4.6 就是这种处境（配置注释：那是唯一端到端验证过的模型）。
+            #
+            # 判据仍是 protocol_ok 而不是无条件收：前三段仍按族拒
+            # （claude 段走 Anthropic 原生路径，往那里发 grok 必失配），
+            # 只有 compat 段的 /chat/completions 真的不限族。
+            if not models:
+                catalog_offfamily = [
+                    m for m in v.catalog
+                    if model_catalog.section_protocol_ok(v.section, m)]
+                models = list(catalog_offfamily)
             # 同产品线取最高世代：目录里常同时报 gpt-5.5 与 gpt-5.6，
             # 两个都写进去等于让 CPA 把请求分给旧版。
             models = model_catalog.newest_generation_per_line(
@@ -1845,6 +1900,17 @@ def build_plan(
                     f"{', '.join(models)}。"
                     "站方目录只说明「声称有」，不等于这把 Key 的分组能用 —— "
                     "很多站禁止推理测活却确实可用，确知可用再勾")
+            # 目录里一个四族的都没有、于是收下了四族之外的名字。
+            # 这不是「工具推荐」，措辞必须说清为什么退这一步。
+            kept_off = [m for m in models if m in catalog_offfamily]
+            if kept_off:
+                sp.warnings.append(
+                    f"站方目录里没有本工具四族清单（gemini / gpt / claude / kimi）"
+                    f"内的任何模型，已收下它自己报的 {', '.join(kept_off)}。"
+                    "退这一步是因为另一个选项更糟：写工具猜的名字，而这个站"
+                    "**从没报过**它们，CPA 路由过去大概率 404。"
+                    "compat 段走 /chat/completions，CPA 对模型名零校验 —— "
+                    "能不能用取决于上游认不认，本工具没有验证过")
         elif model_source == "seed":
             # 走到这里有两种处境，措辞要分开 —— 说错一种就是误导：
             #   · v.usable=False：探测没通过（判死/门禁/限频…），目录也读不到
@@ -1979,11 +2045,35 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
         band = build_band(cfg, section, raw=raw)
         taken = set(band.tiers)     # 不与现有档位相撞：撞上等于与那个站同层轮询
 
-        # 2. 站级排序：组内最高分降序。同分按主机名 —— 必须稳定，否则同一批
-        #    输入两次运行给出不同档位，diff 变得无法复核。
+        # 2. 站级排序：先按「有没有实测依据」，再按组内最高分，最后按主机名。
+        #
+        # 为什么要加第一个键（2026-09-03 真实探测暴露）：`score_verdict` 对
+        # `usable=False` 一律返回 0，于是**探测全灭的站与探测通过但扣满分的站
+        # 排在同一档**，之后只按主机名排 —— 字母序在前的就上去了。
+        #
+        # 实测那次重探：hybgzs 四段全灭（WAF ×12）却在 claude 段拿到 160、
+        # gemini 段拿到 217，都是该段第 2 名；而 `ai.` 开头纯粹是因为字母序。
+        # claude-sonnet-5 与 gemini-3.1-pro 的顶层承载因此换到一个刚被判死的
+        # 站上 —— 顶层站不可用时那一层整个白撞一轮（层级隔离，
+        # scheduler.go:402 只取最高那一桶）。
+        #
+        # 判据用 model_source 而不是 score：前者说的是「这一段这次有没有依据」，
+        # 后者是「探测质量」。三档：
+        #   0  probed        本次实测跑通推理
+        #   1  manual/catalog 手填 / 站方目录声称有
+        #   2  seed          工具猜测，零依据
+        # 同档内仍按分数、再按主机名 —— 稳定性不能丢，否则同一批输入两次运行
+        # 给出不同档位，diff 无法复核。
+        _EVID = {"probed": 0, "manual": 1, "catalog": 1, "seed": 2}
+
+        def _evid(sps: list[SectionPlan]) -> int:
+            # 组内取最强的那一把 —— 同站多 Key 只要有一把实测通了，
+            # 这个站在这一段就是有依据的。
+            return min(_EVID.get(x.model_source, 2) for x in sps)
+
         ranked = sorted(
             by_host.items(),
-            key=lambda kv: (-max(x.score for x in kv[1]), kv[0]),
+            key=lambda kv: (_evid(kv[1]), -max(x.score for x in kv[1]), kv[0]),
         )
 
         # 3. 每个站的上限：走 suggest_priority。安全边界只在那里定义 ——
@@ -2098,6 +2188,17 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
                         f"同站 {len(sps)} 个 Key 共用此档）")
                 if v < cap:
                     note += f"；算法上限 {cap}，为与前一站分开降到 {v}"
+                # 组内证据不一致时点出来（2026-09-03 真实探测发现）：
+                # 同站多 Key 共用一个档是对的（同一个上游、能力相同），但
+                # 「这一档由谁的实测撑起来」得说清 —— agentrouter 的 claude 段
+                # 7 把 Key 里 6 把实测通过、1 把余额耗尽走了种子猜测，那一把
+                # 因此拿到与实测同档的 494，并把 3 个它自己都没验过的模型
+                # （claude-fable-5-1 / mythos-preview / 4.5-haiku）顶上了顶层。
+                # 档位不改 —— 改了就违反「同站同档」；但要让操作员看见。
+                if sp.model_source != "probed" and _evid(sps) == 0:
+                    note += (f"；本 Key 的清单来自"
+                             f"{_SRC_LABEL_CN.get(sp.model_source, sp.model_source)}"
+                             f"，同档是同站其他 Key 的实测撑起来的")
                 sp.priority_reason = note
                 # 影响面要按新值重算 —— 旧值算出来的 impacts 会误导。
                 sp.impacts = compute_impact(band, sp.models, v)

@@ -1455,8 +1455,23 @@ function siteCard(r) {
       // 现场就有「CPAMP 面板看得见模型、这里判死路」的形态：目录是站方
       // 声明有什么，探测测的是这把 Key 的分组能用什么，两者本就会不一致。
       // 目录按段过滤 —— 混族的名字在这个段发不出去，列出来只会误导
-      const cat = (v.catalog || []).filter((m) => m && famOk(sec, m));
-      const cut = (v.catalog || []).filter((m) => m && !famOk(sec, m)).length;
+      //
+      // 但「一个四族的都没有」时退一步收下站方自己报的（2026-09-03，与后端
+      // build_plan 的 catalog 分支同一条规则）：那时另一个选项是只显示手填框，
+      // 而后端会写工具猜的名字 —— 这个站从没报过它们。实测 runanytime 与
+      // facai 的 compat 段就是这种处境（目录里只有 grok-4.6 / glm-5.2，
+      // 而 grok-4.6 是那个站唯一端到端验证过的模型）。
+      //
+      // 判据用 protoOk（协议层）而不是 famOk：前三段仍按族拒，只有 compat 段
+      // 的 /chat/completions 真的不限族。
+      const catFam = (v.catalog || []).filter((m) => m && famOk(sec, m));
+      const catProto = (v.catalog || []).filter((m) => m && protoOk(sec, m));
+      const cat = catFam.length ? catFam : catProto;
+      // 「已滤掉」只算协议层就发不出去的 —— 四族之外那批在 catProto 里，
+      // 收下之后不该再报成滤掉。
+      const cut = (v.catalog || []).filter((m) => m && !protoOk(sec, m)).length;
+      // 目录里一个四族的都没有、于是列的是站方自己报的四族之外的名字
+      const catOff = !catFam.length && catProto.length;
       // 首次渲染：没有人工接管记录时按段规则预勾，省掉一个一个点。
       // 已有记录（用户改过）就完全尊重记录，不覆盖。
       //
@@ -1492,7 +1507,11 @@ function siteCard(r) {
               data-sec="${esc(sec)}">清空</button>
             <span class="hint">目录 ${cat.length} 个，已勾 <b class="cmn">${picked.size}</b>
               ${cut ? ` · 已滤掉 ${cut} 个不符合本段规则的模型` : ''}</span>
-            ${picked.size === 0 && cat.length ? `<div class="hint">
+            ${catOff ? `<div class="hint">站方目录里没有本工具四族清单
+              （gemini / gpt / claude / kimi）内的任何模型，上面列的是它自己报的。
+              退这一步是因为另一个选项更糟：写工具猜的名字，而这个站从没报过它们。
+              能不能用取决于上游认不认 —— 本工具没有验证过</div>` : ''}
+            ${picked.size === 0 && cat.length && !catOff ? `<div class="hint">
               整份目录都落后于市面最新（本段最新已到
               ${(S.ctx && S.ctx.market_top_gen && S.ctx.market_top_gen[sec] || []).join('.')}）
               —— 默认不勾。确知该站只卖这些且够用，手工勾上即可</div>` : ''}
@@ -1524,6 +1543,7 @@ function siteCard(r) {
             placeholder="${cat.length ? '也可手填目录外的模型名，逗号分隔'
               : '还可手填目录外的模型名，逗号分隔（上面那批已按市面最新填好）'}"></div>
           <div class="hint">工具不会验证这些模型 —— 写错会让 CPA 每次轮到它都失败</div>
+          <div class="fmhint"></div>
         </td>
         <td class="num">${v.max_context_length ? fmt(v.max_context_length) : '—'}
           ${v.context_model ? `<div class="hint">@${esc(v.context_model)}</div>` : ''}</td>
@@ -1641,6 +1661,7 @@ function siteCard(r) {
           placeholder="也可手填上面没有的模型名，逗号分隔"></div>
         <div class="hint">手填与「目录」项工具都没验证过 —— 写错会让 CPA
           每次轮到它都失败</div>
+        <div class="fmhint"></div>
         ${backends.length ? `<div class="hint">后端 ${esc(backends.join(' / '))}</div>` : ''}
       </td>
       <td class="num">${v.max_context_length ? fmt(v.max_context_length) : '—'}
@@ -1809,6 +1830,27 @@ function bindResultEvents() {
       const typed = fmi.value.split(',').map((x) => x.trim())
         .filter((x) => x && !known.has(x));
       const list = chosen.concat(typed);
+      // 手填里协议层就不成立的项，当场标出来 —— 后端会丢掉它们并给警告，
+      // 但那要等一次 /api/plan 往返；输入框旁边即时提示更直接。
+      //
+      // 判据用 protoOk（协议层）而不是 famOk（工具选型偏好）：四族之外的
+      // 模型在 compat 段完全合法 —— 实测 runanytime 唯一验证过的就是
+      // grok-4.6。用 famOk 会把它标成红的，而它恰恰是该写进去的那一个。
+      const bad = typed.filter((m) => !protoOk(sc, m));
+      const off = typed.filter((m) => protoOk(sc, m) && !famOk(sc, m));
+      const box = tr && tr.querySelector('.fmhint');
+      if (box) {
+        box.innerHTML = bad.length
+          ? `<span class="warn">${esc(bad.join(', '))} 在本段协议层不成立`
+            + `（${sc === 'gemini-api-key' ? 'gemini 段只收 *-pro 且版本 >= 2.5'
+              : (SECTION_FAMILY[sc] ? SECTION_FAMILY[sc] + ' 段只收该族'
+                : '非对话模型四段都不收')}），提交时会被丢弃</span>`
+          : (off.length
+            ? `<span class="hint">${esc(off.join(', '))} 不在四族清单里，`
+              + `但 compat 段走 /chat/completions、CPA 不校验模型名 —— `
+              + `会按你的指定写入，能不能用取决于上游</span>`
+            : '');
+      }
       S.forced[h] = S.forced[h] || {};
       if (list.length) {
         S.forced[h][sc] = list;
@@ -2050,12 +2092,19 @@ async function refreshPlan(silent) {
         }
       }
       // weight: 0 必须显眼 —— 全量重探会如实把原值搬回来。
+      // weight: 0 必须显眼 —— 全量重探会如实把原值搬回来。
       //
       // 但它的**含义取决于 routing.strategy**（2026-09-02 核实 CPA 源码）：
       // 只有 weighted-round-robin 会调 positiveWeightAuths 把零权重凭据
       // 整个剔除（selector.go:650 → 637-644）；默认的 round-robin 与
       // fill-first 根本不读 weight，那时这个站照常参与轮询。
       // 说成「一定不参与调度」在后两种策略下是错的。
+      //
+      // 措辞里**不提 CPAMP 面板怎么显示**（2026-09-03 核实 CPAMP 源码后删）：
+      // 上一版写「CPAMP 面板显示为『未启用』」，那是编的。CPAMP 只在凭据编辑
+      // 表单的提示文字里说明语义（i18n 的 `config_weight_hint`：「0 会将该凭证
+      // 排除出加权调度」），没有任何列表视图按 weight 渲染启用状态 ——
+      // `health_status_disabled` 只出现在 dashboard 的采集器与版本卡片上。
       if (sp.weight === 0) {
         const pc = tr.querySelector('.prio');
         if (pc && !pc.querySelector('.w0')) {
@@ -2063,12 +2112,10 @@ async function refreshPlan(silent) {
           const strat = (S.ctx && S.ctx.routing_strategy) || '未配置（默认 round-robin）';
           pc.insertAdjacentHTML('beforeend', excl
             ? '<div class="warn b w0">weight: 0 —— 原配置已把它逐出调度池，'
-              + '写回后仍不参与轮询（CPAMP 面板显示为「未启用」）。'
-              + '要解封请手工删掉这一行</div>'
+              + '写回后仍不参与轮询。要解封请手工删掉这一行</div>'
             : `<div class="warn w0">weight: 0 —— 原值搬回。当前
                 <code>routing.strategy = ${esc(strat)}</code> <b>不读 weight</b>，
-                所以这个站仍会正常参与轮询（CPAMP 面板可能显示为「未启用」，
-                那是按 weight 判的，与实际调度不一致）。
+                所以这个站仍会正常参与轮询。
                 只有改成 <code>weighted-round-robin</code> 它才真被逐出</div>`);
         }
       }

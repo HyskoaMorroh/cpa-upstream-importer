@@ -362,3 +362,117 @@ def existing_provider_names(cfg: dict) -> dict[str, str]:
         if h and nm:
             out[h] = nm
     return out
+
+
+def existing_model_extras(cfg: dict) -> dict[tuple[str, str, str, str], dict]:
+    """既有条目里每个模型的**白名单外字段**，按 (段, host, api_key, 模型名) 索引。
+
+    白名单是 render_entry 会自己写的三个：`name` / `alias` /
+    `max-context-length`。CPA 的模型条目还支持另外七个
+    （config_types.go 的 ClaudeModel / CodexModel / GeminiModel /
+    OpenAICompatibilityModel）：
+
+        display-name        模型目录里显示的人读名
+        force-mapping       把上游响应的 model 字段改写回 alias
+        image               图像模型，注册成 OpenAIImageModelType
+        input-modalities    支持的输入模态
+        output-modalities   支持的输出模态
+        is-compat           走兼容口
+        thinking            思考档位支持（不写时 CPA 默认给 low/medium/high）
+
+    为什么单独一份（2026-09-03 逐字段核对 CPA 结构体发现）：`extract_carry_lines`
+    有意跳过整个 models 块，而 render_entry 只写那三个 —— 剩下七个一律抹掉。
+    当前这份生产 config.yaml 一个都没用到，所以还没踩到；但那是巧合，
+    手工加一个 `thinking:` 或 `image: true` 之后整段重写就会静默丢掉它，
+    而 YAML 合法、validate 报成功。
+
+    值存**解析后的 dict**而不是原文行：这里的字段结构浅（标量与字符串数组），
+    重新序列化不难；而按原文行搬要处理「模型清单变了、原行还在」的错位。
+    """
+    from .parse import host_of
+
+    KNOWN = {"name", "alias", "max-context-length"}
+    out: dict[tuple[str, str, str, str], dict] = {}
+
+    def take(section: str, h: str, k: str, models) -> None:
+        for m in models or []:
+            if not isinstance(m, dict):
+                continue
+            name = str(m.get("name") or "").strip()
+            extra = {kk: vv for kk, vv in m.items() if kk not in KNOWN}
+            if name and extra:
+                out[(section, h, k, name)] = extra
+
+    for section in ("gemini-api-key", "codex-api-key", "claude-api-key"):
+        for e in cfg.get(section) or []:
+            if not isinstance(e, dict):
+                continue
+            take(section, host_of(str(e.get("base-url") or "")),
+                 str(e.get("api-key") or ""), e.get("models"))
+
+    for prov in cfg.get("openai-compatibility") or []:
+        if not isinstance(prov, dict):
+            continue
+        h = host_of(str(prov.get("base-url") or ""))
+        for ke in prov.get("api-key-entries") or []:
+            if isinstance(ke, dict):
+                take("openai-compatibility", h,
+                     str(ke.get("api-key") or ""), prov.get("models"))
+
+    return out
+
+
+def existing_model_context(cfg: dict) -> dict[tuple[str, str, str, str], int]:
+    """既有条目里每个模型自己的 `max-context-length`，按
+    **(段, host, api_key, 模型名)** 索引。只收正整数。
+
+    为什么必须搬（2026-09-03 逐字段对账发现）：这个值在 `models:` 块**里面**，
+    而 `extract_carry_lines` 有意跳过整个 models 块（模型清单由方案重新生成，
+    搬原文行会与新清单打架）。于是它落进一个空档：
+      · carry 不搬 —— 在 models 块内
+      · 方案只带**一个**值（`sp.max_context_length` + `sp.context_model`），
+        那是本次探测实测的那一个模型
+    结果：本次没探上下文（`--no-context`、或那个模型没被验）时，历史实测值
+    全部消失。实测生产配置有 8 处，kktoken.cc 的 987500 与 zzzcoding 的 15515
+    都在其中。
+
+    丢了的后果不是不可用，而是**客户端按错的窗口定压缩点**：CPA 把它写进
+    `/v1/models` 的 `context_length`（model_registry.go:1437-1438）与 Codex 的
+    `max_context_window`（internal/client/codex/models/models.go:208-210）。
+    没有这个值时 CPA 回落内置目录值 —— 那对中转站往往偏大，客户端塞满上下文
+    才发现被上游截断，正是第 08 章那条 400 的成因。
+
+    键含模型名：同一个条目里不同模型的窗口能差一个数量级（opus 与 haiku），
+    把其中一个的值抄给另一个比丢掉更糟。
+    """
+    from .parse import host_of
+
+    out: dict[tuple[str, str, str, str], int] = {}
+
+    def take(section: str, h: str, k: str, models) -> None:
+        for m in models or []:
+            if not isinstance(m, dict):
+                continue
+            name = str(m.get("name") or "").strip()
+            val = m.get("max-context-length")
+            if name and isinstance(val, int) and val > 0:
+                out[(section, h, k, name)] = val
+
+    for section in ("gemini-api-key", "codex-api-key", "claude-api-key"):
+        for e in cfg.get(section) or []:
+            if not isinstance(e, dict):
+                continue
+            take(section, host_of(str(e.get("base-url") or "")),
+                 str(e.get("api-key") or ""), e.get("models"))
+
+    # compat 段的 models 在 provider 级，组内所有 Key 共用同一份
+    for prov in cfg.get("openai-compatibility") or []:
+        if not isinstance(prov, dict):
+            continue
+        h = host_of(str(prov.get("base-url") or ""))
+        for ke in prov.get("api-key-entries") or []:
+            if isinstance(ke, dict):
+                take("openai-compatibility", h,
+                     str(ke.get("api-key") or ""), prov.get("models"))
+
+    return out

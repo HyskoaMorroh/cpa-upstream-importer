@@ -973,13 +973,25 @@ footer code{background:none;padding:0}
     <div class="card"><div class="h">缩进不猜，从现有条目读</div>
       <ul><li>四段的缩进未必一致</li>
           <li>猜错整段结构就变形</li></ul></div>
-    <div class="card"><div class="h">max-context-length 只写在实测过的那个模型上</div>
+    <div class="card"><div class="h">max-context-length 逐模型各写自己的</div>
       <ul><li>同站不同模型的窗口能差一个数量级</li>
           <li>把 opus 的实测值抄给 haiku，客户端会按错的窗口定压缩点 ——
-              那正是这个字段要治的 400</li></ul></div>
-    <div class="card"><div class="h">prefix 沿用该段主导值</div>
+              那正是这个字段要治的 400</li>
+          <li>优先级：本次实测 &gt; 原值搬运 &gt; 不写。原值那一档 2026-09-03 才补 ——
+              它在 <code>models:</code> 块内，carry 有意跳过那一块，而方案只带本次
+              实测的那一个，于是本次没探上下文时历史值全丢（实测 8 处）</li></ul></div>
+    <div class="card"><div class="h">prefix 逐条搬原值</div>
       <ul><li>它是<b>额外加一个别名</b>，不取代原名</li>
-          <li>缺它不会让站不可用，但按 <code>ANT/xxx</code> 发的请求命中不到新站</li></ul></div>
+          <li>缺它不会让站不可用，但按 <code>ANT/xxx</code> 发的请求命中不到</li>
+          <li><code>dominant_prefix</code> 只给<b>新条目</b>猜默认值；既有条目
+              自己写的才是真的。搞混会抹掉 121/121 条目的 prefix</li></ul></div>
+    <div class="card"><div class="h">compat 的 provider name 搬原值</div>
+      <ul><li><code>name</code> 就是 CPA 的 provider 身份 ——
+              <code>util.OpenAICompatibleProviderKey(name)</code> 写进
+              <code>provider_key</code></li>
+          <li>冷却、模型能力、执行路由三处都按它索引；用
+              <code>host_of(base_url)</code> 现编会让 12/13 个 provider 改名，
+              冷却状态与能力缓存全部作废</li></ul></div>
     <div class="card"><div class="h">compat 段按站归并</div>
       <ul><li>一个 provider = 一个站，多个 Key 挂在 <code>api-key-entries</code> 下</li>
           <li>每个 Key 生成一个同名 provider 会让模型清单重复 N 遍</li></ul></div>
@@ -1111,6 +1123,33 @@ footer code{background:none;padding:0}
      前</b> —— 那道闸按 <code>model_source</code> 判，手填的清单必须先落进方案，
      否则「手填了真实模型」仍会被当成猜测拦下。三步的顺序是：覆盖模型 → 放行判定 →
      批量定档 → 覆盖 priority。</p>
+
+  <h3>定档先按证据分档，再按分数</h3>
+  <div class="note b">
+    <div class="t">四段全灭的站与实测通过的站排在同一档，字母序决定谁上去</div>
+    <p><code>score_verdict</code> 对 <code>usable=False</code> 一律返回 0，而站级排序
+       原来是「组内最高分降序，同分按主机名」—— 于是「探测全灭」与「探测通过但扣满
+       分」落在同一档，之后主机名的字母序就成了唯一判据。</p>
+    <p>2026-09-03 那次真实探测：<code>ai.hybgzs.com</code> 四段全灭（WAF ×12）却在
+       claude 段拿到该段第 2 名、gemini 段第 2 名，纯粹因为 <code>ai.</code> 开头。
+       <code>claude-sonnet-5</code> 与 <code>gemini-3.1-pro</code> 的顶层承载因此换到
+       一个<b>刚被判死的站</b>上 —— 层级隔离下顶层站不可用时那一层整个白撞一轮
+       （<code>scheduler.go:402</code> 只取最高那一桶）。</p>
+  </div>
+  <p>判据换成 <code>model_source</code>（这一段这次有没有依据）而不是
+     <code>score</code>（探测质量）：<code>probed</code> 0 档、
+     <code>manual</code> / <code>catalog</code> 1 档、<code>seed</code> 2 档。
+     同档内仍按分数、再按主机名 —— 稳定性不能丢，否则同一批输入两次运行给出不同
+     档位，diff 无法复核。</p>
+  <p>修复后 claude 段 8 个 <code>probed</code> 站占 493-500，5 个 <code>seed</code>
+     站掉到 170-175；两个热门模型的顶层回到实测通过的站上。</p>
+  <p><b>组内证据不一致时点出来</b>：同站多 Key 共用一档是对的（同一个上游、能力
+     相同），但「这一档由谁的实测撑起来」得说清。实测
+     <code>agentrouter.org</code> 的 claude 段 7 把 Key 里 6 把实测通过、1 把余额
+     耗尽走了种子猜测 —— 那一把因此拿到与实测同档的 494，并把 3 个它自己都没验过的
+     模型顶上了顶层。档位不改（改了就违反「同站同档」），但
+     <code>priority_reason</code> 里会写「本 Key 的清单来自工具猜测，同档是同站
+     其他 Key 的实测撑起来的」，那句话原样落进 config.yaml 的行尾注释。</p>
 
   <h3>再省画像：门票是站+段的属性，与模型无关</h3>
   <p>画像梯的调用点在<b>种子模型循环内部</b>：第一个种子全败后，循环走到下一个
@@ -1660,6 +1699,30 @@ footer code{background:none;padding:0}
   <p>前端 <code>protoOk</code> 与后端 <code>section_protocol_ok</code> 由
      <code>tests/test_web.py</code> 拿同一批模型名喂两边比对，并写死「两者的差别
      只在四族之外、且只在 compat 段放开」这条不变式 —— 单边改判定会被立刻抓到。</p>
+  <p>手填框旁还有一条<b>即时</b>提示，不用等一次 <code>/api/plan</code> 往返：
+     协议层不成立的标红并说清原因，四族之外的给一句灰字说明。判据同样是
+     <code>protoOk</code> 而不是 <code>famOk</code> —— 用后者会把
+     <code>grok-4.6</code> 标成红的，而它恰恰是该写进去的那一个。</p>
+
+  <h3>目录里一个四族的都没有时，收站方自己报的</h3>
+  <p>同一个形态在<b>目录</b>路径上也会出现，而且是自动路径：按四族过滤后清单变空，
+     就落进种子兜底、写工具猜的名字。那时的选择只有两个 ——</p>
+  <div class="tw"><table>
+    <thead><tr><th style="width:230px">选项</th><th>后果</th></tr></thead>
+    <tbody>
+      <tr><td>写工具猜的名字</td><td>这个站<b>从没报过</b>它们，CPA 路由过去大概率
+        404，把一个「有老模型可用」的站变成死条目</td></tr>
+      <tr><td>写站方自己报的名字</td><td>未验证，但至少是这个站说它有的</td></tr>
+    </tbody>
+  </table></div>
+  <p>后者严格更好，所以退这一步：目录里一个四族的都没有时收下协议层成立的全部名字，
+     <code>model_source</code> 记成 <code>catalog</code>，界面与警告都说清「站方目录
+     里没有本工具四族清单内的任何模型，上面列的是它自己报的 —— 退这一步是因为另一个
+     选项更糟」。</p>
+  <p>目录里<b>有</b>四族的名字时，四族之外的照旧不进清单 —— 选型偏好在有得选时仍然
+     生效。前三段一律按族拒（协议层就发不出去），只有 compat 段的
+     <code>/chat/completions</code> 真的不限族。前后端同一条规则，
+     <code>tests/test_web.py</code> 守着。</p>
 
   <h3>weight: 0 的含义取决于 routing.strategy</h3>
   <p>本项目多处把 <code>weight: 0</code> 当「站已被逐出调度池、挡住它零代价」的
@@ -1836,11 +1899,11 @@ footer code{background:none;padding:0}
 
   <div class="note w">
     <div class="t">如实说明：验证到哪一步</div>
-    <p><b>已验证</b>：假上游套件、单元测试（1147 项，含真实 config.yaml 用例时
-       1149 项）、端到端演练、以及拿两份生产 config.yaml 做的重建对账
-       （<code>tests/rehearse_real_rebuild.py</code>，各 39 项全对上：121 条目 /
+    <p><b>已验证</b>：假上游套件、单元测试（1160 项，含真实 config.yaml 用例时
+       1165 项）、端到端演练、以及拿两份生产 config.yaml 做的重建对账
+       （<code>tests/rehearse_real_rebuild.py</code>，各 41 项全对上：121 条目 /
        79 凭据 / 177 个 <code>(凭据, 段)</code> 槽位，逐字段值零差异）。</p>
-    <p>那份对账值得单独说，因为它抓到的六处缺陷单元测试全绿：compat 段组内没进方案
+    <p>那份对账值得单独说，因为它抓到的七处缺陷单元测试全绿：compat 段组内没进方案
        的 Key 会消失（生产配置 gorouter.app 15 把、tabitoken.com 14 把）、per-key
        的 <code>proxy-url</code> 与 <code>weight</code> 被统一成组内 head 那把的值
        （8 把带 per-key 代理）、同一个站两种 base-url 写法会写出两个同名 provider、
@@ -1848,7 +1911,9 @@ footer code{background:none;padding:0}
        <code>ANT/xxx</code> 别名全失效）、compat 的 <code>name</code> 被改成 host
        （12/13 个 provider 改名，那是 CPA 的 provider 身份，改名作废冷却状态与能力
        缓存）、注释索引把模型名当条目键且 base-url 行尾注释没剥（4676 行注释里
-       118 行彻底丢失）。</p>
+       118 行彻底丢失）、模型级 <code>max-context-length</code> 8/8 消失
+       （它在 <code>models:</code> 块内，carry 有意跳过那一块，而方案只带本次实测的
+       那一个 —— 三方都不管的空档）。</p>
     <p>后三处是<b>逐字段 deep-equal</b> 才抓到的：之前只比字段的<b>出现次数</b>
        （<code>text.count("prefix:")</code>），而「121 个条目的 prefix 全被抹掉、
        同时注释里多出 121 处提到 prefix」这种情况两边都数得对 —— 计数相等，值全错。
