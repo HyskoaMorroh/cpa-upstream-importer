@@ -48,8 +48,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cpa_probe as cp  # noqa: E402
 from cpa_probe.pipeline import Prober, SEED_MODELS  # noqa: E402
 from cpa_probe.batch import (  # noqa: E402
-    BatchProber, existing_prefixes, existing_provider_names,
-    existing_proxies, existing_weights,
+    BatchProber, existing_model_context, existing_model_extras,
+    existing_prefixes, existing_provider_names, existing_proxies,
+    existing_weights,
     extract_existing_entries,
 )
 from cpa_probe.writeback import (  # noqa: E402
@@ -1682,6 +1683,10 @@ class Handler(BaseHTTPRequestHandler):
             #     身份（provider_key），改名作废冷却状态与能力缓存
             prefixes = existing_prefixes(cfg)
             pnames = existing_provider_names(cfg)
+            # 每个模型自己的 max-context-length（在 models 块里，carry 搬不到）
+            mctx = existing_model_context(cfg)
+            # 模型级白名单外字段（当前配置为空，补闸）
+            mextra = existing_model_extras(cfg)
 
             for res in job.results:
                 fh = _by_row(forced, res.row)
@@ -1724,6 +1729,28 @@ class Handler(BaseHTTPRequestHandler):
                     # compat 的 provider name（按 host，组内共用）
                     if sec == "openai-compatibility":
                         sp.provider_name = pnames.get(res.row.host, "")
+                    # 每个模型自己的 max-context-length。
+                    #
+                    # 它在 models 块里，carry 有意跳过那一块（清单由方案重新
+                    # 生成），而方案只带本次实测的那**一个**。不搬的话本次没探
+                    # 上下文时历史实测值全丢 —— 实测生产配置 8 处，客户端会按
+                    # CPA 内置目录的偏大值定压缩点。
+                    sp.prior_context = {
+                        name: val
+                        for (s2, h2, k2, name), val in mctx.items()
+                        if s2 == sec and h2 == res.row.host
+                        and k2 == res.row.api_key
+                    }
+                    # 模型级的白名单外字段（display-name / thinking / image /
+                    # force-mapping / is-compat / *-modalities）—— 同一个空档，
+                    # carry 跳过 models 块、render_entry 只写三个字段。
+                    # 当前配置一个都没用到，这是补闸不是修事故。
+                    sp.prior_model_extras = {
+                        name: dict(val)
+                        for (s2, h2, k2, name), val in mextra.items()
+                        if s2 == sec and h2 == res.row.host
+                        and k2 == res.row.api_key
+                    }
                 all_plans[(res.row.bare, res.row.api_key)] = p
 
             # 用户覆盖分**两批**应用，中间夹着新增段判定与批量定档。
