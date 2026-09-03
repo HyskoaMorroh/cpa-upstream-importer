@@ -26,7 +26,9 @@
 - gemini / claude：裸域名，不带 `/v1`
 - codex / compat：必须带 `/v1`
 
-**priority 语义**：数值**越小越优先**（升序排列，`scheduler.go:1085`）。未设置默认 0（最高优先）。
+**priority 语义**：数值**越大越优先**（`priorityOrder` 降序排，`scheduler.go:1197-1199`；取层用 `priority > bestPriority`，`scheduler.go:402` 与 `selector.go:541-543`）。未设置时 `authPriority` 返回 0（`selector.go:365-372`），是**最低**优先。
+
+> 2026-09-03 更正：此前本文与 README、tutorial 都写成「越小越优先（升序排列，`scheduler.go:1085`）」。那个行号上不是排序代码，结论也与源码相反。
 
 **headers**：`map[string]string`，CPA 不限制 key 集合，以 `header:` 前缀存进 `Auth.Attributes`，转发时原样发出。
 

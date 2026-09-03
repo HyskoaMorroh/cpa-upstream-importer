@@ -249,8 +249,9 @@ const S = {
   planId: null,
   plans: null,
   overrides: {},        // {host: {section: {...}}}
-  // 人工接管：{host: {section: [模型, ...]}}。探测判不可用但操作员确知可用的段。
-  // 很多中转站不给测活（探针短消息被拦、分组限客户端），而真实对话正常。
+  // 人工接管：{host: {section: [模型, ...]}}。任何段都可以接管 ——
+  // 判死段（很多中转站不给测活：探针短消息被拦、分组限客户端，而真实对话正常）
+  // 与可用段（探测只验前几个模型就停，站方实际卖得更多）都走这一份。
   forced: {},
   picks: null,          // Set("host\u0000section")，null = 尚未初始化
   reuseSaved: 0,        // 形态复用省下的请求数
@@ -1457,6 +1458,7 @@ function siteCard(r) {
         <td class="m"><b>${esc(label)}</b></td>
         <td><span class="pill ${pill}">${esc(v.category || '不可用')}</span></td>
         <td>
+          <div class="mlist"></div>
           ${cat.length ? `<div class="cats">${cat.map((m) => `
             <label class="catpick"><input type="checkbox" class="cm"
               data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}"
@@ -1538,6 +1540,41 @@ function siteCard(r) {
       flags.push(`<span class="pill p-b">换模 ${v.swap.rate_pct}%</span>`);
     }
     const backends = Object.keys((v.swap && v.swap.backends) || {});
+    // 可用行的模型格：实测清单 + 目录里探测没验到的名字，都做成勾选框。
+    //
+    // 2026-09-03 现场（截图）：这一格原来只渲染 `v.models.join(', ')` 纯文本，
+    // 于是三条毛病同时存在 ——
+    //   ① v.models 为空（静默换模 / 200 包错误体，`_accept` 全拒）时显示
+    //      「无可信模型」，而后端方案里 sp.models 已经有 6 个（seed 兜底）。
+    //      判死行有 .cats.fallback 容器接住它，可用行连容器都没有。
+    //   ② 可用行完全没有手填入口，操作员想改清单只能去改 config.yaml。
+    //   ③ 探测只验 max_models（默认 4）个就停，站方目录里其余名字在这一格
+    //      看不见 —— 而那些名字往往正是要写进去的。
+    //
+    // 与判死行同一套 DOM 约定（.cats / .cm / .fm / .mtools / .cmn），
+    // 所以 bindResultEvents 与 refreshPlan 的 fallback 填充无需分叉。
+    const uProbed = (v.models || []).filter(Boolean);
+    // 目录里通过本段规则、且不在实测清单里的名字 —— 默认**不勾**：
+    // 实测过的才是有依据的，目录只是站方声称。
+    const uExtra = (v.catalog || [])
+      .filter((m) => m && famOk(sec, m) && !uProbed.includes(m));
+    const uAll = uProbed.concat(uExtra);
+    const uRec = (S.forced[rid] || {})[sec];
+    // 首次渲染按「实测清单」预勾。实测为空时留给 refreshPlan 用 sp.models 填 ——
+    // 那条路要求容器里没有 .cm，所以这里在 uAll 为空时才渲染空的 fallback 容器。
+    //
+    // **不**把预勾结果回写 S.forced（2026-09-03）。判死行那边曾经必须回写，
+    // 因为不回写就没有模型可写；现在后端对每段都算出确定清单，前端显示的
+    // 就是它算出来的那一份 —— 不回写，两边照样一致。
+    //
+    // 而回写有害：`forced` 非空会让 build_plan 走 manual 分支，于是
+    //   · 徽标从「实测」变成「手填」，recommended 翻假，「只勾推荐项」勾不到
+    //   · 更糟的是 seed 猜测被洗成 manual，正好绕过新增段那道闸
+    //     （它按 model_source 判，manual 放行）—— 又回到 121 条目变 246 的老路
+    // S.forced 现在只在**用户真的动过**勾选框或手填框时才写（见 bindResultEvents）。
+    const uPick = new Set(uRec !== undefined ? uRec : uProbed);
+    const uFm = ((S.forced[rid] || {})[sec] || [])
+      .filter((m) => !uAll.includes(m)).join(', ');
 
     return `<tr data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}">
       <td class="pick"><input type="checkbox" class="sel"
@@ -1545,7 +1582,46 @@ function siteCard(r) {
       <td class="m"><b>${esc(label)}</b></td>
       <td><span class="pill p-ok">可用</span></td>
       <td>
-        <div class="mlist">${esc(v.models.join(', ')) || '<span class="hint">无可信模型</span>'}</div>
+        <div class="mlist"></div>
+        ${uAll.length ? `<div class="cats">${uAll.map((m) => `
+          <label class="catpick"><input type="checkbox" class="cm"
+            data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}"
+            value="${esc(m)}"${uPick.has(m) ? ' checked' : ''}>${esc(m)}${
+              uProbed.includes(m) ? '' : ' <span class="hint">目录</span>'}</label>`
+          ).join('')}</div>
+        <div class="mtools">
+          <button type="button" class="mini cmall" data-rid="${esc(rid)}" data-host="${esc(host)}"
+            data-sec="${esc(sec)}">全选</button>
+          <button type="button" class="mini cminv" data-rid="${esc(rid)}" data-host="${esc(host)}"
+            data-sec="${esc(sec)}">反选</button>
+          <button type="button" class="mini cmnone" data-rid="${esc(rid)}" data-host="${esc(host)}"
+            data-sec="${esc(sec)}">清空</button>
+          <span class="hint">实测 ${uProbed.length} 个${
+            uExtra.length ? ` · 目录另有 ${uExtra.length} 个未验证（默认不勾）` : ''
+          }，已勾 <b class="cmn">${uPick.size}</b></span>
+        </div>`
+          // 实测清单为空 —— 留空容器给 refreshPlan 用后端方案里的 sp.models 填。
+          // 与判死行的 fallback 分支同一条路径。
+          : `<div class="cats fallback" data-rid="${esc(rid)}"
+               data-host="${esc(host)}" data-sec="${esc(sec)}"></div>
+             <div class="mtools fallback-tools" hidden>
+               <button type="button" class="mini cmall" data-rid="${esc(rid)}"
+                 data-host="${esc(host)}" data-sec="${esc(sec)}">全选</button>
+               <button type="button" class="mini cminv" data-rid="${esc(rid)}"
+                 data-host="${esc(host)}" data-sec="${esc(sec)}">反选</button>
+               <button type="button" class="mini cmnone" data-rid="${esc(rid)}"
+                 data-host="${esc(host)}" data-sec="${esc(sec)}">清空</button>
+               <span class="hint">已勾 <b class="cmn">0</b></span>
+             </div>
+             <div class="hint">端点响应正常、凭证有效，但返回的模型与请求不一致
+               （静默换模或 200 包错误体）—— 实测清单为空，下面这批取自
+               「当前市面最新」，勾选前请确认</div>`}
+        <div class="pedit"><input type="text" class="fm" style="width:100%"
+          data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}"
+          value="${esc(uFm)}"
+          placeholder="也可手填上面没有的模型名，逗号分隔"></div>
+        <div class="hint">手填与「目录」项工具都没验证过 —— 写错会让 CPA
+          每次轮到它都失败</div>
         ${backends.length ? `<div class="hint">后端 ${esc(backends.join(' / '))}</div>` : ''}
       </td>
       <td class="num">${v.max_context_length ? fmt(v.max_context_length) : '—'}
@@ -1701,7 +1777,19 @@ function bindResultEvents() {
     const fmi = e.target.closest('.fm');
     if (fmi) {
       const h = fmi.dataset.rid, sc = fmi.dataset.sec;
-      const list = fmi.value.split(',').map((x) => x.trim()).filter(Boolean);
+      const tr = fmi.closest('tr');
+      // 勾选框里选中的也要一起带上 —— 这一格有**两个入口**写同一个段。
+      //
+      // 2026-09-03 自查发现：这里原来只取手填框的值就整份覆盖 S.forced，
+      // 于是「勾了目录里的 3 个，再手填 1 个」的结果是 S.forced 只剩那 1 个，
+      // 而 3 个勾选框在界面上还勾着 —— 又一处「界面勾着、实际没接管」。
+      // 反方向（.cm 处理器）一直是合并的，两处不对称正是它没被发现的原因。
+      const chosen = tr
+        ? $$('.cm', tr).filter((x) => x.checked).map((x) => x.value) : [];
+      const known = new Set(tr ? $$('.cm', tr).map((x) => x.value) : []);
+      const typed = fmi.value.split(',').map((x) => x.trim())
+        .filter((x) => x && !known.has(x));
+      const list = chosen.concat(typed);
       S.forced[h] = S.forced[h] || {};
       if (list.length) {
         S.forced[h][sc] = list;
@@ -1805,9 +1893,13 @@ function applyPickPreset(mode) {
   // 「只勾推荐项」保持按 recommended 筛，那才是让工具替你判断的入口。
   S.picks = new Set();
   const missing = [];
+  let blocked = 0;
   S.plans.forEach((p) => {
     Object.entries(p.sections).forEach(([sec, sp]) => {
       if (sp.duplicate) return;
+      // 落盘那层会拒掉的段不勾 —— 勾了也写不进，而界面上勾着就是在骗人。
+      // 原因显示在「建议」列（recommend_reason）。
+      if (sp.write_blocked) { blocked += 1; return; }
       if (mode === 'rec' && !sp.recommended) return;
       if (mode === 'none') return;
       // 不再按「有没有模型」拦 —— 后端现在给每段都算出确定清单
@@ -1829,9 +1921,16 @@ function applyPickPreset(mode) {
   $$('#pickbtns button[data-mode]').forEach((b) => {
     b.classList.toggle('on', b.dataset.mode === mode);
   });
-  if (mode === 'all' && missing.length) {
-    $('#pickstat').textContent = `已勾选 ${S.picks.size} 项写入 · `
-      + `${missing.length} 段异常无模型（后端缺陷，请报）`;
+  if (mode === 'all' && (missing.length || blocked)) {
+    // 「全勾」勾不满时必须说清差在哪 —— 只显示一个数字，操作员会以为
+    // 是自己看错了。两种成因分开报：无模型是后端缺陷，不写入是设计如此。
+    const why = [];
+    if (missing.length) why.push(`${missing.length} 段异常无模型（后端缺陷，请报）`);
+    if (blocked) {
+      why.push(`${blocked} 段标为「不写入」（原本没配这一段且清单只是猜测 ——`
+        + `手填真实模型即可放行）`);
+    }
+    $('#pickstat').textContent = `已勾选 ${S.picks.size} 项写入 · ` + why.join(' · ');
   }
 }
 
@@ -1917,8 +2016,17 @@ async function refreshPlan(silent) {
           if (n) n.textContent = String([...on].filter((m) => sp.models.includes(m)).length);
         }
         // 立刻回写 S.forced —— 提交时读的是它，不读 DOM。
-        // 不写的话「界面上勾着、实际没接管」，正是这一轮要修的症状。
-        if (rec === undefined) {
+        // 不写的话「界面上勾着、实际没接管」，正是上一轮修的症状。
+        //
+        // 但 **seed 例外**（2026-09-03）：那份清单是工具猜的，回写会让它在
+        // 后端被当成手填（forced 非空即走 manual 分支），于是
+        //   · 徽标从「猜测」变「手填」，界面不再提示这批名字没有依据
+        //   · 跨段新增那道闸按 model_source 判，manual 放行 —— 猜测清单
+        //     因此能凭空新增条目，正是 121 条目变 246 那次事故的路径
+        // 不回写也不会丢：后端本来就会写它自己算出的 sp.models，界面显示的
+        // 就是同一份。用户真的取消勾选时 change 事件会写 S.forced（那时
+        // 记成手填是对的 —— 操作员显式做了决定）。
+        if (rec === undefined && sp.model_source !== 'seed') {
           (S.forced[p.line_no] = S.forced[p.line_no] || {})[sec] = [...on];
         }
       }
@@ -1947,24 +2055,42 @@ async function refreshPlan(silent) {
       }
       // 模型清单的来源 —— 判死段现在也有确定清单，但那清单可能只是种子
       // 猜测。不标出来的话，「猜的」和「实测跑通的」在界面上没有区别。
+      //
+      // 这一格每轮 refreshPlan 都重建（不是 insertAdjacentHTML 追加）——
+      // 追加式的写法在 model_source 变化时会留着上一轮的徽标：手填之后
+      // 「猜测」与「手填」两个徽标并列，看不出现在到底按哪份清单写。
       const ml = tr.querySelector('.mlist');
-      if (ml && sp.model_source) {
+      if (ml) {
         const st = SRC_TAG[sp.model_source];
-        if (st && !ml.querySelector('.srctag')) {
-          ml.insertAdjacentHTML('afterbegin',
-            `<span class="pill ${st.c} srctag">${st.t}</span> `);
+        const bits = [];
+        if (st) bits.push(`<span class="pill ${st.c} srctag">${st.t}</span>`);
+        // 新增段：这一段原本不在 config.yaml 里。它改变的是条目数而不只是
+        // 某个字段，diff 里不显眼，所以在行内标出来。
+        if (sp.new_section && !sp.write_blocked) {
+          bits.push('<span class="pill p-i">新增段</span>');
         }
+        let extra = '';
         if (sp.model_source === 'seed') {
-          ml.insertAdjacentHTML('beforeend',
-            '<div class="hint">种子兜底：站方目录也没报模型，'
-            + '这几个名字是本工具猜的，勾选前请确认</div>');
+          extra = '<div class="hint">种子兜底：站方目录也没报模型，'
+            + '这几个名字是本工具猜的，勾选前请确认</div>';
         }
+        if (sp.new_section && !sp.write_blocked) {
+          extra += '<div class="hint">原 config.yaml 里这个凭据没配这一段 ——'
+            + '本次探测发现它也能用，将作为<b>新条目</b>写入，'
+            + '并已计入定档与影响面</div>';
+        }
+        ml.innerHTML = bits.join(' ') + (bits.length ? ' ' : '') + extra;
       }
       const rsn = tr.querySelector('.rsn');
       if (rsn) {
-        const cls = sp.recommended ? 'p-ok' : (sp.writable ? 'p-w' : 'p-m');
-        const tag = sp.recommended ? '建议写入'
-          : (sp.writable ? '需人工确认' : '不可写入');
+        // 三态要与落盘一致：write_blocked 非空时这一段不会写入，界面必须
+        // 说「不写入」而不是「建议写入」（上一版那道闸只在写盘层，界面
+        // 照「没有闸」渲染，勾了写不进 —— 2026-09-03 现场）。
+        const cls = sp.write_blocked ? 'p-m'
+          : (sp.recommended ? 'p-ok' : (sp.writable ? 'p-w' : 'p-m'));
+        const tag = sp.write_blocked ? '不写入'
+          : (sp.recommended ? '建议写入'
+            : (sp.writable ? '需人工确认' : '不可写入'));
         // score 一直没显示，而关掉「试用期定档」后 priority 就是按它算的 ——
         // 看不到分数等于那个开关的依据不可见。
         const sc = (sp.score != null)
