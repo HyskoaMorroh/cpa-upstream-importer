@@ -57,17 +57,12 @@ class Gate(BaseHTTPRequestHandler):
                                    "type": "permission_error"}})
 
 
-def free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
-
-
 def main():
-    port = free_port()
-    srv = ThreadingHTTPServer(("127.0.0.1", port), Gate)
+    # 端口交给 ThreadingHTTPServer 自己 bind（2026-09-05 修竞态）。
+    # 原来是 free_port() 拿到端口后 close，再让 server bind 同一个 ——
+    # 那两步之间有窗口，同机短时间反复分配端口时会被抢走（WinError 10048）。
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Gate)
+    port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{port}"
 

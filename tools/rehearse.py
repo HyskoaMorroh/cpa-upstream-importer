@@ -173,14 +173,6 @@ class ProxyMarkingProber(Prober):
         return super()._call(*a, **kw)
 
 
-def free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
-
-
 def main() -> int:
     cfg_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
         os.path.dirname(ROOT), "config.yaml")
@@ -199,8 +191,11 @@ def main() -> int:
     work = os.path.join(tmpdir, "config.yaml")
     shutil.copy2(cfg_path, work)
 
-    port = free_port()
-    srv = ThreadingHTTPServer(("127.0.0.1", port), FakeUpstream)
+    # 端口交给 ThreadingHTTPServer 自己 bind（2026-09-05 修竞态）。
+    # 原来是 free_port() 拿到端口后 close，再让 server bind 同一个 ——
+    # 那两步之间有窗口，同机短时间反复分配端口时会被抢走（WinError 10048）。
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstream)
+    port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{port}"
 

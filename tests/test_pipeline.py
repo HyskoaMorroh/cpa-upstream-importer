@@ -296,14 +296,6 @@ class ProxyMarkingProber(Prober):
         return super()._call(*a, **kw)
 
 
-def free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
-
-
 # ==========================================================================
 # 用例
 # ==========================================================================
@@ -354,11 +346,13 @@ def test_dead_section_shape_is_cached():
 
         do_GET = do_POST = _all
 
-    sk = _socket.socket()
-    sk.bind(("127.0.0.1", 0))
-    port = sk.getsockname()[1]
-    sk.close()
-    srv = ThreadingHTTPServer(("127.0.0.1", port), _Fake)
+    # 端口交给 ThreadingHTTPServer 自己 bind（2026-09-05 修竞态）。
+    # 原来的写法是「socket bind 0 号拿到端口 → close → 再让 server bind 同一个」，
+    # 那两步之间有窗口 —— 全套跑 11 个套件、4 个起真 HTTP 服务，同一台机器短时间
+    # 反复分配端口，窗口里被抢到就 OSError（Windows 上是 WinError 10048）。
+    # 实测吻合：只在 run.py 全链跑时出现、两次分别落在起服务的两个套件、不可复现。
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Fake)
+    port = srv.server_address[1]
     _threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{port}"
 
@@ -415,8 +409,10 @@ def test_dead_section_shape_is_cached():
           f"后 4 把零请求）、凭证级不缓存、复用结论说清来源")
 
 def main() -> int:
-    port = free_port()
-    srv = ThreadingHTTPServer(("127.0.0.1", port), FakeUpstream)
+    # 端口交给 ThreadingHTTPServer 自己 bind（2026-09-05 修竞态）——
+    # 见 tests/test_server.py 的 free_port docstring。
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstream)
+    port = srv.server_address[1]
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     base = f"http://127.0.0.1:{port}"
