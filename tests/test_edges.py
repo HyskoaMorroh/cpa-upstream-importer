@@ -43,7 +43,9 @@ for _s in (sys.stdout, sys.stderr):
 
 import fixture_cfg                                            # noqa: E402
 import cpa_probe as cp                                        # noqa: E402
-from cpa_probe.pipeline import CandidateResult, SectionVerdict  # noqa: E402
+from cpa_probe import plan as _plan                           # noqa: E402
+from cpa_probe.pipeline import (Attempt, CandidateResult,        # noqa: E402
+                                SectionVerdict)
 from cpa_probe.writeback import (                              # noqa: E402
     apply_diffs,
     build_diffs,
@@ -214,6 +216,59 @@ def _fallback_headers_per_protocol() -> None:
     if sp:
         eq("compat 段回落到 openai-sdk 档",
            bool(any(k.lower().startswith("x-stainless") for k in sp.headers)), True)
+
+    # 回落配头必须**求过值**（2026-09-04）。`Profile.headers` 是模板，含
+    # `{uuid1}` / `{key_hash}` 这类占位符；正常路径取的 `v.min_headers` 是
+    # materialize 的产物，只有这一支曾直接 `dict(p.headers)`。
+    #
+    # 后果已落进生产文件：`x-claude-code-session-id: "{uuid1}"` 出现 5 处
+    # （claude 段 4、compat 段 1）。CPA 会把它原样发给上游
+    # （util/header_helpers.go 只判非空、不校验值形态），站方看到的会话 id
+    # 是字面量 `{uuid1}`。
+    import re as _re
+    for sec in cats:
+        sp2 = plan.sections.get(sec)
+        if not sp2:
+            continue
+        left = {k: v for k, v in sp2.headers.items() if "{" in str(v)}
+        eq(f"{sec} 回落配头无未求值占位符", left, {})
+
+    # 上面那一轮走的是**标准档**那一支（verdict 里没有 id: 记录）。而含
+    # `{uuid1}` 的档只有 cc-full 与三个 body 档（tier 3-5），所以必须另造一个
+    # 「探测实际打到过 cc-full」的 verdict，才走到 `max(hit, key=tier)` 那一支
+    # —— 撤销实验证实：不构造它的话，把 _render(...) 改回 dict(...) 测试仍全绿。
+    UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    for sec, rung in (("claude-api-key", "cc-full"),
+                      ("claude-api-key", "cc-body-json"),
+                      ("openai-compatibility", "cc-full")):
+        vv = SectionVerdict(section=sec, usable=False,
+                            base_url=row.base_for(sec),
+                            category="WAF", action="站方拒绝")
+        vv.attempts = [Attempt(section=sec, model="m", combo=f"id:{rung}",
+                               status="403", category="WAF", action="",
+                               elapsed_ms=1)]
+        hdrs = _plan._fallback_headers(sec, vv, None, "sk-real-key")
+        raw = {k: v for k, v in hdrs.items() if "{" in str(v)}
+        eq(f"{sec}/{rung} 回落配头无未求值占位符", raw, {})
+        sid = hdrs.get("x-claude-code-session-id", "")
+        eq(f"{sec}/{rung} 的 session-id 是真 UUID",
+           bool(_re.fullmatch(UUID_RE, sid)), True)
+        # key_hash 也是模板变量（device_id 要求 ^[a-f0-9]{64}$）
+        for k, v in hdrs.items():
+            if "device" in k.lower() or "hash" in k.lower():
+                eq(f"{sec}/{rung} 的 {k} 已求值",
+                   bool(_re.fullmatch(r"[0-9a-f]{64}", str(v))), True)
+
+    # 同一把 Key 两次求值应当给出**不同**的 session UUID（真实客户端行为）
+    v1 = SectionVerdict(section="claude-api-key", usable=False)
+    v1.attempts = [Attempt(section="claude-api-key", model="m",
+                           combo="id:cc-full", status="403", category="WAF",
+                           action="", elapsed_ms=1)]
+    a = _plan._fallback_headers("claude-api-key", v1, None, "sk-x")
+    b = _plan._fallback_headers("claude-api-key", v1, None, "sk-x")
+    eq("两次求值的 session-id 不同（每请求一个新会话）",
+       a.get("x-claude-code-session-id") != b.get("x-claude-code-session-id"),
+       True)
 
 
 class Harness:

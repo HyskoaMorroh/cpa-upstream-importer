@@ -126,7 +126,9 @@ claude-api-key:
     # ② 造 ParsedRow：既有站 + 一个新站
     lines = [f"{e[1]},{e[2]}" for e in existing]
     lines.append(f"{base}/good,sk-NEW_SITE")
-    parsed = cp.parse_lines("\n".join(lines))
+    # 假上游在 127.0.0.1 —— 生产入口默认拒私网目标（parse.is_private_target），
+    # 端到端脚本要显式放行
+    parsed = cp.parse_lines("\n".join(lines), allow_private=True)
     assert len(parsed.valid) == 3, f"应解析 3 行，实际 {len(parsed.valid)}"
     print(f"② 解析: {len(parsed.valid)} 行有效, "
           f"{len({r.host for r in parsed.valid})} 个不同主机")

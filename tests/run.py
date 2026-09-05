@@ -72,7 +72,20 @@ def main() -> None:
                 print(line)
         if r.returncode:
             failed.append(suite)
+            # 失败时把子套件的原始输出尾部整段打出来（2026-09-05 加）。
+            #
+            # 为什么需要：上面那个回显过滤器按关键词挑行，而它挑不全 ——
+            # 实测遇到一次 `失败套件：test_server.py` 而单跑那个套件全绿，
+            # 复现时手上没有任何失败项信息（`✗` 行没落进过滤器），
+            # 五轮追查全部无法定位。偶发失败最需要的恰恰是第一次的现场。
+            #
+            # 只在失败时打，且只打尾部 —— 通过时那些输出会刷屏。
+            tail = "\n".join((out or "").splitlines()[-40:])
+            if tail.strip():
+                print(f"\n--- {suite} 输出尾部（失败现场）---")
+                print(tail)
             if r.stderr:
+                print(f"--- {suite} stderr ---")
                 print(r.stderr[-1500:])
         else:
             for line in out.split("\n"):
