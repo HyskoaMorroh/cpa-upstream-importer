@@ -901,11 +901,13 @@ def test_profile_verdict_reuse_saves_calls():
         do_GET = _count_and_deny
         do_POST = _count_and_deny
 
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    srv = ThreadingHTTPServer(("127.0.0.1", port), AllGate)
+    # 端口交给 ThreadingHTTPServer 自己 bind（2026-09-05 修竞态）。
+    # 原来的写法是「socket bind 0 号拿到端口 → close → 再让 server bind 同一个」，
+    # 那两步之间有窗口 —— 全套跑 11 个套件、4 个起真 HTTP 服务，同一台机器短时间
+    # 反复分配端口，窗口里被抢到就 OSError（Windows 上是 WinError 10048）。
+    # 实测吻合：只在 run.py 全链跑时出现、两次分别落在起服务的两个套件、不可复现。
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), AllGate)
+    port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
     try:
