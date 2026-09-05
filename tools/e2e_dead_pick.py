@@ -85,7 +85,7 @@ gemini-api-key: []
     raw = io.open(cfg_path, encoding="utf-8").read()
     cfg = yaml.safe_load(raw)
 
-    row = cp.parse_lines(f"{base},sk-ant-gatekeeper").valid[0]
+    row = cp.parse_lines(f"{base},sk-ant-gatekeeper", allow_private=True).valid[0]
     prober = Prober(gap=0.0, probe_context=False, swap_samples=0, workers=4)
     res = prober.probe(row)
 

@@ -56,6 +56,15 @@ def eq(name: str, got, want) -> None:
         print(f"  ok  {name}")
 
 
+def truthy(name: str, got, hint: str = "") -> None:
+    global _pass
+    if got:
+        _pass += 1
+        print(f"  ok  {name}")
+    else:
+        _fail.append(f"{name}\n      实得 {got!r} {hint}")
+
+
 def section(title: str) -> None:
     print(f"\n── {title} " + "─" * max(0, 58 - len(title)))
 
@@ -300,6 +309,111 @@ def free_port() -> int:
 # ==========================================================================
 
 
+
+def test_dead_section_shape_is_cached():
+    """站+段级不通的结论要缓存 —— 否则同主机多 Key 变成 N 次**串行**全量探测。
+
+    2026-09-05 修的 P1。`_shape` 只在 `v.usable` 为真时写入，于是段不通时
+    形态不入缓存 —— 门闩清空、gate 置位、等待的线程醒来，其中一个重新认领
+    又跑一遍完整 `_full_probe`（目录 + 基线 + 整梯画像 + 临时重试）。
+
+    因为门闩存在，这 N 次是**严格串行**的 —— 比没有门闩（至少能并行）更慢。
+    而这是多数情形而非边角：79 凭据实跑里 45 个是 0 段可用。
+
+    实测（5 个 Key 挂同一主机、四段全回 403 门禁）：81 次请求 → 33 次。
+
+    **类别划分是这条修复的关键**：
+      · 站+段级（门禁/WAF/IP封/边缘/死路/时段/客户端/反测活/限频）—— 缓存。
+        这些拒绝取决于请求形态、来源 IP、分组配置或时间，与用哪把 Key 无关
+      · 凭证级（鉴权/余额）—— **不缓存**。那是这把 Key 自己的属性，缓存它
+        会让同站其他 Key 继承别人的欠费结论
+      · 该重试的（临时/未知）—— 不缓存。缓存等于放弃重试
+    """
+    import json as _json
+    import socket as _socket
+    import threading as _threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from cpa_probe.pipeline import Prober as _Prober
+
+    hits = []
+    mode = {"body": ""}
+
+    class _Fake(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _all(self):
+            hits.append(self.path)
+            b = mode["body"].encode()
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        do_GET = do_POST = _all
+
+    sk = _socket.socket()
+    sk.bind(("127.0.0.1", 0))
+    port = sk.getsockname()[1]
+    sk.close()
+    srv = ThreadingHTTPServer(("127.0.0.1", port), _Fake)
+    _threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{port}"
+
+    try:
+        N = 5
+        rows = cp.parse_lines(
+            "\n".join(f"{base},sk-key-{i:04d}" for i in range(N)),
+            allow_private=True).valid
+        eq("5 个 Key 同一主机", len({r.host for r in rows}), 1)
+
+        # ── ① 站+段级失败（门禁）：第 2..N 个 Key 零请求 ──
+        mode["body"] = _json.dumps(
+            {"error": {"message": "This group is restricted to Claude Code"}})
+        hits.clear()
+        pr = _Prober(gap=0.0, timeout=5, probe_context=False, swap_samples=0,
+                     probe_capabilities=False, workers=4)
+        results = [pr.probe(r) for r in rows]
+        gated = len(hits)
+
+        first_key_calls = results[0].total_calls
+        rest = sum(r.total_calls for r in results[1:])
+        eq("第 1 个 Key 正常探测", bool(first_key_calls > 0), True)
+        eq("后 4 个 Key 零请求", rest, 0)
+        truthy("总请求数不随 Key 数线性增长",
+               gated < first_key_calls * 2,
+               f"实测 {gated} 次，首个 Key 自己就 {first_key_calls} 次 —— "
+               f"负缓存没生效")
+        # 结论要传下去，且说清是复用的
+        for r in results[1:]:
+            for sec, v in r.sections.items():
+                eq(f"{sec} 复用后仍判不可用", v.usable, False)
+                eq(f"{sec} 复用后类别一致", v.category, "门禁")
+                truthy(f"{sec} 说清是复用的", "复用" in (v.action or ""),
+                       f"实得 {v.action!r} —— 看起来像这把 Key 也实测过")
+
+        # ── ② 凭证级失败（余额）：**每把 Key 都要各自探** ──
+        mode["body"] = _json.dumps(
+            {"error": {"message": "insufficient balance, 剩余 $0.00"}})
+        hits.clear()
+        pr2 = _Prober(gap=0.0, timeout=5, probe_context=False, swap_samples=0,
+                      probe_capabilities=False, workers=4)
+        res2 = [pr2.probe(r) for r in rows]
+        per_key = [r.total_calls for r in res2]
+        eq("余额类每把 Key 都判不可用",
+           all(not v.usable for r in res2 for v in r.sections.values()), True)
+        truthy("余额类不被缓存（每把 Key 各自探）",
+               all(c > 0 for c in per_key),
+               f"各 Key 请求数 {per_key} —— 有 0 说明欠费结论被错误地"
+               f"传给了别的 Key")
+    finally:
+        srv.shutdown()
+
+    print(f"[OK] Dead shape: 站+段级失败缓存（5 Key {gated} 次请求，"
+          f"后 4 把零请求）、凭证级不缓存、复用结论说清来源")
+
 def main() -> int:
     port = free_port()
     srv = ThreadingHTTPServer(("127.0.0.1", port), FakeUpstream)
@@ -320,7 +434,7 @@ def main() -> int:
 
     def probe(profile: str, **kw):
         seen_events.clear()
-        row = cp.parse_lines(f"{base}/{profile},sk-fake000111222333").valid[0]
+        row = cp.parse_lines(f"{base}/{profile},sk-fake000111222333", allow_private=True).valid[0]
         p = ProxyMarkingProber(
             gap=0.0, timeout=10, probe_context=False, swap_samples=0,
             proxy=fake_proxy,
@@ -424,7 +538,7 @@ def main() -> int:
 
         # ------------------------------------------------------------------
         section("swapper：静默换模")
-        row = cp.parse_lines(f"{base}/swapper,sk-fake000111222333").valid[0]
+        row = cp.parse_lines(f"{base}/swapper,sk-fake000111222333", allow_private=True).valid[0]
         p = ProxyMarkingProber(gap=0.0, timeout=10, probe_context=False,
                                swap_samples=3)
         r = p.probe(row)
@@ -436,7 +550,7 @@ def main() -> int:
 
         # ------------------------------------------------------------------
         section("truncator：上下文上限按截断反推")
-        row = cp.parse_lines(f"{base}/truncator,sk-fake000111222333").valid[0]
+        row = cp.parse_lines(f"{base}/truncator,sk-fake000111222333", allow_private=True).valid[0]
         p = ProxyMarkingProber(gap=0.0, timeout=15, probe_context=True,
                               swap_samples=0)
         r = p.probe(row)
@@ -459,7 +573,7 @@ def main() -> int:
         # ------------------------------------------------------------------
         section("事件流：前端进度条依赖它")
         events: list[tuple[str, dict]] = []
-        row = cp.parse_lines(f"{base}/good,sk-fake000111222333").valid[0]
+        row = cp.parse_lines(f"{base}/good,sk-fake000111222333", allow_private=True).valid[0]
         p = ProxyMarkingProber(gap=0.0, timeout=10, probe_context=False,
                               swap_samples=0,
                               on_event=lambda k, d: events.append((k, d)))
@@ -522,7 +636,7 @@ def main() -> int:
         # 实测日志：mihomo:7890 不通，5 个 key 累计十几分钟纯白等，结果全是
         # 无用的 `000 未知`。预检 4 秒判死一次，之后全程跳过。
         pre_events: list[tuple[str, dict]] = []
-        row_cf = cp.parse_lines(f"{base}/cfguard,sk-fake000111222333").valid[0]
+        row_cf = cp.parse_lines(f"{base}/cfguard,sk-fake000111222333", allow_private=True).valid[0]
         p_dead = ProxyMarkingProber(
             gap=0.0, timeout=10, probe_context=False, swap_samples=0,
             # 保留端口 9 （discard）几乎必然连不上，用它模拟死代理
@@ -556,7 +670,8 @@ def main() -> int:
         rows = cp.parse_lines(
             f"{base}/good,sk-key-one-000111\n"
             f"{base}/good,sk-key-two-000222\n"
-            f"{base}/good,sk-key-three-0333\n"
+            f"{base}/good,sk-key-three-0333\n",
+            allow_private=True
         ).valid
         eq("三个 Key 同一主机", len({r.host for r in rows}), 1)
 
@@ -659,6 +774,10 @@ def main() -> int:
 
     finally:
         srv.shutdown()
+
+    # 这一项自己起假上游（要控制返回体），所以放在主 srv 关掉之后
+    section("站+段级失败的负缓存")
+    test_dead_section_shape_is_cached()
 
     print("\n" + "=" * 66)
     if _fail:

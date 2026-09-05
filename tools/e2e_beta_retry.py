@@ -76,7 +76,7 @@ def main():
     events = []
     prober = Prober(gap=0.0, probe_context=False, swap_samples=0, workers=2,
                     on_event=lambda k, d: events.append((k, d)))
-    row = cp.parse_lines(f"{base},sk-ant-alfa-shape").valid[0]
+    row = cp.parse_lines(f"{base},sk-ant-alfa-shape", allow_private=True).valid[0]
     res = prober.probe(row)
 
     v = res.sections.get("claude-api-key")
@@ -105,7 +105,9 @@ def main():
     assert NEED in v.min_headers[slot], "落地 headers 里没有补上的 beta"
     assert v.profile_name.endswith("+beta"), f"画像名没标注: {v.profile_name}"
     # 基底不能是 browser-ua —— 那是替换型画像，会把 CC 门票整个丢掉。
-    # CPAMP 里能用的形态是「CC 门票 + 1m」，第一版取错档只落地 2 个 header。
+    # 实测能用的形态是「CC 门票 + 1m」，第一版取错档只落地 2 个 header。
+    # （依据是 2026-09-01 那轮 alfa 实测，不是 CPAMP —— 它的测试按钮
+    #  连 CC 门票都不带，见 pipeline._retry_with_betas 的说明。）
     assert "browser" not in v.profile_name, \
         f"基底取了 alt 画像，CC 门票丢了: {v.profile_name}"
     betalist = v.min_headers[slot].split(",")

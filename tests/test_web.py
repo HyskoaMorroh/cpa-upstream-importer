@@ -70,6 +70,121 @@ def truthy(label: str, got, hint: str = "") -> None:
         print(f"  FAIL {label}")
 
 
+
+def check_nginx_security_headers() -> None:
+    """部署模板的安全头必须齐，且 CSP 要与前端的实际用法对账。
+
+    2026-09-05 加。CSP 是纵深防御而不是修某个已知漏洞 —— 当前前端没有可利用的
+    注入点（274 处 `esc()`、36 处 `innerHTML` 全部核对过）。但这个页面渲染的是
+    **完全由第三方上游控制**的内容（站方返回的正文摘要、模型名、错误消息），
+    而全量重探模式下 DOM 里还有整份配置的预览。一旦某处转义漏掉，损失是全量
+    凭据；加这一层把它降级成「脚本被拦」。
+
+    **为什么要与前端用法对账**：CSP 配太严会让页面白屏，而且只在浏览器控制台
+    警告 —— 服务端一切正常、测试全绿、用户看到一片空白。所以这一项两个方向都查：
+
+      · 头齐不齐（少了就没有防护）
+      · 前端有没有 CSP 拦得住的用法（有就是要么放宽 CSP、要么改前端）
+    """
+    import io as _io
+    import re as _re
+
+    conf = _io.open(os.path.join(ROOT, "deploy", "nginx-snippet.conf"),
+                    encoding="utf-8").read()
+    # 剥行尾注释（注释里也提到这些头名，不剥的话断言是空的）
+    def _strip(ln):
+        out, q = [], None
+        for ch in ln:
+            if q:
+                out.append(ch)
+                if ch == q:
+                    q = None
+                continue
+            if ch in "\"'":
+                q = ch
+                out.append(ch)
+                continue
+            if ch == "#":
+                break
+            out.append(ch)
+        return "".join(out)
+
+    code = "\n".join(_strip(ln) for ln in conf.splitlines())
+
+    for hdr in ("Content-Security-Policy", "X-Content-Type-Options",
+                "X-Frame-Options", "Referrer-Policy", "Cache-Control"):
+        truthy(f"部署模板设了 {hdr}", f"add_header {hdr}" in code,
+               "少这个头就少一层防护")
+
+    # token 可能走 query string —— 日志格式不能记 $request / $request_uri
+    truthy("默认关掉 access_log", "access_log off;" in code)
+    live = [ln for ln in code.splitlines()
+            if "access_log" in ln and "off;" not in ln]
+    for ln in live:
+        truthy("启用的 access_log 不记 $request",
+               "$request;" not in ln and "combined" not in ln,
+               f"实得 {ln.strip()!r} —— $request 含完整 query，token 会落盘")
+
+    # CSP 必须在**一行**里：nginx 不支持反斜杠续行，续行会把真实换行塞进头值。
+    #
+    # `\s+` 会跨行匹配，所以按整行查（2026-09-05 撤销实验发现：
+    # 改回多行续行时上面那个正则照样匹配，测试仍绿）。
+    csp_lines = [ln for ln in code.splitlines()
+                 if "add_header Content-Security-Policy" in ln]
+    eq("CSP 指令恰好一条", len(csp_lines), 1)
+    truthy("CSP 的指令名与值在同一行",
+           bool(csp_lines) and csp_lines[0].count('"') == 2
+           and csp_lines[0].rstrip().endswith(";"),
+           f"实得 {csp_lines[0].strip()[:70]!r} —— nginx 不支持反斜杠续行，"
+           f"换行会把真实换行塞进 HTTP 头值")
+    m = _re.search(r'add_header\s+Content-Security-Policy\s+"([^"]*)"',
+                   csp_lines[0] if csp_lines else "")
+    truthy("CSP 的值引号成对", m is not None)
+    if not m:
+        return
+    csp = m.group(1)
+    names = [d.strip().split()[0] for d in csp.split(";") if d.strip()]
+    for want in ("default-src", "script-src", "connect-src", "object-src",
+                 "base-uri", "frame-ancestors"):
+        truthy(f"CSP 有 {want}", want in names)
+    truthy("script-src 不含 unsafe-inline / unsafe-eval",
+           "unsafe" not in csp.split("script-src")[1].split(";")[0],
+           "那等于关掉了 CSP 对脚本注入的防护")
+    truthy("object-src 是 none", "object-src 'none'" in csp)
+    truthy("frame-ancestors 是 none", "frame-ancestors 'none'" in csp)
+
+    # ── 与前端实际用法对账 ──
+    js = _io.open(os.path.join(ROOT, "web", "app.js"), encoding="utf-8").read()
+    html = _io.open(os.path.join(ROOT, "web", "index.html"),
+                    encoding="utf-8").read()
+
+    truthy("前端无内联 <script>（否则 script-src 'self' 会拦）",
+           not _re.search(r"<script(?![^>]*\bsrc=)[^>]*>", html),
+           "加了内联脚本就必须同步放宽 CSP，否则页面白屏")
+    truthy("前端无内联事件处理器（onclick= 等）",
+           not _re.search(r"\son[a-z]+\s*=\s*[\"']", html))
+    truthy("前端不用 eval / new Function",
+           "eval(" not in js and "new Function" not in js)
+    truthy("前端无外部 CDN 引用",
+           not _re.search(r'(src|href)="https?://', html),
+           "引了 CDN 就要把那个域加进 CSP")
+    truthy("前端不打跨域 fetch（connect-src 'self'）",
+           not _re.search(r"fetch\(\s*[\"'`]https?://", js))
+    truthy("前端不用 WebSocket（否则要 connect-src ws:）",
+           "new WebSocket" not in js)
+    # 有内联样式 → CSP 的 style-src 必须含 unsafe-inline
+    if "<style" in html or 'style="' in html:
+        truthy("有内联样式，CSP 的 style-src 放行了它",
+               "'unsafe-inline'" in csp.split("style-src")[1].split(";")[0]
+               if "style-src" in csp else False,
+               "内联样式被 CSP 拦掉 = 页面没有样式")
+    # 无 data: 图片时不必放行 data:，但放了也无害 —— 只在有的时候要求它
+    if "data:image" in html or "data:image" in js:
+        truthy("有 data: 图片，CSP 的 img-src 放行了它", "data:" in csp)
+
+    print(f"[OK] Nginx headers: 5 个安全头齐、CSP {len(names)} 条指令单行、"
+          "script-src 无 unsafe、与前端 8 项用法对账一致")
+
 def main() -> int:
     web = os.path.join(ROOT, "web")
     js = io.open(os.path.join(web, "app.js"), encoding="utf-8").read()
@@ -137,6 +252,9 @@ def main() -> int:
         # gpt 族：正牌、老款、推理系列、图像、开源小模型
         "gpt-5.6-sol", "gpt-5.6", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-4o",
         "o3-mini", "gpt-image-2", "gpt-oss-120b", "gpt-oss-20b",
+        # o 系列全谱 + 以 o 开头但 o 不是版本记号的对照（2026-09-04）
+        "o1", "o1-pro", "o3", "o3-pro", "o4-mini", "o4-mini-high",
+        "omni-3", "oss-20b",
         # claude 族
         "claude-opus-5", "claude-fable-5", "claude-sonnet-5", "claude-opus-4-8",
         "anthropic/claude-opus-5",
@@ -176,7 +294,15 @@ def main() -> int:
             # 日期戳不该让同世代的一款「更新」而挤掉另一款
             "stamp": ["claude-haiku-4-5", "claude-haiku-4-5-20251001"],
             # 整组都认不出版本 —— 全留
-            "nover": ["o1", "o3-mini"],
+            "nover": ["gpt-oss:120b", "gpt-oss:20b"],
+            # o 系列：世代数字紧贴开头的 o，两侧都要读得出来
+            # （2026-09-04 现场：codex 段同时勾着 o1 与 o3）
+            "oseries": ["o1", "o1-pro", "o3", "o3-mini", "o3-pro",
+                        "o4-mini", "o4-mini-high"],
+            # o 与 gpt 是互不相干的编号体系，各自成线
+            "omix": ["o1", "o3", "gpt-5.6"],
+            # 以 o 开头但 o 不是版本记号 —— 不该被当成推理系列
+            "onot": ["omni-3", "oss-20b", "openai/gpt-5.6"],
             # 规格后缀不该自成产品线（32k / nano / codex）
             "specs": ["gpt-4-32k", "gpt-5.4-nano", "gpt-5.6",
                       "gpt-5.3-codex", "gpt-5-codex"],
@@ -275,8 +401,25 @@ console.log(JSON.stringify(out));
     truthy("后端回 market_top_gen", '"market_top_gen"' in srv,
            "前端在勾选前就渲染结果表，那时还没有 /api/plan 的响应")
     truthy("前端 pickDefaults 用它判落后", "market_top_gen" in js)
-    truthy("落后时返回空（一个都不勾）",
-           "if (top && genGreater(mkt, top)) return [];" in js)
+    # 判落后必须**逐产品线**比（2026-09-04）：o 系列与 gpt 系列编号互不相干，
+    # 按全局最高世代比会把「目录里只有 o 系列」的站误判成落后、一个都不预勾。
+    truthy("后端回逐产品线的那一份",
+           '"market_top_gen_lines"' in srv,
+           "只给全局最高世代时无法区分 o 系列与 gpt 系列")
+    truthy("前端也按线比", "market_top_gen_lines" in js)
+    truthy("全部可比线都落后才返回空",
+           "behind.length === shared.length" in js
+           and "return { keep: []" in js)
+    truthy("没有可比线时不判落后", "if (shared.length)" in js,
+           "目录里只有 o 系列而市面清单里没有 o 系列时无从比较，不该惩罚它")
+    # 判落后的那句提示要说清**哪条线**落后到几 —— 逐线比之后「本段最新」不再是
+    # 一个全局数字（o 线 4.0 与 gpt 线 5.6 并存），拿全局值填那句话会显示一个
+    # 与判据无关的数（2026-09-04 自查）。
+    truthy("提示里带出落后的产品线与两侧世代",
+           "stale.line" in js and "stale.cat" in js and "stale.mkt" in js)
+    truthy("不再用全局 market_top_gen 填那句提示",
+           "market_top_gen[sec] || []).join" not in js,
+           "逐线比之后全局值与判据无关，显示它等于给一个对不上的数字")
     truthy("界面说清为什么不勾", "整份目录都落后于市面最新" in js)
     truthy("后端回 catalog_stale", '"catalog_stale"' in srv)
     truthy("限频学习有事件", "rate-limit-learned" in js,
@@ -610,8 +753,19 @@ console.log(JSON.stringify(out));
     for f in ("prefix", "weight"):
         truthy(f"plan_json 带 {f}", f'"{f}": sp.{f}' in srv,
                "它会落进 config.yaml")
+    # 断言的是「本工具自己的界面要说清 weight:0 的后果」，不涉及 CPAMP。
+    #
+    # 2026-09-04 订正措辞：以前这条的理由写「写回后 CPAMP 显示未启用」——
+    # 那是编的。核实 CPAMP 源码：与 weight 有关的只有凭据编辑表单的提示文字
+    # （`accounts.config_weight_hint`），没有任何列表按 weight 渲染启用状态；
+    # 它那个「已停用」徽标（`ai_providers.config_disabled_badge`）读的是
+    # `row.enabled`，来源是「excluded-models 含 `*`」或「compat 的 disabled:true」
+    # （rowData.ts:114 / :152），与 weight 无关。
+    #
+    # 真正的理由是 CPA 自己的调度：weighted-round-robin 下 positiveWeightAuths
+    # 把零权重凭据整个剔除（selector.go），而那件事在界面上必须提前说清。
     truthy("weight:0 在结果表里有警示", "逐出调度池" in js,
-           "写回后 CPAMP 显示未启用，界面必须提前说清")
+           "加权轮询下 CPA 会把它剔出候选，界面必须提前说清")
 
     section("⑧ 收尾时的缺口必须说清")
     # 现场报障：`71/79 (90%)` 就切到第三步，看着像「没跑完就往下走」。
@@ -626,6 +780,9 @@ console.log(JSON.stringify(out));
     # 用户只看到同一个模型出现两次，不知道为什么。
     truthy("前端认 transient-retry", "transient-retry" in js)
     truthy("前端认 model-rejected", "model-rejected" in js)
+
+    section("⑨ 部署模板的安全头与 CSP")
+    check_nginx_security_headers()
 
     print("\n" + "=" * 62)
     if _fail:

@@ -757,20 +757,106 @@ def test_probe_text_not_trivial():
             "database", "index", "cache", "sort", "queue", "thread"]
     assert any(t in text for t in tech), f"PROBE_TEXT 缺技术内容：{text!r}"
 
-    # pipeline 里那条反测活重试用的备用文本也要过同一道
+    # ── 扫描范围：全仓，不只 request.py（2026-09-05 扩大） ──
+    #
+    # 原来只扫 `pipeline.py` 一个文件。而 `legacy/` 里有 5 处 `"hi"`
+    # （audit-upstreams.py 3 处、swap-watch.py 2 处）从未被这道闸看见 ——
+    # 那正是站方反测活规则最先拦的形态，而 README 写着那些脚本
+    # 「原样保留可继续单独使用」。
+    #
+    # 按角色分三档，因为「短文本」在不同位置的含义完全不同：
+    #   · 主流程（cpa_probe/ + server.py + cli.py）—— 严格，直接失败
+    #   · legacy/ —— 是有意保留的旧脚本，不强制改；但**必须在 README 里
+    #     标注过封号风险**，否则这一项失败（不能默默留着一个危险入口）
+    #   · tests/ 与 tools/ —— 跳过：那里的短文本是**假上游返回的响应**，
+    #     不是本工具发出去的请求，把它们判成违规是误报
     import io as _io
-    src = _io.open(os.path.join(ROOT, "cpa_probe", "pipeline.py"),
-                   encoding="utf-8").read()
     import re as _re
-    for m in _re.finditer(r'text="([^"]{1,120})"', src):
-        t = m.group(1)
-        if set(t) == {"x"}:          # 上下文二分的填充，不是给站方读的
-            continue
-        low = t.lower()
-        assert len(t) >= 20, f"pipeline 里的探测文本太短：{t!r}"
-        assert any(x in low for x in tech), f"pipeline 里的文本缺技术内容：{t!r}"
 
-    print(f"[OK] Probe text: {len(text)} 字符、含技术内容、非问候")
+    PAT = _re.compile(r'"(?:text|content|prompt)":\s*"([^"]{1,120})"')
+
+    def _texts(path):
+        s = _io.open(path, encoding="utf-8", errors="replace").read()
+        for m in _re.finditer(r'text="([^"]{1,120})"', s):
+            yield m.group(1)
+        for m in PAT.finditer(s):
+            yield m.group(1)
+
+    def _suspect(t):
+        """像测活吗。返回原因，不像则空串。"""
+        if set(t) <= {"x"}:      # 上下文二分的填充，不是给站方读的
+            return ""
+        if len(t) < 20:
+            return f"太短（{len(t)} 字符）"
+        if not any(x in t.lower() for x in tech):
+            return "缺技术内容"
+        return ""
+
+    # 主流程：严格
+    strict_files = []
+    probe_dir = os.path.join(ROOT, "cpa_probe")
+    for fn in sorted(os.listdir(probe_dir)):
+        if fn.endswith(".py"):
+            strict_files.append(os.path.join(probe_dir, fn))
+    for fn in ("server.py", "cli.py"):
+        strict_files.append(os.path.join(ROOT, fn))
+
+    bad = []
+    for path in strict_files:
+        for t in _texts(path):
+            why = _suspect(t)
+            if why:
+                bad.append(f"{os.path.basename(path)}: {t!r} —— {why}")
+    assert not bad, (
+        "主流程里有像测活的探测文本（站方按这个封号）：\n  "
+        + "\n  ".join(bad))
+
+    # legacy：不强制改，但危险入口必须在 README 里标注过
+    legacy_dir = os.path.join(ROOT, "legacy")
+    legacy_bad = []
+    if os.path.isdir(legacy_dir):
+        for fn in sorted(os.listdir(legacy_dir)):
+            if not fn.endswith(".py"):
+                continue
+            for t in _texts(os.path.join(legacy_dir, fn)):
+                if _suspect(t):
+                    legacy_bad.append(fn)
+                    break
+    if legacy_bad:
+        readme = _io.open(os.path.join(ROOT, "README.md"),
+                          encoding="utf-8").read()
+        # 必须在**讲 legacy 的那一节内部**标注，而不是「README 全文某处提过
+        # 反测活」—— 后者太松：那个词在讲主流程探测文本时也出现，于是删掉
+        # legacy 的风险说明测试照样绿（2026-09-05 撤销实验证实）。
+        lines = readme.splitlines()
+        sec_start = next((i for i, ln in enumerate(lines)
+                          if ln.startswith("#") and "legacy" in ln), -1)
+        assert sec_start >= 0, (
+            f"legacy/ 里有像测活的探测文本（{sorted(set(legacy_bad))}），"
+            f"而 README 里没有一节专门讲 legacy —— 用户会按「原样保留可继续"
+            f"单独使用」去跑它们")
+        depth = len(lines[sec_start]) - len(lines[sec_start].lstrip("#"))
+        sec_end = len(lines)
+        for i in range(sec_start + 1, len(lines)):
+            ln = lines[i]
+            if ln.startswith("#"):
+                d = len(ln) - len(ln.lstrip("#"))
+                if d <= depth:
+                    sec_end = i
+                    break
+        section_text = "\n".join(lines[sec_start:sec_end])
+        assert "封号" in section_text or "反测活" in section_text, (
+            f"README 讲 legacy 的那一节（第 {sec_start + 1} 行起）没提封号 / "
+            f"反测活风险，而那些脚本里有 {sorted(set(legacy_bad))} 这样的测活文本")
+        missing_names = [fn for fn in sorted(set(legacy_bad))
+                         if fn not in section_text]
+        assert not missing_names, (
+            f"这些 legacy 脚本有测活文本，但 README 那一节没点名：{missing_names}"
+            f" —— 不点名等于没警告，用户不知道该避开哪个")
+
+    print(f"[OK] Probe text: {len(text)} 字符、含技术内容、非问候；"
+          f"全仓主流程 {len(strict_files)} 个文件零违规；"
+          f"legacy {len(sorted(set(legacy_bad)))} 个脚本的旧文本已在 README 标注风险")
 
 
 def test_profile_verdict_reuse_saves_calls():
@@ -823,7 +909,7 @@ def test_profile_verdict_reuse_saves_calls():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
 
     try:
-        row = parse_lines(f"http://127.0.0.1:{port},sk-test").valid[0]
+        row = parse_lines(f"http://127.0.0.1:{port},sk-test", allow_private=True).valid[0]
 
         calls["n"] = 0
         Prober(gap=0.0, probe_context=False, swap_samples=0, workers=4,
@@ -1202,8 +1288,34 @@ quota-exceeded:
 
     ok, msg = validate(new)
     assert ok, msg
-    print(f"[OK] Rebuild preserves: 全局键与无方案段全部保留、无重复顶层键"
-          f"（{len(warns)} 条警告）")
+
+    # ⑤ 段头自带空字面量（`claude-api-key: []` / `{}`）—— 那种段头后面直接挂
+    # `- api-key:` 是非法 YAML。增量路径早就用 `_empty_literal_rewrite` 处理
+    # 这件事，全量重建这一支曾经漏了（2026-09-04 自查）：同一份输入走两条路，
+    # 一条合法一条不合法。落盘被 validate 挡住，所以症状是「全量重探对这类
+    # 文件整个不可用」——本项目自己的 tools/e2e_dead_pick.py 造场景就用 `[]`。
+    for lit in ("[]", "{}", "{ }", "[]  # 本段暂时清空"):
+        src = f'host: "127.0.0.1"\n\nclaude-api-key: {lit}\n'
+        cfg_e = yaml.safe_load(src)
+        pe = ImportPlan(host="n.example", masked_key="k", line_no=1)
+        pe.sections["claude-api-key"] = SectionPlan(
+            section="claude-api-key", base_url="https://n.example",
+            api_key="sk-n", models=["claude-opus-5"], priority=100,
+            model_source="probed")
+        new_e, _w = rebuild_config_full(
+            cfg_e, {("https://n.example", "sk-n"): pe},
+            src.splitlines(keepends=True))
+        ok_e, msg_e = validate(new_e)
+        assert ok_e, f"段头 `{lit}` 时产出非法 YAML：{msg_e[:120]}"
+        ents = (yaml.safe_load(new_e) or {}).get("claude-api-key") or []
+        assert len(ents) == 1, f"段头 `{lit}` 时条目没写进去：{ents}"
+        # 空字面量被摘掉，行尾注释保留（那也是人写的）
+        assert f"claude-api-key: {lit.split('#')[0].strip()}" not in new_e
+        if "#" in lit:
+            assert "本段暂时清空" in new_e, "行尾注释丢了"
+
+    print(f"[OK] Rebuild preserves: 全局键与无方案段全部保留、无重复顶层键、"
+          f"空字面量段头摘成裸键（{len(warns)} 条警告）")
 
 
 def test_rebuild_keeps_unknown_fields():
@@ -1278,12 +1390,20 @@ codex-api-key:
     got_b = ca.get(carry_key("a.example.com", "sk-B"))
     assert got_b == [], f"sk-B 应当是空的 carry，实得 {got_b}"
 
-    # ③ codex 段的 websockets 在 headers 之后 —— 缩进状态机要能出得来
+    # ③ codex 段的 websockets **不再走 carry**（2026-09-04）：它由实测决定，
+    #    改成 render_entry 自己写、原值由 existing_toggles 搬。两条路同时生效
+    #    会写出两行同名键 —— PyYAML 取后一个，而 Go 的 yaml.v3 直接报
+    #    `mapping key already defined` 让 CPA 起不来。
     cc = carry["codex-api-key"]
     txt_c = "".join(cc.get(carry_key("a.example.com", "cdx-A")) or [])
-    assert "websockets" in txt_c, f"codex 没搬到 websockets：{txt_c!r}"
+    assert "websockets" not in txt_c, (
+        f"websockets 已移出 carry，不该再被原文搬运：{txt_c!r}")
 
     # ④ 整链：全量重建后字段计数必须与原文一致
+    #    websockets 走 existing_toggles 而不是 carry，所以方案里要照 server 的
+    #    全量重探那条路把它搬进来（不搬就是这份测试自己丢的，不是产品缺陷）。
+    from cpa_probe.batch import existing_toggles
+    tg = existing_toggles(cfg)
     plans = {}
     for sec, ak, bu, pri in (("claude-api-key", "sk-A", "https://a.example.com", 290),
                              ("claude-api-key", "sk-B", "https://a.example.com", 190),
@@ -1292,7 +1412,8 @@ codex-api-key:
         pl.sections[sec] = SectionPlan(
             section=sec, base_url=bu, api_key=ak,
             models=["claude-opus-5" if "claude" in sec else "gpt-5.6-sol"],
-            priority=pri)
+            priority=pri,
+            prior_toggles=dict(tg.get((sec, "a.example.com", ak)) or {}))
         plans[(bu, ak)] = pl
 
     new, warns = rebuild_config_full(cfg, plans, lines)
@@ -1324,7 +1445,8 @@ codex-api-key:
     assert "api-keys" in n2 and n2["api-keys"] == ["sk-client"]
 
     print("[OK] Unknown fields carried: request-scoped-errors / excluded-models"
-          " / websockets / fingerprint-profile 逐字保真，同站不同 Key 不染色")
+          " / fingerprint-profile 逐字保真，同站不同 Key 不染色；"
+          "websockets 已移出 carry 改由实测 + existing_toggles 决定")
 
 
 def test_rebuild_keeps_model_context_length():
@@ -1440,8 +1562,11 @@ claude-api-key:
 ''')
     ex = existing_model_extras(cfg2)
     k5 = ("claude-api-key", "a.example.com", "kA", "claude-opus-5")
-    assert ex[k5] == {"display-name": "Opus 5", "force-mapping": True,
-                     "thinking": {"levels": ["low", "high"]}}, ex[k5]
+    # alias 也在 extras 里（2026-09-04）：render_entry 写死 `alias: ""` 只对
+    # 「原本就是空串」的条目成立，非空 alias 是段级兼容名，必须搬回来。
+    assert ex[k5] == {"alias": "", "display-name": "Opus 5",
+                      "force-mapping": True,
+                      "thinking": {"levels": ["low", "high"]}}, ex[k5]
     sp4 = SectionPlan(section="claude-api-key", base_url="https://a.example.com",
                       api_key="kA",
                       models=["claude-opus-5", "claude-haiku-4-5"], priority=500,
@@ -1465,8 +1590,38 @@ claude-api-key:
     assert _yaml_field("  ", "x", object()) == []
     assert _yaml_field("  ", "x", [{"deep": [object()]}]) == []
 
+    # 非空 alias 必须搬回来，且**只写一行**（它在 extras 表里只为了被搬运，
+    # 渲染位置紧跟 name 与现有文件的键序一致；extras 循环要跳过它，
+    # 否则一个模型写出两行 alias）。
+    cfg6 = yaml.safe_load('''
+claude-api-key:
+  - api-key: "kB"
+    base-url: "https://b.example.com"
+    models:
+      - name: "claude-opus-5"
+        alias: "opus"
+      - name: "claude-sonnet-5"
+        alias: ""
+''')
+    ex6 = existing_model_extras(cfg6)
+    sp6 = SectionPlan(section="claude-api-key", base_url="https://b.example.com",
+                      api_key="kB",
+                      models=["claude-opus-5", "claude-sonnet-5"], priority=1,
+                      prior_model_extras={k[3]: v for k, v in ex6.items()})
+    t6 = "claude-api-key:\n" + "\n".join(
+        render_entry(sp6, "  ", "    ", "x")) + "\n"
+    assert _v(t6)[0], _v(t6)[1]
+    assert t6.count("alias:") == 2, f"每个模型只该写一行 alias：\n{t6}"
+    back6 = {m["name"]: m
+             for m in yaml.safe_load(t6)["claude-api-key"][0]["models"]}
+    assert back6["claude-opus-5"]["alias"] == "opus", back6
+    # 原本就是空串的照旧写空串 —— 不改成与 name 相同，否则生产配置里 459 行
+    # 原本是 `""` 的会全被改掉，diff 里多出 459 处无意义改动
+    assert back6["claude-sonnet-5"]["alias"] == "", back6
+
     print("[OK] Model context: 逐模型搬原值，实测优先，绝不把 A 的窗口外推给 B；"
-          "白名单外的模型字段也搬回，认不出的形状整个跳过")
+          "白名单外的模型字段也搬回，认不出的形状整个跳过；"
+          "非空 alias 搬回且只写一行")
 
 
 def test_rebuild_keeps_prefix_and_provider_name():
@@ -2742,6 +2897,1020 @@ claude-api-key:
           "手填丢弃项两种情形都有提示")
 
 
+
+def test_capability_toggles_probed_and_written():
+    """段专属能力开关必须**实测**出来，三态各自落到确定的写回行为。
+
+    2026-09-04 用户要求：「不光是 headers，包括 Websockets 是否需要开启等
+    都需要检测做出打开或者不打开的配置」。
+
+    为什么必须实测而不是照抄别的条目：这两个开关改变 CPA **发出去的形态**，
+    而站方支不支持是站方的属性。抄错的后果不对称 ——
+      · websockets 抄成 true 而站方不支持 → CPA 走 WS 通道且**不回落 HTTP**
+        （CodexAutoExecutor 只按下游形态与该开关分流，
+        codex_websockets_executor.go:71-77），那个凭据的 WS 请求全废
+      · 抄成 false 而站方支持 → 只是用不上 WS，无害
+    所以默认必须是「不开」，只有实测 101 才开。
+
+    三态与写回行为：
+      True  → 写 `<字段>: true`
+      False → **不写**（CPA 零值即关闭），且原值即使是 true 也不搬 —— 那正是
+              这次探测要修掉的错配置
+      None  → 也不写，但原值为 true 时照原值搬运（没有证据就不动）
+    """
+    import yaml
+    from cpa_probe import client
+    from cpa_probe.pipeline import Attempt, SectionVerdict
+    from cpa_probe.plan import SectionPlan
+    from cpa_probe.writeback import (_RENDERED_KEYS, render_entry, validate)
+    from cpa_probe.batch import existing_toggles
+
+    # ── (1) http→ws 与 CPA 的 buildCodexResponsesWebsocketURL 同构 ──
+    assert client.http_to_ws("https://x.example/v1/responses") == (
+        "wss://x.example/v1/responses")
+    assert client.http_to_ws("http://x.example/v1/responses") == (
+        "ws://x.example/v1/responses")
+    # 非 http/https 或缺主机名 → 空串，调用方据此跳过（对应 CPA 那边直接
+    # 报 unsupported responses websocket URL scheme）
+    assert client.http_to_ws("ftp://x/y") == ""
+    assert client.http_to_ws("") == ""
+
+    # ── (2) 握手判定：101 才算支持，其余都不算 ──
+    prober = Prober(gap=0.0, probe_context=False, swap_samples=0,
+                    probe_capabilities=True)
+    row = cp.parse_lines("https://ws.example,sk-ws").valid[0]
+    calls = []
+    state = {}
+
+    def fake_ws(url, *, headers=None, timeout=10):
+        calls.append({"url": url, "headers": dict(headers or {})})
+        return client.Response(state["status"], state["body"], 12,
+                               state.get("error", ""))
+
+    ws_orig = client.ws_handshake
+    client.ws_handshake = fake_ws            # type: ignore[assignment]
+    try:
+        for status, body, err, want, why in (
+            ("101", "", "", True, "101 = 支持"),
+            ("400", '{"error":"beta header required"}', "", False,
+             "400 = 不支持"),
+            ("403", "cf challenge", "", False, "403 = 不支持"),
+            ("000", "", "timeout", None, "连接层失败 = 未能判定，不是不支持"),
+            # 101 但 accept 算不对 —— 反代吞了 Upgrade 自己回 101 的形态
+            ("101", "", "Sec-WebSocket-Accept 不匹配", False, "假 101 = 不支持"),
+        ):
+            state.clear()
+            state.update({"status": status, "body": body, "error": err})
+            v = SectionVerdict(section="codex-api-key", usable=True,
+                               base_url="https://ws.example/v1",
+                               models=["gpt-5.6-sol"])
+            prober._probe_websockets(row, v)
+            assert v.websockets is want, (
+                f"{why}：期望 {want}，实得 {v.websockets}"
+                f"（note={v.websockets_note}）")
+            assert v.websockets_note, f"{why} 必须给出说明"
+        # 握手要打到 CPA 那条路径上，且带上它无条件发的 beta 头
+        assert calls[0]["url"] == "wss://ws.example/v1/responses", calls[0]
+        assert calls[0]["headers"].get("OpenAI-Beta") == (
+            "responses_websockets=2026-02-06"), calls[0]["headers"]
+        assert calls[0]["headers"].get("Authorization") == "Bearer sk-ws"
+
+        # ── (3) 需代理的段不探 —— 直连结果说明不了走代理时的行为 ──
+        n_before = len(calls)
+        v_proxy = SectionVerdict(section="codex-api-key", usable=True,
+                                 base_url="https://ws.example/v1",
+                                 models=["gpt-5.6-sol"], need_proxy=True)
+        prober._probe_websockets(row, v_proxy)
+        assert v_proxy.websockets is None, "需代理时该记未探测而不是不支持"
+        assert "代理" in v_proxy.websockets_note, v_proxy.websockets_note
+        assert len(calls) == n_before, "需代理时不该真发握手"
+    finally:
+        client.ws_handshake = ws_orig        # type: ignore[assignment]
+
+    # ── (4) 只在该段、且该段可用时才探 ──
+    for sec in ("gemini-api-key", "claude-api-key"):
+        v = SectionVerdict(section=sec, usable=True,
+                           base_url="https://ws.example", models=["m"])
+        prober._stage5_capabilities(row, v)
+        assert v.websockets is None and v.prompt_cache_key is None, (
+            f"{sec} 没有这类开关，不该被探")
+    v_dead = SectionVerdict(section="codex-api-key", usable=False,
+                            base_url="https://ws.example/v1")
+    prober._stage5_capabilities(row, v_dead)
+    assert v_dead.websockets is None, "段不通时无从验证，不该判成不支持"
+
+    off = Prober(gap=0.0, probe_context=False, swap_samples=0,
+                 probe_capabilities=False)
+    v_off = SectionVerdict(section="codex-api-key", usable=True,
+                           base_url="https://ws.example/v1", models=["m"])
+    off._stage5_capabilities(row, v_off)
+    assert v_off.websockets is None and not v_off.websockets_note
+
+    # ── (5) compat 的 prompt_cache_key：请求体带上那个字段再发一次 ──
+    pc = Prober(gap=0.0, probe_context=False, swap_samples=0,
+                probe_capabilities=True)
+    seen = []
+    pc_state = {}
+
+    def fake_call(section, base, key, model, **kw):
+        seen.append(kw)
+        return Attempt(section=section, model=model, combo=kw.get("combo", ""),
+                       status=pc_state["status"], category="", action="",
+                       elapsed_ms=3, excerpt=pc_state.get("excerpt", ""),
+                       error_envelope=pc_state.get("envelope", False))
+
+    pc._call = fake_call                     # type: ignore[assignment]
+    for status, envelope, want, why in (
+        ("200", False, True, "200 = 上游收下了"),
+        ("400", False, False, "400 = 上游拒收，开着会让每个请求都失败"),
+        ("200", True, False, "200 但正文是错误体 = 不算支持"),
+        ("000", False, None, "连接层失败 = 未能判定"),
+    ):
+        pc_state.clear()
+        pc_state.update({"status": status, "envelope": envelope,
+                         "excerpt": "unrecognized request argument"})
+        v = SectionVerdict(section="openai-compatibility", usable=True,
+                           base_url="https://ws.example/v1", models=["m"])
+        pc._probe_prompt_cache_key(row, v)
+        assert v.prompt_cache_key is want, (
+            f"{why}：期望 {want}，实得 {v.prompt_cache_key}")
+    assert seen[0]["body_patch"]["prompt_cache_key"], "补丁没带上那个字段"
+
+    # ── (6) 写回：三态各自的行为 ──
+    def render(sec, **kw):
+        sp = SectionPlan(section=sec, base_url="https://w.example/v1",
+                         api_key="k", models=["m"], priority=100, **kw)
+        txt = f"{sec}:\n" + "\n".join(
+            render_entry(sp, "  ", "    ", "2026-09-04")) + "\n"
+        ok, msg = validate(txt)
+        assert ok, msg
+        return txt, yaml.safe_load(txt)[sec][0]
+
+    t, e = render("codex-api-key", websockets=True,
+                  websockets_note="实测握手返回 101")
+    assert e.get("websockets") is True and "实测握手返回 101" in t
+
+    _t, e = render("codex-api-key", websockets=False,
+                   websockets_note="实测握手返回 400")
+    assert "websockets" not in e, "实测不支持时不该写这个字段"
+
+    _t, e = render("codex-api-key", websockets=False,
+                   prior_toggles={"websockets": True})
+    assert "websockets" not in e, (
+        "实测不支持时原值 true 也不该搬 —— 那正是本次要修掉的错配置")
+
+    t, e = render("codex-api-key", websockets=None,
+                  prior_toggles={"websockets": True})
+    assert e.get("websockets") is True and "原值搬运" in t, (
+        "未探测时该按原值搬运（没有证据就不动）")
+
+    _t, e = render("codex-api-key", websockets=None)
+    assert "websockets" not in e
+
+    _t, e = render("openai-compatibility", prompt_cache_key=True,
+                   prompt_cache_note="实测带 prompt_cache_key 时返回 200")
+    assert e.get("support-prompt-cache-key") is True
+    _t, e = render("openai-compatibility", prompt_cache_key=False,
+                   prior_toggles={"support-prompt-cache-key": True})
+    assert "support-prompt-cache-key" not in e
+
+    # ── (7) 原值查表：只收显式 true，键含段，compat 逐 Key 查得到 ──
+    cfg_t = yaml.safe_load("""
+codex-api-key:
+  - api-key: "kw"
+    base-url: "https://t.example/v1"
+    websockets: true
+  - api-key: "kf"
+    base-url: "https://t.example/v1"
+    websockets: false
+  - api-key: "kn"
+    base-url: "https://t.example/v1"
+openai-compatibility:
+  - name: "t"
+    base-url: "https://t.example/v1"
+    support-prompt-cache-key: true
+    api-key-entries:
+      - api-key: "c1"
+      - api-key: "c2"
+    models:
+      - name: "m"
+        alias: ""
+""")
+    tg = existing_toggles(cfg_t)
+    assert tg[("codex-api-key", "t.example", "kw")] == {"websockets": True}
+    assert ("codex-api-key", "t.example", "kf") not in tg, (
+        "false 与不写在 CPA 侧等价，不必收")
+    assert ("codex-api-key", "t.example", "kn") not in tg
+    for k in ("c1", "c2"):
+        assert tg[("openai-compatibility", "t.example", k)] == {
+            "support-prompt-cache-key": True}
+
+    # ── (8) 不能与 carry 重复写 ──
+    # 两条路都写会产出重复键：PyYAML 取后一个，而 Go 的 yaml.v3 直接报
+    # `mapping key already defined` —— CPA 起不来，不是「值取谁」的小问题。
+    assert "websockets" in _RENDERED_KEYS
+    assert "support-prompt-cache-key" in _RENDERED_KEYS
+
+    print("[OK] Capability toggles: 握手实测三态、需代理与段不通时记未探测、"
+          "只在有该开关的段探、写回 True 才写而 False 连原值一起关、"
+          "未探测按原值搬运、不与 carry 重复")
+
+
+
+def test_compat_same_host_multi_path_isolated():
+    """同一台主机按**路径**挂多个 provider 时，六张查表不能互相串。
+
+    2026-09-04 补闸。compat 段是「一个 provider 一条条目、多 Key 挂在下面」，
+    而同一主机可以按路径挂多个互不相干的上游 —— 本项目自己的
+    `tools/e2e_redetect.py` 假上游正是 `127.0.0.1:PORT/good` 与 `.../gate`。
+
+    渲染归并（`compat_provider_key`）、per-key 续行（`compat_key_blocks`）、
+    孤儿保留（`_orphan_provider_lines`）三处早就用含路径的键，只有六张
+    `existing_*` 查表还在按 host 索引 —— 后一个 provider 覆盖前一个，
+    于是重探 `/good` 会拿到 `/gate` 的 prefix / headers / name / 窗口值。
+
+    生产配置 compat 段同 host 多路径 0 处，所以这是潜在缺陷；但假上游脚本
+    正是这个形态，端到端演练迟早会踩上。
+    """
+    import yaml
+    from cpa_probe.batch import (entry_scope, existing_headers,
+                                 existing_model_context, existing_prefixes,
+                                 existing_provider_names, existing_proxies,
+                                 existing_toggles, provider_name_for)
+
+    cfg = yaml.safe_load("""
+openai-compatibility:
+  - name: "good"
+    base-url: "http://127.0.0.1:9000/good/v1"
+    prefix: "GOOD"
+    support-prompt-cache-key: true
+    headers:
+      x-route: "good"
+    api-key-entries:
+      - api-key: "shared"
+        proxy-url: "http://p1:1"
+    models:
+      - name: "m"
+        alias: ""
+        max-context-length: 111
+  - name: "gate"
+    base-url: "http://127.0.0.1:9000/gate/v1"
+    prefix: "GATE"
+    headers:
+      x-route: "gate"
+    api-key-entries:
+      - api-key: "shared"
+        proxy-url: "http://p2:2"
+    models:
+      - name: "m"
+        alias: ""
+        max-context-length: 222
+""")
+    good = "http://127.0.0.1:9000/good/v1"
+    gate = "http://127.0.0.1:9000/gate/v1"
+    sg, st = entry_scope("openai-compatibility", good), \
+        entry_scope("openai-compatibility", gate)
+    assert sg != st, f"两个 provider 的 scope 必须不同：{sg} / {st}"
+    # 前三段仍按 host —— 它们的 base-url 没有路径维度
+    assert entry_scope("claude-api-key", "https://x.example") == "x.example"
+
+    K = "openai-compatibility"
+    pre = existing_prefixes(cfg)
+    assert pre[(K, sg, "shared")] == "GOOD" and pre[(K, st, "shared")] == "GATE"
+    hdr = existing_headers(cfg)
+    assert hdr[(K, sg, "shared")] == {"x-route": "good"}
+    assert hdr[(K, st, "shared")] == {"x-route": "gate"}
+    pxy = existing_proxies(cfg)
+    assert pxy[(K, sg, "shared")] == "http://p1:1"
+    assert pxy[(K, st, "shared")] == "http://p2:2"
+    mctx = existing_model_context(cfg)
+    assert mctx[(K, sg, "shared", "m")] == 111
+    assert mctx[(K, st, "shared", "m")] == 222
+    tg = existing_toggles(cfg)
+    assert (K, sg, "shared") in tg, "开关只在 /good 上，不该被 /gate 覆盖掉"
+    assert (K, st, "shared") not in tg
+    # provider name 两级查找：精确命中含路径的键
+    pn = existing_provider_names(cfg)
+    assert provider_name_for(pn, good) == "good"
+    assert provider_name_for(pn, gate) == "gate"
+    # 新站（表里没有精确条目）按 host 回落 —— 同 host 只有一个 provider 时
+    # 那就是对的；这里有两个，回落值不确定但必须是其中之一而不是空
+    assert provider_name_for(pn, "http://127.0.0.1:9000/brand-new/v1") in (
+        "good", "gate")
+    assert provider_name_for(pn, "https://never.seen/v1") == ""
+
+    print("[OK] Compat scope: 同 host 多路径的六张查表互不串，"
+          "provider name 精确命中 + 新站按 host 回落")
+
+
+def test_find_compat_provider_strips_trailing_comments():
+    """`find_compat_provider` 取 base-url / name / api-key 时必须剥行尾注释。
+
+    2026-09-04 补闸。生产 config.yaml 前三段有 86 行
+    `base-url: "https://x" # 注意不带 /v1` 这种写法；同一种写法迁到 compat 段，
+    原来的 `strip('"')` 会让值带着注释文本 —— 与 want 比不相等，于是「同站再来
+    新 Key」会**新建**一个同 base-url 的 provider。
+
+    CPA 的 `SanitizeOpenAICompatibility` 只丢缺 base-url 的、不去重，所以那把
+    Key 会在轮询池里占两个位，而冷却 / 模型能力 / 执行路由三处按 `name` 索引，
+    对同一把 Key 命中两套配置。
+    """
+    from cpa_probe.writeback import find_compat_provider
+
+    for tail, why in (("", "无注释"),
+                      (" # 注意带 /v1", "空格 + 注释"),
+                      ("  # 直连，不走网关", "多空格 + 中文注释")):
+        src = f'''openai-compatibility:
+  - name: "chma" # 短名，与 host 不同
+    base-url: "https://chiangma.com/v1"{tail}
+    api-key-entries:
+      - api-key: "sk-a" # 2026-08-20 新增
+      - api-key: "sk-b"
+    models:
+      - name: "m"
+        alias: ""
+'''
+        got = find_compat_provider(src.splitlines(keepends=True),
+                                   "https://chiangma.com/v1")
+        assert got is not None, f"{why}：没命中现有 provider —— 会新建重复条目"
+        assert got["name"] == "chma", f"{why}：name 带上了注释 {got['name']!r}"
+        assert got["existing_keys"] == ["sk-a", "sk-b"], (
+            f"{why}：api-key 带上了注释 {got['existing_keys']}")
+
+    print("[OK] find_compat_provider: base-url / name / api-key 都剥行尾注释，"
+          "同站新 Key 追加进现有 provider 而不新建重复条目")
+
+
+def test_section_span_recognizes_odd_top_level_keys():
+    """段边界要认含点号与引号的顶层键，否则那个键会被 carry 吞掉。
+
+    2026-09-04 补闸。原来的判据是 `^[a-zA-Z_][a-zA-Z0-9_-]*\\s*:` —— 认不出
+    `a.b: 42` 与 `"my key": 42`。那时 `_section_span` 的 end 落在更后面，
+    那个顶层键被划进 span，`extract_carry_lines` 把它当成条目的 carry 行收走，
+    重建后它从**顶层消失**。
+
+    CPA 的 46 个顶层 yaml tag 全是合法标识符，两份生产文件的 42 个顶层键也全
+    合法，所以这是补闸而不是修事故 —— 但「零缩进且不是列表项」本来就是 YAML
+    顶层键的完整判据，正则那一版只是它的子集。
+    """
+    import yaml
+    from cpa_probe.writeback import (_TOP_LEVEL_KEY, extract_carry_lines,
+                                     rebuild_config_full, validate)
+    from cpa_probe.plan import ImportPlan, SectionPlan
+
+    # 判据本身
+    for line, want in (
+        ('host: "127.0.0.1"', True), ("claude-api-key:", True),
+        ("openai-compatibility: []", True),
+        ("a.b: 42", True), ('"my key": 42', True), ("'q': 1", True),
+        ('  - api-key: "k"', False), ("- top: 1", False),
+        ("# comment", False), ("    priority: 900", False),
+        ("", False), ("   ", False), ("plain-text-no-colon", False),
+    ):
+        assert bool(_TOP_LEVEL_KEY.match(line)) is want, (line, want)
+
+    for weird in ("a.b: 42", '"my key": 42'):
+        src = ('host: "x"\n\nclaude-api-key:\n'
+               '  - api-key: "k1"\n    base-url: "https://a.example"\n'
+               '    priority: 900\n    excluded-models: ["*"]\n'
+               '    models:\n      - name: "m"\n        alias: ""\n'
+               f'{weird}\napi-keys:\n  - sk-client\n')
+        cfg = yaml.safe_load(src)
+        lines = src.splitlines(keepends=True)
+        # 那个键不该被当成条目的 carry 行
+        carry = extract_carry_lines(lines)
+        blob = "".join(v for d in carry.values() for v in
+                       (x for lst in d.values() for x in lst))
+        assert weird.split(":")[0] not in blob, (
+            f"{weird!r} 被 carry 收走了：{blob[:200]}")
+        # 重建后它必须还在顶层
+        p = ImportPlan(host="a.example", masked_key="k1", line_no=1)
+        p.sections["claude-api-key"] = SectionPlan(
+            section="claude-api-key", base_url="https://a.example",
+            api_key="k1", models=["m"], priority=900, model_source="probed")
+        new, _w = rebuild_config_full(
+            cfg, {("https://a.example", "k1"): p}, lines)
+        assert validate(new)[0]
+        got = yaml.safe_load(new)
+        key = weird.split(":")[0].strip().strip('"')
+        assert key in got, f"{weird!r} 重建后从顶层消失了"
+        assert "api-keys" in got, "排在它之后的顶层键也跟着丢了"
+
+    print("[OK] Section span: 含点号与引号的顶层键不再被 carry 吞掉")
+
+
+def test_yaml_field_escapes_subkeys_and_skips_odd_floats():
+    """`_yaml_field` 的子键要转义，非有限 / 科学计数的 float 整个跳过。
+
+    2026-09-04 补闸。两处都会产出「YAML 合法但语义漂移」的结果，而
+    `validate()` 只看语法：
+      · 子键含冒号（`{'a: b': 1}`）→ 写成 `a: b: 1`，非法 YAML
+      · `1e20` → 写成 `1e+20`，YAML 读回是**字符串** `'1e+20'`
+      · `inf` / `nan` → 同样漂成字符串
+
+    CPA 的模型级字段里没有 float（全是 int / bool / []string），所以这两支只在
+    原文件手工写了这些形状时才会走到 —— 与「认不出的形状整个跳过」同一条原则。
+    """
+    import math
+    import yaml
+    from cpa_probe.writeback import _yaml_field
+
+    def roundtrip(key, val):
+        """渲染再读回，返回**那个键的值**。认不出的形状返回 None。"""
+        rows = _yaml_field("  ", key, val)
+        if not rows:
+            return None
+        txt = "root:\n" + "\n".join(rows) + "\n"
+        got = yaml.safe_load(txt)["root"]
+        assert isinstance(got, dict) and len(got) == 1, got
+        return next(iter(got.values()))
+
+    # 子键含冒号 / 是 YAML 关键字 —— 都要能原样读回
+    assert roundtrip("thinking", {"a: b": 1}) == {"a: b": 1}
+    assert roundtrip("thinking", {"null": 1}) == {"null": 1}
+    assert roundtrip("thinking", {"true": 1}) == {"true": 1}
+    # 键本身含冒号 —— 读回时键必须还是那个字符串
+    _rows = _yaml_field("  ", "a: b", 1)
+    assert yaml.safe_load("root:\n" + "\n".join(_rows) + "\n")["root"] == {
+        "a: b": 1}
+    # 正常形状照旧
+    assert roundtrip("thinking", {"levels": ["low", "high"], "min": 1}) == {
+        "levels": ["low", "high"], "min": 1}
+    assert roundtrip("ratio", 1.5) == 1.5
+    assert roundtrip("mods", ["text", "image"]) == ["text", "image"]
+    assert roundtrip("x", []) == []
+    assert roundtrip("x", {}) == {}
+    # 会漂移的 float：整个跳过
+    for bad in (1e20, float("inf"), float("-inf"), float("nan")):
+        assert _yaml_field("  ", "ratio", bad) == [], repr(bad)
+    assert _yaml_field("  ", "nums", [1.0, 1e20]) == []
+    assert math.isfinite(1.5)   # 正常值不受影响，见上
+
+    print("[OK] _yaml_field: 子键与键都转义，非有限与科学计数的 float 整个跳过")
+
+
+def test_carry_tables_are_wired_into_writeback_path():
+    """六张 `existing_*` 查表必须真的被写回路径**调用**，不只是存在。
+
+    2026-09-04 撤销实验发现的缺口：把 `server.py` 里搬 headers 那一行改成
+    `old = None`（即「不搬原值」），1198 项测试**全绿**、两份真实配置的演练也
+    全对上 —— 因为演练脚本自己也搬 headers（`build_plans` 里那几行），
+    于是它只守住了 `writeback` 那一层，守不住「server 有没有调查表」。
+
+    这类缺陷的形态是「函数写对了，但没人调用它」。`assign_priorities` 曾只在
+    网页端调、`_clean_override_models` 曾只在重探路过滤，都是同一形态。
+    所以这里按源码断言调用点，与 `test_three_paths_share_the_gates` 同一套做法。
+    """
+    import ast as _ast
+    import io as _io
+
+    # ── 结构：八张表在 CarryTables 里建，两条产品路径都调它 ──
+    #
+    # 2026-09-04 把搬运逻辑从 _api_plan 的循环里抽进 CarryTables，所以结构断言
+    # 也跟着换位置：以前断言「_api_plan 调了 existing_*」，现在断言
+    # 「CarryTables 建了八张表 + 两条路都调 carry.apply」。
+    bsrc = _io.open(os.path.join(ROOT, "cpa_probe", "batch.py"),
+                    encoding="utf-8").read()
+    btree = _ast.parse(bsrc)
+    cls = next((n for n in _ast.walk(btree)
+                if isinstance(n, _ast.ClassDef) and n.name == "CarryTables"),
+               None)
+    assert cls is not None, "batch.py 里找不到 CarryTables"
+    cls_called = set()
+    for n in _ast.walk(cls):
+        if isinstance(n, _ast.Call):
+            nm = getattr(n.func, "attr", None) or getattr(n.func, "id", None)
+            if nm:
+                cls_called.add(nm)
+
+    WANT = {
+        "existing_weights": "weight: 0 是逐出调度池的唯一表达",
+        "existing_proxies": "必须走代理的站会改成直连",
+        "existing_prefixes": "ANT/xxx 这半边别名全失效",
+        "existing_provider_names": "改名作废 CPA 的冷却状态与能力缓存",
+        "existing_headers": "整字段消失：实测 24/24 与 66/66 条目",
+        "existing_toggles": "原来开着的 websockets 被抹掉",
+        "existing_model_context": "客户端按偏大的窗口定压缩点",
+        "existing_model_extras": "手工加的模型级字段被抹掉",
+    }
+    missing = {k: why for k, why in WANT.items() if k not in cls_called}
+    assert not missing, (
+        "CarryTables 没建这些表 —— 对应字段会在整段重写时消失：\n"
+        + "\n".join(f"  {k}: {why}" for k, why in missing.items()))
+
+    # apply 必须把每一类都赋回 SectionPlan —— 只建表不赋值等于没搬
+    apply_fn = next((n for n in cls.body
+                     if isinstance(n, _ast.FunctionDef) and n.name == "apply"),
+                    None)
+    assert apply_fn is not None, "CarryTables 没有 apply"
+    assigned = set()
+    for n in _ast.walk(apply_fn):
+        if isinstance(n, _ast.Assign):
+            for tgt in n.targets:
+                if isinstance(tgt, _ast.Attribute):
+                    assigned.add(tgt.attr)
+    for attr, why in (("headers", "headers 搬了却没赋给 sp"),
+                      ("prior_toggles", "能力开关原值没赋给 sp"),
+                      ("prefix", "prefix 没赋给 sp"),
+                      ("provider_name", "compat 的 name 没赋给 sp"),
+                      ("prior_context", "模型级窗口值没赋给 sp"),
+                      ("prior_model_extras", "模型级白名单外字段没赋给 sp"),
+                      ("weight", "weight 没赋给 sp"),
+                      ("proxy_url", "proxy-url 没赋给 sp")):
+        assert attr in assigned, why
+
+    # 产品的写回路径与演练脚本都必须调它 —— 任一侧自己抄一遍就会分叉，
+    # 而分叉的后果实测过：演练自己搬 headers，于是「server 不搬」照样对上账。
+    for rel, who in (("server.py", "网页写回路径"),
+                     (os.path.join("tests", "rehearse_real_rebuild.py"),
+                      "真实文件演练")):
+        src2 = _io.open(os.path.join(ROOT, rel), encoding="utf-8").read()
+        assert "CarryTables(" in src2 and "carry.apply(" in src2, (
+            f"{who}（{rel}）没走 CarryTables —— 两侧逻辑分叉，"
+            f"演练对上账不等于产品对")
+
+    # 源码结构断言挡不住「调了、赋了，但赋的是空」——
+    # 把 `old = hdrs.get(...)` 改成 `old = None` 时上面那些断言全过。
+    # 所以再加一层**行为**断言：直接跑 _api_plan 里那段搬运逻辑的等价形态，
+    # 比对方案里的字段与原配置。
+    #
+    # 为什么不真起 HTTP 服务跑一遍：那要假上游 + 完整任务编排，而这里要验的
+    # 只有「查表结果流进方案」这一件事。等价形态由 rehearse_real_rebuild 的
+    # build_plans 提供 —— 它就是照 server 那条路写的，且被上面那条断言
+    # 要求「用同一批查表」。
+    import sys as _sys
+    if os.path.join(ROOT, "tests") not in _sys.path:
+        _sys.path.insert(0, os.path.join(ROOT, "tests"))
+    import yaml as _yaml
+    from rehearse_real_rebuild import build_plans as _build_plans
+
+    cfg_w = _yaml.safe_load("""
+claude-api-key:
+  - api-key: "kh"
+    base-url: "https://carry.example"
+    prefix: "ANT"
+    priority: 700
+    weight: 0
+    proxy-url: "http://mihomo:7890"
+    headers:
+      anthropic-beta: "context-1m-2025-08-07"
+      user-agent: "claude-cli/2.1.220"
+    models:
+      - name: "claude-opus-5"
+        alias: "opus"
+        max-context-length: 262144
+codex-api-key:
+  - api-key: "kw"
+    base-url: "https://carry.example/v1"
+    priority: 300
+    websockets: true
+    models:
+      - name: "gpt-5.6-sol"
+        alias: ""
+openai-compatibility:
+  - name: "carry-short-name"
+    base-url: "https://carry.example/v1"
+    prefix: "CHMA"
+    priority: 100
+    support-prompt-cache-key: true
+    api-key-entries:
+      - api-key: "kc"
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+""")
+    plans_w = _build_plans(cfg_w)
+    got = {}
+    for pl in plans_w.values():
+        for sec, sp in pl.sections.items():
+            got[(sec, sp.api_key)] = sp
+
+    cl = got[("claude-api-key", "kh")]
+    assert cl.headers == {"anthropic-beta": "context-1m-2025-08-07",
+                          "user-agent": "claude-cli/2.1.220"}, (
+        f"headers 没流进方案：{cl.headers}")
+    assert cl.weight == 0, f"weight 没流进方案：{cl.weight}"
+    assert cl.proxy_url == "http://mihomo:7890", cl.proxy_url
+    assert cl.prefix == "ANT", cl.prefix
+    assert cl.prior_context == {"claude-opus-5": 262144}, cl.prior_context
+    assert (cl.prior_model_extras.get("claude-opus-5") or {}).get(
+        "alias") == "opus", cl.prior_model_extras
+
+    cx = got[("codex-api-key", "kw")]
+    assert cx.prior_toggles == {"websockets": True}, (
+        f"能力开关原值没流进方案：{cx.prior_toggles}")
+
+    cp_ = got[("openai-compatibility", "kc")]
+    assert cp_.provider_name == "carry-short-name", (
+        f"provider name 没流进方案（会被现编成 host）：{cp_.provider_name}")
+    assert cp_.prior_toggles == {"support-prompt-cache-key": True}, (
+        cp_.prior_toggles)
+    assert cp_.prefix == "CHMA", cp_.prefix
+
+    print("[OK] Carry wiring: CarryTables 建齐八张表并赋回方案、"
+          "值真的流进方案（headers / weight / proxy / prefix / name / "
+          "窗口 / alias / 能力开关）、产品与演练同走 carry.apply")
+
+
+
+def test_merge_entry_headers_behaviour():
+    """headers 合并的行为断言。抽成函数之后才测得动。
+
+    2026-09-04 撤销实验的最后一个缺口：把 `server.py` 里 `old = hdrs.get(...)`
+    改成 `old = None`（即「不搬原值」），1198 项测试**全绿**。根因是那段合并逻辑
+    内联在 `_api_plan` 的循环里 —— 只能靠源码结构断言「这几行在不在」，
+    而结构断言挡不住「行还在，赋的是空」。
+
+    抽成 `writeback.merge_entry_headers` 之后就能直接测行为。这一项守四件事：
+      ① 原值里探测没提到的键**保留**（能力 beta 就是这样丢的）
+      ② 探测值覆盖同名键（它是本次实测出来的最省必需集）
+      ③ `anthropic-beta` 走 `betas.merge` 合并而不是覆盖（它是集合，覆盖会丢项）
+      ④ 头名大小写不敏感匹配，但保留原条目的写法（改大小写会污染 diff）
+    """
+    from cpa_probe.writeback import merge_entry_headers as M
+
+    # ① 原值独有的键保留 —— 这正是 anyrouter.top 丢 1m 上下文的形态
+    got = M({"anthropic-beta": "context-1m-2025-08-07"}, {})
+    assert got == {"anthropic-beta": "context-1m-2025-08-07"}, (
+        f"探测为空时原值必须整份保留，实得 {got}")
+
+    # 原值为空、探测有值 —— 新条目的情形
+    assert M(None, {"user-agent": "cc/1"}) == {"user-agent": "cc/1"}
+    assert M({}, {"user-agent": "cc/1"}) == {"user-agent": "cc/1"}
+    assert M(None, None) == {}
+
+    # ② 同名键以探测值为准，原值里的其他键保留
+    got = M({"user-agent": "old/1", "x-site-token": "keep-me"},
+            {"user-agent": "claude-cli/2.1.220"})
+    assert got == {"user-agent": "claude-cli/2.1.220",
+                   "x-site-token": "keep-me"}, got
+
+    # ③ anthropic-beta 合并：两边的项都要在，且不重复
+    got = M({"anthropic-beta": "context-1m-2025-08-07,oauth-2025-04-20"},
+            {"anthropic-beta": "claude-code-20250219,context-1m-2025-08-07"})
+    items = [x.strip() for x in got["anthropic-beta"].split(",")]
+    assert set(items) == {"context-1m-2025-08-07", "oauth-2025-04-20",
+                          "claude-code-20250219"}, items
+    assert len(items) == len(set(items)), f"有重复项：{items}"
+
+    # ④ 大小写：匹配不敏感，但保留原条目的写法
+    got = M({"Anthropic-Beta": "context-1m-2025-08-07", "User-Agent": "old/1"},
+            {"anthropic-beta": "claude-code-20250219",
+             "user-agent": "claude-cli/2.1.220"})
+    assert "Anthropic-Beta" in got and "anthropic-beta" not in got, (
+        f"改了原条目的大小写写法，会在 diff 里多出无意义改动：{sorted(got)}")
+    assert got["User-Agent"] == "claude-cli/2.1.220", got
+    beta_items = {x.strip() for x in got["Anthropic-Beta"].split(",")}
+    assert beta_items == {"context-1m-2025-08-07", "claude-code-20250219"}, (
+        beta_items)
+
+    # 原值的 anthropic-beta 是空串时不该走合并（合并空串会产出前导逗号）
+    got = M({"anthropic-beta": ""}, {"anthropic-beta": "claude-code-20250219"})
+    assert got == {"anthropic-beta": "claude-code-20250219"}, got
+
+    # 不改入参（server 那条路会把 old 复用给别的条目）
+    old_in = {"user-agent": "old/1"}
+    probed_in = {"user-agent": "new/1"}
+    M(old_in, probed_in)
+    assert old_in == {"user-agent": "old/1"}, "改了入参 old"
+    assert probed_in == {"user-agent": "new/1"}, "改了入参 probed"
+
+    # 搬运路径必须走这个函数。两条产品路径（网页写回、真实文件演练）现在都调
+    # CarryTables.apply，所以断言点在那里 —— 它自己写一套合并就会分叉。
+    import io as _io
+    bsrc = _io.open(os.path.join(ROOT, "cpa_probe", "batch.py"),
+                    encoding="utf-8").read()
+    assert "merge_entry_headers" in bsrc, (
+        "CarryTables 没用 merge_entry_headers —— headers 会被整份替换，"
+        "原条目里手工配的能力 beta 静默消失")
+
+    print("[OK] Headers merge: 原值独有键保留、同名以实测为准、"
+          "anthropic-beta 合并去重、大小写不敏感但保留原写法、不改入参、"
+          "CarryTables 走同一个函数")
+
+def test_capability_probe_is_actually_invoked():
+    """能力探测必须真的被 `_full_probe` 调用。
+
+    2026-09-04 撤销实验发现的缺口：把 `_stage5_capabilities` 的第一行改成
+    `if True: return`（即「永不探测」），1198 项全绿 —— 已有的用例都直接调
+    `_probe_websockets` / `_probe_prompt_cache_key`，没有一条断言那两个
+    子步骤会被编排调用。
+
+    与 `_stage4_context` 同一形态：那一步也曾漏在编排之外（那次是加了新阶段
+    却忘了接线）。所以这里断言编排链本身。
+    """
+    from cpa_probe.pipeline import Attempt, SectionVerdict
+
+    prober = Prober(gap=0.0, probe_context=False, swap_samples=0,
+                    probe_capabilities=True)
+    row = cp.parse_lines("https://wire.example,sk-wire").valid[0]
+
+    seen = []
+
+    def fake_stage1(_row, section):
+        v = SectionVerdict(section=section, usable=True,
+                           base_url=f"https://wire.example",
+                           models=["m"])
+        return v
+
+    prober._stage1 = fake_stage1                     # type: ignore[assignment]
+    prober._stage2 = lambda *a, **k: seen.append("stage2")   # type: ignore
+    prober._stage4_swap = lambda *a, **k: seen.append("swap")  # type: ignore
+    prober._stage4_context = lambda *a, **k: seen.append("ctx")  # type: ignore
+    prober._stage5_capabilities = lambda *a, **k: seen.append("caps")  # type: ignore
+
+    prober._full_probe(row, "codex-api-key")
+    assert "caps" in seen, (
+        f"_full_probe 没调 _stage5_capabilities —— 能力开关永远是「未探测」，"
+        f"实际调用序列 {seen}")
+    # 顺序：它要用到 v.models（compat 那一支）与 v.min_headers（WS 握手带门票），
+    # 两者在前面几步才定下来，所以必须排在最后
+    assert seen.index("caps") == len(seen) - 1, (
+        f"能力探测必须排在最后 —— 它依赖前面几步的产物，实际 {seen}")
+
+    # 段不通时整条链都不该往下走
+    seen.clear()
+    prober._stage1 = lambda _r, s: SectionVerdict(  # type: ignore[assignment]
+        section=s, base_url="https://wire.example", usable=False)
+    prober._full_probe(row, "codex-api-key")
+    assert seen == [], f"段不通时不该跑后续阶段，实际 {seen}"
+
+    # 上面那一轮只验「被调用」。`if True: return` 会让它变成空操作而照样被调 ——
+    # 所以再验「调用之后 verdict 真的变了」。
+    from cpa_probe import client as _client
+
+    real = Prober(gap=0.0, probe_context=False, swap_samples=0,
+                  probe_capabilities=True)
+    ws_orig = _client.ws_handshake
+    _client.ws_handshake = lambda url, *, headers=None, timeout=10: (
+        _client.Response("101", "", 5, ""))
+    try:
+        vv = SectionVerdict(section="codex-api-key", usable=True,
+                            base_url="https://wire.example/v1",
+                            models=["gpt-5.6-sol"])
+        real._stage5_capabilities(row, vv)
+        assert vv.websockets is True, (
+            f"_stage5_capabilities 是空操作 —— 握手回 101 也没写进 verdict，"
+            f"实得 {vv.websockets}（note={vv.websockets_note!r}）")
+        assert vv.websockets_note, "结论必须带实测依据"
+        assert any(a.combo == "ws-upgrade" for a in vv.attempts), (
+            "握手那次没记进 attempts —— 导出日志与界面都看不到它")
+    finally:
+        _client.ws_handshake = ws_orig
+
+    # compat 那一支同理
+    real2 = Prober(gap=0.0, probe_context=False, swap_samples=0,
+                   probe_capabilities=True)
+    real2._call = lambda section, base, key, model, **kw: Attempt(  # type: ignore
+        section=section, model=model, combo=kw.get("combo", ""), status="200",
+        category="", action="", elapsed_ms=2)
+    vc = SectionVerdict(section="openai-compatibility", usable=True,
+                        base_url="https://wire.example/v1", models=["m"])
+    real2._stage5_capabilities(row, vc)
+    assert vc.prompt_cache_key is True, (
+        f"compat 那一支是空操作，实得 {vc.prompt_cache_key}")
+
+    print("[OK] Capability wiring: _full_probe 调 _stage5_capabilities 且排在最后、"
+          "调用后结论真的写进 verdict 并记进 attempts、段不通时整条链不走")
+
+
+def test_flow_style_section_head_rebuilds():
+    """段头是 flow 序列时，全量重建也要产出合法 YAML。
+
+    2026-09-05 修。`_empty_literal_rewrite` 只认 `[]` 与 `{}`，而
+    `claude-api-key: [{api-key: "k1", ...}]` 是**合法 YAML、CPA 读得出来**，
+    重建却把块序列挂在它后面：
+
+        claude-api-key: [{api-key: "k1", ...}]
+          - api-key: "k1"                       ← 非法
+
+    `validate()` 挡住了（不会写坏文件），所以症状不是「写坏配置」而是
+    「全量重探对这类文件整个不可用」，且报错是
+    `while parsing a block mapping` —— 看不出根因是段头形态。
+
+    跨行 flow（`claude-api-key: [` 换行再列条目）单独覆盖：首行的 `[` 之后
+    什么都没有，按「`[` 后面必须有内容」判会漏掉它。闭合位置按括号计数找，
+    引号内的括号不计（`base-url: "https://x/[a]"`）。
+    """
+    import yaml as _yaml
+    from cpa_probe.plan import ImportPlan, SectionPlan
+    from cpa_probe.writeback import (rebuild_config_full, validate,
+                                     _FLOW_SECTION_HEAD, _flow_section_span)
+
+    # 判据本身：空 flow 与空 map 不能命中（那两个由 _empty_literal_rewrite 管，
+    # 两条路都命中会重复改写）
+    for line, want in (("claude-api-key: [\n", True),
+                       ("claude-api-key: [{a: 1}]\n", True),
+                       ("claude-api-key: []\n", False),
+                       ("claude-api-key: []  # 待填\n", False),
+                       ("claude-api-key: {}\n", False),
+                       ("claude-api-key:\n", False)):
+        assert bool(_FLOW_SECTION_HEAD.match(line)) is want, (line, want)
+
+    # 括号计数：引号里的方括号不算。
+    #
+    # 样本要用引号里**未配对的开括号**（`"https://x/[a"`）—— 那时不看引号的
+    # 实现会 depth 永不归零、跑到文件末尾返回 None，段头就不被识别。
+    # 用未配对的**闭**括号（`"…/]a"`）测不出来：`[` `{` `]`(引号内) `}`
+    # 恰好在同一行归零，答案碰巧对（2026-09-05 撤销实验证实过这一点）。
+    lines = ('claude-api-key: [{api-key: "k", base-url: "https://x/[a"}]\n'
+             'other: 1\n').splitlines(True)
+    assert _flow_section_span(lines, 0) == 1, (
+        f"引号里的 [ 被当成嵌套了：span={_flow_section_span(lines, 0)}")
+    # 未配对的闭括号也要正确（靠同一份实现顺带覆盖）
+    lines_c = ('claude-api-key: [{api-key: "k", base-url: "https://x/]a"}]\n'
+               'other: 1\n').splitlines(True)
+    assert _flow_section_span(lines_c, 0) == 1, _flow_section_span(lines_c, 0)
+    # 反向：引号外的嵌套要算对
+    lines2 = ('claude-api-key: [{a: [1, 2]}, {b: 3}]\n'
+              'other: 1\n').splitlines(True)
+    assert _flow_section_span(lines2, 0) == 1, _flow_section_span(lines2, 0)
+
+    # 零缩进的 flow 内容：`_section_span` 会在第一行内容处就收尾（那些行零缩进、
+    # 含冒号，看着像顶层键），而 flow 实际延伸到 `]`。cursor 取 `end` 而不是
+    # `max(end, flow_end)` 的话，剩下的 flow 行会被当成「段之后的内容」原样
+    # 输出 —— 产出重复条目 + 悬挂的 `]`。
+    zero_indent = ('other: 1\nclaude-api-key: [\n'
+                   '{api-key: "k1", base-url: "https://a.example", '
+                   'priority: 900},\n'
+                   '{api-key: "k2", base-url: "https://b.example", '
+                   'priority: 800}\n]\napi-keys:\n  - sk-c\n')
+    cfg_z = _yaml.safe_load(zero_indent)
+    p_z = ImportPlan(host="a.example", masked_key="k1", line_no=1)
+    p_z.sections["claude-api-key"] = SectionPlan(
+        section="claude-api-key", base_url="https://a.example", api_key="k1",
+        models=["claude-opus-5"], priority=900, model_source="probed")
+    new_z, _wz = rebuild_config_full(
+        cfg_z, {("https://a.example", "k1"): p_z},
+        zero_indent.splitlines(True))
+    ok_z, msg_z = validate(new_z)
+    assert ok_z, f"零缩进 flow 内容：产出非法 YAML —— {msg_z[:100]}"
+    assert "{api-key:" not in new_z, (
+        f"flow 内容行被重复输出了：\n{new_z[:300]}")
+    assert not any(ln.strip() == "]" for ln in new_z.splitlines()), (
+        f"悬挂的 ] 没被吃掉：\n{new_z[:300]}")
+    got_z = _yaml.safe_load(new_z)
+    assert len(got_z.get("claude-api-key") or []) == 1, got_z
+
+    CASES = {
+        "单行 flow":
+            'other: 1\nclaude-api-key: [{api-key: "k1", '
+            'base-url: "https://a.example", priority: 900}]\n'
+            'api-keys:\n  - sk-c\n',
+        "跨行 flow":
+            'other: 1\nclaude-api-key: [\n  {api-key: "k1", '
+            'base-url: "https://a.example", priority: 900}\n]\n'
+            'api-keys:\n  - sk-c\n',
+        "跨行 flow 多条":
+            'other: 1\nclaude-api-key: [\n  {api-key: "k1", '
+            'base-url: "https://a.example", priority: 900},\n'
+            '  {api-key: "k2", base-url: "https://b.example", '
+            'priority: 800}\n]\napi-keys:\n  - sk-c\n',
+        "flow 值里含方括号":
+            'other: 1\nclaude-api-key: [{api-key: "k1", '
+            'base-url: "https://a.example/[x]", priority: 900}]\n'
+            'api-keys:\n  - sk-c\n',
+        # 回归：原来就支持的三种形态不能被弄坏
+        "空 flow（回归）":
+            'other: 1\nclaude-api-key: []\napi-keys:\n  - sk-c\n',
+        "空 flow 带注释（回归）":
+            'other: 1\nclaude-api-key: []  # 待填\napi-keys:\n  - sk-c\n',
+        "空 map（回归）":
+            'other: 1\nclaude-api-key: {}\napi-keys:\n  - sk-c\n',
+        "正常块序列（回归）":
+            'other: 1\nclaude-api-key:\n  - api-key: "k1"\n'
+            '    base-url: "https://a.example"\n    priority: 900\n'
+            'api-keys:\n  - sk-c\n',
+    }
+    for why, raw in CASES.items():
+        cfg = _yaml.safe_load(raw)
+        p = ImportPlan(host="a.example", masked_key="k1", line_no=1)
+        p.sections["claude-api-key"] = SectionPlan(
+            section="claude-api-key", base_url="https://a.example",
+            api_key="k1", models=["claude-opus-5"], priority=900,
+            model_source="probed")
+        new, _w = rebuild_config_full(
+            cfg, {("https://a.example", "k1"): p}, raw.splitlines(True))
+        ok, msg = validate(new)
+        assert ok, f"{why}：产出非法 YAML —— {msg[:120]}"
+        got = _yaml.safe_load(new)
+        assert len(got.get("claude-api-key") or []) == 1, (
+            f"{why}：条目数不对 —— {got.get('claude-api-key')}")
+        assert "other" in got and "api-keys" in got, (
+            f"{why}：其他顶层键丢了 —— {sorted(got)}")
+        # 段头不能还留着 flow 的残骸
+        assert "[{" not in new.split("api-keys")[0], (
+            f"{why}：flow 残骸还在，会产出重复条目")
+
+    print(f"[OK] Flow section head: {len(CASES)} 种段头形态（含跨行与"
+          "引号内方括号）都产出合法 YAML，空 flow / 空 map / 块序列不受影响")
+
+
+def test_model_level_capability_fields_are_carried():
+    """模型级字段（含 CPA 新加的 is-compat / thinking）必须被搬运。
+
+    2026-09-05（契约对齐审计发现的分类缺口）。`models[].is-compat` 按 CPA 的
+    文档确实是**上游能力**（`config_types.go:539-544`：给「不接受原生
+    agent_message 或空签名 thinking 块的第三方 Responses 端点」用），
+    而本项目原来把它归进「手工加的模型级字段」——归类的**理由**写错了。
+
+    但结论仍然是「只搬不探」，判据换成代价与收益之比：
+
+      · 探它要构造 MultiAgentV2 的 agent_message 请求体
+      · 而它只在 `codex.optimize-multi-agent-v2` 也为 true 时生效
+        （同一段 CPA 注释写明的），生产配置里那个是 **false**
+
+    探一个当前配置下不生效的字段，成本真实、收益为零。
+
+    这一项守两件事：搬运真的覆盖这些字段；以及**不探的理由被钉住** ——
+    那个理由是配置决定的（`optimize-multi-agent-v2: false`），配置一改，
+    这条断言会提醒重新评估。
+    """
+    import io as _io
+    import yaml as _yaml
+
+    from cpa_probe.batch import existing_model_extras
+
+    cfg = _yaml.safe_load("""
+codex-api-key:
+  - api-key: "k"
+    base-url: "https://a.example/v1"
+    priority: 500
+    models:
+      - name: "gpt-5.6-sol"
+        alias: ""
+        is-compat: true
+        display-name: "Sol"
+        force-mapping: true
+        thinking:
+          levels: ["low", "high"]
+          zero-allowed: false
+""")
+    got = existing_model_extras(cfg)
+    key = ("codex-api-key", "a.example", "k", "gpt-5.6-sol")
+    assert key in got, f"模型级字段没被搬：{list(got)}"
+    extras = got[key]
+    for field, want in (("is-compat", True),
+                        ("display-name", "Sol"),
+                        ("force-mapping", True)):
+        assert extras.get(field) == want, (
+            f"{field} 没搬到（实得 {extras.get(field)!r}）—— "
+            f"整段重写会把它抹掉")
+    # thinking 是嵌套 dict，_yaml_field 的 dict 分支要递归保真
+    assert extras.get("thinking") == {"levels": ["low", "high"],
+                                      "zero-allowed": False}, extras.get(
+        "thinking")
+
+    # 写回一轮，确认这些字段真的落回文件
+    from cpa_probe.plan import ImportPlan, SectionPlan
+    from cpa_probe.writeback import rebuild_config_full, validate
+
+    raw = ('codex-api-key:\n'
+           '  - api-key: "k"\n'
+           '    base-url: "https://a.example/v1"\n'
+           '    priority: 500\n'
+           '    models:\n'
+           '      - name: "gpt-5.6-sol"\n'
+           '        alias: ""\n'
+           '        is-compat: true\n'
+           '        thinking:\n'
+           '          levels: ["low", "high"]\n')
+    cfg2 = _yaml.safe_load(raw)
+    p = ImportPlan(host="a.example", masked_key="k", line_no=1)
+    sp = SectionPlan(section="codex-api-key", base_url="https://a.example/v1",
+                     api_key="k", models=["gpt-5.6-sol"], priority=500,
+                     model_source="probed")
+    sp.prior_model_extras = {
+        "gpt-5.6-sol": dict(existing_model_extras(cfg2)[
+            ("codex-api-key", "a.example", "k", "gpt-5.6-sol")])}
+    p.sections["codex-api-key"] = sp
+    new, _w = rebuild_config_full(
+        cfg2, {("https://a.example", "k"): p}, raw.splitlines(True))
+    ok, msg = validate(new)
+    assert ok, f"重建后非法 YAML：{msg[:100]}"
+    back = _yaml.safe_load(new)["codex-api-key"][0]["models"][0]
+    assert back.get("is-compat") is True, f"is-compat 落盘丢了：{back}"
+    assert back.get("thinking") == {"levels": ["low", "high"]}, back
+
+    # ── 不探的理由被钉住 ──
+    #
+    # 生产配置的 `codex.optimize-multi-agent-v2` 为 false，所以 is-compat
+    # 当前不生效 —— 那正是「不探」的判据。它一旦改成 true，这条断言会红，
+    # 提醒重新评估要不要探。
+    import os as _os
+
+    prod = "C:/Users/devin/OneDrive/Desktop/fsdownload/config.yaml"
+    if _os.path.isfile(prod):
+        pcfg = _yaml.safe_load(_io.open(prod, encoding="utf-8").read()) or {}
+        codex_cfg = pcfg.get("codex") or {}
+        assert codex_cfg.get("optimize-multi-agent-v2") is not True, (
+            "生产配置把 codex.optimize-multi-agent-v2 打开了 —— "
+            "`models[].is-compat` 现在会生效，「不探它」的理由不再成立，"
+            "要重新评估（见 README 的能力开关表）")
+
+    print("[OK] Model-level fields: is-compat / thinking / display-name / "
+          "force-mapping 都被搬运并落盘；不探 is-compat 的前置条件已钉住")
+
 def test_context_limit_lower_bound():
     """截断反推出的荒谬小值不许写进 config.yaml。
 
@@ -3017,6 +4186,451 @@ claude-api-key:
           f"个不同档位，全部 <= 上限 {cap}，零劫持；raw 生效 "
           f"{without} → {with_raw}；{len(many)} 站时整批下移到 "
           f"{max(vals3)}..{min(vals3)}（warns={len(warns)}）")
+
+
+def test_existing_hosts_keep_their_tier():
+    """重探**既有站**不改它的 priority —— 那是站间次序，重探不构成改它的依据。
+
+    2026-09-04 现场截图：同一个上游地址、只是 token 不同的几条，priority 不一致。
+    两个独立成因，各自都足以造成拆档：
+
+      ① `assign_priorities` 把重探的既有站当新站处理：算 cap、按分数排、逐站
+         取 `min(cap, 上一站 - 1)`。`taken` 里塞着这些站**自己**的旧档，于是每个
+         站都躲开自己原来的值往下掉。拿生产 config.yaml 实测：claude 段 12 个站
+         从 1000/995/990/985/700/650/630/600/400/350/300/50 变成 500..489 一片连号。
+      ② 留守条目（用户没勾 / 判不可写 / 探测异常）由 `_orphan_entry_lines` 原样
+         搬回旧值，与被重探那几把的新值并存 —— kktoken claude 3 把→164 + 2 把
+         留在 372；tabitoken claude 9 把→167 + 5 把留在 371。
+
+    后果与「同站同档」那条约束冲突：CPA 的层级隔离只取最高可用桶
+    （selector.go:527-553 availableAuthsFromPriorityBuckets 只收 bestPriority），
+    同站被拆成两层就把「多 Key 并行轮询」变成「主备切换」—— 高档那几把先被打光
+    配额，低档那批只在它们全部不可用时才轮到。
+
+    ①在 assign_priorities 里修（沿用原档），②在 _orphan_entry_lines 里修
+    （把留守条目对齐到同站新档）。这一项守①，落盘那一半由
+    rehearse_real_rebuild 的第⑤组守。
+    """
+    import yaml
+    from cpa_probe.plan import (ImportPlan, SectionPlan, assign_priorities,
+                                existing_host_tiers, build_band)
+
+    cfg = yaml.safe_load('''
+claude-api-key:
+  - api-key: "k1"
+    base-url: "https://big.example"
+    priority: 1000
+    models: [{name: "m1", alias: ""}]
+  - api-key: "k2"
+    base-url: "https://big.example"
+    priority: 1000
+    models: [{name: "m1", alias: ""}]
+  - api-key: "k3"
+    base-url: "https://big.example"
+    priority: 1000
+    models: [{name: "m1", alias: ""}]
+  - api-key: "k4"
+    base-url: "https://mid.example"
+    priority: 700
+    models: [{name: "m1", alias: ""}]
+  - api-key: "k5"
+    base-url: "https://low.example"
+    priority: 100
+    models: [{name: "m1", alias: ""}]
+''')
+
+    def mk(host, key, models=("m1",), src="probed", score=100):
+        pl = ImportPlan(host=host, masked_key="k", line_no=abs(hash(key)) % 9999)
+        pl.sections["claude-api-key"] = SectionPlan(
+            section="claude-api-key", base_url=f"https://{host}",
+            api_key=key, models=list(models), score=score, model_source=src)
+        return pl
+
+    # ── ① 全部重探：每个既有站都留在自己原来的档 ──────────────────
+    plans = [mk("big.example", "k1"), mk("big.example", "k2"),
+             mk("big.example", "k3"), mk("mid.example", "k4"),
+             mk("low.example", "k5")]
+    assign_priorities(plans, cfg, probation=True)
+    got = {}
+    for pl in plans:
+        got.setdefault(pl.host, set()).add(
+            pl.sections["claude-api-key"].priority)
+    assert got == {"big.example": {1000}, "mid.example": {700},
+                   "low.example": {100}}, got
+    for pl in plans:
+        rsn = pl.sections["claude-api-key"].priority_reason
+        assert "沿用该站在本段的原档" in rsn, rsn
+
+    # ── ② 只重探一部分 Key：拿到的还是同一个档 ────────────────────
+    partial = [mk("big.example", "k1")]
+    assign_priorities(partial, cfg, probation=True)
+    assert partial[0].sections["claude-api-key"].priority == 1000
+
+    # ── ③ 既有站与新站混在一批：既有站不动，新站照常走空档分配 ──────
+    mixed = [mk("big.example", "k1"), mk("mid.example", "k4"),
+             mk("brand.example", "sk-new")]
+    warns = assign_priorities(mixed, cfg, probation=True)
+    vals = {pl.host: pl.sections["claude-api-key"].priority for pl in mixed}
+    assert vals["big.example"] == 1000 and vals["mid.example"] == 700, vals
+    assert vals["brand.example"] not in (1000, 700, 100), (
+        f"新站不该撞上现有档位：{vals}")
+    assert vals["brand.example"] <= 1000, vals
+
+    # ── ④ 沿用原档会抢别人顶层时才重新定档 ────────────────────────
+    # low.example 原本在 100，本次给它注册一个 m2 —— 而 m2 的现有顶层在 700。
+    # 100 < 700，不构成劫持，仍沿用。
+    cfg4 = yaml.safe_load('''
+claude-api-key:
+  - api-key: "a"
+    base-url: "https://hi.example"
+    priority: 700
+    models: [{name: "m2", alias: ""}]
+  - api-key: "b"
+    base-url: "https://lo.example"
+    priority: 100
+    models: [{name: "m1", alias: ""}]
+''')
+    keep = [mk("lo.example", "b", models=("m1", "m2"))]
+    assign_priorities(keep, cfg4, probation=True)
+    assert keep[0].sections["claude-api-key"].priority == 100
+
+    # 反向：hi.example 原本在 700，本次给它注册 m3 —— m3 的顶层在 900，
+    # 700 < 900 仍不构成劫持。真正会劫持的是「本站档位高于新模型的顶层」。
+    cfg5 = yaml.safe_load('''
+claude-api-key:
+  - api-key: "a"
+    base-url: "https://hi.example"
+    priority: 700
+    models: [{name: "m2", alias: ""}]
+  - api-key: "c"
+    base-url: "https://carrier.example"
+    priority: 300
+    models: [{name: "m3", alias: ""}]
+''')
+    grab = [mk("hi.example", "a", models=("m2", "m3"))]
+    w5 = assign_priorities(grab, cfg5, probation=True)
+    v5 = grab[0].sections["claude-api-key"].priority
+    assert v5 < 300, (
+        f"沿用 700 会抢走 m3 在 300 的顶层，该重新定档，实得 {v5}")
+    assert any("抢走" in w and "重新定档" in w for w in w5), w5
+
+    # ── ⑤ 原文件里就已经拆开的站：按最高档对齐，并报出来 ──────────
+    cfg6 = yaml.safe_load('''
+claude-api-key:
+  - api-key: "s1"
+    base-url: "https://split.example"
+    priority: 800
+    models: [{name: "m1", alias: ""}]
+  - api-key: "s2"
+    base-url: "https://split.example"
+    priority: 200
+    models: [{name: "m1", alias: ""}]
+''')
+    band6 = build_band(cfg6, "claude-api-key")
+    anchor, pre = existing_host_tiers(band6)
+    assert anchor["split.example"] == 800, anchor
+    assert pre["split.example"] == [800, 200], pre
+    sp6 = [mk("split.example", "s1"), mk("split.example", "s2")]
+    w6 = assign_priorities(sp6, cfg6, probation=True)
+    assert {p.sections["claude-api-key"].priority for p in sp6} == {800}
+    assert any("原 config.yaml 里就占着" in w for w in w6), w6
+
+    # ── ⑥ 幂等：跑两次给出同样的值 ────────────────────────────────
+    twice = [mk("big.example", "k1"), mk("brand.example", "sk-new")]
+    assign_priorities(twice, cfg, probation=True)
+    again = [mk("big.example", "k1"), mk("brand.example", "sk-new")]
+    assign_priorities(again, cfg, probation=True)
+    assert ([p.sections["claude-api-key"].priority for p in twice]
+            == [p.sections["claude-api-key"].priority for p in again])
+
+    # ── ⑥ 沿用原档不等于影响面为零：本次新加的模型造成的遮挡要报出来 ──
+    # 2026-09-04 自查：`pinned` 分支清掉了三类旧警告却没重新加挡站那一条，
+    # 于是「档位没变、但这个模型的格局变了」在界面上完全看不到。
+    cfg7 = yaml.safe_load('''
+claude-api-key:
+  - api-key: "a"
+    base-url: "https://mid.example"
+    priority: 500
+    models: [{name: "mA", alias: ""}]
+  - api-key: "b"
+    base-url: "https://top.example"
+    priority: 900
+    models: [{name: "mB", alias: ""}]
+  - api-key: "c"
+    base-url: "https://bot.example"
+    priority: 100
+    models: [{name: "mB", alias: ""}]
+''')
+    sh = [mk("mid.example", "a", models=("mA", "mB"))]
+    assign_priorities(sh, cfg7, probation=True)
+    spx = sh[0].sections["claude-api-key"]
+    assert spx.priority == 500, f"500 < 900 不构成劫持，该沿用，实得 {spx.priority}"
+    assert not spx.hijacked, [i.model for i in spx.hijacked]
+    shadowed = [w for w in spx.warnings if "挡在其后" in w]
+    assert shadowed, (
+        f"沿用 500 会把 bot.example(100) 挡在其后，必须报出来，实得 {spx.warnings}")
+    # 措辞要指向「去掉模型」而不是「改这个站的 priority」—— 档位不是本轮选的
+    assert "本档是该站原有的" in shadowed[0], shadowed[0]
+    assert "从模型清单里去掉" in shadowed[0], shadowed[0]
+    assert "改成" not in shadowed[0], (
+        "沿用原档时不该建议「改成 N」—— 那会把用户引向改一个不该动的既有值")
+    # 没有新增遮挡时不该凭空加警告
+    plain = [mk("mid.example", "a", models=("mA",))]
+    assign_priorities(plain, cfg7, probation=True)
+    assert not [w for w in plain[0].sections["claude-api-key"].warnings
+                if "挡在其后" in w], "没有遮挡却报了"
+
+    print("[OK] Existing tier pinned: 既有站沿用原档（全勾/部分勾都一样）、"
+          "新站仍走空档分配、会抢顶层时才重新定档、原文件已拆开的按最高档对齐、"
+          "沿用后新增的遮挡照样报出来")
+
+
+def test_orphan_entries_realign_priority():
+    """留守条目的 priority 必须对齐到同站本次的新档 —— 否则同站被拆成两层。
+
+    `_orphan_entry_lines` 原样搬回「没进方案」的条目，那是对的（删除只该由用户
+    显式操作）。但**原样**包含 priority，于是当同站另几把 Key 拿到新值时，
+    落盘结果里这一个站有两个 priority。
+
+    2026-09-04 现场截图就是这个形态：kktoken.cc 的 claude 段 5 条里 3 条 372、
+    2 条 164。CPA 的层级隔离只取最高可用桶（selector.go:527-553），
+    两层意味着低档那批只在高档全部不可用时才轮到 —— 「多 Key 并行轮询」变成
+    「主备切换」。
+
+    与 test_existing_hosts_keep_their_tier 是同一个症状的两半：那一项守
+    assign_priorities 不乱改既有站的档，这一项守写回时留守条目跟着对齐。
+    两条都要有 —— 用户手工改了 priority（覆盖在定档之后应用）时只有这一条兜得住。
+    """
+    import yaml
+    from cpa_probe.writeback import rebuild_config_full, validate
+    from cpa_probe.plan import SectionPlan, ImportPlan
+
+    orig = """host: "127.0.0.1"
+
+claude-api-key:
+  - api-key: "k1"
+    base-url: "https://multi.example"
+    prefix: "ANT"
+    priority: 900        # 上一轮定的
+    weight: 3
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+  - api-key: "k2"
+    base-url: "https://multi.example"
+    prefix: "ANT"
+    priority: 900
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+  # k3 这一把有自己的注释，搬运时不能丢
+  - api-key: "k3"
+    base-url: "https://multi.example"
+    prefix: "ANT"
+    priority: 900
+    proxy-url: "http://mihomo:7890"
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+"""
+    cfg = yaml.safe_load(orig)
+    lines = orig.splitlines(keepends=True)
+
+    # 只有 k1 进方案，且它拿到一个**不同于原值**的 priority
+    # （模拟用户手工改档，或旧版定档给出的新值）
+    p = ImportPlan(host="multi.example", masked_key="k1", line_no=1)
+    p.sections["claude-api-key"] = SectionPlan(
+        section="claude-api-key", base_url="https://multi.example",
+        api_key="k1", models=["claude-opus-5"], priority=250,
+        prefix="ANT", model_source="probed")
+    new, warns = rebuild_config_full(
+        cfg, {("https://multi.example", "k1"): p}, lines)
+    ok, msg = validate(new)
+    assert ok, msg
+    got = yaml.safe_load(new)
+    ents = got["claude-api-key"]
+    assert len(ents) == 3, f"条目数该守恒为 3，实得 {len(ents)}"
+    vals = {e["priority"] for e in ents}
+    assert vals == {250}, (
+        f"同站三把 Key 该同档，实得 {sorted(vals)} —— 留守的两把没跟着对齐")
+    # 对齐只改 priority 那一行，其余字段逐字保留
+    by_key = {e["api-key"]: e for e in ents}
+    assert by_key["k3"].get("proxy-url") == "http://mihomo:7890", (
+        "留守条目的 proxy-url 被改动了")
+    assert all(e.get("prefix") == "ANT" for e in ents), "prefix 丢了"
+    assert "k3 这一把有自己的注释" in new, "留守条目自己的注释丢了"
+    # 行尾注释要说清这个值是对齐来的，不是本次实测出来的
+    assert "对齐同站档位" in new, "对齐后的行尾注释没说明来由"
+    assert any("已对齐到同站新档" in w for w in warns), warns
+
+    # 原值本来就等于新值时不改、也不报 —— 避免制造无意义的 diff
+    p2 = ImportPlan(host="multi.example", masked_key="k1", line_no=1)
+    p2.sections["claude-api-key"] = SectionPlan(
+        section="claude-api-key", base_url="https://multi.example",
+        api_key="k1", models=["claude-opus-5"], priority=900,
+        prefix="ANT", model_source="probed")
+    new2, warns2 = rebuild_config_full(
+        cfg, {("https://multi.example", "k1"): p2}, lines)
+    assert validate(new2)[0]
+    assert {e["priority"] for e in yaml.safe_load(new2)["claude-api-key"]} == {900}
+    assert not any("已对齐到同站新档" in w for w in warns2), (
+        f"值没变却报了对齐，实得 {warns2}")
+    assert "对齐同站档位" not in new2, "值没变却改写了行尾注释"
+
+    # 条目里有嵌套结构、其中也叫 priority 时，只改条目级那一行 ——
+    # 命中第一条之后无论改没改都停。原文件的 `plugins.configs.example.priority: 1`
+    # 就是这种形状（缩进 6，在条目级的 4 之外）。
+    nested = """host: "127.0.0.1"
+
+claude-api-key:
+  - api-key: "n1"
+    base-url: "https://nest.example"
+    priority: 900
+    request-scoped-errors:
+      configs:
+        example:
+          priority: 1
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+  - api-key: "n2"
+    base-url: "https://nest.example"
+    priority: 900
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+"""
+    cfgn = yaml.safe_load(nested)
+    pn = ImportPlan(host="nest.example", masked_key="n2", line_no=1)
+    pn.sections["claude-api-key"] = SectionPlan(
+        section="claude-api-key", base_url="https://nest.example",
+        api_key="n2", models=["claude-opus-5"], priority=400,
+        model_source="probed")
+    new3, _w3 = rebuild_config_full(
+        cfgn, {("https://nest.example", "n2"): pn},
+        nested.splitlines(keepends=True))
+    assert validate(new3)[0]
+    got3 = yaml.safe_load(new3)["claude-api-key"]
+    assert {e["priority"] for e in got3} == {400}, (
+        f"条目级 priority 该对齐到 400，实得 {[e['priority'] for e in got3]}")
+    keep = next(e for e in got3 if e["api-key"] == "n1")
+    assert keep["request-scoped-errors"]["configs"]["example"]["priority"] == 1, (
+        "嵌套结构里的同名键被改掉了")
+
+    # 同一批方案里同 host 拿到**不同** priority（操作员手工改过一部分）——
+    # 「同站的新档」不唯一，此时不许替他挑一个去改留守条目（2026-09-04 自查）。
+    amb = """host: "127.0.0.1"
+
+claude-api-key:
+  - api-key: "k1"
+    base-url: "https://m.example"
+    priority: 900
+    models: [{name: "claude-opus-5", alias: ""}]
+  - api-key: "k2"
+    base-url: "https://m.example"
+    priority: 900
+    models: [{name: "claude-opus-5", alias: ""}]
+  - api-key: "k3"
+    base-url: "https://m.example"
+    priority: 900
+    models: [{name: "claude-opus-5", alias: ""}]
+"""
+    cfga = yaml.safe_load(amb)
+    pa: dict = {}
+    for key, pri in (("k1", 250), ("k2", 777)):
+        q = ImportPlan(host="m.example", masked_key=key, line_no=1)
+        q.sections["claude-api-key"] = SectionPlan(
+            section="claude-api-key", base_url="https://m.example",
+            api_key=key, models=["claude-opus-5"], priority=pri,
+            model_source="probed")
+        pa[("https://m.example", key)] = q
+    newa, warnsa = rebuild_config_full(cfga, pa, amb.splitlines(keepends=True))
+    assert validate(newa)[0]
+    bya = {e["api-key"]: e["priority"] for e in yaml.safe_load(newa)["claude-api-key"]}
+    assert bya == {"k1": 250, "k2": 777, "k3": 900}, (
+        f"手工改出的两个值该照写，留守的 k3 该保持 900，实得 {bya}")
+    assert any("不同" in w and "保持原值" in w for w in warnsa), (
+        f"同站多档无法对齐时必须报出来而不是默默挑一个，实得 {warnsa}")
+
+    # 嵌套块排在条目级 priority **之前**时也要改对那一行（2026-09-04 自查）。
+    # 第一版只认「第一条 priority: 行」，不看缩进 —— 这个顺序下命中的是嵌套里
+    # 那个，于是三重错误：条目级没对齐（拆档没修上）、嵌套里一个无关键被改成
+    # 档位值、而 realigned 报的是「已对齐」。字段顺序不保证，手工编辑过的条目
+    # 完全可能是这个形状。
+    before_nested = """host: "127.0.0.1"
+
+claude-api-key:
+  - api-key: "p1"
+    base-url: "https://ord.example"
+    request-scoped-errors:
+      configs:
+        example:
+          priority: 1
+    priority: 900
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+  - api-key: "p2"
+    base-url: "https://ord.example"
+    priority: 900
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+"""
+    cfgo = yaml.safe_load(before_nested)
+    po = ImportPlan(host="ord.example", masked_key="p2", line_no=1)
+    po.sections["claude-api-key"] = SectionPlan(
+        section="claude-api-key", base_url="https://ord.example",
+        api_key="p2", models=["claude-opus-5"], priority=300,
+        model_source="probed")
+    newo, warnso = rebuild_config_full(
+        cfgo, {("https://ord.example", "p2"): po},
+        before_nested.splitlines(keepends=True))
+    assert validate(newo)[0]
+    go = yaml.safe_load(newo)["claude-api-key"]
+    assert {e["priority"] for e in go} == {300}, (
+        f"嵌套块在前时条目级 priority 该对齐到 300，实得 "
+        f"{[e['priority'] for e in go]}")
+    kept_o = next(e for e in go if e["api-key"] == "p1")
+    assert kept_o["request-scoped-errors"]["configs"]["example"]["priority"] == 1, (
+        "嵌套结构里的同名键被当成条目级 priority 改掉了")
+    assert any("已对齐到同站新档" in w for w in warnso), warnso
+
+    # 值不是裸整数（`"900"` / `!!int 900` / 锚点）—— 本工具不改，但**必须报**。
+    # 静默跳过等于让用户以为拆档修好了：条目仍留在旧档，与同站其他 Key 分两层。
+    odd_src = """host: "127.0.0.1"
+
+claude-api-key:
+  - api-key: "q1"
+    base-url: "https://odd.example"
+    priority: "900"
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+  - api-key: "q2"
+    base-url: "https://odd.example"
+    priority: 900
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+"""
+    cfgq = yaml.safe_load(odd_src)
+    pq = ImportPlan(host="odd.example", masked_key="q2", line_no=1)
+    pq.sections["claude-api-key"] = SectionPlan(
+        section="claude-api-key", base_url="https://odd.example",
+        api_key="q2", models=["claude-opus-5"], priority=350,
+        model_source="probed")
+    newq, warnsq = rebuild_config_full(
+        cfgq, {("https://odd.example", "q2"): pq},
+        odd_src.splitlines(keepends=True))
+    assert validate(newq)[0]
+    assert any("没能对齐" in w for w in warnsq), (
+        f"引号包裹的 priority 改不了，必须报出来而不是静默跳过，实得 {warnsq}")
+    assert 'priority: "900"' in newq, "不该去改非裸整数的写法"
+
+    print("[OK] Orphan realign: 留守条目跟着同站新档走、其余字段与注释逐字保留、"
+          "值未变时不制造 diff、嵌套同名键不误伤（含嵌套排在前面的顺序）、"
+          "同站多档时报出来而不替人挑、改不动的写法明确报出来")
 
 
 def test_batch_key_includes_api_key():
@@ -3299,6 +4913,8 @@ if __name__ == "__main__":
         ("条目守恒与未勾不删", test_rebuild_entry_conservation),
         ("重建保留 weight", test_rebuild_keeps_weight),
         ("批量定档站级差异", test_assign_priorities_site_level),
+        ("既有站沿用原档", test_existing_hosts_keep_their_tier),
+        ("留守条目对齐同站档位", test_orphan_entries_realign_priority),
         ("模型库三层兜底", test_model_catalog_three_layers),
         ("规则收紧不留死角", test_model_rules_no_dead_end),
         ("端点通但模型空也要兜底", test_usable_but_empty_models),
@@ -3307,6 +4923,21 @@ if __name__ == "__main__":
         ("落后目录不默认勾", test_stale_catalog_not_recommended),
         ("限频阈值自动学习", test_rate_limit_learned),
         ("上下文上限下限校验", test_context_limit_lower_bound),
+        ("能力开关实测与写回",
+         test_capability_toggles_probed_and_written),
+        ("compat 同 host 多路径隔离", test_compat_same_host_multi_path_isolated),
+        ("查表接线到写回路径", test_carry_tables_are_wired_into_writeback_path),
+        ("headers 合并行为", test_merge_entry_headers_behaviour),
+        ("flow 段头重建", test_flow_style_section_head_rebuilds),
+        ("模型级能力字段搬运",
+         test_model_level_capability_fields_are_carried),
+        ("能力探测真的被调用", test_capability_probe_is_actually_invoked),
+        ("compat provider 查找剥注释",
+         test_find_compat_provider_strips_trailing_comments),
+        ("段边界认异形顶层键",
+         test_section_span_recognizes_odd_top_level_keys),
+        ("_yaml_field 子键与 float",
+         test_yaml_field_escapes_subkeys_and_skips_odd_floats),
         ("批量键含 api_key", test_batch_key_includes_api_key),
         ("批量记录异常站", test_batch_records_errors),
         ("cgroup 异常值降级", test_cgroup_bad_values),

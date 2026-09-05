@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import collections
+import copy
 import io
 import os
 import re
@@ -105,21 +106,16 @@ def build_plans(cfg: dict, *, source: str = "probed",
                 only: set[str] | None = None) -> dict:
     """把既有条目原样变成方案。only 给定时只保留那些段（模拟未勾选）。
 
-    weight / proxy-url 必须照 server 的全量重探那条路搬运（existing_weights /
-    existing_proxies）。不搬的话这份演练自己就把它们丢了，对不上账不是产品
-    的问题而是演练的问题 —— 而那正好会掩盖真实的丢字段缺陷。
+    weight / proxy-url / headers 必须照 server 的全量重探那条路搬运
+    （existing_weights / existing_proxies / existing_headers）。不搬的话这份
+    演练自己就把它们丢了，对不上账不是产品的问题而是演练的问题 —— 而那正好会
+    掩盖真实的丢字段缺陷。
     """
-    from cpa_probe.batch import (existing_model_context,
-                                 existing_model_extras, existing_prefixes,
-                                 existing_provider_names, existing_proxies,
-                                 existing_weights)
+    # 与产品**同一个**搬运实现（2026-09-04）。以前这里自己抄了一遍那八张表，
+    # 于是「server 不搬 headers」这个缺陷演练照样对上账 —— 演练自己搬了。
+    from cpa_probe.batch import CarryTables
 
-    weights = existing_weights(cfg)
-    proxies = existing_proxies(cfg)
-    prefixes = existing_prefixes(cfg)
-    pnames = existing_provider_names(cfg)
-    mctx = existing_model_context(cfg)
-    mextra = existing_model_extras(cfg)
+    carry = CarryTables(cfg)
 
     plans: dict = {}
     for short, base, key, orig in cp.extract_existing_entries(cfg):
@@ -134,24 +130,12 @@ def build_plans(cfg: dict, *, source: str = "probed",
                                       line_no=len(plans) + 1)
         models = [str(m.get("name")) for m in (orig.get("models") or [])
                   if isinstance(m, dict) and m.get("name")]
-        h = cp.host_of(base)
         sp = SectionPlan(
             section=sec, base_url=base, api_key=key,
             models=models or ["claude-opus-5"],
             priority=int(orig.get("priority") or 100),
-            weight=weights.get((sec, h, key)),
-            proxy_url=proxies.get((sec, h, key), ""),
             model_source=source)
-        if (sec, h, key) in prefixes:
-            sp.prefix = prefixes[(sec, h, key)]
-        if sec == "openai-compatibility":
-            sp.provider_name = pnames.get(h, "")
-        sp.prior_context = {name: val
-                            for (s2, h2, k2, name), val in mctx.items()
-                            if s2 == sec and h2 == h and k2 == key}
-        sp.prior_model_extras = {name: dict(val)
-                                 for (s2, h2, k2, name), val in mextra.items()
-                                 if s2 == sec and h2 == h and k2 == key}
+        carry.apply(sp, key)
         p.sections[sec] = sp
     return plans
 
@@ -187,14 +171,19 @@ def main() -> int:
     check("四段之外的全局键全部一致",
           [k for k in cfg if k not in SECS and cfg[k] != n2.get(k)], [])
 
-    # 每个条目的**每个字段** deep-equal，只豁免本次有意改的三个。
+    # 每个条目的**每个字段** deep-equal，只豁免本次有意改的两个。
     #
     # 为什么必须逐字段比值（2026-09-03）：上一版只比字段的**出现次数**
     # （`text.count("prefix:")`），于是「121 个条目的 prefix 全被抹掉、
     # 同时注释里多出 121 处提到 prefix」这种情况两边都数得对 —— 计数相等，
     # 值全错。实测这一关抓到两处：prefix 121/121 被 dominant_prefix 覆盖、
     # compat 的 provider name 12/13 被改成 host（那是 CPA 的 provider 身份）。
-    INTENT = {"priority", "models", "headers"}
+    #
+    # `headers` 2026-09-04 从豁免里**拿掉**：它曾被当成「本次有意改」而跳过，
+    # 于是「24/24 与 66/66 条目的 headers 全丢」这处 P0 一直没被这一关抓到。
+    # 它其实与 proxy-url 同构 —— 探测有值优先、否则搬原值，所以原值必须守住。
+    # 见 batch.existing_headers。
+    INTENT = {"priority", "models"}
     # 这两个字段「显式写空串」与「不写」在 CPA 侧完全等价：synthesizer 存的是
     # `strings.TrimSpace(...)`，proxy 判 `!= ""` 才建 transport
     # （proxy_helpers.go:34-42），prefix 走 normalizeModelPrefix 也 trim。
@@ -234,7 +223,7 @@ def main() -> int:
             if fval(ea[k], f) != fval(eb[k], f):
                 fdiff[f] += 1
                 fex.setdefault(f, (k[1], k[0], ea[k].get(f), eb[k].get(f)))
-    check("非预期字段差异（priority/models/headers 之外）", dict(fdiff), {})
+    check("非预期字段差异（priority/models 之外）", dict(fdiff), {})
     for f, (h, s, a, b) in fex.items():
         print(f"       {f} @ {h}/{s}: {str(a)[:52]} → {str(b)[:52]}")
 
@@ -429,6 +418,73 @@ def main() -> int:
     check("probed 把空位全部补上", slots(n6), total)
     check("新增有警告并写明依据",
           any("新增" in x and "本次实测通过" in x for x in w6), True)
+
+    print("\n── ⑤ 同站同档：落盘后每个 (站, 段) 只能有一个 priority " + "─" * 3)
+    # 2026-09-04 现场截图：kktoken.cc 的 claude 段 5 把 Key 里 3 把拿 164、
+    # 2 把留在 372；tabitoken.com 14 把里 9 把拿 167、5 把留在 371。
+    #
+    # 两个独立成因，各自都足以造成拆档：
+    #   ① assign_priorities 把重探的既有站当新站，从空档重新分配 —— 全勾时
+    #      整份配置的站间次序被推平（claude 段 12 个站从 1000..50 变成连号）
+    #   ② 留守条目（没勾 / 判不可写 / 探测异常）由 _orphan_entry_lines 原样
+    #      搬回旧值，与被重探那几把的新值并存
+    #
+    # CPA 的层级隔离只取最高可用桶（selector.go:527-553），同站被拆成两层
+    # 就把「多 Key 并行轮询」变成「主备切换」。
+    def tiers_by_host(c: dict) -> dict:
+        out: dict = {}
+        for s in SECS:
+            for e in (c.get(s) or []):
+                if not isinstance(e, dict):
+                    continue
+                h = cp.host_of(str(e.get("base-url") or ""))
+                out.setdefault((s, h), set()).add(e.get("priority"))
+        return out
+
+    before = tiers_by_host(cfg)
+    pre_split = {k for k, v in before.items() if len(v) > 1}
+    check("原配置本身没有拆档的 (站, 段)", sorted(pre_split), [])
+
+    # 全勾：定档跑完 + 整段重写，站间次序必须与原配置逐项一致
+    plans_all = build_plans(cfg)
+    cp.mark_new_sections(cfg, list(plans_all.values()))
+    cp.assign_priorities(list(plans_all.values()), cfg,
+                         probation=True, raw=raw)
+    new7, _w7 = cp.rebuild_config_full(cfg, plans_all, lines)
+    check("YAML 合法（全勾 + 定档）", cp.validate(new7)[0], True)
+    after = tiers_by_host(yaml.safe_load(new7) or {})
+    check("全勾：没有任何 (站, 段) 被拆档",
+          sorted(k for k, v in after.items() if len(v) > 1), [])
+    check("全勾：既有站的档位逐项不变",
+          sorted(f"{s}|{h}={sorted(v)}" for (s, h), v in after.items()
+                 if before.get((s, h)) != v),
+          [])
+
+    # 部分勾选：每个 (站, 段) 只让前半数 Key 进方案，留守那批必须被对齐
+    part: dict = {}
+    seen_n: dict = {}
+    for k, p in plans_all.items():
+        keep = {}
+        for sec, sp in p.sections.items():
+            hkey = (sec, cp.host_of(sp.base_url))
+            n = seen_n.get(hkey, 0)
+            seen_n[hkey] = n + 1
+            if n % 2 == 0:              # 隔一把勾一把
+                keep[sec] = sp
+        if keep:
+            q = copy.copy(p)
+            q.sections = keep
+            part[k] = q
+    new8, w8 = cp.rebuild_config_full(cfg, part, lines)
+    check("YAML 合法（隔一把勾一把）", cp.validate(new8)[0], True)
+    n8 = yaml.safe_load(new8) or {}
+    after8 = tiers_by_host(n8)
+    check("部分勾选：没有任何 (站, 段) 被拆档",
+          sorted(k for k, v in after8.items() if len(v) > 1), [])
+    check("部分勾选：条目一条不少", slots(n8), slots(cfg))
+    for s in SECS:
+        check(f"部分勾选：{s} 条目数不变",
+              len(n8.get(s) or []), len(cfg.get(s) or []))
 
     print("\n" + "=" * 60)
     if _bad:

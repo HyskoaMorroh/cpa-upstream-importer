@@ -599,14 +599,22 @@ def main() -> int:
     eq("未设 weight 记成 None 而非跳过",
        W("openai-compatibility",
          {"api-key-entries": [{"weight": 0}, {"api-key": "d"}]}), [0, None])
+    # 每个 provider 都要带 models —— compat 段空 models 时 CPA 对它零注册
+    # 模型（service_models.go:206-216 走 UnregisterClient），那条判据 2026-09-05
+    # 加进 entry_out_of_pool。这一节测的是 **weight 语义**，所以其余维度必须
+    # 给齐正常值，否则测到的是别的判据。
+    _M = [{"name": "claude-opus-5", "alias": ""}]
     cfg_c = {"routing": {"strategy": "weighted-round-robin"},
              "openai-compatibility": [
         {"name": "dead", "base-url": "https://dead.example/v1", "priority": 500,
+         "models": _M,
          "api-key-entries": [{"api-key": "a", "weight": 0},
                              {"api-key": "b", "weight": 0}]},
         {"name": "mixed", "base-url": "https://mixed.example/v1", "priority": 400,
+         "models": _M,
          "api-key-entries": [{"api-key": "c", "weight": 0}, {"api-key": "d"}]},
         {"name": "live", "base-url": "https://live.example/v1", "priority": 300,
+         "models": _M,
          "api-key-entries": [{"api-key": "e"}]}]}
     bc = cp.build_band(cfg_c, "openai-compatibility")
     eq("dead.example 判死", "dead.example" in bc.dead_hosts, True)
