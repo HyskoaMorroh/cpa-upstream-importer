@@ -12,9 +12,23 @@
     不是配置层去重，别混淆。
 
 定档（§7）—— priority 数值大者优先，且**层级隔离**：
-    selector.go:325-333  if priority > bestPriority，只保留最大那一桶
+    selector.go:539-549  availableAuthsFromPriorityBuckets 只收集 bestPriority
+    （行号 2026-09-05 校正：原写 325-333，那一段现在是日志脱敏正则；
+     同族的 highestPriorityAuths 在 564-583）
     低档凭据只在更高档全部不可用时才参与。所以插档不是「排个序」，
     而是「决定它跟谁同层、把谁挡在后面」。
+
+    **一条例外：codex 段的 WS 请求跨档**（2026-09-05 核实）
+    下游是 WS 连接且 provider 是 codex/xai 时，scheduler.go:987-997 的
+    highestReadyPriorityLocked 从高到低扫 priorityOrder，返回**第一个含
+    ws 凭据的档** —— 源码注释自己写着 "even if they are in a lower
+    priority tier than HTTP-only credentials"。
+
+    触发条件在本部署是活的（weighted-round-robin + session-affinity: false
+    → 内建选择器 → scheduler 快路）。本模块的处置是**只在文案上说清、
+    不改定档算法**（见 ws_crosstier_note 的说明）：跨档只发生在那条少数
+    路径上，HTTP 请求的档位谱仍然完全成立；而 websockets 是探测写的、
+    会随重探变化，让它参与定档会让档位谱不稳定。
 
 影响面 —— atlas 记的教训：第一版 620 方案劫持了 4 个模型的顶层。
     改 priority 前必须枚举该层会吃到哪些模型。本模块对每个新条目
@@ -33,7 +47,11 @@ from . import model_catalog
 # pipeline 不导入 plan，这个方向无环。只取白名单判定与每段模型上限，
 # 目录读回来的名字必须过同一道白名单 —— 不然中转站目录里的
 # embedding / whisper / tts 之类会被注册成对话模型。
-from .pipeline import (MAX_MODELS_PER_SECTION, SEED_MODELS, model_allowed,
+# SEED_MODELS 不在这里用（种子兜底走 model_catalog.latest_models 的三层，
+# 那才是「市面最新」；SEED_MODELS 是**基线阶段逐个打**的短清单，两回事）。
+# 不要为了注释里提到它就导入 —— pyflakes 会报未用，而那条告警的意义正是
+# 「这个名字在这里没有作用」。
+from .pipeline import (MAX_MODELS_PER_SECTION, model_allowed,
                        model_fits_section)
 
 # 只有 gemini 段在配置层去重（静默丢弃）
@@ -241,12 +259,39 @@ class Band:
     section: str
     tiers: list[int] = field(default_factory=list)          # 降序
     hosts_at: dict[int, list[str]] = field(default_factory=dict)
+    # codex 段带 `websockets: true` 的档与站（降序）。
+    #
+    # 为什么单独记（2026-09-05，契约对齐审计发现）
+    # ----------------------------------------
+    # 本工具整套影响面计算建立在「priority 硬隔离」上 ——
+    # `availableAuthsFromPriorityBuckets`（selector.go:539-549）只收集
+    # bestPriority 那一桶。codex 段的 WS 请求是唯一的例外，见
+    # `ws_crosstier_note`。
+    # 但 codex 段有一条例外：**下游是 WS 连接**时，
+    # `scheduler.go:987-997`（`highestReadyPriorityLocked`，preferWebsocket=true）
+    # 从高到低扫 priorityOrder，返回**第一个含 ws 凭据的档** —— 源码注释自己
+    # 写着 "even if they are in a lower priority tier than HTTP-only
+    # credentials"。
+    #
+    # 触发条件在本部署是活的：`routing.strategy: weighted-round-robin` +
+    # `session-affinity: false` → 内建选择器 → scheduler 快路
+    # （conductor_selection.go 的 useSchedulerFastPath）。
+    #
+    # 生产实测（fsdownload 版 codex 段）：425 档带 ws 且是最高档，所以此刻
+    # 不越档；但 350/349/348 三档全无 ws，425 一冷却，WS 请求会直接跳到
+    # 154 档的 anyrouter.top（也带 ws），越过三个健康档。
+    #
+    # **只用于文案与影响面，不参与定档**：跨档只发生在下游用 WS 连接时
+    # （Codex Desktop 那条路），HTTP 请求的档位谱仍然完全成立；而
+    # `websockets` 是探测写的、会随重探变化，让它参与定档会让档位谱不稳定。
+    ws_tiers: list[int] = field(default_factory=list)
+    ws_hosts_at: dict[int, list[str]] = field(default_factory=dict)
     model_top: dict[str, int] = field(default_factory=dict)  # 模型 -> 当前顶层 priority
     # 模型 -> {档位: 承载该模型的站点}。算「挡住谁」必须按模型分开 ——
     # 30 档上有 6 个站，但只有声明了同一个模型的那几个才会被挡。
     model_tiers: dict[str, dict[int, list[str]]] = field(default_factory=dict)
     # 已被 weight: 0 逐出调度池的站。**挡住它们没有任何代价** ——
-    # selector.go:423-430 的 positiveWeightAuths 已经把零权重凭据整个剔除，
+    # selector.go:636-644 的 positiveWeightAuths 已经把零权重凭据整个剔除，
     # 它们本来就不会被选中。
     #
     # 为什么必须区分（2026-08-30 实测发现的定档缺陷）：
@@ -366,11 +411,50 @@ _DEAD_NOTE_PAREN = re.compile(
 # **活站被当成死站，新站于是拿到过高的档位，压住真正可用的站。**
 #
 # 当前这 13 个站没踩到只是运气：没有一个域名含这些词。
+# 注释里出现这些词时**不当站名**。
+#
+# 2026-09-05 补全：原表停在旧字段集，CPA 后来加的字段一个都没进。实测触发 ——
+#
+#     # websockets: true   实测 503 不支持 WS
+#       → _DEAD_NOTE 命中、_HOST_IN_NOTE 抓出 `websockets`
+#       → _looks_like_host 返回 True → 进 unhealthy_hosts
+#
+# 于是一个**字段名**被当成死站，定档因此偏保守（新站被压到一堆「死站」后面），
+# 而且不报错、不警告。生产 config.yaml 当前只抓出三个真站名没踩到，
+# 但本工具自己写的 `websockets: true   # 原值搬运…` 行尾注释改成英文就会触发。
+#
+# 取值范围：CPA `config_types.go` 的 99 个 yaml tag 里**会出现在四段条目内部**
+# 的那些。全局配置的 tag（addr / cert / timeout / strategy 之类）不加 ——
+# 它们不会出现在条目级注释里。
+#
+# 2026-09-05 第二轮又补六个（审计发现，它们确实在条目内部）：
+#   `mode`  —— claude 段的 `cloak.mode`（`config_types.go:333`）
+#   `min` / `max` / `levels` / `zero-allowed` / `dynamic-allowed`
+#           —— `models[].thinking` 的子键
+#              （`internal/registry/model_registry.go:102-111`）
+#
+# `mode` 这个词特别值得记：我上一轮**特意把它排除在外**，理由是「某个站真叫
+# `mode.example.com` 时它的点分标签里就有 mode」。那个顾虑本身没错，但代价
+# 算反了 —— `mode` 作为 cloak 子键出现在条目注释里的概率，远高于某个中转站
+# 的域名恰好叫 mode.*。真站名撞上时的后果是「少认一个死站」（定档偏保守，
+# 与不加这张表时的行为相同）；而漏排除时的后果是「把一个真站判成死站」，
+# 那会让新站档位偏高、真的挡住在用站。两侧不对称，取更安全的一侧。
 _NOT_A_HOST = frozenset("""
 api-key base-url proxy-url prefix priority weight models headers name alias
 disabled enabled request-scoped-errors api-key-entries max-context-length
 excluded-models fingerprint-profile action code status message error
 czone cf-ray note todo fixme warning tip
+
+websockets alpha-search support-prompt-cache-key disable-cooling request-retry
+rebuild-mid-system-message experimental-cch-signing cloak strict-mode
+sensitive-words cache-user-id match-regexr match not-match exist not-exist
+is-compat thinking display-name force-mapping image
+input-modalities output-modalities
+disable-codex-cloaking identity-confuse inject-x-search
+optimize-multi-agent-v2 stabilize-device-profile
+switch-preview-model switch-project store-auth store-sources
+
+mode min max levels zero-allowed dynamic-allowed
 """.split())
 
 
@@ -631,7 +715,7 @@ def entry_weights(section: str, entry: dict) -> list:
     这与整段修复的意图直接矛盾，且只影响 compat 段（最难发现的那种）。
 
     返回 [] 表示没有任何显式 weight —— **与 [0] 是完全不同的含义**：
-    没设 weight 走 credentialweight.Default（=1，selector.go:166-168），
+    没设 weight 走 credentialweight.Default（=1，credentialweight/weight.go:14 与 selector.go:380-398），
     显式设 0 才被 positiveWeightAuths 剔除。
     """
     if section == "openai-compatibility":
@@ -730,6 +814,77 @@ def weight_zero_excludes(cfg: dict) -> bool:
     return raw in _WRR_ALIASES
 
 
+def entry_out_of_pool(section: str, entry: dict) -> str:
+    """这个条目是不是已经被 CPA 排除在调度池外。是则返回原因，否则空串。
+
+    与 `weight: 0` 的性质相同（都是「CPA 不会把请求路由到它」），但判据不同 ——
+    weight 只在 weighted-round-robin 下生效，这两个**任何策略下都生效**。
+
+    两种形态（2026-09-05 加，审计发现）
+    -----------------------------
+    ① compat 段的 `disabled: true`
+       `internal/watcher/synthesizer/config.go:288-290` 与
+       `sdk/cliproxy/service_models.go:198` 都是遇 Disabled 直接 continue ——
+       那个 provider **连 Auth 都不合成**，根本不在池里。
+
+    ② 任意段的 `excluded-models: ["*"]`
+       那正是 CPA 管理面板「停用一个 config 型凭据」的实现
+       （`internal/api/handlers/management/config_apikey_disable.go:12` 的
+       `configAPIKeyDisablePattern = "*"`）。`applyExcludedModels`
+       （`service_models.go:541-574`）用通配匹配把该凭据的模型全过滤掉，
+       `registerResolvedModelsForAuth` 拿到空清单就 `UnregisterClient`。
+
+    为什么这件事重要：`build_band` 原来只看 priority / models / weight，
+    于是这两类条目被当成**在用站**参与定档避让。实测后果是一个
+    `disabled: true` 的 provider 在 300 档就把新站压到 225，
+    而理由文案说「会挡 N 个在用站」—— 其中那一个不在调度池里。
+
+    本工具其实**知道**第二条：`web/app.js` 与 `tests/test_web.py` 都写着
+    「`excluded-models` 含 `*`」是 CPAMP 停用徽标的来源，只是定档这一路
+    没据此排除。
+    """
+    if section == "openai-compatibility" and entry.get("disabled") is True:
+        return "provider 被 disabled: true 停用"
+    ex = entry.get("excluded-models")
+    if isinstance(ex, list) and any(str(x).strip() == "*" for x in ex):
+        return 'excluded-models 含 "*"（等于停用该凭据）'
+
+    # ③ base-url 为空 —— CPA 在**加载期**就把这条目删掉（2026-09-05 加）。
+    #
+    # 门槛按段不同，不能写成一条：
+    #   · codex   `config_normalization.go:208-210`  `if e.BaseURL == "" { continue }`
+    #   · compat  同文件 `:167-170`  同一句，注释写着 "treated as removed"
+    #     —— 这两段**只要 base-url 空就删**，哪怕 api-key 有值
+    #   · gemini  同文件 `:244-246`  `if entry.APIKey == "" && entry.BaseURL == ""`
+    #   · claude  `internal/watcher/synthesizer/config.go:145-147` 同上
+    #     —— 这两段要**两个都空**才删
+    base = str(entry.get("base-url") or "").strip()
+    if not base:
+        if section in ("codex-api-key", "openai-compatibility"):
+            return "base-url 为空（CPA 加载期直接删掉这个条目）"
+        if not str(entry.get("api-key") or "").strip():
+            return "api-key 与 base-url 都为空（CPA 加载期直接删掉）"
+
+    # ④ compat 的 models 为空 —— 该条目对**每个具名模型**都不在池里。
+    #
+    # `registerCompat`（`sdk/cliproxy/service_models.go:206-216`）在模型清单空
+    # 且插件也没给模型时走 `UnregisterClient`，该 Auth 零注册模型；而
+    # `scheduledAuthMeta.supportsModel`（`sdk/cliproxy/auth/scheduler.go:838-841`）
+    # 在 `supportedModelSet` 为空时对任何具名模型返回 **false**。
+    #
+    # **只对 compat 成立**：codex 段空 models 会回落 `GetCodexProModels()`
+    # （`service_models.go:825-826`），仍在池。这个差别是本工具此前把两段
+    # 一视同仁的原因，也是它必须分开写的原因。
+    if section == "openai-compatibility":
+        ms = entry.get("models")
+        has_named = isinstance(ms, list) and any(
+            isinstance(m, dict) and str(m.get("name") or "").strip()
+            for m in ms)
+        if not has_named:
+            return "models 为空（CPA 对该 provider 零注册模型，不在调度池里）"
+    return ""
+
+
 def build_band(cfg: dict, section: str, *, raw: str = "") -> Band:
     """从现有 config.yaml 算出该段的档位谱与每个模型的当前顶层。
 
@@ -747,9 +902,13 @@ def build_band(cfg: dict, section: str, *, raw: str = "") -> Band:
     # 见 weight_zero_excludes 的说明。
     wrr = weight_zero_excludes(cfg)
 
+    # codex 段带 `websockets: true` 的档与站。见下方 ws_tiers 的写入处。
+    ws_tiers: set[int] = set()
+    ws_hosts: dict[int, list[str]] = {}
     for e in cfg.get(section) or []:
         if not isinstance(e, dict):
             continue
+        entry = e
         pri = e.get("priority")
         if not isinstance(pri, int):
             continue
@@ -761,9 +920,31 @@ def build_band(cfg: dict, section: str, *, raw: str = "") -> Band:
         # 在 api-key-entries 里，条目级读不到（自查发现的缺陷）。
         if wrr and host and entry_all_zero_weight(section, e):
             dead.add(host.lower())
+        # 已被 CPA 排除在调度池外的条目（disabled / excluded-models 含 `*`）。
+        # 与 weight:0 不同的是这两个**任何策略下都生效**，所以不看 wrr。
+        # 见 entry_out_of_pool。
+        out_why = entry_out_of_pool(section, e)
+        if host and out_why:
+            dead.add(host.lower())
+            # **也不参与档位与模型归属**：它不在池里，让它占一个档位、
+            # 或者声明「这个模型的最高档是我」，都会让新站被错误地压低。
+            # weight:0 那条只加进 dead 不跳过归属，因为它只在 wrr 下成立，
+            # 而档位谱要对所有策略都成立。
+            continue
         tiers.setdefault(pri, [])
         if host and host not in tiers[pri]:
             tiers[pri].append(host)
+        # codex 段的 `websockets: true` 会让**下游是 WS 连接**的请求跨档取
+        # （scheduler.go:987-997 的 highestReadyPriorityLocked，preferWebsocket
+        # 时从高到低扫 priorityOrder 返回第一个含 ws 凭据的档，源码注释写着
+        # "even if they are in a lower priority tier"）。
+        # 单独记一份，供影响面文案说清这一层。见 Band.ws_tiers。
+        if section == "codex-api-key" and entry.get("websockets") is True:
+            ws_tiers.add(pri)
+            if host:
+                ws_hosts.setdefault(pri, [])
+                if host not in ws_hosts[pri]:
+                    ws_hosts[pri].append(host)
         for m in _models_of(e):
             if m not in model_top or pri > model_top[m]:
                 model_top[m] = pri
@@ -773,6 +954,8 @@ def build_band(cfg: dict, section: str, *, raw: str = "") -> Band:
                 at.append(host)
 
     band.tiers = sorted(tiers, reverse=True)
+    band.ws_tiers = sorted(ws_tiers, reverse=True)
+    band.ws_hosts_at = {k: sorted(v) for k, v in ws_hosts.items()}
     band.hosts_at = {k: sorted(v) for k, v in tiers.items()}
     band.model_top = model_top
     band.model_tiers = {
@@ -785,9 +968,13 @@ def build_band(cfg: dict, section: str, *, raw: str = "") -> Band:
     for e in cfg.get(section) or []:
         if not isinstance(e, dict):
             continue
-        # 「还有活 key」= 这个条目不是全 0。同一个站可能有多个条目，
-        # 任一条目还有活 key 就不算整站死掉。
-        if not entry_all_zero_weight(section, e):
+        # 「还有活 key」= 这个条目不是全 0，**且**没被排除出池。
+        #
+        # 后半句是 2026-09-05 补的：不加的话一个 `disabled: true` 的条目会把
+        # 自己所在的站从 dead_hosts 里救回来 —— 它确实「不是全 0 权重」，
+        # 但它根本不在调度池里。
+        if (not entry_all_zero_weight(section, e)
+                and not entry_out_of_pool(section, e)):
             h = host_of(str(e.get("base-url") or "")).lower()
             if h:
                 alive.add(h)
@@ -1049,6 +1236,66 @@ class Impact:
         return seen
 
 
+def ws_crosstier_note(band: Band, new_priority: int,
+                      new_has_ws: bool) -> str:
+    """codex 段 WS 请求的跨档说明。不适用时返回空串。
+
+    为什么需要这句话（2026-09-05，契约对齐审计发现）
+    ------------------------------------------
+    界面上「挡住 N 个在用站」「新值高于现有顶层」这些结论，全都基于
+    **priority 硬隔离**（`availableAuthsFromPriorityBuckets` 只收集
+    bestPriority 那一桶）。而 codex 段有一条例外：下游是 WS 连接时，
+    `scheduler.go:987-997` 会**跨档**取第一个含 ws 凭据的档。
+
+    所以对 codex 段必须多说一句 —— 否则用户按「档位隔离」的心智模型去理解
+    影响面，而 WS 请求的实际去向与那个模型不符。
+
+    两种情形分开说：
+      · 新条目**带** ws：它会参与 WS 请求的跨档竞争，而竞争的对手不是
+        「同档的站」而是「所有档里带 ws 的站」
+      · 新条目**不带** ws：WS 请求根本不会落到它身上，无论它在哪一档
+    """
+    if band.section != "codex-api-key":
+        return ""
+    if not band.ws_tiers:
+        # 全段没有一个带 ws 的条目 —— 那么 preferWebsocket 那一支
+        # 找不到任何桶，会回落到普通的最高档逻辑，硬隔离仍然成立。
+        return ""
+    higher_ws = [p for p in band.ws_tiers if p > new_priority]
+    lower_ws = [p for p in band.ws_tiers if p < new_priority]
+    if new_has_ws:
+        parts = [
+            "本条目带 websockets: true —— 下游用 WS 连接时 CPA 会跨档"
+            "取第一个含 ws 凭据的档（scheduler.go:987，源码注释明确说"
+            "「即使它在更低的档」）"
+        ]
+        if higher_ws:
+            hosts = sorted({h for p in higher_ws
+                            for h in band.ws_hosts_at.get(p, [])})
+            parts.append(
+                f"更高的 ws 档还有 {'、'.join(hosts[:4])}"
+                f"（档位 {'/'.join(str(p) for p in higher_ws[:4])}）—— "
+                f"WS 请求会先打它们")
+        if lower_ws:
+            hosts = sorted({h for p in lower_ws
+                            for h in band.ws_hosts_at.get(p, [])})
+            parts.append(
+                f"更低的 ws 档 {'、'.join(hosts[:4])} 会被本条目挡在后面，"
+                f"即使中间那些档比本条目健康")
+        if not higher_ws:
+            parts.append("本条目将成为 WS 请求的首选")
+        return "；".join(parts) + "。"
+    # 不带 ws
+    hosts = sorted({h for p in band.ws_tiers
+                    for h in band.ws_hosts_at.get(p, [])})
+    return (
+        f"本条目没有 websockets: true —— 下游用 WS 连接时 CPA 会跨档去找带 ws "
+        f"的凭据（当前是 {'、'.join(hosts[:4])}，档位 "
+        f"{'/'.join(str(p) for p in band.ws_tiers[:4])}），"
+        f"本条目在哪一档都不参与那条路径。"
+        f"上面的档位结论只对 HTTP 请求成立。")
+
+
 def compute_impact(band: Band, models: list[str], new_priority: int) -> list[Impact]:
     """枚举该新条目声明的每个模型，算出它对现有格局的影响。
 
@@ -1158,7 +1405,8 @@ def gentler_option(
 
 
 def _shadow_warning(band: Band, models: list[str], priority: int,
-                    shadow: dict[str, list[str]]) -> str:
+                    shadow: dict[str, list[str]], *,
+                    pinned: bool = False) -> str:
     """「挡住了谁」这条警告的正文。
 
     为什么要分开活站与死站（2026-09-02 演练发现）：原来只报总数，
@@ -1168,6 +1416,11 @@ def _shadow_warning(band: Band, models: list[str], priority: int,
 
     用户看到的是前者，于是会去调低一个本来最优的档位。README 早就写着
     「这条警告还会区分被挡的是活站还是死站」，但代码里没做 —— 文档超前于实现。
+
+    `pinned=True` 是「沿用原档的既有站」（2026-09-04）。那时结尾**不能**给
+    「改成 N 则只挡 M 个」这种建议 —— 本轮根本没有在选档，档位是它自己原来
+    就占着的；挡住别人是因为本次给它注册了原来没有的模型。给出「往下挪」的
+    建议会把用户引向一个错的动作（改动一个不该动的既有值）。
     """
     hosts = sorted(shadow)
     dead = _dead_shadowed(band, models, priority)
@@ -1184,6 +1437,13 @@ def _shadow_warning(band: Band, models: list[str], priority: int,
            f"（{head}）—— 它们只在本站也不可用时才被尝试。")
     if len(hosts) > len(live):
         msg += f"另有 {len(hosts) - len(live)} 个已不可用的站，挡住无代价。"
+    if pinned:
+        # 沿用原档：档位不是本轮选的，新增的遮挡来自本次给这个站注册的模型。
+        blocking = sorted({m for ms in shadow.values() for m in ms})
+        which = "、".join(blocking[:4]) + ("…" if len(blocking) > 4 else "")
+        return (msg + f"本档是该站原有的（本轮未改），遮挡来自本次给它注册的"
+                      f"模型（{which}）—— 要解开就从模型清单里去掉它们，"
+                      f"而不是改这个站的 priority")
     # 空档内取任何值效果都一样（465 与 200、890 挡的是同一批站），
     # 真正的选择是「插哪个空档」。所以不说「手工调低」，直接给下一档
     # 的具体值和代价，省掉用户自己试的那一轮。
@@ -1220,6 +1480,27 @@ class SectionPlan:
     # 上限实测于哪个模型。写回时只给这一个模型加 max-context-length，
     # 其余模型留空（CPA 会回落内置目录值），不把 A 的实测值外推到 B。
     context_model: str = ""
+    # ---- 段专属能力开关（2026-09-04）----
+    #
+    # 三态：True 写 `<字段>: true`；False 与 None 都**不写**（CPA 的零值就是
+    # 关闭），但界面措辞不同 —— False 是「实测不支持」，None 是「未探测」。
+    # 把这两者显示成一个样子就是「未验证当已验证」的镜像错误。
+    #
+    # 值的来源有三层，与 max_context_length 同一套优先级：
+    #   ① 本次实测（SectionVerdict.websockets / prompt_cache_key）
+    #   ② 原条目的值（prior_toggles，全量重探时搬回来）
+    #   ③ 都没有就不写
+    #
+    # 为什么 ② 不可省：这两个字段在 `_RENDERED_KEYS` 里，所以 carry 不搬；
+    # 而关掉能力探测（--no-capabilities）时方案侧是 None。不搬的话原有的
+    # `websockets: true` 会静默消失 —— 与 headers / proxy-url 完全同构的空档。
+    websockets: bool | None = None
+    websockets_note: str = ""
+    prompt_cache_key: bool | None = None
+    prompt_cache_note: str = ""
+    # 原条目里这两个开关的值，{字段名: 值}。只收显式写了 true 的
+    # （CPA 的零值即关闭，写 false 与不写等价，所以不必区分）。
+    prior_toggles: dict[str, bool] = field(default_factory=dict)
     # 原条目里**每个模型自己**的 max-context-length，{模型名: 值}。
     #
     # 为什么要单独一份（2026-09-03 逐字段对账发现）：这个值在 `models:` 块里，
@@ -1271,14 +1552,15 @@ class SectionPlan:
     # 原条目里 render_entry 不认识的字段，按 YAML 原文行搬运。
     #
     # 为什么必须有（2026-09-02 拿生产 config.yaml 核对发现）：render_entry 是
-    # 白名单式渲染（只写它知道的 10 个字段），而全量重探会用它**整段重写**。
-    # 生产配置 108 个条目里 106 条带白名单外的字段，重写后全部静默消失：
+    # 白名单式渲染（只写它知道的 12 个字段），而全量重探会用它**整段重写**。
+    # 生产配置 121 个条目里 117 条带白名单外的字段，重写后全部静默消失：
     #
-    #   request-scoped-errors  105 条  按状态码+正文做冷却，丢了就没有冷却
-    #   excluded-models         39 条  `["*"]` = 该站只用显式列的模型
-    #   websockets               2 条  codex 段的 WebSocket 开关
+    #   request-scoped-errors  116 条  按状态码+正文做冷却，丢了就没有冷却
     #   fingerprint-profile      1 条  claude 段让 CPA 自己补设备指纹
-    #   disabled（compat）       1 条  手工停用的 provider 会复活
+    #
+    # 2026-09-04 重新点过：以前这张表里的 `excluded-models 39 条` 与
+    # `disabled 1 条` 都是 0（那两个数把注释也数进去了）；`websockets` 移到
+    # 实测那条路（见 writeback._toggle_lines）。
     #
     # 存原文行而不是解析后的值：这些字段的结构任意深（request-scoped-errors
     # 是对象数组），重新序列化既要处理缩进又要处理引号风格，而原文行拿来就能
@@ -1438,7 +1720,8 @@ _STD_PROFILE = {
 }
 
 
-def _fallback_headers(section: str, v, cfg: dict | None) -> dict[str, str]:
+def _fallback_headers(section: str, v, cfg: dict | None,
+                      api_key: str = "") -> dict[str, str]:
     """判不可用的段该配哪套请求头。
 
     min_headers 只在「找到最省可用档」时才有值，判死的段永远是空的。可是
@@ -1449,6 +1732,23 @@ def _fallback_headers(section: str, v, cfg: dict | None) -> dict[str, str]:
     取探测**实际打到的最高档**，因为那是实测走过的最完整形态。没有任何
     id: 尝试记录时（连门票梯都没进就死了，比如 DNS 不通）回落到该段标准档
     —— 不取全量档，设备指纹那类头有站方会拒。
+
+    **必须走 `profiles.render` 求值**（2026-09-04 逐字段对账发现）
+    -------------------------------------------------------
+    `Profile.headers` 是**模板**，含 `{uuid1}` / `{key_hash}` 这类占位符。
+    正常路径取的是 `v.min_headers` —— 那是 `materialize` 求过值的产物；
+    只有这一支直接 `dict(p.headers)`，于是占位符原样写进 config.yaml。
+
+    实测已落进生产文件：`fsdownload/config.yaml` 里
+    `x-claude-code-session-id: "{uuid1}"` 出现 5 处（claude 段 4、compat 段 1），
+    而同一份 Desktop 配置里那个头是真 UUID。CPA 会把它原样发给上游
+    （`util/header_helpers.go` 的 ApplyCustomHeadersFromAttrs 只判非空、
+    不校验值形态），站方看到字面 `{uuid1}` 作为会话 id。
+
+    只对 headers 求值，不碰 body_patch —— 那是请求体字段，条目只支持 headers
+    （见 profiles.config_advice）。所以用 `render` 而不是 `materialize`：
+    后者会连 body_patch 一起算，而 headers 与 body 的 UUID 必须同源那条约束
+    只在**发请求**时成立，写 config.yaml 时没有 body 侧。
 
     标准档按**档名**指定，不按 tier 数字（2026-09-01 修正）
     ------------------------------------------------------
@@ -1462,20 +1762,22 @@ def _fallback_headers(section: str, v, cfg: dict | None) -> dict[str, str]:
     站因为多了个看不懂的头而拒。族名不会随梯子插档而漂移，所以按名字取。
     """
     from .profiles import ladder as _ladder
+    from .profiles import render as _render
 
     tried = {a.combo[3:] for a in v.attempts if a.combo.startswith("id:")}
     rungs = _ladder(section, cfg, include_alt=False)
     if tried:
         hit = [p for p in rungs if p.name in tried]
         if hit:
-            return dict(max(hit, key=lambda p: p.tier).headers)
+            return _render(dict(max(hit, key=lambda p: p.tier).headers),
+                           api_key)
     want = _STD_PROFILE.get(section, "")
     std = [p for p in rungs if p.name == want]
     if not std:
         # 档名没命中（梯子改过名）：退到该段 tier 最低的非 baseline 档，
         # 而不是某个写死的数字 —— 宁可少几个头也不要发错协议的头。
         std = sorted((p for p in rungs if p.tier >= 1), key=lambda p: p.tier)
-    return dict(std[0].headers) if std else {}
+    return _render(dict(std[0].headers), api_key) if std else {}
 
 
 def build_plan(
@@ -1598,7 +1900,7 @@ def build_plan(
         # 前提是有模型清单：手填 > 探测通过 > 目录 GET 读到的。目录是 CPAMP
         # 测活的唯一手段（它连推理都不发），可信度足够当候选。三者全空才跳过 ——
         # 那时连注册哪些模型都不知道，compat 段的 models 还是必填字段
-        # （config_types.go:670 无 omitempty）。
+        # （config_types.go:679 无 omitempty）。
         # 三者全空时**不再跳过**：退到该段的种子模型。
         #
         # 为什么改（2026-09-01 用户实测）：79 个凭据全量重探后「全勾」只勾中
@@ -1622,7 +1924,7 @@ def build_plan(
             #
             # 取探测实际打到的最高档门票：那是实测走过的最完整形态，比猜一个
             # 档次可靠。不取全量档 —— 设备指纹那类头有站方会拒。
-            headers = _fallback_headers(section, v, cfg)
+            headers = _fallback_headers(section, v, cfg, row.api_key)
         # 沿用该段主导 prefix。CPA 的五元组指纹**含 prefix**
         # （formatGeminiKeyDedupID），所以要在算 fp 之前定下来。
         prefix = dominant_prefix(cfg, section)
@@ -1785,6 +2087,12 @@ def build_plan(
             headers=headers,
             max_context_length=v.max_context_length,
             context_model=v.context_model,
+            # 段专属能力开关的实测结论。三态原样带过来 —— False（实测不支持）
+            # 与 None（未探测）在写回时行为相同，但界面措辞必须分开。
+            websockets=getattr(v, "websockets", None),
+            websockets_note=getattr(v, "websockets_note", ""),
+            prompt_cache_key=getattr(v, "prompt_cache_key", None),
+            prompt_cache_note=getattr(v, "prompt_cache_note", ""),
             score=score,
             model_source=model_source,
             catalog_stale=catalog_stale,
@@ -1951,6 +2259,16 @@ def build_plan(
                 shadow.setdefault(host, []).append(imp.model)
         if shadow:
             sp.warnings.append(_shadow_warning(band, sp.models, sp.priority, shadow))
+        # codex 段 WS 请求的跨档说明（2026-09-05）。
+        #
+        # 无条件加（不只在 shadow 非空时）：上面那些「挡住谁」的结论建立在
+        # priority 硬隔离上，而 WS 请求不受它约束。用户按档位隔离的心智模型
+        # 去读影响面，WS 请求的实际去向与那个模型不符 —— 这句话就是补上
+        # 那一层。见 ws_crosstier_note。
+        ws_note = ws_crosstier_note(band, sp.priority,
+                                    v.websockets is True)
+        if ws_note:
+            sp.warnings.append(ws_note)
         if v.swap_detected:
             sw = v.swap
             detail = f"{sw.get('rate_pct', 0)}%（{sw.get('swap')}/{sw.get('same', 0) + sw.get('swap', 0)} 次）"
@@ -1977,6 +2295,60 @@ def build_plan(
 
 
 # ---------------- 批量定档 ----------------
+
+
+# 「这一段这次有没有依据」的三档。与 score 不同：score 说的是探测质量，
+# 这个说的是清单从哪来。
+#   0  probed         本次实测跑通推理
+#   1  manual/catalog 手填 / 站方目录声称有
+#   2  seed           工具猜测，零依据
+_EVID = {"probed": 0, "manual": 1, "catalog": 1, "seed": 2}
+
+
+def _evid(sps: list[SectionPlan]) -> int:
+    """组内最强的那一把 —— 同站多 Key 只要有一把实测通了，这个站就是有依据的。"""
+    return min(_EVID.get(x.model_source, 2) for x in sps)
+
+
+def existing_host_tiers(band: Band) -> tuple[dict[str, int], dict[str, list[int]]]:
+    """本段里**每个站已经占着哪一档**，以及哪些站在原文件里就已经被拆开了。
+
+    返回 ({host: 档位}, {host: [多个档位]})。第二个字典只收原文件里就有多个
+    priority 的站 —— 那是先前留下的状态，不是本次造成的，但会让「同站同档」
+    无从判断，所以要报出来。
+
+    取最高那一档作为锚：CPA 的层级隔离只取最高可用桶
+    （selector.go:527-553 availableAuthsFromPriorityBuckets 只收 bestPriority；
+    scheduler.go:1229-1231 priorityOrder 降序），低档那批实际不参与首选。
+    """
+    per: dict[str, list[int]] = {}
+    for pri, hosts in band.hosts_at.items():
+        for h in hosts:
+            hl = (h or "").lower()
+            if hl:
+                per.setdefault(hl, []).append(pri)
+    anchor = {h: max(v) for h, v in per.items()}
+    split = {h: sorted(v, reverse=True) for h, v in per.items() if len(set(v)) > 1}
+    return anchor, split
+
+
+def _hijacks_at(band: Band, models: list[str], priority: int,
+                host: str) -> list[str]:
+    """在 priority 上注册这些模型，会抢走哪些**别人**的顶层。
+
+    与 `compute_impact(...).hijacks` 的差别：这个站自己已经承载该模型顶层时
+    不算劫持 —— 它本来就在那一档上，同站另一把 Key 并进来不改变任何归属。
+    """
+    out: list[str] = []
+    hl = (host or "").lower()
+    for imp in compute_impact(band, models, priority):
+        if not imp.hijacks:
+            continue
+        carriers = (band.model_tiers.get(imp.model) or {}).get(imp.current_top) or []
+        if hl in {(c or "").lower() for c in carriers}:
+            continue                    # 顶层就是自己，不算抢
+        out.append(imp.model)
+    return out
 
 
 def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
@@ -2045,6 +2417,107 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
         band = build_band(cfg, section, raw=raw)
         taken = set(band.tiers)     # 不与现有档位相撞：撞上等于与那个站同层轮询
 
+        # 1b. 已在本段占着档位的站 —— **留在原档，不重新分配**（2026-09-04）。
+        #
+        # 为什么必须区分「已有站」与「新站」（现场截图）
+        # ------------------------------------------
+        # 原来这里把每个站都当新站处理：算 cap、按分数排、逐站取
+        # `min(cap, 上一站 - 1)`。对真正的新站是对的，对**重探既有站**是错的：
+        #
+        #   · 落盘后同站被拆成两层。留守条目（没勾 / 判不可写 / 探测异常）
+        #     由 _orphan_entry_lines 原样搬回旧值，被重探的那几把拿新值。
+        #     实测那次：kktoken claude 3 把→164 + 2 把留在 372；
+        #     tabitoken claude 9 把→167 + 5 把留在 371。
+        #   · 即使全勾，整份配置的站间次序也被推平重排：`taken` 里塞着这些站
+        #     自己的旧档，于是每个站都躲开自己原来的值往下掉。实测 claude 段
+        #     12 个站从 1000/995/990/985/700/650/630/600/400/350/300/50
+        #     变成 500..489 一片连号。
+        #
+        # `priority` 的语义是「哪一层先被尝试」（层级隔离，
+        # selector.go:527-553 只取最高可用桶）。既有站的档位是先前一轮定下的
+        # 站间次序，重探一次不构成改它的依据 —— 重探验证的是「这把 Key 还能
+        # 不能用」，不是「这个站该排第几」。
+        #
+        # 唯一的例外由下面的 `_hijacks_at` 兜：留在原档会抢走别人顶层时才动它
+        # （成因是本次给它注册了原来没有的模型），那时按新站流程重新定档。
+        anchor, pre_split = existing_host_tiers(band)
+        if pre_split:
+            for h, vals in sorted(pre_split.items()):
+                warns.append(
+                    f"段 {section}：{h} 在原 config.yaml 里就占着 {len(set(vals))} 个"
+                    f"档位（{'、'.join(str(v) for v in vals)}）—— 同站多 Key 本该同层，"
+                    f"这是本次之前留下的状态。已按最高档 {max(vals)} 对齐")
+
+        pinned: dict[str, int] = {}     # host -> 沿用的原档
+        fresh: list[tuple[str, list[SectionPlan]]] = []
+        for host, sps in by_host.items():
+            hl = (host or "").lower()
+            keep = anchor.get(hl)
+            if keep is None:
+                fresh.append((host, sps))
+                continue
+            union: list[str] = []
+            for sp in sps:
+                for m in sp.models:
+                    if m not in union:
+                        union.append(m)
+            grabbed = _hijacks_at(band, union, keep, hl)
+            if grabbed:
+                # 留在原档会抢走别人的顶层 —— 成因只有一个：本次给这个站注册了
+                # 它原来没有的模型，而那个模型的现有顶层比这个站的档位低。
+                # 那时不能沿用原档，走新站流程让 suggest_priority 重新划线。
+                names = "、".join(grabbed[:3])
+                warns.append(
+                    f"段 {section}：{host} 沿用原档 {keep} 会抢走 {len(grabbed)} 个"
+                    f"模型的顶层（{names}）—— 本次给它加了原来没有的模型，"
+                    f"已按新站流程重新定档")
+                fresh.append((host, sps))
+                continue
+            pinned[hl] = keep
+
+        for host, sps in by_host.items():
+            hl = (host or "").lower()
+            if hl not in pinned:
+                continue
+            keep = pinned[hl]
+            for sp in sps:
+                sp.priority = keep
+                sp.priority_reason = (
+                    f"沿用该站在本段的原档 {keep}"
+                    f"（同站 {len(sps)} 个 Key 共用此档）—— 重探验证的是这把 Key "
+                    f"还能不能用，不改站间次序")
+                if sp.model_source != "probed" and _evid(sps) == 0:
+                    sp.priority_reason += (
+                        f"；本 Key 的清单来自"
+                        f"{_SRC_LABEL_CN.get(sp.model_source, sp.model_source)}")
+                sp.impacts = compute_impact(band, sp.models, keep)
+                sp.warnings = [
+                    w for w in sp.warnings
+                    if "抢走" not in w and "挡在其后" not in w
+                    and "排在 " not in w]
+                # 挡站警告要按沿用后的值重新加（2026-09-04 自查）。
+                #
+                # 沿用原档不等于「影响面为零」：本次可能给这个站注册了它原来
+                # 没有的模型，而那个模型在更低的档上有承载站。那时这个站就挡在
+                # 了它们前面 —— 档位没变，但**这个模型的格局变了**。
+                # 只清警告不重加，界面上就完全看不到这件事。
+                #
+                # 抢顶层那一支不在这里：`_hijacks_at` 已经把会抢的挪进 fresh，
+                # 走到这里的必然不抢，所以只补挡站那一条。
+                shadow: dict[str, list[str]] = {}
+                for imp in sp.impacts:
+                    for h2 in imp.shadowed_hosts:
+                        shadow.setdefault(h2, []).append(imp.model)
+                if shadow:
+                    sp.warnings.append(
+                        _shadow_warning(band, sp.models, keep, shadow,
+                                        pinned=True))
+
+        # 新站才进下面的分配流程。已有站的档位已被 `taken` 覆盖，不会被撞上。
+        by_host = dict(fresh)
+        if not by_host:
+            continue
+
         # 2. 站级排序：先按「有没有实测依据」，再按组内最高分，最后按主机名。
         #
         # 为什么要加第一个键（2026-09-03 真实探测暴露）：`score_verdict` 对
@@ -2058,19 +2531,9 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
         # scheduler.go:402 只取最高那一桶）。
         #
         # 判据用 model_source 而不是 score：前者说的是「这一段这次有没有依据」，
-        # 后者是「探测质量」。三档：
-        #   0  probed        本次实测跑通推理
-        #   1  manual/catalog 手填 / 站方目录声称有
-        #   2  seed          工具猜测，零依据
+        # 后者是「探测质量」。三档，见 _EVID。
         # 同档内仍按分数、再按主机名 —— 稳定性不能丢，否则同一批输入两次运行
         # 给出不同档位，diff 无法复核。
-        _EVID = {"probed": 0, "manual": 1, "catalog": 1, "seed": 2}
-
-        def _evid(sps: list[SectionPlan]) -> int:
-            # 组内取最强的那一把 —— 同站多 Key 只要有一把实测通了，
-            # 这个站在这一段就是有依据的。
-            return min(_EVID.get(x.model_source, 2) for x in sps)
-
         ranked = sorted(
             by_host.items(),
             key=lambda kv: (_evid(kv[1]), -max(x.score for x in kv[1]), kv[0]),

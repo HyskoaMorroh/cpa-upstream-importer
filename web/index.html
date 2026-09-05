@@ -625,6 +625,9 @@ https://其他站.com,sk-yyyyyyyyyyyyyyyy
   <div class="opts">
     <label class="opt"><input type="checkbox" id="o_ctx" checked> 探测上下文上限
       <span class="hint">写入 max-context-length</span></label>
+    <label class="opt"><input type="checkbox" id="o_caps" checked> 探测能力开关
+      <span class="hint">codex 的 websockets、compat 的 support-prompt-cache-key。
+        每段最多 1 次额外请求；关掉则按原值搬运而不是实测</span></label>
     <label class="opt"><input type="checkbox" id="o_proxy" checked> 失败时试代理
       <span class="hint">预检不通则自动跳过</span></label>
     <label class="opt">同站间隔 <input type="number" id="o_gap" value="3" min="0" max="30" step="0.5"> 秒
@@ -634,7 +637,7 @@ https://其他站.com,sk-yyyyyyyyyyyyyyyy
       <span class="hint">四段同时 + 多站同时，快 4–8 倍</span></label>
     <label class="opt" style="border-top: 2px solid var(--border); padding-top: 12px; margin-top: 12px;">
       <input type="checkbox" id="o_full_redetect"> <strong>全量重探模式</strong>
-      <span class="hint">重新探测 config.yaml 中所有既有站，与新站一起重新生成配置（headers/代理/优先级/前缀全部更新）。预计耗时 5-8 分钟。</span>
+      <span class="hint">重新探测 config.yaml 中所有既有站，与新站一起重新生成配置：模型清单按实测替换、headers 合并原值与实测、codex 的 websockets 与 compat 的 support-prompt-cache-key 按实测开或关、priority 沿用各站原档（只有新站才定档）、weight / prefix / provider name 只搬原值。预计耗时 5-8 分钟。</span>
     </label>
     <label class="opt" id="o_max_workers_row" style="margin-left: 24px;" hidden>
       站级并发数 <input type="number" id="o_max_workers" value="30" min="1" max="64" step="1">

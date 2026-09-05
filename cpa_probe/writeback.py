@@ -40,6 +40,7 @@ PUT /config.yaml。整段 PUT 要重新序列化，会丢注释 —— 所以走
 
 from __future__ import annotations
 
+import copy
 import datetime
 import io
 import json
@@ -50,6 +51,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
+from . import betas
 from .plan import ImportPlan, SectionPlan
 
 
@@ -162,6 +164,16 @@ def backup(path: str, *, backup_dir: str | None = None) -> str:
     return dst
 
 
+# 顶层键那一行：零缩进、不是列表项、不是注释，且这一行里有个冒号。
+#
+# 不要求键名是标识符 —— YAML 允许 `a.b:` 与 `"my key":`，而把它们判成
+# 「不是顶层键」会让上一段的 span 吞掉它们（见 _section_span 的说明）。
+#
+# 要求「有冒号」而不是「以冒号结尾」：顶层键可以带值（`host: "127.0.0.1"`）。
+# 排除 `-` 开头是因为零缩进的列表项属于上一个键的值。
+_TOP_LEVEL_KEY = re.compile(r"^(?![-#\s])[^\s:][^:]*:(\s|$)")
+
+
 def _section_span(lines: list[str], section: str) -> tuple[int, int] | None:
     """找出某段在文件里的行范围（0-based, [start, end)）。
 
@@ -197,8 +209,18 @@ def _section_span(lines: list[str], section: str) -> tuple[int, int] | None:
         l = lines[i]
         if not l.strip():
             continue
-        # 顶层键：零缩进且不是列表项、不是注释
-        if re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]*\s*:", l):
+        # 顶层键 = 零缩进、不是列表项、不是注释。
+        #
+        # 判据从「标识符正则」放宽到「零缩进且不以 - 或 # 开头」
+        # （2026-09-04 修）：原来的 `^[a-zA-Z_][\w-]*\s*:` 认不出含点号的键
+        # （`a.b: 42`）与引号键（`"my key": 42`）—— 那时段尾判在更后面，
+        # 那个顶层键被划进 span、进而被 extract_carry_lines 当成条目的 carry 行
+        # 收走，重建后它从顶层**消失**。
+        #
+        # CPA 的 46 个顶层 yaml tag 全是合法标识符，两份生产文件的 42 个顶层键
+        # 也全合法，所以这是补闸不是修事故。但「零缩进且不是列表项」本来就是
+        # YAML 顶层键的完整判据，正则那一版只是它的一个子集。
+        if _TOP_LEVEL_KEY.match(l):
             end = i
             break
 
@@ -230,6 +252,54 @@ def _empty_literal_rewrite(lines: list[str], start: int,
         return None
     tail = f"  {m.group(3)}" if m.group(3) else ""
     return start + 1, f"{m.group(1)}{tail}"
+
+
+# 非空 flow 序列的段头：`claude-api-key: [{api-key: "k1", ...}]`。
+#
+# 只匹配到 `[` 为止 —— 内容可能在下一行（`claude-api-key: [` 换行再列条目），
+# 那时首行 `[` 之后什么都没有。闭合位置由 `_flow_section_span` 按括号计数找。
+# 排除 `[]`（空 flow 由 _empty_literal_rewrite 处理，两者不能都命中）。
+_FLOW_SECTION_HEAD = re.compile(
+    r"^([A-Za-z0-9_.\-\"']+\s*:)\s*\[\s*(?!\]\s*(?:#.*)?$)")
+
+
+def _flow_section_span(lines: list[str], start: int) -> int | None:
+    """段头是**非空** flow 序列时，返回它占到第几行（不含）；否则 None。
+
+    为什么需要（2026-09-05 修）
+    ----------------------
+    `_empty_literal_rewrite` 只认 `[]` 与 `{}`。而 `claude-api-key:
+    [{api-key: "k1", ...}]` 是合法 YAML、CPA 读得出来，全量重建却会把块序列
+    挂在它后面：
+
+        claude-api-key: [{api-key: "k1", ...}]
+          - api-key: "k1"                       ← 非法
+
+    `validate()` 挡住了（不会写坏文件），但**全量重建对这种文件整个不可用**，
+    而报错是 `while parsing a block mapping` —— 看不出根因是段头形态。
+
+    按括号计数找闭合，不用正则 —— flow 里可以嵌任意深度且能跨行。
+    引号内的括号不计数（`base-url: "https://x/[a]"` 这种）。
+    """
+    if not _FLOW_SECTION_HEAD.match(lines[start]):
+        return None
+    depth = 0
+    q = ""
+    for i in range(start, len(lines)):
+        for ch in lines[i]:
+            if q:
+                if ch == q:
+                    q = ""
+                continue
+            if ch in "\"'":
+                q = ch
+            elif ch in "[{":
+                depth += 1
+            elif ch in "]}":
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+    return None                     # 没闭合 —— 文件本身有问题，交给 validate
 
 
 def _detect_indent(lines: list[str], start: int, end: int) -> tuple[str, str]:
@@ -298,6 +368,41 @@ def _yaml_str(v: str) -> str:
     return '"' + s + '"'
 
 
+# YAML plain 标量能安全承载的头名：HTTP token 字符集的常见子集。
+# 只有它才免引号 —— 其余一律走 _yaml_str。
+#
+# 为什么不无条件加引号（2026-09-04）：生产 config.yaml 里 277 个头名全是这种
+# 形态、全部不带引号，无条件加引号会让 diff 里多出 277 处纯风格改动，把真正
+# 要看的 priority 变化埋掉。而不加引号的风险只存在于**非** token 名字上
+# （`a #c` / `null` / `1` / 含制表符），那些走 _yaml_str。
+_SAFE_HEADER_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9!#$%&'*+.^_`|~-]*$")
+
+# YAML 1.1 的字面量关键字。它们**符合** token 形态却会被解析成非字符串：
+# `null` → None、`true`/`yes`/`on` → True。PyYAML 与 Go 的 yaml.v3 都这样读，
+# 于是 CPA 侧 `map[string]string` 拿到的键不是那个头名 —— 头静默消失。
+# 大小写不敏感（YAML 认 `Null` / `TRUE` / `Yes`）。
+_YAML_KEYWORDS = frozenset({
+    "null", "~", "true", "false", "yes", "no", "on", "off",
+})
+
+
+def _yaml_header_name(name: str) -> str:
+    """头名的 YAML 字面量。常规 HTTP token 原样，其余加引号转义。
+
+    名字来自 `overrides.headers` 与前端编辑器，两处都只 trim 不校验形态
+    （server.py 的 `str(k)`、web/app.js 的 `.trim()`）。实测未转义时：
+      · `a #c` 单头 → 本工具 validate **放过**，CPA 报
+        `cannot unmarshal !!str into map[string]string`（工具放过、CPA 拒收）
+      · `null` → 双侧「合法」，但 YAML 把键读成 None，CPA 读出的 Headers
+        为空 —— 那个头静默消失
+      · `1` / `true` → 键类型变 int / bool
+    """
+    n = str(name)
+    if n.lower() in _YAML_KEYWORDS:
+        return _yaml_str(n)
+    return n if _SAFE_HEADER_NAME.match(n) else _yaml_str(n)
+
+
 def _weight_note(w: int) -> str:
     """weight 行尾该加什么说明。按 CPA 的**实际**语义判，不只判 `== 0`。
 
@@ -336,19 +441,40 @@ def _yaml_field(indent: str, key: str, val) -> list[str]:
     而不是硬塞 —— 写出半个结构比丢掉更糟，那会让 YAML 变成合法但语义错误的
     东西，而 validate() 只看语法。跳过至少是可见的（diff 里那几行不在了）。
     """
+    # 键也要能安全写出（2026-09-04 修）：子键来自原文件的解析结果，
+    # 而 YAML 允许 `a: b` 这种含冒号的键。原来直接 `str(k2)` 插值，
+    # 于是 `{'a: b': 1}` 写成 `a: b: 1` —— 非法 YAML，整份配置读不出来。
+    k = _yaml_header_name(str(key))
     if isinstance(val, bool):
-        return [f"{indent}{key}: {'true' if val else 'false'}"]
+        return [f"{indent}{k}: {'true' if val else 'false'}"]
     if isinstance(val, int):
-        return [f"{indent}{key}: {val}"]
+        return [f"{indent}{k}: {val}"]
     if isinstance(val, float):
-        return [f"{indent}{key}: {val!r}"]
+        # 非有限值（inf / nan）与科学计数法在 YAML 里读回是**字符串**
+        # （`1e+20` → `'1e+20'`），那是语义漂移而不是保真。按「认不出的形状
+        # 整个跳过」处理 —— 与下面 list/dict 分支同一条原则。
+        # CPA 的模型级字段里没有 float（全是 int / bool / []string），
+        # 所以这一支只在原文件手工写了浮点时才会走到。
+        import math
+        if not math.isfinite(val):
+            return []
+        txt = repr(val)
+        if "e" in txt or "E" in txt:
+            return []
+        return [f"{indent}{k}: {txt}"]
     if isinstance(val, str):
-        return [f"{indent}{key}: {_yaml_str(val)}"]
+        return [f"{indent}{k}: {_yaml_str(val)}"]
     if isinstance(val, (list, tuple)):
         if not val:
-            return [f"{indent}{key}: []"]
+            return [f"{indent}{k}: []"]
         if all(isinstance(x, (str, int, float, bool)) for x in val):
-            rows = [f"{indent}{key}:"]
+            # 列表元素里的 float 同样要过有限性检查
+            if any(isinstance(x, float)
+                   and (x != x or x in (float("inf"), float("-inf"))
+                        or "e" in repr(x) or "E" in repr(x))
+                   for x in val):
+                return []
+            rows = [f"{indent}{k}:"]
             for x in val:
                 rows.append(f"{indent}  - " + (
                     ("true" if x else "false") if isinstance(x, bool)
@@ -358,8 +484,8 @@ def _yaml_field(indent: str, key: str, val) -> list[str]:
         return []
     if isinstance(val, dict):
         if not val:
-            return [f"{indent}{key}: {{}}"]
-        rows = [f"{indent}{key}:"]
+            return [f"{indent}{k}: {{}}"]
+        rows = [f"{indent}{k}:"]
         for k2 in sorted(val):
             sub = _yaml_field(f"{indent}  ", str(k2), val[k2])
             if not sub:
@@ -375,7 +501,7 @@ def find_compat_provider(lines: list[str], base_url: str) -> dict | None:
     为什么必须先找：`name` 就是 CPA 的 provider 身份 ——
     `util.OpenAICompatibleProviderKey(name)` 的结果被写进 Auth 的
     `provider_key`，而冷却（conductor_cooldown.go:73）、模型能力
-    （api_key_model_capabilities.go:186）、执行路由（conductor_execution.go:1473）
+    （api_key_model_capabilities.go:186）、执行路由（conductor_execution.go:1605-1609）
     三处都按它索引。两个同名 provider 会让这三处对同一个 key 命中两套配置。
 
     所以同一个站再来新 Key 时，正确做法是**把 Key 追加进现有 provider 的
@@ -404,12 +530,23 @@ def find_compat_provider(lines: list[str], base_url: str) -> dict | None:
         existing: list[str] = []
         in_keys = False
         for j, l in enumerate(block):
+            # 值一律走 _scalar_value：它会剥行尾注释（2026-09-04 修）。
+            #
+            # 原来只 strip 引号。生产 config.yaml 里前三段有 86 行
+            # `base-url: "https://x" # 注意不带 /v1` 这种写法，同一种写法迁到
+            # compat 段就让 base_here 带着注释文本 —— 与 want 比不相等，
+            # 于是「同站再来新 Key」会新建一个同 base-url 的 provider，
+            # 而 CPA 的 SanitizeOpenAICompatibility 不去重：同一把 Key 在
+            # 轮询池里占两个位，冷却/能力/路由三处各命中一套配置。
+            #
+            # 同文件的 compat_key_blocks 与 _scalar_value 早就正确剥注释了，
+            # 只有这一处漏了。
             m = re.match(r"^\s*-?\s*base-url:\s*(.+?)\s*$", l)
             if m and not base_here:
-                base_here = m.group(1).strip().strip('"').strip("'").rstrip("/")
+                base_here = _scalar_value(m.group(1)).rstrip("/")
             m = re.match(r"^\s*-?\s*name:\s*(.+?)\s*$", l)
             if m and not name_here and not in_keys:
-                name_here = m.group(1).strip().strip('"').strip("'")
+                name_here = _scalar_value(m.group(1))
             m = re.match(r"^(\s*)api-key-entries:\s*$", l)
             if m:
                 keys_line = st + j
@@ -419,7 +556,9 @@ def find_compat_provider(lines: list[str], base_url: str) -> dict | None:
             if in_keys:
                 mk = re.match(r"^\s*-\s*api-key:\s*(.+?)\s*$", l)
                 if mk:
-                    existing.append(mk.group(1).strip().strip('"').strip("'"))
+                    # api-key 同样可能带行尾注释（生产配置里有
+                    # `api-key: "sk-x" # 2026-08-20 新增` 这种写法）
+                    existing.append(_scalar_value(mk.group(1)))
                 elif re.match(r"^\s*[a-zA-Z_-]+:\s*", l) and not l.strip().startswith("-"):
                     # 遇到同级的下一个字段（models: / headers: …），entries 段结束
                     cur_indent = len(l) - len(l.lstrip())
@@ -442,6 +581,248 @@ def find_compat_provider(lines: list[str], base_url: str) -> dict | None:
                     "keys_line": keys_line, "keys_indent": keys_indent,
                     "existing_keys": existing, "last_key_line": last}
     return None
+
+
+# 值需要脱敏的字段。键名匹配不区分大小写，也认带 `- ` 前缀的列表项。
+#
+# 为什么按**字段名**而不是按值形态（如 `sk-` 前缀）：中转站的 Key 形态五花八门
+# （`sk-`、`AIza`、纯 hex、UUID、base64），按形态匹配必然漏。字段名是有限集，
+# 且它就是 CPA 的 schema —— 漏一个字段比漏一种形态容易发现。
+_SECRET_FIELDS = frozenset({
+    "api-key",              # 四段的上游凭据
+    "secret-key",           # remote-management 的管理密钥（bcrypt 哈希）
+    "password",
+    "token",
+    "access-token",
+    "refresh-token",
+    "client-secret",
+})
+
+# `api-keys:` 那种下面挂裸标量列表的顶层键（CPA 的客户端入口 Key）。
+# 它的值不在 `键: 值` 形态里，而是独立的 `  - sk-xxx` 行，所以要按「当前在
+# 哪个块里」判断。
+_SECRET_LIST_KEYS = frozenset({"api-keys"})
+
+# 值里**可能内嵌**凭据的字段：`scheme://user:pass@host`。生产配置里这种写法
+# 0 处（两份都查过），但 mihomo 之外的代理常要用户名密码，所以留一道。
+# 与 _SECRET_FIELDS 分开处理：这里只抹 userinfo 段，主机与端口要留着 ——
+# 那是排障时最需要看的部分。
+_URL_FIELDS = frozenset({"proxy-url", "base-url"})
+_URL_USERINFO = re.compile(r"(://)([^/@\s\"']+):([^/@\s\"']+)@")
+
+_KV_LINE = re.compile(r"^(\s*(?:-\s+)?)([A-Za-z0-9_.\-\"']+)(\s*:\s*)(.*)$")
+_LIST_ITEM = re.compile(r"^(\s*)-\s+(.+?)\s*$")
+
+
+def redact_yaml_secrets(text: str) -> str:
+    """把 YAML 文本里的凭据值换成脱敏形态。**只动值，不动结构**。
+
+    为什么需要（2026-09-05 修的 P1）
+    ----------------------------
+    全量重探那条路的 `/api/plan` 响应里，diff 就是**重建后的整个文件** ——
+    不是增量片段。于是 121 个条目的 `api-key:` 明文、`remote-management`
+    的 `secret-key`、以及全部注释一起进了浏览器：
+
+        生产 config.yaml：177 行 api-key 明文 + 1 行 secret-key，共 349KB
+
+    而 `server.py` 开头第 15 行自述「完整 key 只在内存里，不落日志、
+    **不进 JSON 响应**（一律 masked）」—— 那条纪律在这条路径上没有兑现。
+
+    后果：凭据落进浏览器内存与 DOM；界面的「复制」按钮把整份配置连 177 个
+    Key 一起写进系统剪贴板；任何一处 XSS 或恶意浏览器扩展就是一次全量泄露。
+
+    为什么按行脱敏而不是「不给全文」
+    -----------------------------
+    全量重探的价值就在于「写回前看清整个文件会变成什么样」。给一段掐头去尾的
+    片段等于把这个功能废掉。按行脱敏保留了行号、缩进、注释、以及其余全部字段，
+    diff 仍然完全可读，只有凭据值变成 `sk-abc...wxyz` 这种形态。
+
+    落盘走的是服务端内存里的原文（`entry["preview"]`），不受本函数影响 ——
+    脱敏只作用于**发给客户端的那一份**。
+
+    保留原有的引号风格与行尾注释：改动那些会在 diff 里产生无意义的差异，
+    让人分不清「这行真的变了」还是「只是被脱敏了」。
+    """
+    out: list[str] = []
+    in_secret_list = False
+    list_indent = -1
+
+    for line in text.splitlines(keepends=True):
+        nl = ""
+        body = line
+        if body.endswith("\r\n"):
+            nl, body = "\r\n", body[:-2]
+        elif body.endswith("\n"):
+            nl, body = "\n", body[:-1]
+
+        stripped = body.strip()
+
+        # 注释行与空行原样保留 —— 注释里不该有凭据（真有的话那是配置本身的
+        # 问题，且注释是人写的，脱敏它会破坏排障记录）
+        if not stripped or stripped.startswith("#"):
+            out.append(body + nl)
+            continue
+
+        # 正在 `api-keys:` 这种裸标量列表里
+        if in_secret_list:
+            m = _LIST_ITEM.match(body)
+            if m and len(m.group(1)) > list_indent:
+                val, comment = _split_comment(m.group(2))
+                out.append(f"{m.group(1)}- {_mask_scalar(val)}{comment}" + nl)
+                continue
+            # 缩进回到列表键那一级或更外 —— 列表结束
+            cur = len(body) - len(body.lstrip())
+            if cur <= list_indent:
+                in_secret_list = False
+
+        m = _KV_LINE.match(body)
+        if not m:
+            out.append(body + nl)
+            continue
+
+        prefix, key, sep, rest = m.groups()
+        bare = key.strip().strip('"').strip("'").lower()
+
+        if bare in _SECRET_LIST_KEYS and not rest.strip():
+            in_secret_list = True
+            list_indent = len(prefix) - len(prefix.rstrip())
+            list_indent = len(prefix.replace("- ", "  ")) if "-" in prefix \
+                else len(prefix)
+            out.append(body + nl)
+            continue
+
+        if bare in _SECRET_FIELDS:
+            val, comment = _split_comment(rest)
+            out.append(f"{prefix}{key}{sep}{_mask_scalar(val)}{comment}" + nl)
+            continue
+
+        if bare in _URL_FIELDS and "@" in rest:
+            val, comment = _split_comment(rest)
+            new_val = _URL_USERINFO.sub(
+                lambda m: f"{m.group(1)}{m.group(2)}:***@", val)
+            out.append(f"{prefix}{key}{sep}{new_val}{comment}" + nl)
+            continue
+
+        out.append(body + nl)
+
+    return "".join(out)
+
+
+def _split_comment(rest: str) -> tuple[str, str]:
+    """把 `"值" # 注释` 拆成 (值, " # 注释")。引号内的 # 不算注释起点。"""
+    q = ""
+    for i, ch in enumerate(rest):
+        if q:
+            if ch == q:
+                q = ""
+            continue
+        if ch in "\"'":
+            q = ch
+        elif ch == "#" and (i == 0 or rest[i - 1] in " \t"):
+            return rest[:i].rstrip(), " " + rest[i:]
+    return rest.rstrip(), ""
+
+
+def _mask_scalar(val: str) -> str:
+    """脱敏一个标量值，保留它原来的引号风格。
+
+    与 `parse.mask_key` 同一口径（前 6 后 4），但这里要处理引号 ——
+    改动引号风格会在 diff 里制造无意义差异。
+    """
+    from .parse import mask_key
+
+    raw = val.strip()
+    if not raw:
+        return val
+    quote = ""
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+        quote, raw = raw[0], raw[1:-1]
+    if not raw:
+        return val
+    masked = mask_key(raw)
+    return f"{quote}{masked}{quote}" if quote else masked
+
+
+def merge_entry_headers(old: dict[str, str] | None,
+                        probed: dict[str, str] | None) -> dict[str, str]:
+    """把探测得出的 headers 合并进原条目的 headers。原值为底，探测值覆盖同名键。
+
+    为什么是**合并**而不是「探测有值就整份用探测的」（2026-09-04）
+    -------------------------------------------------------
+    画像梯能产出的 `anthropic-beta` 是写死的常量清单，里面**永远没有**两项：
+
+      · `oauth-2025-04-20`      —— profiles.py 有意去掉：api-key 探测不该
+                                   声称走 oauth
+      · `context-1m-2025-08-07` —— 只由 betas.py 在站方正文点名时才补
+
+    整份替换会把原条目里手工配的能力 beta 静默抹掉。实测 Desktop 版那份配置：
+    含这两个 beta 的条目 33 个，其中 anyrouter.top 的 claude 条目 headers
+    **只有** `anthropic-beta: context-1m-2025-08-07`、没有 UA —— baseline 一通过
+    `need_ua=False`，`sp.headers` 是空 dict，那个站的 1m 上下文直接被关掉。
+
+    合并方向：原值在下、探测值在上。探测值是本次实测出来的最省必需集，同名键
+    以它为准；原值里探测没提到的键（能力 beta、站方特供头）保留。
+
+    `anthropic-beta` 特殊 —— 它是逗号分隔的**集合**，同名覆盖会丢项，所以走
+    `betas.merge` 保序去重合并。头名大小写不敏感（HTTP 语义），所以匹配时
+    统一小写比较，但**保留原条目的大小写写法**：改大小写会在 diff 里多出
+    无意义改动。
+
+    抽成独立函数而不是内联在 server 的循环里（2026-09-04）：内联时只能靠源码
+    结构断言「这一行在不在」，而那挡不住「赋的是空」—— 撤销实验里把
+    `old = hdrs.get(...)` 改成 `old = None`，1198 项测试全绿。
+    """
+    if not old:
+        return dict(probed or {})
+    merged = dict(old)
+    if not probed:
+        return merged
+    lower = {k.lower(): k for k in merged}
+    for hk, hv in probed.items():
+        exist = lower.get(hk.lower())
+        if exist is not None and hk.lower() == "anthropic-beta" and merged[exist]:
+            merged[exist] = betas.merge(
+                merged[exist],
+                [x.strip() for x in str(hv).split(",") if x.strip()])
+        elif exist is not None:
+            merged[exist] = hv
+        else:
+            merged[hk] = hv
+    return merged
+
+
+def _toggle_lines(sp: SectionPlan, field: str) -> list[str]:
+    """段专属能力开关要写的行。三态：只有 True 才写。
+
+    值的优先级（与 max-context-length 同一套）：
+      ① 本次实测（sp.websockets / sp.prompt_cache_key）
+      ② 原条目的值（sp.prior_toggles）—— 关掉能力探测或该段本次未跑时兜住
+      ③ 都没有就不写 —— CPA 的零值就是关闭（`websockets bool` 无指针，
+         config_types.go:486），所以「不写」与「写 false」运行时等价
+
+    为什么 False 也不写：写 `websockets: false` 与不写效果相同，但会在 diff 里
+    多出一行、且让「这个站被测过且不支持」与「用户显式关掉」混在一起。行尾
+    注释里说明实测结论，字段本身省掉。
+
+    为什么 ① 覆盖 ②：实测是本轮的新证据。这里有一个方向性的取舍 ——
+    实测 False 会**关掉**原来开着的开关。那是对的：`websockets: true` 而站方
+    不支持时 CPA 不会回落 HTTP（codex_websockets_executor.go:71-77），
+    那个凭据的 WS 请求全废；把它关掉是修复而不是破坏。
+    但 None（未探测）绝不覆盖原值 —— 那才是「没有证据就不动」。
+    """
+    out: list[str] = []
+    for name, probed, note in (
+        ("websockets", sp.websockets, sp.websockets_note),
+        ("support-prompt-cache-key", sp.prompt_cache_key, sp.prompt_cache_note),
+    ):
+        if probed is True:
+            tail = f"   # {note}" if note else ""
+            out.append(f"{field}{name}: true{tail}")
+        elif probed is None and sp.prior_toggles.get(name):
+            out.append(f"{field}{name}: true   # 原值搬运（本次未探测此开关）")
+        # probed is False：实测不支持 —— 不写。原值即使为 true 也不搬，
+        # 那正是这次探测要修掉的错配置。
+    return out
 
 
 def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
@@ -489,7 +870,26 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
             # `alias: <name>` 的**运行时效果完全相同**；而写死值会让
             # 全量重建把 459 行原本是 `""` 的行全改掉 —— diff 里 459 处
             # 无意义改动，掩盖真正要看的 priority 变化。
-            rows.append(f'{indent}  alias: ""')
+            # alias：原值优先，没有原值才写空串。
+            #
+            # 写空串对生产配置里那 459 个条目是对的（它们 100% 就是 `""`），
+            # 而 CPA 在 alias 为空时自动回落成 name
+            # （buildConfiguredModelInfo，service_models.go:678-682），
+            # 所以 `alias: ""` 与 `alias: <name>` 运行时等价。
+            #
+            # 但**非空且与 name 不同**的 alias 不等价 —— 那是段级兼容名
+            # （README 明确推荐这个做法：保留原名轮询、用 alias 补兼容名）。
+            # 原来这里写死空串、`existing_model_extras` 又把 alias 排除在外、
+            # carry 跳过整个 models 块，于是它掉进第三个空档：整段重写后
+            # `alias: "claude-opus-5"` 变成 `alias: ""`（2026-09-04 修）。
+            #
+            # 仍然**不**写成与 name 相同：那会让 459 行原本是 `""` 的行全被
+            # 改掉，diff 里多出 459 处无意义改动，掩盖真正要看的 priority 变化。
+            _al = (sp.prior_model_extras.get(m) or {}).get("alias")
+            if _al is not None and str(_al) != "":
+                rows.append(f'{indent}  alias: {_yaml_str(str(_al))}')
+            else:
+                rows.append(f'{indent}  alias: ""')
             # 每个模型自己的窗口值。三档，优先级递减：
             #   ① 本次实测的那一个（context_model）—— 最新的实测依据
             #   ② 原条目里这个模型自己的值（prior_context）—— 历史实测依据
@@ -508,7 +908,13 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
             # 白名单外的模型级字段（display-name / thinking / image /
             # force-mapping / is-compat / *-modalities）—— 原样搬回。
             # carry 跳过整个 models 块，这七个字段没有别人接。
+            #
+            # alias 已经在上面单独处理过（它在 extras 表里只为了被搬运，
+            # 渲染位置必须紧跟 name，与现有文件的键序一致），这里跳过它，
+            # 否则一个模型会写出两行 alias。
             for k, v in sorted((sp.prior_model_extras.get(m) or {}).items()):
+                if k == "alias":
+                    continue
                 rows.extend(_yaml_field(f"{indent}  ", k, v))
         return rows
 
@@ -566,7 +972,13 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
         if sp.headers:
             out.append(f"{field}headers:")
             for k, v in sp.headers.items():
-                out.append(f"{field}  {k}: {_yaml_str(v)}")
+                # 头**名**也要过 _yaml_str（2026-09-04 自查）：名字来自
+                # overrides.headers 与前端编辑器，两处都只 trim 不校验形态。
+                # 实测 `a #c` 单头时本工具 validate 放过而 CPA 报
+                # `cannot unmarshal !!str into map[string]string`；`null` 双侧
+                # 「合法」但 CPA 读出的 Headers 为空 —— 那个头静默消失。
+                out.append(f"{field}  {_yaml_header_name(k)}: {_yaml_str(v)}")
+        out.extend(_toggle_lines(sp, field))
         for ln in sp.carry_lines:
             out.append(ln.rstrip("\n"))
         out.append(f"{field}models:")
@@ -590,7 +1002,12 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
     if sp.headers:
         out.append(f"{field}headers:")
         for k, v in sp.headers.items():
-            out.append(f"{field}  {k}: {_yaml_str(v)}")
+            # 键也走 _yaml_str —— 见 compat 分支同一处的说明。
+            out.append(f"{field}  {_yaml_header_name(k)}: {_yaml_str(v)}")
+    # 段专属能力开关（codex 的 websockets）。放在 headers 之后、carry 之前 ——
+    # 与生产 config.yaml 的键序一致（实测两条 `websockets: true` 分别紧跟
+    # base-url 与 headers）。
+    out.extend(_toggle_lines(sp, field))
     # 原条目里 render_entry 不认识的字段，按原文行搬运。
     # 放在 models 之前 —— YAML 映射无序，但放这里让 diff 与原文的键序一致。
     # 已经 rstrip 过换行，写出时由调用方统一补。
@@ -895,7 +1312,7 @@ def reload_cpa(base: str, mgmt_password: str, text: str, *,
     真正让新上游可用的仍是随后那次 reloadClients。
 
     mgmt_password 必须是**原始密码**，不是 config.yaml 里那串 `$2a$` 哈希 ——
-    校验用 bcrypt.CompareHashAndPassword（handler.go:387）。
+    校验用 bcrypt.CompareHashAndPassword（handler.go:389）。
     """
     if not mgmt_password:
         return False, "缺少管理密码，无法触发重载"
@@ -942,14 +1359,20 @@ def push_to_cpa(base: str, mgmt_key: str, text: str, *, timeout: int = 120) -> t
             body = e.read().decode("utf-8", "replace")[:400]
         except Exception:
             pass
-        # 422 才是语义校验失败的真实状态码（config_basic.go:152 用的是
-        # StatusUnprocessableEntity）；400 只用于 body 读不出来/YAML 语法错
-        # （:121, :133）。两者都属"CPA 未落盘"的安全失败。
+        # 422 才是语义校验失败的真实状态码（config_basic.go:153 用的是
+        # StatusUnprocessableEntity）；400 只用于 body 读不出来（:121）与
+        # YAML 语法错（:126）。这三个码都属「CPA 未落盘」的安全失败。
+        #
+        # **500 不在这一类**（2026-09-05 订正）：原来这里把 `:133` 也算进 400，
+        # 而那一行是 `StatusInternalServerError`（write_failed，创建 temp 文件
+        # 失败）。代码分支本身没错（下面只判 400/422），但那句话会误导下一轮
+        # 判断「500 是不是也安全」—— 而 `:158` 之后的 500 是**落盘之后**
+        # LoadConfig 失败，且不回滚。那时磁盘上已经是新内容了。
         if e.code in (400, 422):
             return False, (f"{e.code} 校验未通过，CPA 未落盘（这是安全失败）：{body}")
         if e.code == 401:
             return False, ("401 鉴权失败。PUT 端点用 bcrypt 比对**原始密码**"
-                           "（handler.go:387），传 config.yaml 里那串 $2a$ 哈希"
+                           "（handler.go:389），传 config.yaml 里那串 $2a$ 哈希"
                            "必然 401。连续 5 次失败会封该 IP 30 分钟")
         if e.code == 403:
             # 403 有两种来源，处置完全相反，必须分开说 ——
@@ -1114,7 +1537,11 @@ def verify_upstream(
 
 def _orphan_entry_lines(lines: list[str], span: tuple[int, int],
                         section: str,
-                        planned: set[tuple[str, str]]) -> list[str]:
+                        planned: set[tuple[str, str]],
+                        host_tier: dict[str, tuple[int, str]] | None = None,
+                        realigned: list[str] | None = None,
+                        field_indent: int | None = None,
+                        skipped: list[str] | None = None) -> list[str]:
     """段内**未被本次方案覆盖**的条目原文行（含它们自己的注释）。
 
     整段重写只写 planned 里的凭据，这个函数把其余条目原样捞出来接在后面。
@@ -1126,6 +1553,12 @@ def _orphan_entry_lines(lines: list[str], span: tuple[int, int],
 
     compat 段不走这里：它的结构是 provider 级 + api-key-entries，一个条目
     含多个 Key，「未覆盖」要在 Key 粒度判断，语义与前三段不同。
+
+    host_tier：{host: (本次该站的新 priority, 行尾注释)}。给了它就把留守条目的
+    `priority:` 行对齐到同站的新值 —— 见 _realign_priority 的说明。不给则原样搬。
+    field_indent 是该段条目的字段缩进（`_detect_indent` 的第二个返回值），用来
+    区分条目级 `priority:` 与嵌套结构里的同名键。skipped 收「找到条目但没能改」
+    的原因（值不是裸整数等）—— 静默跳过等于让用户以为拆档修好了。
     """
     from .parse import host_of
 
@@ -1176,8 +1609,99 @@ def _orphan_entry_lines(lines: list[str], span: tuple[int, int],
             continue                    # 认不出身份的块不搬 —— 宁可漏不可错
         if (h, k) in planned:
             continue
+        if host_tier and h in host_tier:
+            new_pri, note = host_tier[h]
+            blk, changed, odd = _realign_priority(blk, new_pri, note,
+                                                  indent=field_indent)
+            if changed and realigned is not None and h not in realigned:
+                realigned.append(h)
+            if odd and skipped is not None:
+                skipped.append(f"{h}（{odd}）")
         out.extend(blk)
     return out
+
+
+# 条目级 `priority:` 行。值必须是裸整数，后面可带行尾注释。
+#
+# 缩进要**由调用方限定**（`_realign_priority` 的 indent 参数）—— 不限定就会
+# 命中嵌套结构里的同名键。真实 config.yaml 里 `plugins.configs.example.priority`
+# 缩进 6、条目级是 4；而字段顺序不保证（手工编辑过的条目可能把嵌套块写在
+# 条目级 priority 之前），「命中第一条就停」那时会改错那一行。
+_PRI_LINE = re.compile(r"^(\s*)priority\s*:\s*(-?\d+)\s*(#.*)?$")
+
+# 值不是裸整数的写法。这些形态本工具**不改**，但必须报出来 —— 静默跳过等于
+# 「用户以为拆档修好了，其实没修」。CPA 侧照样能解析它们
+# （yaml.Unmarshal 认 `"900"` 与 `!!int 900`），所以它们是合法的既有写法。
+_PRI_ODD = re.compile(r"^\s*priority\s*:\s*(?!-?\d+\s*(?:#|$))\S")
+
+
+def _realign_priority(block: list[str], new_pri: int, note: str,
+                      indent: int | None = None) -> tuple[list[str], bool, str]:
+    """把留守条目的 `priority:` 对齐到同站本次的新值。
+
+    为什么必须做（2026-09-04 现场截图）
+    ------------------------------
+    `assign_priorities` 保证「同站所有 Key 同档」，但那只作用于**进了本批方案**
+    的段。留守条目（用户没勾、判不可写、探测异常）由 `_orphan_entry_lines`
+    原样搬回来 —— 于是同一个站的 5 把 Key 拿新值、另外 9 把留在旧值上：
+
+        kktoken.cc  claude  3 把 → 164   +  2 把留在 372
+        tabitoken   claude  9 把 → 167   +  5 把留在 371
+
+    这与 CPA 的调度语义直接冲突：`priority` 决定「哪一层先被尝试」，
+    层级隔离下只取最高那一桶（selector.go:527-553 的
+    availableAuthsFromPriorityBuckets 只收 bestPriority；
+    scheduler.go:1229-1231 的 priorityOrder 降序）。同站多 Key 指向同一个上游、
+    能力完全相同，被拆成两层就把「多 Key 并行轮询」变成了「主备切换」——
+    留在高档的那几把先被打光配额，低档那批只在它们全部不可用时才轮到。
+
+    为什么对齐而不是「让留守条目决定新值」：新值来自本轮定档的完整安全推导
+    （suggest_priority 的三条硬约束 + 全段单调递减），旧值是上一轮的产物；
+    把新值抬回旧值会越过本轮算出的上限，可能劫持顶层。
+
+    只改**条目级**的那一行，靠 `indent` 限定（2026-09-04 自查修正）
+    ------------------------------------------------------------
+    第一版只认「第一条 `priority:` 行」，不看缩进。真实 config.yaml 里
+    `plugins.configs.example.priority: 1` 缩进 6、条目级是 4；而**字段顺序不保证**
+    —— 手工编辑过的条目完全可能把 `request-scoped-errors:` 这类嵌套块写在条目级
+    `priority:` 之前。那时「第一条」命中的是嵌套里那个，于是：条目级 priority
+    没被对齐（拆档没修上），嵌套结构里一个无关的键被改成了档位值，而
+    `realigned` 报的是「已对齐」—— 三重错误叠在一起，且 YAML 仍然合法。
+
+    给了 `indent` 就只认该缩进的行。调用方传的是该段条目的字段缩进
+    （`_detect_indent` 从原文件读出来的，四段未必一致）。
+
+    返回 (新行, 改没改, 跳过原因)。第三项非空表示「找到了这个条目但没能改」——
+    值不是裸整数（`"900"` / `!!int 900` / 锚点 / flow 风格）或整个条目找不到
+    条目级 priority。这类必须报出来：静默跳过等于让用户以为拆档修好了。
+    """
+    out: list[str] = []
+    changed = False
+    done = False
+    odd = ""
+    for line in block:
+        raw = line.rstrip("\n")
+        m = None if done else _PRI_LINE.match(raw)
+        if m and indent is not None and len(m.group(1)) != indent:
+            m = None                    # 嵌套里的同名键，不是条目级那一行
+        if m:
+            done = True
+            if int(m.group(2)) != new_pri:
+                nl = "\n" if line.endswith("\n") else ""
+                out.append(f"{m.group(1)}priority: {new_pri}        "
+                           f"# {note}{nl}")
+                changed = True
+                continue
+        elif not done and not odd and _PRI_ODD.match(raw):
+            # 值不是裸整数。缩进也要对得上才算条目级 —— 否则嵌套里的
+            # `priority: *anchor` 会被误报成本条目的问题。
+            lead = len(raw) - len(raw.lstrip())
+            if indent is None or lead == indent:
+                odd = raw.strip()
+        out.append(line)
+    if not changed and not odd and not done:
+        odd = "该条目没有条目级 priority 行"
+    return out, changed, odd
 
 
 def _orphan_provider_lines(lines: list[str], span: tuple[int, int],
@@ -1682,6 +2206,41 @@ def rebuild_config_full(
                         f"方案内（探测异常 / 未勾选 / 判不可写）—— 已原样保留在"
                         f"这个 provider 下，不会因整条重写而丢失")
                 attach_carry(head)
+                # 模型级字段（窗口值、白名单外字段）要取**组内并集**，不只读
+                # head 的（2026-09-04 逐字段对账发现）。
+                #
+                # compat 段的 `models:` 块在 **provider 级**，一份清单为组内所有
+                # Key 共用；而 `prior_context` / `prior_model_extras` 是按
+                # (段, host, api_key) 查出来的 per-Key 数据。只读 head 的话，
+                # head 一旦是「本次新粘的 Key」（它在原文件里没有任何记录），
+                # 整组的模型级字段就查不到 —— `models` 块被重写成裸
+                # `name` / `alias`。
+                #
+                # 实测生产配置 kktoken.cc 的 compat 段：新 Key 排在方案前面时
+                # `claude-opus-5: 987500` 变成空；排在后面才不丢。触发条件低到
+                # 「同 priority 时谁先进 all_plans」，而那个顺序取决于输入行序。
+                #
+                # 并集不会引入重复：同一个模型名在组内各 Key 那里是同一个值
+                # （它们读的是同一份 provider 级 models 块），dict 更新即可。
+                # 万一真有分歧，以 head 的为准 —— 最后写它。
+                merged_ctx: dict[str, int] = {}
+                merged_extra: dict[str, dict] = {}
+                for g in group:
+                    if g is head:
+                        continue
+                    merged_ctx.update(g.prior_context or {})
+                    for mname, fields in (g.prior_model_extras or {}).items():
+                        merged_extra.setdefault(mname, {}).update(fields)
+                merged_ctx.update(head.prior_context or {})
+                for mname, fields in (head.prior_model_extras or {}).items():
+                    merged_extra.setdefault(mname, {}).update(fields)
+                if merged_ctx != (head.prior_context or {}):
+                    head = copy.copy(head)
+                    head.prior_context = merged_ctx
+                    head.prior_model_extras = merged_extra
+                elif merged_extra != (head.prior_model_extras or {}):
+                    head = copy.copy(head)
+                    head.prior_model_extras = merged_extra
                 for c in _comments_for(comments_map, section, head, used, _host_of):
                     out.append(c if c.endswith("\n") else c + "\n")
                 # 每把 Key 自己的方案 —— per-key 的 proxy-url / weight 逐把取，
@@ -1732,12 +2291,60 @@ def rebuild_config_full(
         # 三种都不该导致删除。删除只应由用户显式操作，不该是「没勾」的副作用。
         if keep_unplanned and span:
             planned = {(_host_of(x.base_url), x.api_key) for x in entries}
-            kept = _orphan_entry_lines(original_lines, span, section, planned)
+            # 留守条目的 priority 对齐到同站本次的新值 —— 同站同档必须在
+            # **落盘结果**上成立，不只在方案对象里成立。见 _realign_priority。
+            #
+            # 同一批 entries 里同 host 出现多个 priority 时**整站放弃对齐**
+            # （2026-09-04 自查）：那意味着操作员手工把同站的几把 Key 改成了
+            # 不同值（覆盖在定档之后应用，`assign_priorities` 拦不住）。
+            # 此时「同站的新档」不存在唯一答案，随便挑一个去改留守条目等于
+            # 用工具的猜测覆盖操作员的显式意图。改为报出来让人自己决定。
+            per_host: dict[str, set[int]] = {}
+            for x in entries:
+                h = _host_of(x.base_url)
+                if h:
+                    per_host.setdefault(h, set()).add(x.priority)
+            host_tier: dict[str, tuple[int, str]] = {}
+            ambiguous = sorted(h for h, v in per_host.items() if len(v) > 1)
+            for h, vals in per_host.items():
+                if len(vals) > 1:
+                    continue
+                pri = next(iter(vals))
+                host_tier[h] = (
+                    pri,
+                    f"{stamp} 对齐同站档位 · 本次未重探此 Key，"
+                    f"随同站其他 Key 一并置为 {pri}"
+                    f"（同站同档，否则被拆成两层轮询）")
+            if ambiguous:
+                warnings.append(
+                    f"段 {section}：{len(ambiguous)} 个站的 Key 在本次方案里拿到了"
+                    f"**不同**的 priority（{'、'.join(ambiguous)}）—— 通常是手工改过。"
+                    f"该站没进方案的 Key 因此保持原值不动：同站的「新档」不唯一，"
+                    f"工具不替你挑。要同站同层请把它们改成同一个值")
+            realigned: list[str] = []
+            skipped: list[str] = []
+            kept = _orphan_entry_lines(original_lines, span, section, planned,
+                                       host_tier=host_tier,
+                                       realigned=realigned,
+                                       field_indent=len(field),
+                                       skipped=skipped)
             if kept:
                 out.extend(kept)
                 warnings.append(
                     f"段 {section}：{len(entries)} 条按新方案重写，"
                     f"另有条目不在本次方案内 —— 已原样保留")
+            if realigned:
+                warnings.append(
+                    f"段 {section}：{len(realigned)} 个站有 Key 不在本次方案内，"
+                    f"其 priority 已对齐到同站新档"
+                    f"（{'、'.join(sorted(realigned))}）—— 同站多 Key 必须同层，"
+                    f"分成两层会退化成主备切换而不是并行轮询")
+            if skipped:
+                warnings.append(
+                    f"段 {section}：{len(skipped)} 个留守条目的 priority **没能对齐**"
+                    f"（{'、'.join(skipped[:4])}{'…' if len(skipped) > 4 else ''}）"
+                    f"—— 本工具只改裸整数写法的那一行。这些条目会与同站其他 Key "
+                    f"分处两层（主备切换而非并行轮询），请手工核对")
         return out
 
     # 5. 逐行走原文件，只替换四段的 span 内容，其余逐字保留。
@@ -1763,10 +2370,44 @@ def rebuild_config_full(
             # 删掉的后果是「这一段的站这次全部判重复」就把整段清空。
             out_lines.extend(original_lines[start:end])
         else:
-            out_lines.append(original_lines[start])      # 段头原样
+            # 段头原样输出，**除非**它自带空字面量（`claude-api-key: []` /
+            # `{}`）—— 那种段头后面直接挂 `- api-key:` 是非法 YAML
+            # （2026-09-04 自查：增量路径早就用 `_empty_literal_rewrite` 处理
+            # 这件事，全量重建这一支漏了，于是同一份输入走两条路一条合法
+            # 一条不合法。落盘被 validate 挡住，所以症状是「全量重探对这类
+            # 文件整个不可用」而不是写坏文件）。
+            #
+            # 这类段头在全新或被清空的 config.yaml 里很常见，本项目自己的
+            # tools/e2e_dead_pick.py 造场景时就用 `claude-api-key: []`。
+            head_line = original_lines[start]
+            rw = _empty_literal_rewrite(original_lines, start, section)
+            flow_end = None
+            if rw is not None:
+                nl = "\n" if head_line.endswith("\n") else ""
+                head_line = rw[1] + nl
+            else:
+                # **非空** flow 序列（`claude-api-key: [{api-key: "k1", ...}]`）。
+                #
+                # 合法 YAML、CPA 读得出来，但块序列不能挂在它后面。
+                # 段头改成裸键，flow 那几行整个丢掉 —— 里面的条目已经由
+                # render_section 从方案重新生成了（方案本身就是从 cfg 读的，
+                # 而 cfg 是 PyYAML 解析这份 flow 得来的，所以不丢数据）。
+                #
+                # 2026-09-05 加。此前 validate 会挡住产出（不会写坏文件），
+                # 但报错是 `while parsing a block mapping` —— 看不出根因是
+                # 段头形态，症状表现为「全量重探对这类文件整个不可用」。
+                flow_end = _flow_section_span(original_lines, start)
+                if flow_end is not None:
+                    key = head_line.split(":", 1)[0]
+                    nl = "\n" if original_lines[flow_end - 1].endswith("\n") \
+                        else ""
+                    head_line = f"{key}:{nl}"
+            out_lines.append(head_line)
             out_lines.extend(body)
             replaced.append(section)
-        cursor = end
+        # flow 段头跨了几行就跳过那几行 —— 否则它们会被当成「段之后的内容」
+        # 原样输出，产出重复条目
+        cursor = max(end, flow_end) if body is not None and flow_end else end
 
     # 最后一个段之后的所有内容 —— 这里正是第一版丢掉 api-keys 与
     # remote-management 的地方
@@ -1847,6 +2488,16 @@ def _comments_for(comments_map: dict, section: str, sp: SectionPlan,
 _RENDERED_KEYS = frozenset({
     "api-key", "base-url", "prefix", "priority", "weight", "proxy-url",
     "headers", "models", "name", "api-key-entries",
+    # 段专属能力开关（2026-09-04）：从 carry 移到 render_entry 自己写。
+    #
+    # 为什么要移：它们现在**由实测决定**（_stage5_capabilities），而 carry 是
+    # 原文行搬运 —— 两者同时生效会写出两行同名键。PyYAML 取后一个、
+    # 而 Go 的 yaml.v3 直接报 `mapping key already defined` 拒绝加载整份配置。
+    # 也就是说重复键不是「值取谁」的小问题，是 CPA 起不来。
+    #
+    # 移过来之后原值由 `existing_toggles` 查表搬（见 _toggle_lines 的三层
+    # 优先级），语义与 headers / proxy-url 一致。
+    "websockets", "support-prompt-cache-key",
 })
 
 
@@ -1889,15 +2540,17 @@ def extract_carry_lines(lines: list[str]) -> dict[str, dict[str, list[str]]]:
 
     为什么必须有（2026-09-02 拿生产 config.yaml 核对发现）
     -------------------------------------------------
-    render_entry 是白名单式渲染，只写它知道的 10 个字段；而全量重探用它
-    **整段重写**。生产配置 108 个条目里 106 条带白名单外的字段，重写后
+    render_entry 是白名单式渲染，只写它知道的 12 个字段；而全量重探用它
+    **整段重写**。生产配置 121 个条目里 117 条带白名单外的字段，重写后
     全部静默消失 —— validate() 报成功，YAML 也合法，只是行为变了：
 
-        request-scoped-errors  105 条   冷却规则，丢了坏站不再被剔除
-        excluded-models         39 条   `["*"]` = 只用显式列的模型
-        websockets               2 条   codex 的 WebSocket 开关
+        request-scoped-errors  116 条   冷却规则，丢了坏站不再被剔除
         fingerprint-profile      1 条   让 CPA 自己补设备指纹
-        disabled                 1 条   手工停用的 provider 会复活
+
+    2026-09-04 重新点过：以前这张表里的 `excluded-models 39 条` 与
+    `disabled 1 条` **都是 0** —— 那两个数是 `grep -c` 数出来的，把注释里的
+    `# excluded-models 可选…` 也数进去了。这类计数从此按解析后的 YAML 数。
+    `websockets` 也从这张表里移走了：它现在由实测决定，见 _toggle_lines。
 
     存**原文行**而不是解析后的值：这些字段结构任意深（request-scoped-errors
     是对象数组），重新序列化要处理缩进、引号风格、键序；而原文行拿来就能用、
@@ -1972,8 +2625,9 @@ def extract_carry_lines(lines: list[str]) -> dict[str, dict[str, list[str]]]:
         if not stripped or stripped.startswith("#"):
             continue
 
-        # 离开本段（顶层键）
-        if re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]*\s*:", line):
+        # 离开本段（顶层键）。判据与 _section_span 同一个 —— 三处都要认
+        # 含点号与引号的顶层键，否则那个键会被当成条目的 carry 行收走。
+        if _TOP_LEVEL_KEY.match(line):
             flush()
             section = None
             skip_indent = None
@@ -2116,8 +2770,8 @@ def _extract_entry_comments(lines: list[str]) -> dict[str, dict[str, list[str]]]
         if not stripped:
             continue
 
-        # 顶层键（非本段）：离开该段
-        if re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]*\s*:", line):
+        # 顶层键（非本段）：离开该段。判据与 _section_span 同一个。
+        if _TOP_LEVEL_KEY.match(line):
             current_section = None
             pending = []
             models_indent = None

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 import concurrent.futures
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     from .pipeline import Prober, CandidateResult
     from .parse import ParsedRow
@@ -131,6 +131,135 @@ class BatchProber:
         return results
 
 
+def entry_scope(section: str, base_url: str) -> str:
+    """查表键里的「站」这一维。前三段用 host，compat 段用**含路径**的 provider 身份。
+
+    为什么两段不同（2026-09-04 修）
+    ---------------------------
+    前三段是「一个 Key 一条条目」，站的身份就是 host —— base-url 除了
+    `/v1` 后缀之外没有路径。
+
+    compat 段是「一个 provider 一条条目、多 Key 挂在下面」，而同一台主机
+    可以按**路径**挂多个互不相干的 provider（本项目自己的
+    `tools/e2e_redetect.py` 假上游正是 `127.0.0.1:PORT/good` 与 `.../gate`）。
+    用 host 做键时那两个 provider 的条目互相覆盖：重探 `/good` 会拿到
+    `/gate` 的 prefix / headers / name / 窗口值。
+
+    渲染归并（`compat_provider_key`）、per-key 续行（`compat_key_blocks`）、
+    孤儿保留（`_orphan_provider_lines`）三处本来就用含路径的键，只有这六张
+    查表还在用 host —— 这个函数把它们统一起来。
+
+    生产配置 compat 段同 host 多路径 0 处，所以这是补闸而不是修事故。
+    """
+    if section == "openai-compatibility":
+        from .writeback import compat_provider_key
+        return compat_provider_key(base_url)
+    from .parse import host_of
+    return host_of(base_url)
+
+
+
+class CarryTables:
+    """既有条目里「探测问不出来、必须原样搬」的那些字段，一次建表、逐段搬运。
+
+    为什么要抽成一个类（2026-09-04）
+    ------------------------------
+    这八张表原来在两处各写一遍：`server.py` 的 `_api_plan` 循环，与
+    `tests/rehearse_real_rebuild.py` 的 `build_plans`。两处分叉的后果实测过
+    两次：
+
+      · 演练自己也搬 headers，所以「server 不搬」这个缺陷演练照样对上账
+      · 反过来，演练少搬一张表时对不上账会被当成产品缺陷
+
+    更要紧的是**可测性**：内联在循环里时只能靠 AST 断言「这一行在不在」，
+    而那挡不住「行还在、传的是空」—— 撤销实验里把 `old = hdrs.get(...)` 改成
+    `old = None`，1198 项测试全绿。抽出来之后行为直接测得到。
+
+    每张表少一张的后果（都实测过或读过 CPA 源码确认）：
+
+      weight        `weight: 0` 是「逐出加权调度池」的唯一表达
+      proxy-url     必须走代理的站会改成直连，下次请求拿 403
+      prefix        `ANT/xxx` 这半边别名全失效（实测 121/121 条目）
+      provider name CPA 的 provider_key，改名作废冷却状态与能力缓存（12/13）
+      headers       整字段消失（实测 24/24 与 66/66 条目）
+      能力开关      原来开着的 websockets 被抹掉
+      模型级窗口    客户端按 CPA 内置目录的偏大值定压缩点（实测 8 处）
+      模型级其余    手工加的 display-name / thinking 等被抹掉
+    """
+
+    __slots__ = ("weights", "proxies", "prefixes", "provider_names",
+                 "headers", "toggles", "model_context", "model_extras")
+
+    def __init__(self, cfg: dict):
+        self.weights = existing_weights(cfg)
+        self.proxies = existing_proxies(cfg)
+        self.prefixes = existing_prefixes(cfg)
+        self.provider_names = existing_provider_names(cfg)
+        self.headers = existing_headers(cfg)
+        self.toggles = existing_toggles(cfg)
+        self.model_context = existing_model_context(cfg)
+        self.model_extras = existing_model_extras(cfg)
+
+    def apply(self, sp, api_key: str) -> None:
+        """把原值搬进这个 SectionPlan。就地改，不返回。
+
+        搬运方向按字段分（判据是「这个字段是谁的属性」，见 README 的
+        「重探时每个字段以哪一侧为准」）：
+
+          · weight / prefix / provider name / 模型级字段 —— 只搬原值，
+            探测不产生这些
+          · proxy-url —— 探测有值优先（那是本次实测结论），否则搬原值
+          · headers —— 合并，原值为底、探测值覆盖同名键
+          · 能力开关 —— 只提供「未探测时的兜底」，覆盖关系在
+            `_toggle_lines` 里判，不在这里
+        """
+        from .writeback import merge_entry_headers
+
+        sec = sp.section
+        # 键里的「站」这一维：前三段是 host，compat 段是含路径的 provider
+        # 身份 —— 同一主机可按路径挂多个 provider，用 host 查会串到另一个
+        # 上游的配置上。见 entry_scope。
+        scope = entry_scope(sec, sp.base_url)
+        k = (sec, scope, api_key)
+
+        w = self.weights.get(k)
+        if w is not None:
+            sp.weight = w
+
+        # 探测判定需要代理时它已有值，不覆盖 —— 那是本次实测结论；
+        # 只补「原来有、这次没探出来」的情形。
+        if not sp.proxy_url:
+            got = self.proxies.get(k)
+            if got:
+                sp.proxy_url = got
+
+        sp.headers = merge_entry_headers(self.headers.get(k), sp.headers)
+
+        got_t = self.toggles.get(k)
+        if got_t:
+            sp.prior_toggles = dict(got_t)
+
+        # `"" in prefixes` 与「键不存在」要分开 —— 前者是操作员显式写了空串，
+        # 也该照原样。
+        if k in self.prefixes:
+            sp.prefix = self.prefixes[k]
+
+        if sec == "openai-compatibility":
+            sp.provider_name = provider_name_for(self.provider_names,
+                                                 sp.base_url)
+
+        sp.prior_context = {
+            name: val
+            for (s2, h2, k2, name), val in self.model_context.items()
+            if s2 == sec and h2 == scope and k2 == api_key
+        }
+        sp.prior_model_extras = {
+            name: dict(val)
+            for (s2, h2, k2, name), val in self.model_extras.items()
+            if s2 == sec and h2 == scope and k2 == api_key
+        }
+
+
 def extract_existing_entries(cfg: dict) -> list[tuple[str, str, str, str]]:
     """从 config.yaml 提取所有既有站
 
@@ -228,7 +357,8 @@ def existing_weights(cfg: dict) -> dict[tuple[str, str, str], int]:
     for prov in cfg.get("openai-compatibility") or []:
         if not isinstance(prov, dict):
             continue
-        h = host_of(str(prov.get("base-url") or ""))
+        h = entry_scope("openai-compatibility",
+                        str(prov.get("base-url") or ""))
         for ke in prov.get("api-key-entries") or []:
             if not isinstance(ke, dict):
                 continue
@@ -282,7 +412,8 @@ def existing_proxies(cfg: dict) -> dict[tuple[str, str, str], str]:
     for prov in cfg.get("openai-compatibility") or []:
         if not isinstance(prov, dict):
             continue
-        h = host_of(str(prov.get("base-url") or ""))
+        h = entry_scope("openai-compatibility",
+                        str(prov.get("base-url") or ""))
         for ke in prov.get("api-key-entries") or []:
             if not isinstance(ke, dict):
                 continue
@@ -290,6 +421,73 @@ def existing_proxies(cfg: dict) -> dict[tuple[str, str, str], str]:
             k = str(ke.get("api-key") or "")
             if pu and h and k:
                 out[("openai-compatibility", h, k)] = pu
+
+    return out
+
+
+def existing_headers(cfg: dict) -> dict[tuple[str, str, str], dict[str, str]]:
+    """既有条目的 headers，按 **(段, host, api_key)** 索引。只收非空 map。
+
+    为什么必须搬运（2026-09-04 逐字段对账发现，与 proxy-url 同一个成因）
+    ----------------------------------------------------------------
+    `headers` 是四段条目级字段里**唯一**「只生成、不搬运」的那一个：
+      · 它在 `_RENDERED_KEYS` 里，所以 `extract_carry_lines` 不搬（那是给
+        白名单**外**的字段用的）
+      · 而 `existing_*` 查表以前没有它
+    于是整段重写时原值被方案值整体替换。方案的 headers 只在探测**当场判定
+    需要 UA**（`v.need_ua`）时才有值，重探时那个站可能 baseline 就通 ——
+    `sp.headers` 是空 dict，那一行整个写不出来。
+
+    实测两份生产 config.yaml：Desktop 版 24/24 条目的 headers 全丢
+    （codex 10、claude 13、compat 1），fsdownload 版 66/66 全丢。丢的内容含
+    `anthropic-beta`（Desktop 24 条、fsdownload 25 条）、`user-agent`、
+    `originator`、X-Stainless 全族。
+
+    后果是真的改运行行为：条目级 headers 会一路到达上游请求
+    （config.go 的 addConfigHeadersToAttrs → attribute `header:<Name>` →
+    util/header_helpers.go 的 ApplyCustomHeadersFromAttrs），所以丢掉
+    `anthropic-beta: context-1m-2025-08-07` 就是把那个站的 1m 上下文关掉，
+    而 YAML 合法、validate 报成功、写后验证也发现不了。
+
+    与 `proxy_url` 采用同一条处置：探测有值优先（那是本次实测结论），
+    否则搬原值。见 server.py 里 headers 那一段的合并逻辑。
+
+    键含段的理由与 existing_proxies 相同：同一个凭据在不同段的 headers 是
+    **独立配置**（claude 段要 anthropic-beta，compat 段发它毫无意义）。
+    """
+    from .parse import host_of
+
+    out: dict[tuple[str, str, str], dict[str, str]] = {}
+
+    def take(section: str, h: str, k: str, raw) -> None:
+        if not isinstance(raw, dict) or not raw:
+            return
+        got = {str(kk): str(vv) for kk, vv in raw.items()
+               if str(kk).strip() and vv is not None}
+        if got and h and k:
+            out[(section, h, k)] = got
+
+    for section in ("gemini-api-key", "codex-api-key", "claude-api-key"):
+        for e in cfg.get(section) or []:
+            if not isinstance(e, dict):
+                continue
+            take(section, host_of(str(e.get("base-url") or "")),
+                 str(e.get("api-key") or ""), e.get("headers"))
+
+    # compat 段的 headers 在 **provider 级**，组内所有 Key 共用同一份
+    # （OpenAICompatibilityAPIKey 只有 api-key / weight / proxy-url，
+    # config_types.go:700 起）。所以按组内每把 Key 各存一份同样的值 ——
+    # 查表方按 (段, host, key) 问，拿到的是这个 provider 的那一份。
+    for prov in cfg.get("openai-compatibility") or []:
+        if not isinstance(prov, dict):
+            continue
+        h = entry_scope("openai-compatibility",
+                        str(prov.get("base-url") or ""))
+        hdrs = prov.get("headers")
+        for ke in prov.get("api-key-entries") or []:
+            if not isinstance(ke, dict):
+                continue
+            take("openai-compatibility", h, str(ke.get("api-key") or ""), hdrs)
 
     return out
 
@@ -325,7 +523,8 @@ def existing_prefixes(cfg: dict) -> dict[tuple[str, str, str], str]:
     for prov in cfg.get("openai-compatibility") or []:
         if not isinstance(prov, dict) or "prefix" not in prov:
             continue
-        h = host_of(str(prov.get("base-url") or ""))
+        h = entry_scope("openai-compatibility",
+                        str(prov.get("base-url") or ""))
         val = str(prov.get("prefix") or "")
         for ke in prov.get("api-key-entries") or []:
             if not isinstance(ke, dict):
@@ -338,37 +537,138 @@ def existing_prefixes(cfg: dict) -> dict[tuple[str, str, str], str]:
 
 
 def existing_provider_names(cfg: dict) -> dict[str, str]:
-    """compat 段每个 provider 的 `name`，按 host 索引。
+    """compat 段每个 provider 的 `name`，按 **provider 身份**（含路径）索引。
 
     `name` 就是 CPA 的 provider 身份 ——
     `util.OpenAICompatibleProviderKey(name)` 的结果写进 Auth 的
     `provider_key`，而冷却（conductor_cooldown.go:73）、模型能力
-    （api_key_model_capabilities.go:186）、执行路由（conductor_execution.go:1619）
+    （api_key_model_capabilities.go:186）、执行路由（conductor_execution.go:1605-1609）
     三处都按它索引。
 
     实测生产配置里 12/13 个 provider 的 name 是人读短名（`runanytime`、
     `chma`、`facai`），与 host 不同。用 host 现编会把它们全部改名：冷却状态
     与能力缓存作废，而且本项目自己的 `name_alias_map`（注释里的短名 → 域名）
     也跟着失效 —— 下一轮读注释拿健康度就大面积漏判。
-    """
-    from .parse import host_of
 
+    为什么键是 `compat_provider_key` 而不是 host（2026-09-04 修）
+    -------------------------------------------------------
+    同一台主机可以按**路径**挂多个互不相干的 provider。按 host 索引时后一个
+    覆盖前一个，于是重探 `/good` 会拿到 `/gate` 的 name —— 两个 provider 同名，
+    CPA 的三处索引对同一把 Key 命中两套配置，同一把 Key 在轮询池里占两个位。
+
+    这与 `compat_key_blocks` / `_orphan_provider_lines` / 渲染时的归并键
+    （都是 `compat_provider_key`）本来就该一致 —— 这一处是漏改的。
+    生产配置 compat 段同 host 多路径 0 处，但本项目自己的
+    `tools/e2e_redetect.py` 假上游正是这个形态。
+
+    **兼容回落**：调用方拿到的是三元组查不到时按 host 再查一次的两级表 ——
+    见 `provider_name_for`。直接读这张表的调用方要用那个函数，别自己拼键。
+    """
     out: dict[str, str] = {}
     for prov in cfg.get("openai-compatibility") or []:
         if not isinstance(prov, dict):
             continue
-        h = host_of(str(prov.get("base-url") or ""))
+        pk = entry_scope("openai-compatibility",
+                         str(prov.get("base-url") or ""))
         nm = str(prov.get("name") or "").strip()
-        if h and nm:
-            out[h] = nm
+        if pk and nm:
+            out[pk] = nm
+    return out
+
+
+def provider_name_for(names: dict[str, str], base_url: str) -> str:
+    """从 `existing_provider_names` 的表里取这个 base-url 对应的 provider name。
+
+    两级查找：先按 `compat_provider_key`（含路径）精确匹配，查不到再按 host
+    回落。回落的理由：新导入的站在表里没有精确条目，而「同一个 host 只有一个
+    provider」是绝大多数情形 —— 那时按 host 拿到的就是对的。
+
+    同 host 有多个 provider 时回落会**不确定**（拿到哪个取决于 dict 顺序），
+    所以只在精确查不到时才用，且此时 host 下只可能是「新站」——
+    既有站必然精确命中。
+    """
+    from .parse import host_of
+
+    pk = entry_scope("openai-compatibility", base_url)
+    if pk in names:
+        return names[pk]
+    h = host_of(base_url)
+    for key, nm in names.items():
+        if host_of(key) == h:
+            return nm
+    return ""
+
+
+def existing_toggles(cfg: dict) -> dict[tuple[str, str, str], dict[str, bool]]:
+    """既有条目里**显式写了 true** 的段专属能力开关，按 (段, host, api_key) 索引。
+
+    收哪两个：
+        codex-api-key         websockets                Responses 的 WS 通道
+        openai-compatibility  support-prompt-cache-key  注入 prompt_cache_key
+
+    为什么只收 true：CPA 的零值就是关闭（`websockets bool` 无指针，
+    config_types.go:486），`false` 与「不写」运行时完全等价。只收 true 让
+    搬运的语义变成「把用户显式打开的开关保住」，而不需要区分两种关闭写法。
+
+    为什么必须搬（2026-09-04，与 headers 同一个成因）：这两个字段在
+    `_RENDERED_KEYS` 里，所以 `extract_carry_lines` 不搬（那是给白名单**外**的
+    字段用的）；而方案侧的值只在**本次探测跑了能力探测**时才有。关掉
+    `--no-capabilities` 或该段本次判不可用时方案是 None，整段重写就把原有的
+    `websockets: true` 抹掉了。实测生产配置 codex 段有 2 条。
+
+    另两段没有这类开关：GeminiKey / ClaudeKey 的布尔字段
+    （`rebuild-mid-system-message` / `experimental-cch-signing` /
+    `disable-cooling`）是**本地行为**开关而不是上游能力，它们由 carry 原文
+    搬运（不在 `_RENDERED_KEYS` 里），不需要这张表。
+    """
+    from .parse import host_of
+
+    out: dict[tuple[str, str, str], dict[str, bool]] = {}
+
+    for e in cfg.get("codex-api-key") or []:
+        if not isinstance(e, dict):
+            continue
+        if e.get("websockets") is not True:
+            continue
+        h = host_of(str(e.get("base-url") or ""))
+        k = str(e.get("api-key") or "")
+        if h and k:
+            out.setdefault(("codex-api-key", h, k), {})["websockets"] = True
+
+    # compat 的开关在 **provider 级**，组内所有 Key 共用 —— 按每把 Key 各存
+    # 一份同样的值，查表方按 (段, host, key) 问就拿得到（与 existing_headers
+    # 同一套做法）。
+    for prov in cfg.get("openai-compatibility") or []:
+        if not isinstance(prov, dict):
+            continue
+        if prov.get("support-prompt-cache-key") is not True:
+            continue
+        h = entry_scope("openai-compatibility",
+                        str(prov.get("base-url") or ""))
+        for ke in prov.get("api-key-entries") or []:
+            if not isinstance(ke, dict):
+                continue
+            k = str(ke.get("api-key") or "")
+            if h and k:
+                out.setdefault(("openai-compatibility", h, k), {})[
+                    "support-prompt-cache-key"] = True
+
     return out
 
 
 def existing_model_extras(cfg: dict) -> dict[tuple[str, str, str, str], dict]:
     """既有条目里每个模型的**白名单外字段**，按 (段, host, api_key, 模型名) 索引。
 
-    白名单是 render_entry 会自己写的三个：`name` / `alias` /
-    `max-context-length`。CPA 的模型条目还支持另外七个
+    白名单是 render_entry 自己有确定值的两个：`name` 与
+    `max-context-length`（后者另有 `existing_model_context` 专门搬）。
+    `alias` **不在**白名单里（2026-09-04 修）—— render_entry 写死 `alias: ""`，
+    而那只对「原本就是空串」的条目成立：非空 alias 三方都不管
+    （render 写死、这张表原来排除它、carry 跳过 models 块），整段重写后
+    `alias: "claude-opus-5"` 变成 `alias: ""`。两份生产文件里非空 alias 是 0 个，
+    所以当前是潜在缺陷；但 README 明确把 `models[].alias` 写成推荐做法
+    （「保留原名轮询，用 models[].alias 补段级兼容名」），按文档配就会丢。
+
+    CPA 的模型条目还支持另外七个
     （config_types.go 的 ClaudeModel / CodexModel / GeminiModel /
     OpenAICompatibilityModel）：
 
@@ -391,7 +691,8 @@ def existing_model_extras(cfg: dict) -> dict[tuple[str, str, str, str], dict]:
     """
     from .parse import host_of
 
-    KNOWN = {"name", "alias", "max-context-length"}
+    # alias 不在这里 —— 它要进 extras 才能被搬回来。见上面的说明。
+    KNOWN = {"name", "max-context-length"}
     out: dict[tuple[str, str, str, str], dict] = {}
 
     def take(section: str, h: str, k: str, models) -> None:
@@ -413,7 +714,8 @@ def existing_model_extras(cfg: dict) -> dict[tuple[str, str, str, str], dict]:
     for prov in cfg.get("openai-compatibility") or []:
         if not isinstance(prov, dict):
             continue
-        h = host_of(str(prov.get("base-url") or ""))
+        h = entry_scope("openai-compatibility",
+                        str(prov.get("base-url") or ""))
         for ke in prov.get("api-key-entries") or []:
             if isinstance(ke, dict):
                 take("openai-compatibility", h,
@@ -469,7 +771,8 @@ def existing_model_context(cfg: dict) -> dict[tuple[str, str, str, str], int]:
     for prov in cfg.get("openai-compatibility") or []:
         if not isinstance(prov, dict):
             continue
-        h = host_of(str(prov.get("base-url") or ""))
+        h = entry_scope("openai-compatibility",
+                        str(prov.get("base-url") or ""))
         for ke in prov.get("api-key-entries") or []:
             if isinstance(ke, dict):
                 take("openai-compatibility", h,
