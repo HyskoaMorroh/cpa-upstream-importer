@@ -132,6 +132,70 @@ SECTION_FAMILY: dict[str, str] = {
 }
 
 
+# 模型名的合法字符与形态。
+#
+# 为什么必须校验（2026-09-05 加，审计发现）
+# ----------------------------------
+# 模型名来自**站方的 `/models` 目录**（第三方完全可控），而它会被
+# 直接拼进出网 URL：
+#
+#     request.py:92  f"{base}/v1beta/models/{model}:generateContent"
+#
+# 实测通过原来全部闸门并原样上线的名字：
+#     '../../../gemini-3.1-pro'        → 逃出 base 路径，打到同主机别的端点
+#     'gemini-3.1-pro-x?a=b'           → `:generateContent` 落进 query，
+#                                        实际请求的是另一个端点；它回 200
+#                                        就成了「该模型可用」的伪证
+#     'gemini-3.1-pro.%2e%2e%2fadmin'  → 编码过的路径穿越
+#
+# 而且**不需要拿到 200**：plan.py 的 catalog 分支把目录里的名字直接当候选，
+# 于是这串字面量进 config.yaml，CPA 用同样的方式拼 URL 再发一次
+# （gemini_executor.go 也是裸拼、不 escape）。本工具是这条链上唯一有机会
+# 校验的一环。
+#
+# `/` 必须允许
+# ----------
+# 生产配置里 85 个模型名有 `Business/gemini-2.5-pro`、`anthropic/claude-opus-5`
+# 这种带前缀的形态 —— 那是中转站的分组/厂商前缀，合法且常见。
+# 实测那 85 个名字用到的非字母数字字符只有 `-` `.` `/` 三个，最长 34 字符。
+#
+# 所以判据不是「不许有 `/`」，而是「只许这三个符号 + 禁止路径穿越
+# + 禁止 query/fragment 的起始字符」。
+_NAME_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+
+# 长度上限：真实名字最长 34，给 4 倍余量。超长名本身就是异常信号，
+# 而且会让 URL 超过某些中转站的路径长度限制。
+_NAME_MAX = 128
+
+
+def name_is_safe(name: str) -> str:
+    """模型名能不能安全地拼进 URL 与写进 config.yaml。不能则返回原因。
+
+    只做**字符与形态**校验，不判族/版本（那是 `section_allows` 的事）。
+    分开是因为两者的失效方式不同：族判错只是少探一个模型，
+    字符没校验会让出网请求打到别的端点、并把脏字符串写进生产配置。
+    """
+    n = (name or "").strip()
+    if not n:
+        return "模型名为空"
+    if len(n) > _NAME_MAX:
+        return f"模型名过长（{len(n)} 字符，上限 {_NAME_MAX}）"
+    if not _NAME_OK.match(n):
+        bad = sorted({c for c in n if not re.match(r"[A-Za-z0-9._:/-]", c)})
+        return (f"模型名含非法字符 {bad or ['(首字符不是字母数字)']} —— "
+                f"它会被拼进出网 URL 并写进 config.yaml")
+    # 路径穿越：`..` 作为任意一段，或名字以 / 开头/结尾
+    segs = n.split("/")
+    if any(seg in ("", ".", "..") for seg in segs):
+        return "模型名含空段或 .. 段（路径穿越）"
+    # 编码过的穿越：%2e%2e%2f 之类。上面的字符集已经排除了 `%`，
+    # 这一条是防将来放宽字符集时忘掉它 —— 留着比省下便宜。
+    low = n.lower()
+    if "%2e" in low or "%2f" in low or "%5c" in low:
+        return "模型名含编码过的路径分隔符"
+    return ""
+
+
 def section_allows(section: str, name: str) -> bool:
     """这个模型能不能进这个段。用户 2026-09-02 定的四条规则。
 
@@ -142,6 +206,11 @@ def section_allows(section: str, name: str) -> bool:
     `section_protocol_ok` —— 那一层只挡协议层不可能成立的，不挡族。
     见 build_plan 里 forced_kept 的说明。
     """
+    # 字符与形态校验放最前（2026-09-05 加）。手填与自动挑选都要过 ——
+    # 操作员也可能从站方页面复制粘贴一个带 `?` 或 `../` 的名字。
+    # 见 name_is_safe：这个名字会被拼进出网 URL 并写进 config.yaml。
+    if name_is_safe(name):
+        return False
     n = bare_name(name)
     if not n:
         return False
@@ -178,6 +247,10 @@ def section_protocol_ok(section: str, name: str) -> bool:
         往那里发 grok 上游必失配，放行只会制造死条目。
       · 非对话模型（图像/语音/嵌入/批处理）四段都拒：协议不同，必失配。
     """
+    # 字符与形态校验也在这里 —— 手填不豁免。见 name_is_safe 与
+    # section_allows 里同一句注释：这个名字会被拼进出网 URL。
+    if name_is_safe(name):
+        return False
     n = bare_name(name)
     if not n:
         return False
@@ -208,6 +281,25 @@ def section_protocol_ok(section: str, name: str) -> bool:
 _VERSION_RE = re.compile(
     r"(?<![A-Za-z0-9.])(k?)(\d+(?:[.\-]\d+)*)(o?)(?![A-Za-z0-9])")
 
+# OpenAI 推理系列的世代：`o1` / `o3` / `o4-mini` 里的数字。
+#
+# 为什么要单独一条（2026-09-04 现场截图：codex 段同时勾着 o1 与 o3）
+# ------------------------------------------------------------
+# `_VERSION_RE` 要求版本数字前面不紧贴字母（`(?<![A-Za-z0-9.])`），而这一族
+# 的数字**紧贴开头的 o**。于是 `o1` / `o3` / `o4-mini` 全部解析成「无版本」，
+# `newest_generation_per_line` 的「整组认不出版本就全留」兜底把七个名字一起
+# 留下并默认全勾 —— 与 `gpt-4o` 那次是同一个形态（正则读不出版本 ⇒ 躲过
+# 世代过滤），只是换了一族。
+#
+# o3 是 o1 的后继（同一条推理产品线的下一代），把两代一起注册进 config.yaml
+# 等于让 CPA 的轮询把请求分给旧款。
+#
+# 为什么用 `^o` 而不是把 `o?` 加进 `_VERSION_RE` 的可选前缀：那样
+# `omni-3` / `oss-20b` 这类以 o 开头但 o 不属于版本记号的名字也会被改判。
+# 锚在开头 + 紧跟数字，只命中真正的推理系列（与 `_OPENAI_REASONING_RE`
+# 同一套判据）。
+_O_SERIES_RE = re.compile(r"^o(\d+(?:[.\-]\d+)*)(?![A-Za-z0-9])")
+
 
 def series_and_version(name: str) -> tuple[str, tuple[int, ...] | None]:
     """拆成 (系列, 版本元组)。认不出版本时版本为 None。
@@ -218,9 +310,19 @@ def series_and_version(name: str) -> tuple[str, tuple[int, ...] | None]:
         claude-opus-5    → ("claude-opus-*", (5,))
         claude-opus-4-8  → ("claude-opus-*", (4, 8))  同系列，版本更低
         kimi-k3          → ("kimi-k*", (3,))
-        o1               → ("o1", None)              整名就是系列名
+        o1               → ("o*", (1,))             推理系列：o 后紧跟的数字是世代
+        o4-mini          → ("o*-mini", (4,))
     """
     n = bare_name(name)
+    # 推理系列先判 —— `_VERSION_RE` 读不出它的版本（数字紧贴开头的 o），
+    # 而「读不出版本」会让 o1 与 o3 一起躲过世代过滤。见 _O_SERIES_RE。
+    mo = _O_SERIES_RE.match(n)
+    if mo:
+        try:
+            nums = tuple(int(x) for x in re.split(r"[.\-]", mo.group(1)))
+        except ValueError:
+            return n, None
+        return "o*" + n[mo.end():], nums
     m = _VERSION_RE.search(n)
     if not m:
         return n, None
@@ -586,22 +688,57 @@ def catalog_is_stale(section: str, catalog: list[str], *,
     「落后」的判据是**世代**而非名字：只要目录最高世代低于市面最新，就算
     落后。不比较具体名字 —— 站方特供型号（`gpt-5.6-preview-xyz`）不在市面
     名录里，按名字比会把它误判成落后。
+
+    世代比较必须**同产品线内**进行（2026-09-04 修）
+    ----------------------------------------
+    原来直接比两侧的全局最高世代。给 o 系列补上版本解析之后（见
+    `_O_SERIES_RE`）这条立刻出错：`o3-mini` 的世代是 (3,0)，而 codex 段的市面
+    最新是 `gpt-5.6-sol` 的 (5,6) —— 两个数字来自**互不相干的编号体系**，
+    o 系列的 3 不代表它比 gpt 的 5.6 老一代（`o3` 与 `gpt-5` 是同期产品）。
+    按全局比会把「目录里只有 o 系列」的站误判成落后，从而不预勾任何模型。
+
+    改成逐产品线比：只对**两侧都出现**的产品线比较最高世代，全部落后才算
+    落后。目录里的线在市面清单里没有对应（只有 o 系列）时无从比较，不判落后
+    —— 与 `newest_generation_per_line` 的「整组认不出版本就全留」同一条原则。
     """
     if not catalog:
         return False, ""
     fit = [m for m in catalog if section_allows(section, m)]
     if not fit:
         return False, ""
-    cat_top = top_generation(fit)
-    if cat_top is None:
-        return False, ""          # 目录里全是认不出版本的名字，无从比较
     latest, _src = latest_models(section, cfg=cfg, remote=remote, limit=12)
-    mkt_top = top_generation(latest)
-    if mkt_top is None or cat_top >= mkt_top:
-        return False, ""
+    cat_by_line = top_generation_per_line(fit)
+    mkt_by_line = top_generation_per_line(latest)
+    shared = [ln for ln in cat_by_line if ln in mkt_by_line]
+    if not shared:
+        return False, ""          # 没有可比的产品线，无从判断
+    behind = [ln for ln in shared if cat_by_line[ln] < mkt_by_line[ln]]
+    if len(behind) < len(shared):
+        return False, ""          # 至少一条线是跟得上的，整份目录不算落后
+    ln = max(behind, key=lambda x: mkt_by_line[x])
+    cat_top, mkt_top = cat_by_line[ln], mkt_by_line[ln]
     return True, (
         f"站方目录最高世代 {cat_top[0]}.{cat_top[1]}，"
         f"市面最新已到 {mkt_top[0]}.{mkt_top[1]}")
+
+
+def top_generation_per_line(names: list[str]) -> dict[str, tuple[int, int]]:
+    """{产品线: 该线的最高世代}。认不出版本的名字不参与。
+
+    公开入口，给 server.py 的 /api/context 用 —— 前端判「站方目录整体落后」
+    必须按产品线比，与 `catalog_is_stale` 用同一套数据。见那个函数的说明。
+    """
+    out: dict[str, tuple[int, int]] = {}
+    for n in names:
+        if not n:
+            continue
+        g = generation(series_and_version(n)[1])
+        if g is None:
+            continue
+        line = _product_line(n)
+        if line not in out or g > out[line]:
+            out[line] = g
+    return out
 
 
 def latest_models(section: str, *, cfg: dict | None = None,
@@ -686,6 +823,11 @@ _LINE_STRIP = re.compile(
 
 def _product_line(name: str) -> str:
     n = bare_name(name)
+    # 推理系列的世代数字紧贴开头的 o，`_LINE_STRIP` 的版本支路读不到它
+    # （那一支要求数字前不紧贴字母）。不先剥掉的话 o1 / o3 / o4-mini 各自
+    # 自成一条产品线，「每条线取最高世代」就无从比较 —— 七个名字全留。
+    # 剥完统一叫 `o`，于是它们是同一条线的不同世代。
+    n = _O_SERIES_RE.sub("o", n, count=1)
     prev = None
     # 反复剥到不动为止 —— `gemini-3.1-pro-preview-customtools` 要剥三次
     while n != prev:

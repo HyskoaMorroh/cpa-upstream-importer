@@ -78,8 +78,19 @@ def build_request(
     """返回 (url, headers, json_body)。
 
     base_url 会先按段规范化，所以调用方传带不带 /v1 都对。
+
+    model 必须先过 `model_catalog.name_is_safe`（2026-09-05 加的最后一道）。
+    gemini 段把它拼进 URL 路径，含 `../` 或 `?` 的名字会改变请求去向 ——
+    上游两层闸（`section_allows` / `section_protocol_ok`）已经拦过，这里再拦
+    一次是因为**这里才是真正拼 URL 的地方**：将来加新调用路径时，忘了过上游
+    闸门也不会漏出去。抛异常而不是静默改名 —— 静默改会让日志里的模型名与
+    实际发出去的不一致。
     """
     _check(section)
+    from .model_catalog import name_is_safe
+    why = name_is_safe(model)
+    if why:
+        raise ValueError(f"模型名不安全，拒绝构造请求：{why}（{model[:60]!r}）")
     base = base_for_section(base_url, section)
     headers: dict[str, str] = {"Content-Type": "application/json"}
 
@@ -100,7 +111,11 @@ def build_request(
 
     elif section == "claude-api-key":
         # 带 `?beta=true` —— CPA 三条 claude 路径全都带
-        # （claude_executor_execute.go:30、_stream.go:32、_tokens.go:128）。
+        # （claude_executor_execute.go:31、claude_executor_stream.go:33、
+        #   claude_executor_tokens.go:128 —— 三处都是
+        #   `fmt.Sprintf("%s/v1/messages?beta=true", baseURL)`）。
+        # 用全名不用缩写：CPA 的 executor 目录里有 40 多个
+        # `claude_executor_*.go`，写 `_stream.go` 那种缩写在别处搜不到。
         # 原来不带的理由是「少一个变量」，但那让探测与真实转发形态不一致：
         # 站方按 query 参数分流时，探测通了而 CPA 不通（或反之）。
         # 对齐优先于减少变量 —— 探测要问的是「CPA 这样发通不通」。
@@ -177,7 +192,16 @@ def identity_combos(section: str, cfg: dict | None = None):
 
 
 def parse_models_response(section: str, text: str) -> list[str]:
-    """从列模型响应里抽出模型 id 清单。三种 JSON 形态都认。"""
+    """从列模型响应里抽出模型 id 清单。三种 JSON 形态都认。
+
+    **在这里就丢掉字符不安全的名字**（2026-09-05 加）。这是站方数据进入本工具的
+    第一个入口，越早丢越好 —— 后面有目录落盘、探测队列、方案生成、界面预勾、
+    写回 config.yaml 五条下游路径，逐个补闸容易漏（实测 `newest_generation_per_line`
+    就会原样保留 `../../../gemini-3.1-pro`）。
+
+    丢掉而不是报错：一个中转站的目录里混进几个奇怪名字不该让整轮探测失败。
+    但要**在事件流里说出来** —— 调用方拿 `parse_models_response_verbose` 取原因。
+    """
     import json
     import re
 
@@ -208,16 +232,67 @@ def parse_models_response(section: str, text: str) -> list[str]:
                 v = it.get("id") or it.get("name") or ""
                 if isinstance(v, str) and v:
                     out.append(v)
-    return sorted(set(out))
+    return sorted(set(_keep_safe_names(out)))
+
+
+def _keep_safe_names(names: list[str]) -> list[str]:
+    """丢掉字符不安全的模型名。见 model_catalog.name_is_safe。"""
+    from .model_catalog import name_is_safe
+
+    return [n for n in names if not name_is_safe(n)]
+
+
+def unsafe_names(text: str, section: str = "") -> list[tuple[str, str]]:
+    """目录里被丢掉的名字与原因。给事件流用 —— 静默丢站方数据不好。
+
+    单独一个函数而不是让 `parse_models_response` 返回两个值：那个函数有
+    七个调用点，改签名都要动；而「被丢了什么」只有事件流关心。
+    """
+    import json
+    import re
+
+    from .model_catalog import name_is_safe
+
+    raw: list[str] = []
+    try:
+        data = json.loads(text)
+    except Exception:
+        raw = re.findall(r'"(?:id|name)"\s*:\s*"([^"]{2,80})"', text)
+    else:
+        def walk(items):
+            for it in items or []:
+                if isinstance(it, str):
+                    raw.append(it)
+                elif isinstance(it, dict):
+                    v = it.get("id") or it.get("name") or ""
+                    if isinstance(v, str) and v:
+                        raw.append(v.split("/")[-1]
+                                   if v.startswith("models/") else v)
+        if isinstance(data, dict):
+            walk(data.get("data") or data.get("models") or [])
+        elif isinstance(data, list):
+            walk(data)
+    out = []
+    for n in dict.fromkeys(raw):
+        why = name_is_safe(n)
+        if why:
+            out.append((n[:80], why))
+    return out
 
 
 def next_page_token(text: str) -> str:
     """Gemini 列模型的翻页游标。没有就返回空串。
 
     为什么需要（2026-09-01，对齐 CPAMP）：`/v1beta/models` 分页返回，
-    默认页长有限。CPAMP 的 healthCheck.ts:279-364 会一直翻到
-    `nextPageToken` 为空（上限 20 页）；本工具原来只读第一页，于是
+    默认页长有限。CPAMP 会一直翻到 `nextPageToken` 为空、上限 20 页
+    （`apps/web/src/services/api/models.ts:314` 的
+    `for (let page = 0; page < 20; page += 1)`，被
+    `ProviderHealthCheckDrawer/healthCheck.ts:401` 的
+    `fetchGeminiModelsViaApiCall` 调用）；本工具原来只读第一页，于是
     gemini 段的目录被截断，后面的模型根本没机会被验。
+
+    2026-09-04 核实：文件位置以前写成 `healthCheck.ts:279-364` —— 那个行号区间
+    是 `models.ts` 里的分页函数，不是 healthCheck。上限 20 页这个数是对的。
 
     其余三段（OpenAI / Codex / Claude 形态）不分页，调用方只对 gemini 用。
     """

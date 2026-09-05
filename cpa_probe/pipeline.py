@@ -207,7 +207,7 @@ def _body_kind(prof) -> str:
 # 而其中 27 个日志里其实出现过 200、7 个 /models 目录明明拿到过模型。
 #
 # 这句话确实来自上游而非 CPA：CLIProxyAPI 全仓库搜 "No available channel"
-# 零命中，它自己的措辞是 conductor_selection.go:492 的 auth_unavailable。
+# 零命中，它自己的措辞是 conductor_selection.go:496 的 auth_unavailable。
 _MODEL_SPECIFIC_DEAD_END = re.compile(
     r"model_not_found"
     r"|no available channel"          # 上游中转站：该分组无此模型的活跃通道
@@ -217,9 +217,38 @@ _MODEL_SPECIFIC_DEAD_END = re.compile(
     re.I,
 )
 
-# 只在这些码上认「模型专属」。200 不该走到这里；5xx 里只认 503
-# （中转站的调度失败），500/502/504 是站方故障，已归「临时」并会重试。
-_MODEL_SPECIFIC_CODES = frozenset({"400", "403", "404", "503"})
+# 只在这些码上认「模型专属」。200 不该走到这里。
+#
+# 5xx 全收（2026-09-05 修）
+# ----------------------
+# 原来只认 503，注释说「500/502/504 是站方故障，已归临时并会重试」——
+# **那句话不成立**：classify 的正文优先规则让
+# `No available channel for model X under group default` 在**任何**状态码上
+# 都判「死路」（classify.py 的正文关键词先于状态码兜底）。实测：
+#
+#     400 死路 model_specific=True    ← 豁免，会试下一个种子
+#     403 死路 model_specific=True    ← 同上
+#     404 死路 model_specific=True    ← 同上
+#     500 死路 model_specific=False   ← **立刻判死整段**
+#     502 死路 model_specific=False   ← 同上
+#     503 死路 model_specific=True    ← 豁免
+#     504 死路 model_specific=False   ← 同上
+#
+# 于是同一句话、同一个语义（「这个分组里没有你要的这个模型」），只因为中转站
+# 用 500 而不是 503 发出来，就让 `_stage1` 在第一个种子上直接 return ——
+# 连第二个种子、画像梯、代理都不试。
+#
+# 而中转站在过载时用 500/502 回这句话是常见形态：项目自己的复盘说 666 次 500
+# 是日志最大头。
+#
+# 状态码本身不带语义（这句措辞来自上游中转站而非 CPA，全仓搜零命中，见
+# `_MODEL_SPECIFIC_DEAD_END` 的说明），所以不该用它当豁免闸。5xx 一律放行 ——
+# 真是站方故障的话正文里不会有这句话，`classify` 会判「临时」而不是「死路」，
+# 走不到这个函数。
+_MODEL_SPECIFIC_CODES = frozenset({
+    "400", "403", "404",
+    "500", "502", "503", "504",
+})
 
 
 def _model_specific_dead_end(att) -> bool:
@@ -338,6 +367,31 @@ class SectionVerdict:
     # 客户端会按错误的窗口定压缩点，重演那条 400。
     context_model: str = ""
     context_untrusted: bool = False
+    # ---- 段专属能力开关的实测结论（2026-09-04）----
+    #
+    # 三态，不是布尔：
+    #   True  实测确认支持 —— 写 `<字段>: true`
+    #   False 实测确认不支持 —— **不写这个字段**（CPA 的零值就是关闭）
+    #   None  没探（不适用 / 本段不通 / 需代理时直连探不准）—— 也不写，
+    #         但方案里要说明「未探测」而不是「不支持」
+    #
+    # 为什么 False 与 None 都不写却要分开记：写回时行为相同，但**界面措辞
+    # 与警告不同**。把「探过、站方明确拒绝」和「没探过」显示成同一个样子，
+    # 就是本项目反复修的那类缺陷（「未验证当已验证」的镜像）。
+    #
+    # websockets（codex 段）：CPA 的 CodexAutoExecutor 只在
+    # 「下游是 WS」且「该凭据 websockets=true」时才走 WS 通道
+    # （codex_websockets_executor.go:71）；上游地址是
+    # `{base}/responses` 的 http→ws 换 scheme（同文件 :223-240）。
+    # 站方不支持时 CPA **不会自动回落**到 HTTP —— 那一条会直接失败，
+    # 所以这个开关必须靠实测决定，不能照抄别的条目。
+    websockets: bool | None = None
+    websockets_note: str = ""
+    # support-prompt-cache-key（compat 段）：CPA 会在请求体注入
+    # `prompt_cache_key`（openai_compat_executor.go:875）。上游不认这个字段
+    # 时的表现分两种 —— 忽略（无害）或 400 拒收（有害），所以要实测。
+    prompt_cache_key: bool | None = None
+    prompt_cache_note: str = ""
     category: str = ""
     action: str = ""
     attempts: list[Attempt] = field(default_factory=list)
@@ -378,6 +432,12 @@ class SectionVerdict:
             bits.append(f"⚠ 换模 {self.swap.get('rate_pct', 0)}%")
         if self.max_context_length:
             bits.append(f"上限 {self.max_context_length:,}")
+        # 能力开关只在**确认支持**时进摘要 —— 「不支持」是常态（中转站多数
+        # 不支持 WS），把它也列出来会让摘要长一倍而没有信息量。
+        if self.websockets:
+            bits.append("支持 WebSocket")
+        if self.prompt_cache_key:
+            bits.append("支持 prompt_cache_key")
         return " · ".join(bits)
 
 
@@ -403,6 +463,7 @@ class Prober:
         gap: float = 3.0,
         timeout: int = 120,
         probe_context: bool = True,
+        probe_capabilities: bool = True,
         swap_samples: int = 3,
         workers: int = 4,
         max_models: int = MAX_MODELS_PER_SECTION,
@@ -420,6 +481,14 @@ class Prober:
         self.gap = gap
         self.timeout = timeout
         self.probe_context = probe_context
+        # 段专属能力开关的实测（codex 的 websockets、compat 的
+        # support-prompt-cache-key）。每段最多 1 次额外请求，只在该段已判可用
+        # 时才跑 —— 段不通时这两个开关无从验证，探它只是白烧配额。
+        #
+        # 留开关的理由与 probe_context 相同：这两次请求对「站能不能用」这个
+        # 主问题没有贡献，赶时间或省配额时可以关掉。关掉时字段记 None
+        # （未探测），写回时不写那个字段，界面说明「未探测」而不是「不支持」。
+        self.probe_capabilities = probe_capabilities
         self.swap_samples = swap_samples
         # 每段收几个模型、最多试几次。做成参数是因为这两个数的取舍与
         # 具体站群有关：聚合站多时该压低尝试数，站少而模型杂时该放宽。
@@ -457,6 +526,21 @@ class Prober:
         # 只缓存**失败**：成功的形态已经由 _shape 记着，而且成功时 _stage1
         # 直接 return，不会走到下一个种子。
         self._profiles_failed: set[tuple[str, str]] = set()
+        # (host, section) -> 站+段级的失败结论。**与用哪把 Key 无关**的那一类。
+        #
+        # 为什么需要（2026-09-05 修）：`_shape` 只在 `v.usable` 时写入，
+        # 于是段不通时形态不入缓存 —— 门闩清空、gate 置位、等待的线程醒来，
+        # 其中一个重新认领又跑一遍完整 `_full_probe`（目录 + 基线 + 整梯画像
+        # + 临时重试）。15 个 Key 挂同一主机就是 15 次全量探测，而且因为门闩
+        # 存在这 15 次是**严格串行**的 —— 比没有门闩（至少能并行）更慢。
+        #
+        # 而这是多数情形而非边角：79 凭据实跑里 45 个是 0 段可用。
+        #
+        # 只缓存**站+段级**的失败（见 _HOST_LEVEL_FAIL）。凭证级的
+        # （鉴权 / 余额）是这把 Key 自己的属性，缓存它会让同站的其他 Key
+        # 错误地继承别人的欠费结论 —— 那正是原来「只在 usable 时缓存」
+        # 想避免的事，但它把两类一起排除了。
+        self._dead_shape: dict[tuple[str, str], SectionVerdict] = {}
         self._lock = threading.RLock()
         self._proxy_state: bool | None = None   # None=未检 True/False=预检结果
         # 代理预检专用锁。不复用 _lock —— 预检要占最多 4 秒，
@@ -777,6 +861,10 @@ class Prober:
         base = base_for_section(row.bare, section)
         v = SectionVerdict(section=section, base_url=base)
         seen: list[tuple[str, str]] = []      # 每个候选的 (类别, 处置)
+        # 模型专属死路单独一张表（2026-09-05）。它们**不参与**「整段是什么
+        # 状况」的评选，但在没有别的结论时仍要报出来 —— 否则段判不可用却
+        # 没有类别，界面显示成空白。见下方 seen / seen_weak 的取值处。
+        seen_weak: list[tuple[str, str]] = []
 
         # 目录优先。拿不到就是空列表，`_probe_order` 自动回落到种子。
         v.catalog = self._stage0_catalog(row, section, base)
@@ -801,7 +889,27 @@ class Prober:
                                  combo=f"retry{tries}")
                 v.attempts.append(att)
 
-            seen.append((att.category, att.action))
+            # 模型专属的死路**不进 seen**（2026-09-05 修）。
+            #
+            # 上面那段 docstring 已经写明「修法是两层：模型专属死路不进 seen，
+            # 这里再把客户端排在死路之前」—— 但第一层从来没实现，这一行是
+            # 无条件 append 的。
+            #
+            # 后果（实测）：「opus-5 客户端门禁 + sonnet-5 该站没有这个模型」
+            # 这种组合里，「死路」严重度 rank 2 优于「门禁」rank 5，于是
+            # `min(seen, ...)` 最终报「死路 — 分组无渠道」，而真正该报的是
+            # 客户端门禁（补标识或人工接管就能用）。报错方向反了：
+            # 一个能救的站被说成没救。
+            #
+            # 判据与提前 return 那一处同一个 `_model_specific_dead_end` ——
+            # 它说的是「这个拒绝只针对当前这个模型」，那种结论本来就不该
+            # 参与「整个段是什么状况」的评选。
+            if att.category == "死路" and _model_specific_dead_end(att):
+                # 只针对这个模型的死路 —— 记进兜底表而不是评选表。
+                # 见下方 seen_weak 的说明。
+                seen_weak.append((att.category, att.action))
+            else:
+                seen.append((att.category, att.action))
 
             if att.ok:
                 v.category, v.action = att.category, att.action
@@ -854,6 +962,10 @@ class Prober:
                     v.usable = True
                     v.need_proxy = True
                     v.category, v.action = att.category, att.action
+                    # 补目录必须在 _accept **之前**：_accept 会把这个模型记进
+                    # v.models，而 plan 的 catalog 分支看的是 v.catalog ——
+                    # 顺序反了的话本次这一个模型进了 models，而目录仍是空的。
+                    self._recatalog_via_proxy(row, section, base, v)
                     v.models = self._accept(v, model, att)
                     return v
 
@@ -876,15 +988,60 @@ class Prober:
             #   门禁/IP封/边缘/401/403 —— 都可能实际是形态问题被误分类
             #   鉴权   —— 401 unauthorized client 会落到这里（实测 golf）
             # 判错方向的代价不对称：多试几档只是多几次请求，漏试会把可用站判死。
+            #
+            # 为什么还要看 `betas.wanted`（2026-09-05 修的 P1）
+            # ------------------------------------------
+            # 站方在 **400** 上索要 beta 时，上面两个条件一个都不命中 ——
+            # classify 对 400 没有兜底，实测这几种正文全落「未知」：
+            #
+            #     400 + '请启用 128k 输出后重试'
+            #     400 + 'missing required header: anthropic-beta'
+            #     400 + 'anthropic-beta must include output-128k-2025-02-19'
+            #     400 + 'the model requires fine-grained-tool-streaming'
+            #
+            # （同样的正文在 403 上都判「门禁」，所以 403 那条路是通的。）
+            #
+            # 而 `_retry_with_betas` 的**唯一调用点**在 `_try_profiles` 内部
+            # （本文件 :1130）—— 整梯不跑，它就永远不跑。于是 betas.py 的
+            # `output-128k-2025-02-19` 与 `fine-grained-tool-streaming` 两条
+            # 规则是**死代码**。1m 那条能走到纯属巧合：classify 恰好把
+            # 「1m context」限定在 {400, 403} 上判「门禁」。
+            #
+            # 更糟的是「未知」在 `_PROXY_SECOND` 里（本文件 :150 附近），
+            # 于是处置变成**换出口 IP** —— 对「缺一个请求头」这个根因
+            # 完全无关的补救，白烧一次代理请求还得不出正确结论。
+            #
+            # 为什么不干脆把 400 加进状态码集合：那会让**每一个** 400 都多跑
+            # 一整梯（最多 6 档 × 每档一次请求），而 400 是最常见的错误码
+            # （参数错、模型名错、body 形状错都是 400）。只在正文**明说**
+            # 缺什么 beta 时才跑 —— 那时补上再打一次几乎必然成功，
+            # 而 betas.py 的 docstring 正是这么承诺的：
+            # 「补上再打一次就通，没有任何理由让用户去手填」。
+            #   正文点名要 beta —— 2026-09-05 加。见下方长注释。
             if (att.category in ("客户端", "WAF", "门禁", "IP封", "边缘", "鉴权")
-                    or att.status in ("401", "403", "503")):
+                    or att.status in ("401", "403", "503")
+                    or betas.wanted(att.excerpt or "")):
                 if self._try_profiles(row, section, base, model, v):
                     return v
 
         # 全部种子都没通。取**最严重**的类别，而不是最后一个种子的结论。
         # 见本方法 docstring：后者会让一个该站不存在的模型判死整段。
-        if seen:
-            best = min(seen, key=lambda ca: self._severity_rank(ca[0]))
+        # 模型专属死路排除在评选之外（2026-09-05 修）。
+        #
+        # 上面那段 docstring 早就写明「修法是两层：模型专属死路不进 seen，
+        # 这里再把客户端排在死路之前」—— 但第一层从来没实现。
+        #
+        # 后果（实测）：「opus-5 客户端门禁 + sonnet-5 该站没有这个模型」这种
+        # 组合里，「死路」rank 2 优于「门禁」rank 5，于是最终报「死路 — 分组
+        # 无渠道，充值无效」，而真正该报的是客户端门禁（补标识或人工接管就能
+        # 用）。报错方向反了：一个能救的站被说成没救。
+        #
+        # 但**不能整个丢掉**：如果所有种子都是模型专属死路（该站确实没有我们
+        # 试的这几个模型），那它就是唯一的结论 —— 丢掉会让段判不可用却没类别，
+        # 界面显示成空白。所以分两级取。
+        pool = seen or seen_weak
+        if pool:
+            best = min(pool, key=lambda ca: self._severity_rank(ca[0]))
             v.category, v.action = best
 
         # 第二级代理：原因不明（未知）或疑似链路问题（临时）的段，在**所有**
@@ -908,16 +1065,24 @@ class Prober:
             if att.ok:
                 # 走 _accept 而不是直接置 models —— 它查换模与「200 包错误体」
                 # 这两种假阳性。拒收时返回空列表，段仍不可写，不会静默进配置。
+                # need_proxy 先置位 —— _recatalog_via_proxy 要看它决定走不走代理。
+                # 但 _accept 可能拒收（换模 / 200 包错误体），那时段仍不可用，
+                # 所以拒收后要**还原**：need_proxy=True 配 usable=False 会让
+                # 能力探测（_stage5_capabilities）以为「这个段需要代理」而跳过，
+                # 而实际上它压根不可用 —— 两种不可用的原因显示成一种。
+                v.need_proxy = True
+                self._recatalog_via_proxy(row, section, base, v)
                 accepted = self._accept(v, model, att)
                 if accepted:
                     v.usable = True
-                    v.need_proxy = True
                     v.category, v.action = att.category, att.action
                     v.models = accepted
                     self.on_event("proxy-rescued", {
                         "section": section, "host": host_of(base),
                         "model": model, "was": was,
                     })
+                else:
+                    v.need_proxy = False    # 见上：拒收时还原，别混淆两种不可用
         return v
 
     def _profile_kwargs(self, v: SectionVerdict, api_key: str) -> dict:
@@ -1038,7 +1203,10 @@ class Prober:
 
         # 基底取**非 alt 的族内最高档**。alt（browser-ua）是替换型画像，不是
         # CC 门票的超集 —— 拿它作基底会把 CC 门票整个丢掉，实测落地只剩 2 个
-        # header。而 CPAMP 里能用的形态是「CC 门票 + 1m」，不是「浏览器 + 1m」。
+        # header。而实测能用的形态是「CC 门票 + 1m」，不是「浏览器 + 1m」
+        # （2026-09-04：这一句原来写「CPAMP 里能用的形态是…」，而 CPAMP 并不
+        # 决定这件事 —— 它的测试按钮只发 x-api-key + anthropic-version，
+        # 连 CC 门票都不带。依据是 2026-09-01 那轮 alfa 实测，不是 CPAMP）。
         top = None
         for prof in profiles.ladder(section, self.cfg_snapshot):
             if not prof.is_baseline and not prof.alt:
@@ -1083,6 +1251,38 @@ class Prober:
 
     # ---------- ⓿ 目录发现（先问站方，再动手打） ----------
 
+    def _recatalog_via_proxy(self, row: ParsedRow, section: str, base: str,
+                             v: SectionVerdict) -> None:
+        """代理救活这个段之后，补一次目录。就地改 v.catalog，不返回。
+
+        为什么需要（2026-09-05 修）
+        ----------------------
+        `_stage0_catalog` 在 `_stage1` 最前面跑，那时 `need_proxy` 还没定 ——
+        所以它**永远直连**。被 IP 封的站这一步拿 000/403，catalog 为空。
+
+        之后 `via-proxy` 或 `via-proxy-last` 把段救活并置 `need_proxy=True`，
+        但目录不会补取（`_stage2` 明确不再 GET）。于是 `v.catalog` 保持空，
+        plan 的 catalog 分支走不到，只能落到**种子猜测**或「市面最新」兜底 ——
+        写进 config.yaml 的模型名与这个站实际卖的没有关系。而 `_probe_order`
+        自己的 docstring 就说这种情形「CPA 路由过去 404」。
+
+        `_stage0_catalog` 的签名里**本来就有** `need_proxy` 参数，只是没有任何
+        调用点传它 —— 这是接线漏了，不是设计缺失。
+
+        只在 catalog 为空时补：直连能读目录、但推理被 IP 封的站确实存在
+        （目录端点常在 CDN 边缘就放行），那种情况已有目录，重取只是白花一次请求。
+        """
+        if v.catalog or not v.need_proxy or not self.live_proxy:
+            return
+        got = self._stage0_catalog(row, section, base, need_proxy=True)
+        if not got:
+            return
+        v.catalog = got
+        self.on_event("catalog-via-proxy", {
+            "section": section, "host": host_of(base), "count": len(got),
+            "why": "直连拿不到目录，代理救活后补取",
+        })
+
     def _stage0_catalog(self, row: ParsedRow, section: str,
                         base: str, *, need_proxy: bool = False) -> list[str]:
         """GET /models 拿站方声明的模型清单。**在任何推理请求之前**跑。
@@ -1099,10 +1299,21 @@ class Prober:
         为什么这一步比推理请求安全
         ------------------------
         · GET 目录端点，多数站不计费、不计入调用统计、不触发风控；
-        · 参考实现全都只这么做：CPAMP 的健康检查只发 GET 目录
-          （healthCheck.ts:397-451，全库无 POST messages/chat 测活），
+        · 参考实现全都只这么做：CPAMP 的**批量健康检查**只发 GET 目录
+          （`ProviderHealthCheckDrawer/healthCheck.ts:397-450`，四段分别调
+          `fetchGeminiModelsViaApiCall` / `fetchV1ModelsViaApiCall` /
+          `fetchClaudeModelsViaApiCall` / `fetchModelsViaApiCall`，全部 GET），
           CLIProxyAPI 自己完全不探上游存活（唯一定时任务 model_updater.go
           拉的是 GitHub 上的模型名录 JSON，不发推理请求）。
+
+          **准确说**（2026-09-04 核实）：CPAMP 里确实有发推理的地方 ——
+          凭据编辑抽屉的「测试」按钮（`ClaudeEditDrawer.tsx:520-556` POST
+          `/v1/messages` 带 `messages:[{content:"Hi"}]`、
+          `CodexEditDrawer.tsx:396` POST `/responses`、
+          `OpenAIEditDrawer.tsx:476` POST `/chat/completions`）。
+          那是**单条目手工点一次**，不是批量巡检；而且它发的正是用户明确禁止的
+          `Hi` 形态。所以这一条的准确表述是「批量健康检查只发 GET」，
+          不是「CPAMP 全库无 POST 测活」。
         · 与用户「严禁 Hi/你好 这类简单测活」的要求同向：能不发推理就不发。
 
         拿不到目录不是失败 —— 返回空列表，调用方回落到种子模型。
@@ -1136,6 +1347,14 @@ class Prober:
             for m in request.parse_models_response(section, resp.body):
                 if m not in seen:
                     seen.append(m)
+            # 被字符校验丢掉的名字要说出来 —— 静默丢站方数据会让人以为
+            # 「这个站的目录里就没有那个模型」。见 request.unsafe_names 与
+            # model_catalog.name_is_safe。
+            for bad, why in request.unsafe_names(resp.body, section):
+                self.on_event("model-rejected", {
+                    "section": section, "host": host_of(base),
+                    "model": bad, "reason": why,
+                })
             token = (request.next_page_token(resp.body)
                      if section == "gemini-api-key" else "")
             if not token:
@@ -1270,6 +1489,160 @@ class Prober:
             self.on_event("context", {"section": v.section, "model": model,
                                       "limit": limit, "untrusted": untrusted})
 
+    # ---------- ⑤ 段专属能力开关 ----------
+
+    def _stage5_capabilities(self, row: ParsedRow, v: SectionVerdict) -> None:
+        """实测该段的能力开关，得出「开」还是「不开」。
+
+        两个开关各属一段，判据完全不同，所以分开写：
+
+          codex  `websockets`               能不能走 Responses 的 WS 通道
+          compat `support-prompt-cache-key` 上游认不认注入的 prompt_cache_key
+
+        另两段没有这类开关（核对 GeminiKey / ClaudeKey 结构体，
+        config_types.go:570 / :351：它们的布尔字段是
+        `rebuild-mid-system-message` / `experimental-cch-signing` /
+        `disable-cooling`，全都是**本地行为**而非上游能力 —— 探不出来，
+        也不该靠探测决定，见 README 的说明）。
+
+        为什么必须实测而不是照抄别的条目：这两个开关都会改变 CPA **发出去的
+        形态**，而站方支不支持是站方的属性。抄错的后果不对称：
+          · websockets 抄成 true 而站方不支持 → CPA 走 WS 通道，握手失败，
+            **不会自动回落 HTTP**（CodexAutoExecutor 只按下游形态与该开关分流，
+            codex_websockets_executor.go:71-77）—— 那个凭据的 WS 请求全废
+          · websockets 抄成 false 而站方支持 → 只是用不上 WS，无害
+        所以默认值必须是「不开」，只有实测 101 才开。
+        """
+        if not self.probe_capabilities or not v.usable:
+            return
+        if v.section == "codex-api-key":
+            self._probe_websockets(row, v)
+        elif v.section == "openai-compatibility":
+            self._probe_prompt_cache_key(row, v)
+
+    def _probe_websockets(self, row: ParsedRow, v: SectionVerdict) -> None:
+        """codex 段：`{base}/responses` 换成 wss 发一次握手。
+
+        与 CPA 完全同构（codex_websockets_connection.go）：
+          · URL   `buildCodexResponsesWebsocketURL`（:223）只换 scheme
+          · 头    `applyCodexWebsocketHeaders`（codex_websockets_request.go:67）
+                  发 `Authorization: Bearer`，并保证
+                  `OpenAI-Beta: responses_websockets=2026-02-06`（:102-105）
+        没有那个 beta 头时站方可能回 400 而不是 101 —— 那样测出来的是
+        「没带门票的握手不通」，不是「站方不支持 WS」。
+
+        需代理的站不探（`need_proxy`）：CPA 的 WS 拨号走
+        `newProxyAwareWebsocketDialer` 会用条目的 proxy-url，而这里直连。
+        直连拿到的 403 说明不了走代理时的行为 —— 记 None（未探测）而不是 False，
+        否则就是「拿一个不成立的实验下结论」。
+        """
+        if v.need_proxy:
+            v.websockets = None
+            v.websockets_note = ("该段需走代理，而本探测是直连 —— 直连的握手结果"
+                                 "说明不了走代理时的行为，故未探测")
+            self.on_event("capability", {
+                "section": v.section, "host": row.host, "name": "websockets",
+                "result": "skipped", "why": "need_proxy"})
+            return
+
+        base = base_for_section(row.bare, v.section)
+        ws_url = client.http_to_ws(f"{base.rstrip('/')}/responses")
+        if not ws_url:
+            v.websockets = None
+            v.websockets_note = f"base-url 形态无法转成 ws/wss：{base}"
+            return
+
+        self._throttle(row.host, v.section)
+        headers = {
+            "Authorization": f"Bearer {row.api_key}",
+            # CPA 无条件保证这个头（codex_websockets_request.go:102-105）。
+            # 少了它站方可能回 400，那测的就不是「支不支持 WS」。
+            "OpenAI-Beta": "responses_websockets=2026-02-06",
+            "Originator": "codex-tui",
+        }
+        # 段已学到的必需头一并带上 —— 门票是站的属性，WS 握手同样要过
+        # （applyCodexWebsocketHeaders 也会带 UA / x-codex-beta-features）。
+        headers.update({k: val for k, val in (v.min_headers or {}).items()
+                        if val and k.lower() != "content-type"})
+        resp = client.ws_handshake(ws_url, headers=headers,
+                                   timeout=min(self.timeout, 30))
+        excerpt = _body_excerpt(resp.body) if resp.body else ""
+        att = Attempt(
+            section=v.section, model="(ws-handshake)", combo="ws-upgrade",
+            status=resp.status,
+            category="" if resp.status == "101" else _classify(resp.status,
+                                                              resp.body)[0],
+            action="", elapsed_ms=resp.elapsed_ms,
+            excerpt=excerpt or resp.error, sent_chars=0,
+        )
+        v.attempts.append(att)
+
+        if resp.status == "101" and not resp.error:
+            v.websockets = True
+            v.websockets_note = f"实测握手返回 101（{resp.elapsed_ms}ms）"
+        elif resp.status == "000":
+            # 连接层失败：与「站方明确拒绝」不同 —— 可能是网络抖动。
+            # 记 None 而不是 False，写回时同样不写，但界面说「未测出」。
+            v.websockets = None
+            v.websockets_note = f"握手未得到响应（{resp.error}）—— 未能判定"
+        else:
+            v.websockets = False
+            v.websockets_note = (f"实测握手返回 {resp.status}"
+                                 f"{'：' + excerpt[:80] if excerpt else ''}")
+        self.on_event("capability", {
+            "section": v.section, "host": row.host, "name": "websockets",
+            "result": v.websockets, "status": resp.status,
+            "elapsed_ms": resp.elapsed_ms})
+
+    def _probe_prompt_cache_key(self, row: ParsedRow,
+                                v: SectionVerdict) -> None:
+        """compat 段：请求体带 `prompt_cache_key` 再发一次，看上游收不收。
+
+        CPA 开 `support-prompt-cache-key` 后会往请求体注入这个字段
+        （openai_compat_executor.go:875 起）。上游的反应有两种：
+          · 忽略未知字段 → 200，开着无害且能命中上游的前缀缓存
+          · 严格校验    → 400 `unrecognized request argument` 之类，
+                          开着会让**每一个**请求都失败
+        后者正是必须实测的理由 —— 那是一个「开了就全废」的开关。
+
+        判据只看这一次请求成不成立，不比对缓存命中：命中率要多轮同 prompt
+        才看得出，而那与「开关能不能开」是两个问题。
+        """
+        if not v.models:
+            return
+        base = base_for_section(row.bare, v.section)
+        model = v.models[0]
+        # 画像的 body 补丁与本探测的补丁必须**合并**，不能各传一个 ——
+        # `_profile_kwargs` 在有画像时返回的 dict 里就带 `body_patch`，
+        # 再显式传一个会 TypeError（同名关键字给了两次）。而那个异常会被
+        # `probe()` 的兜底捕获成「死路 — 探测异常」，把一个可用段判死。
+        kw = dict(self._profile_kwargs(v, row.api_key))
+        patch = dict(kw.pop("body_patch", None) or {})
+        patch["prompt_cache_key"] = f"cpa-probe-{row.host}"
+        att = self._call(
+            v.section, base, row.api_key, model,
+            combo="prompt-cache-key",
+            proxy=self.live_proxy if v.need_proxy else None,
+            body_patch=patch,
+            **kw,
+        )
+        v.attempts.append(att)
+        if att.ok and not att.error_envelope:
+            v.prompt_cache_key = True
+            v.prompt_cache_note = "实测带 prompt_cache_key 时返回 200"
+        elif att.status == "000":
+            v.prompt_cache_key = None
+            v.prompt_cache_note = f"该次请求未得到响应（{att.excerpt[:60]}）—— 未能判定"
+        else:
+            v.prompt_cache_key = False
+            v.prompt_cache_note = (
+                f"实测带 prompt_cache_key 时返回 {att.status}"
+                f"{'：' + att.excerpt[:80] if att.excerpt else ''}")
+        self.on_event("capability", {
+            "section": v.section, "host": row.host,
+            "name": "support-prompt-cache-key",
+            "result": v.prompt_cache_key, "status": att.status})
+
     # 上限直接写在错误正文里的常见形态。命中任一即可免掉整轮二分。
     #
     # 为什么值得单独做：二分最多 6 次请求，body 20 万-110 万字符，
@@ -1279,18 +1652,45 @@ class Prober:
     #   Claude 系  prompt is too long: 215000 tokens > 200000 maximum
     #   国内中转    最大上下文长度为 128000
     # 有明说就用它，不必自己试出来。
+    # 「这个数字是**限额**」的语气词。关键词与数字之间必须有它们之一 ——
+    # 否则抓到的可能是「请求用了多少」（2026-09-05 修，见 _limit_from_body）。
+    _LIMIT_CUE = (r"(?:is|are|of|limit(?:ed)?(?:\s+to)?|max(?:imum)?|"
+                  r"至多|最多|上限|限制|为|是)")
+
     _LIMIT_PATTERNS = (
         # "maximum context length is 200000 tokens"
         r"maximum\s+context\s+length\s+is\s+(\d{4,8})",
         # "prompt is too long: 215000 tokens > 200000 maximum"
         r">\s*(\d{4,8})\s*maximum",
         # "context_length_exceeded ... limit 128000"
-        r"context[_\s-]?length[^\d]{0,40}?(\d{4,8})",
-        # "max_tokens ... 200000" / "max input tokens: 200000"
-        r"max(?:imum)?[_\s-]?(?:input[_\s-]?)?tokens?[^\d]{0,20}(\d{4,8})",
+        #
+        # 关键词与数字之间必须有限额语气词（2026-09-05 收紧）。
+        # 原来是 `[^\d]{0,40}?` —— 那 40 个任意非数字字符会跨过
+        # 「your request has」，于是
+        #   'context_length_exceeded: your request has 275000 tokens'
+        # 抠出 275000，那是**请求用量**而不是上限，比真实窗口大。
+        # 写进 config.yaml 的后果：客户端永不压缩，每个长请求都撞 400。
+        r"context[_\s-]?length[^\d]{0,24}?" + _LIMIT_CUE + r"[^\d]{0,12}(\d{4,8})",
         # 中文形态
         r"最大(?:上下文)?(?:长度|token数?)[^\d]{0,10}(\d{4,8})",
         r"上下文[^\d]{0,10}(?:上限|限制)[^\d]{0,10}(\d{4,8})",
+        # 「max input tokens: 200000」—— 明确说 input 的才要
+        r"max(?:imum)?[_\s-]?input[_\s-]?tokens?[^\d]{0,12}(\d{4,8})",
+    )
+
+    # 正文里出现这些字样时整段放弃 —— 那里的数字说的是**输出**上限，
+    # 与上下文窗口是两回事（2026-09-05 加）。
+    #
+    # 为什么去掉原来那条 `max…tokens?` 模式：`max_tokens` 在 OpenAI 系里指的
+    # 就是输出上限。实测两处误取：
+    #   'max_tokens: 64000 > 32000, which is the maximum allowed output tokens'
+    #     → 抠出 64000（请求值，不是上限）
+    #   'max_tokens must be <= 8192'
+    #     → 抠出 8192，把输出上限写成上下文窗口
+    # 那条模式带来的误取比命中多，整条删掉比修它划算。
+    _OUTPUT_LIMIT_HINTS = (
+        "output tokens", "completion tokens", "max_tokens", "maxtokens",
+        "max output", "输出上限", "输出长度", "最大输出",
     )
 
     @classmethod
@@ -1309,14 +1709,35 @@ class Prober:
             return None
         low = excerpt.lower()
         for pat in cls._LIMIT_PATTERNS:
-            m = re.search(pat, low)
-            if not m:
-                continue
-            try:
-                val = int(m.group(1))
-            except (ValueError, IndexError):
-                continue
-            if 8_000 <= val <= 2_000_000:
+            for m in re.finditer(pat, low):
+                try:
+                    val = int(m.group(1))
+                except (ValueError, IndexError):
+                    continue
+                if not (8_000 <= val <= 2_000_000):
+                    continue
+                # 这个数字周围在谈**输出**上限就跳过它（2026-09-05）。
+                #
+                # 按**匹配位置**看而不是看整篇正文：中转站的错误正文里同时提
+                # 上下文与输出上限很常见，例如
+                #   'maximum context length is 200000 tokens;
+                #    output tokens limited to 8192'
+                # 整段否决会把 200000 也丢掉 —— 而那个值是对的，白走一轮二分。
+                #
+                # 窗口只到匹配**前面**那一小段，不看后面 —— 关键在于
+                # 「这个数字是被谁限定的」，而限定词在数字之前
+                # （`max_tokens: 64000`、`输出上限 8192`）。
+                #
+                # 看后面会误伤：`maximum context length is 200000 tokens;
+                # output tokens limited to 8192` 里，200000 后面 32 字符内
+                # 就有 `output tokens` —— 而那说的是另一个数字。
+                #
+                # 前 40 字符：够覆盖 `max_tokens must be <= ` 与
+                # `at most ... completion tokens` 这类写法。
+                lo = max(0, m.start() - 40)
+                near = low[lo:m.start()]
+                if any(h in near for h in cls._OUTPUT_LIMIT_HINTS):
+                    continue
                 return val
         return None
 
@@ -1408,6 +1829,45 @@ class Prober:
 
     # ---------- 形态复用 ----------
 
+    def _reuse_dead(
+        self, row: ParsedRow, section: str, dead: SectionVerdict
+    ) -> SectionVerdict:
+        """同主机的第 2..N 个 Key，且这个段已知是**站+段级**不通：零请求返回。
+
+        与 `_reuse_shape` 的区别在于要不要再发一次请求：
+
+          · `_reuse_shape` 仍打一次基线 —— 段是通的，而**凭证有效性是 Key 的
+            属性**，这把 Key 可能欠费
+          · 这里一次都不发 —— 拒绝的原因与凭据无关（门禁按请求形态、IP封 按
+            来源、死路是分组里没这个渠道、时段按时间），再问一遍答案一样
+
+        省的量（2026-09-05 量化）：15 个 Key 挂同一主机、该段不通时，
+        原来是 15 次完整 `_full_probe`（目录 + 基线 + 整梯画像 + 临时重试），
+        而且因为门闩在，这 15 次**严格串行**。现在是 1 次 + 14 次零请求复用。
+
+        `attempts` 不复制：那是第一把 Key 的实际请求记录，挂到别的 Key 上会让
+        导出日志显示成「这把 Key 也发了这些请求」—— 那是假的。只留一条说明。
+        """
+        base = base_for_section(row.bare, section)
+        v = SectionVerdict(section=section, base_url=base)
+        # 站方声明的模型目录是**主机**的属性，沿用（操作员人工接管时要看它）
+        v.catalog = list(dead.catalog)
+        v.usable = False
+        v.category = dead.category
+        v.action = dead.action
+        v.need_proxy = dead.need_proxy
+        v.min_headers = dict(dead.min_headers)
+        v.profile_name = dead.profile_name
+        v.time_window = tuple(dead.time_window) if dead.time_window else ()
+        # `action` 后面补一句说明来源 —— 界面与导出日志都显示这个字段，
+        # 不说的话看起来像「这把 Key 也实测过」。
+        v.action = (dead.action or "") + "（复用同主机同段结论，未重复发请求）"
+        self.on_event("shape-reuse-dead", {
+            "host": row.host, "section": section, "key": row.masked(),
+            "category": dead.category, "action": dead.action,
+        })
+        return v
+
     def _reuse_shape(
         self, row: ParsedRow, section: str, shape: SectionVerdict
     ) -> SectionVerdict:
@@ -1488,6 +1948,13 @@ class Prober:
         v.max_context_length = shape.max_context_length
         v.context_model = shape.context_model
         v.context_untrusted = shape.context_untrusted
+        # 能力开关也是**主机**的属性（站方支不支持 WS / 认不认
+        # prompt_cache_key），与 Key 无关 —— 沿用，不再各探一次。
+        # 这与 need_proxy / min_headers / max_context_length 同一条理由。
+        v.websockets = shape.websockets
+        v.websockets_note = shape.websockets_note
+        v.prompt_cache_key = shape.prompt_cache_key
+        v.prompt_cache_note = shape.prompt_cache_note
         self.on_event("shape-reused", {"section": section, "host": row.host,
                                        "verified": True, "ok": True,
                                        "models": len(v.models)})
@@ -1508,7 +1975,31 @@ class Prober:
             self._stage2(row, v)
             self._stage4_swap(row, v)
             self._stage4_context(row, v)
+            # 能力开关放最后：它要用到 v.models（compat 那一支）与
+            # v.min_headers（codex 的 WS 握手也要带门票），两者都在前面几步
+            # 才定下来。
+            self._stage5_capabilities(row, v)
         return v
+
+    # 哪些失败类别是「站 + 段」级的 —— 换一把 Key 结论不变。
+    #
+    # 判据是**这个拒绝取决于什么**：
+    #   门禁 / WAF / IP封 / 边缘 —— 站方按请求形态或来源 IP 拒，与凭据无关
+    #   死路               —— 分组里没有这个渠道 / 路径不存在，换 Key 也没有
+    #   时段               —— 站方按时间判，与凭据无关
+    #   客户端             —— 要的是请求画像，与凭据无关
+    #   反测活 / 限频       —— 探测自身的形态与节奏问题
+    #
+    # **不在这里**的两类必须逐 Key 各自探：
+    #   鉴权（401）—— 这把 Key 不对，别的可能对
+    #   余额       —— 这把 Key 欠费，别的可能有钱
+    # 把它们缓存下来会让同站其他 Key 继承别人的欠费结论。
+    #
+    # 「临时」「未知」也不缓存：那两类本来就该重试，缓存等于放弃重试。
+    _HOST_LEVEL_FAIL = frozenset({
+        "门禁", "WAF", "IP封", "边缘", "死路", "时段", "客户端",
+        "反测活", "限频",
+    })
 
     def _probe_one_section(self, row: ParsedRow, section: str) -> SectionVerdict:
         """探一个段。probe() 的工作单元，串行与并行共用同一份逻辑。
@@ -1530,6 +2021,11 @@ class Prober:
                 shape = self._shape.get(key)
                 if shape is not None:
                     break                       # 已有形态，走复用
+                dead = self._dead_shape.get(key)
+                if dead is not None:
+                    # 站+段级的失败结论已有，直接复用 —— 不再跑那 12 次
+                    # 昂贵探测。见 _dead_shape 与 _HOST_LEVEL_FAIL。
+                    return self._reuse_dead(row, section, dead)
                 gate = self._inflight.get(key)
                 if gate is None:
                     # 本线程认领这次形态学习
@@ -1542,10 +2038,15 @@ class Prober:
                 try:
                     v = self._full_probe(row, section)
                     with self._lock:
-                        # 只有真正学到东西才存 —— 凭证类失败（欠费）是 Key 的
-                        # 属性，存下来会让后面的 Key 错误地继承别人的欠费结论。
                         if v.usable:
                             self._shape[key] = v
+                        elif v.category in self._HOST_LEVEL_FAIL:
+                            # 站+段级的失败也缓存（2026-09-05）——
+                            # 它与用哪把 Key 无关，后到的 Key 白跑一遍
+                            # 只是把请求数乘以 Key 数，结论一模一样。
+                            # 凭证类（鉴权/余额）与该重试的（临时/未知）
+                            # 不在这张表里，见 _HOST_LEVEL_FAIL。
+                            self._dead_shape[key] = v
                 finally:
                     # 无论成败都必须放闸，否则等待方永久卡死
                     with self._lock:

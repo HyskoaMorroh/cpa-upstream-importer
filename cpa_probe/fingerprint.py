@@ -30,7 +30,30 @@ _ID_RULES: list[tuple[re.Pattern[str], str]] = [
 
 _ID_RE = re.compile(r'"id"\s*:\s*"((?:msg|resp|chatcmpl)[^"]{0,60})"')
 _MODEL_RE = re.compile(r'"model"\s*:\s*"([^"]+)"')
-_INPUT_TOKENS_RE = re.compile(r'"(?:input_tokens|prompt_tokens)"\s*:\s*(\d+)')
+# 「这次请求的输入用了多少 token」的字段名，**按协议分**。
+#
+# 为什么必须覆盖 gemini（2026-09-05 修，审计发现）
+# ----------------------------------------
+# 原来只认 `input_tokens`（Anthropic / Codex responses）与 `prompt_tokens`
+# （OpenAI / compat）。gemini 用的是 `usageMetadata.promptTokenCount` ——
+# 于是 gemini 段 `input_tokens()` 恒返回 None，而截断校验是
+#
+#     tok is None → check() 直接返回 (True, None) → _bisect 第一发 hi 就「通过」
+#
+# 结果 `max-context-length: 1100000` 被凭空写进 gemini 段：
+# `_MIN_TRUSTED_CONTEXT` 与「relay-m 发 105 万字符只回 13 万 tokens」那条实测
+# 教训，在 gemini 段一次都不会触发。静默截断的 gemini 站拿到一个假的百万窗口，
+# 客户端据此定压缩点。同一处也让 swap 的 token_span_anomaly 在 gemini 段恒为假。
+#
+# 判据：CPA 自己按段取字段 —— helps/usage_helpers.go:901 读 `promptTokenCount`。
+# 蛇形变体（`prompt_token_count`）也认：Google 的 SDK 有两种命名，
+# 而中转站转发时可能保留任一种。
+_INPUT_TOKENS_RE = re.compile(
+    r'"(?:input_tokens'
+    r'|prompt_tokens'
+    r'|promptTokenCount'          # gemini 原生（usageMetadata 下）
+    r'|prompt_token_count'        # gemini 蛇形变体
+    r')"\s*:\s*(\d+)')
 
 
 def resp_model(text: str) -> str | None:
