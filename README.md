@@ -303,6 +303,45 @@ diff 无法复核。修复后 claude 段 8 个 `probed` 站占 493-500，5 个 `
 一堆死站后面 —— 单站诊断、CLI、网页端因此会给出不同的 priority，现在三条途径
 全部传。
 
+#### 既有站沿用原档，重探不改站间次序（2026-09-04）
+
+**现场**：同一个上游地址、只是 token 不同的几条，`priority` 不一致 ——
+`kktoken.cc` 的 claude 段 5 条里 3 条 372、2 条 164；`tabitoken.com` 14 条里
+9 条 371、5 条 167。
+
+两个独立成因，各自都足以造成拆档：
+
+| 成因 | 位置 | 表现 |
+|---|---|---|
+| 重探的既有站被当新站，从空档重新分配 | `assign_priorities` | 全勾时整份配置的站间次序被推平：claude 段 12 个站从 1000/995/990/985/700/650/630/600/400/350/300/50 变成 500..489 一片连号 |
+| 留守条目原样搬回旧值 | `_orphan_entry_lines` | 没勾 / 判不可写 / 探测异常的那几把留在旧档，与被重探那几把的新值并存 |
+
+第一个成因里有个自我强化的细节：`taken`（不许相撞的档位集合）是从 `cfg` 读出来
+的，里面塞着**这些站自己**的旧档 —— 于是每个站都躲开自己原来的值往下掉。
+
+**语义依据**：`priority` 决定「哪一层先被尝试」，层级隔离下只取最高可用桶
+（`availableAuthsFromPriorityBuckets`，`selector.go:527-553`；`priorityOrder`
+降序，`scheduler.go:1229-1231`）。既有站的档位是先前一轮定下的站间次序，
+**重探一次不构成改它的依据** —— 重探验证的是「这把 Key 还能不能用」，不是
+「这个站该排第几」。
+
+**做法**：`existing_host_tiers(band)` 先算出每个站在本段已占的档（取最高那一档
+作锚，低档的实际不参与首选），按 host 命中的直接沿用、`priority_reason` 写
+「沿用该站在本段的原档 N」；只有真正的新站才进原来的空档分配流程。唯一的例外由
+`_hijacks_at` 兜：沿用原档会抢走**别人**的顶层时（成因只有一个——本次给这个站
+注册了它原来没有的模型，而那个模型的现有顶层比这个站的档位低）才按新站流程
+重新定档，并给一条警告。
+
+落盘那一半在 `_orphan_entry_lines` 里修：留守条目的 `priority:` 行对齐到同站的
+新值，其余字段与注释逐字保留，行尾注释换成「对齐同站档位 · 本次未重探此 Key」。
+值本来就相同时不改也不报 —— 不制造无意义的 diff。
+
+两处各有自己的测试（`test_existing_hosts_keep_their_tier` /
+`test_orphan_entries_realign_priority`），而 `rehearse_real_rebuild` 的第⑤组拿
+真实配置守最终不变式：**落盘后每个 `(站, 段)` 只能有一个 `priority`**，全勾与
+「隔一把勾一把」两种情形都比。原文件里本来就拆开的站按最高档对齐并报出来 ——
+那是本次之前留下的状态，但会让「同站同档」无从判断。
+
 ### 模型库：段级规则 + 同系列取最新 + 在线名录（2026-09-02）
 
 现场两张截图暴露的两个问题：
@@ -340,8 +379,26 @@ diff 无法复核。修复后 claude 段 8 个 `probed` 站占 493-500，5 个 `
   现在按**产品线**分组（剥掉版本与变体后缀：`-sol` / `-luna` / `-terra` /
   `-high` / `-low` / `-preview` / `-nano` / `-32k` / `-codex` …），线内取最高
   世代。世代只比版本号前两位 —— `claude-haiku-4-5-20251001` 的日期戳不该让它比
-  `claude-haiku-4-5` 更新（同一款）。整条线都认不出版本时全留（`o1` /
-  `o3-mini`），无从比较不淘汰。
+  `claude-haiku-4-5` 更新（同一款）。整条线都认不出版本时全留
+  （`gpt-oss:120b` / `gpt-oss:20b`），无从比较不淘汰。
+
+  **2026-09-04 三次修正：`o` 系列**。现场截图里 codex 段同时勾着 `o1` 与 `o3`
+  （连 `o1-pro` / `o3-mini` / `o3-pro` / `o4-mini` / `o4-mini-high` 一共七个全勾）。
+  与 `gpt-4o` 那次是**同一个形态**，换了一族：版本正则要求数字前不紧贴字母
+  （`(?<![A-Za-z0-9.])`），而这一族的数字紧贴开头的 `o`，于是七个名字全部解析成
+  「无版本」，被「整组认不出就全留」的兜底一起收下。`o3` 是 `o1` 的后继，两代
+  一起注册等于让 CPA 的轮询把请求分给旧款。
+
+  加了一条 `_O_SERIES_RE`（`^o\d+`），产品线统一叫 `o`，于是七个名字变成
+  `o` / `o-pro` 两条线各取最高世代 → `o3-pro` / `o4-mini` / `o4-mini-high`。
+  锚在开头且紧跟数字，`omni-3` / `oss-20b` / `openai/...` 不受影响。
+
+  这一改带出一处连带缺陷：`catalog_is_stale`（判「站方目录整体落后」）原来比
+  两侧的**全局**最高世代，而 `o` 系列与 `gpt` 系列是**互不相干的编号体系** ——
+  `o3` 的 3 不代表它比 `gpt-5.6` 老一代（两者同期）。给 `o` 系列补上版本解析后，
+  「目录里只有 o 系列」的站会被误判成落后从而一个都不预勾。改成**逐产品线**比：
+  只对两侧都出现的线比较，全部落后才算落后，没有可比的线就不判。后端与前端
+  （`market_top_gen_lines`）用同一套数据，否则界面预勾与落盘清单再次分叉。
 - **非对话模型一律不收** —— 图像（`gpt-image-2`、`gemini-3-pro-image`）、
   语音（`-tts`）、嵌入、开源小模型（`-oss-`）、批处理（`gemini-batch-inference`）。
   它们走的不是对话协议路径，写进去 CPA 路由必失配。
@@ -429,6 +486,119 @@ compat   claude-opus-5, gpt-5-codex, kimi-k3, gemini-3.1-pro, …
 **手填也过同一套规则**，但丢弃项会明确告知 —— 手填是用户的显式意图，悄悄改掉
 比拒绝更糟。实测手填 `gpt-5.6-sol, gpt-image-2, gpt-oss-20b, gpt-5.5,
 claude-opus-5` 时收下前两个合法的，并警告「手填的 3 个模型已丢弃」。
+
+### 能力开关靠实测决定开或不开（2026-09-04）
+
+CPA 的布尔字段不都是一类。逐个读四段的结构体（含**模型级**字段），分三类：
+
+| 字段 | 位置 | 性质 | 本项目怎么处置 |
+|---|---|---|---|
+| `websockets` | codex 条目 | **上游能力** | 实测握手 |
+| `support-prompt-cache-key` | compat 条目 | **上游能力** | 实测请求 |
+| `models[].is-compat` | codex 模型 | **上游能力** | 只搬原值，**不探**（见下） |
+| `alpha-search` | codex 条目 | 授权类（`CredentialPolicyCodexAlphaSearchV1` 按它筛凭据） | 只搬原值，**不探**（见下） |
+| `rebuild-mid-system-message` | claude 条目 | 本地行为（把 role=system 消息挪到顶层 system） | carry 原文搬运 |
+| `experimental-cch-signing` | claude 条目 | 本地行为（CCH 签名，CPA 自己按 upstream 决定） | 同上 |
+| `cloak.strict-mode` / `cache-user-id` | claude 条目 | 本地改写行为 | 同上 |
+| `disable-cooling` / `request-retry` | 四段条目 | 本地策略 | 同上 |
+| `disabled` | compat 条目 | 用户显式停用 | 同上，不该被探测覆盖 |
+| `models[].thinking` / `display-name` / `force-mapping` / `image` / `*-modalities` | 各段模型 | 声明与本地映射 | `existing_model_extras` 搬原值 |
+
+**「是上游能力」与「该由探测决定」是两件事**（2026-09-05 校正）。前一张表把
+它们混成一栏，于是 `is-compat` 被归进「手工字段只搬不探」——那个归类的理由
+写错了：它确实是上游能力。
+
+真正的判据是**探的代价与收益之比**：
+
+| 字段 | 是上游能力 | 探它要付什么 | 开错的后果 | 结论 |
+|---|---|---|---|---|
+| `websockets` | 是 | 一次 WS 握手（不计费） | CPA 走 WS 且**不回落 HTTP**，那个凭据的 WS 请求全废 | **探** |
+| `support-prompt-cache-key` | 是 | 一次带 `prompt_cache_key` 的普通请求 | 上游严格校验时**每一个**请求都失败 | **探** |
+| `is-compat`（codex 段） | 是 | 要构造 MultiAgentV2 的 `agent_message` 请求体 | **当前配置下无影响**（见下） | **不探** |
+| `is-compat`（claude 段） | 是 | 要先拿到一个带签名的 thinking 块再回放 —— **两轮有状态对话** | 上游拒收空签名 thinking 时，带 thinking 的请求失败 | **不探**（探不了） |
+| `alpha-search` | 否（授权类） | 一次真实搜索请求到 `{base}/alpha/search`，那是**计费的业务调用** | 只是这个凭据不被 Alpha Search 端点选中 | **不探** |
+
+`is-compat` 这个字段在**两个结构体里都有，而语义不同** —— 之前只看了 codex 那个，
+结论虽然对但理由不完整：
+
+| | codex 段（`CodexModel`） | claude 段（`ClaudeModel`） |
+|---|---|---|
+| 源码 | `config_types.go:539-545` | `config_types.go:443-447` |
+| 作用 | 把 MultiAgentV2 的 `agent_message` 转成可移植的 Responses message | 保留**空签名**的 thinking 块，并启用 provider-aware 的签名回放 |
+| 前置条件 | **要 `codex.optimize-multi-agent-v2` 也为 true** | **无条件** |
+| 消费点 | `api_key_model_capabilities.go:228` | 一路进 `sanitizeClaudeMessagesForClaudeUpstreamWithDebug`（`claude_executor_execute.go:271`、`claude_executor_stream.go:263`） |
+| 生产现状 | `optimize-multi-agent-v2: false` → **不生效** | 生效，但 0 个模型配了它 |
+
+两侧「不探」的理由不同，必须分开记：
+
+- **codex 侧是「当前不生效」** —— 探一个前置条件关着的字段，成本真实、收益为零。
+  **那个开关一旦改成 true，这一行要重新评估。**
+- **claude 侧是「探不了」** —— 要判断一个站接不接受空签名的 thinking 块，
+  得先让上游返回一次带 thinking 的响应，再把它回放进下一次请求。那是**两轮
+  有状态的对话**，而探测的每一次请求都是独立单轮。硬探只能得出不可靠结论，
+  那比不探更糟 —— 本项目一直在避免「未验证当已验证」。
+
+`alpha-search` 与这两个的不探理由又不同：那个的代价是**花钱**（真实搜索调用），
+而且开错的后果轻（选不中就是没有可用凭据，不像 `websockets` 那样全废）。
+
+**三种「不探」的理由各不相同，这件事本身值得记**：不探不等于漏了。
+`websockets` 与 `support-prompt-cache-key` 之所以探，是因为「一次不计费的请求
+就能判定」且「配错的后果是全废」两条同时成立。
+
+#### `websockets` 怎么探
+
+与 CPA 的 `dialCodexWebsocket`（`codex_websockets_connection.go:30`）同构：
+
+- **URL**：`{base}/responses` 的 http→ws 换 scheme。与
+  `buildCodexResponsesWebsocketURL`（同文件 `:223-240`）逐行对齐 —— 只换
+  scheme，路径与 query 原样
+- **头**：`Authorization: Bearer`，加上 CPA 无条件保证的
+  `OpenAI-Beta: responses_websockets=2026-02-06`（`codex_websockets_request.go:102-105`）。
+  少这个头站方可能回 400，那测出来的是「没带门票的握手不通」而不是「不支持 WS」
+- 再叠加该段已学到的最小必需头 —— 门票是站的属性，WS 握手同样要过
+
+用标准库手搓握手，不引第三方（`cpa_probe/` 全模块无第三方依赖）：只需要状态行
+那一次，帧收发不需要。
+
+**校验 `Sec-WebSocket-Accept`**：光看 101 会把「反代吞了 Upgrade、自己回个 101」
+当成支持。accept 值是 `key + GUID` 的 SHA-1 base64（RFC 6455 §4.2.2），算不对
+就不是真正的 WS 端点。
+
+`need_proxy` 的段**不探**：CPA 的 WS 拨号走 `newProxyAwareWebsocketDialer` 会用
+条目的 `proxy-url`，而这里直连 —— 直连拿到的 403 说明不了走代理时的行为，那是
+「拿一个不成立的实验下结论」。记 `None`（未探测）而不是 `False`。
+
+#### `support-prompt-cache-key` 怎么探
+
+CPA 开这个开关后会往请求体注入 `prompt_cache_key`
+（`openai_compat_executor.go:875` 起）。上游的反应有两种：
+
+- 忽略未知字段 → 200，开着无害且能命中上游的前缀缓存
+- 严格校验 → 400 `unrecognized request argument` 之类，开着会让**每一个**请求都失败
+
+后者正是必须实测的理由 —— 那是一个「开了就全废」的开关。判据只看这一次请求成不
+成立，不比对缓存命中：命中率要多轮同 prompt 才看得出，而那与「开关能不能开」
+是两个问题。
+
+#### 一处顺带修掉的重复键隐患
+
+这两个字段原来在 carry 白名单**外**（走原文搬运）。改成 `render_entry` 自己写
+之后，两条路同时生效会产出两行同名键。这不是「值取谁」的小问题：
+
+```
+PyYAML          取后一个（静默）
+Go 的 yaml.v3   报 mapping key already defined —— CPA 起不来
+```
+
+用 Go 实跑确认过，不是推测。所以把它们移进 `_RENDERED_KEYS`，原值改由
+`existing_toggles` 查表搬。
+
+#### 三条途径都要看得见
+
+`--no-capabilities`（CLI）/「探测能力开关」勾选框（Web）/ 单站诊断不探（它不
+生成写回方案）。显示：诊断页新增「能力开关」列（三态各自措辞）、结果表处置格的
+徽标（只显示确认支持的 —— 「不支持」是常态，316 行里每行都挂一个会淹掉真信息）、
+事件流、导出日志、CLI 输出。
 
 ### `weight: 0` 的语义取决于 routing.strategy（2026-09-02）
 
@@ -524,6 +694,14 @@ else:
 `/api/context` 回 `market_top_gen`，因为结果表在勾选**之前**就渲染了，那时还没有
 `/api/plan` 的响应，两边都要能判。
 
+**2026-09-04 改成逐产品线比**：给 `o` 系列补上版本解析后，全局比较立刻出错 ——
+`o3-mini` 的世代是 (3,0)，而 codex 段的市面最新是 `gpt-5.6-sol` 的 (5,6)，两个数字
+来自互不相干的编号体系。按全局比会把「目录里只有 o 系列」的站判成落后、一个都不
+预勾。现在只对**两侧都出现**的产品线比较最高世代，全部落后才算落后；目录里的线
+在市面清单里没有对应时无从比较，不判落后 —— 与「整组认不出版本就全留」同一条原则。
+`/api/context` 因此多回一个 `market_top_gen_lines`（逐线版本），前端用它，
+不再用全局那个数。
+
 ### 限频阈值自动学习（2026-09-02）
 
 一个站在 79 凭据那轮里 **46 次**撞上 `bulk probe guard`，判定「限频」→ 处置写着
@@ -570,6 +748,75 @@ bulk probe guard: ip 1.2.3.4 requested 4 distinct models in 60s
 按两元组搬运会把 compat 的代理灌进 claude 段，实测 claude 段 `proxy-url`
 从 3 条涨到 8 条。多一跳不会让请求失败，所以 `validate` 与写后验证都发现不了。
 键改成 `(段, host, api_key)` 后前后各段完全一致。
+
+### 重探时每个字段以哪一侧为准（2026-09-04）
+
+「全量重探会更新什么」以前只有一句「headers/代理/优先级/前缀全部更新」，
+而实现里各字段的处置**本来就不一致**（`proxy-url` 是「探测有值优先、否则搬
+原值」，不是整字段替换）。文档与代码不一致时人会按文档做决定，所以把判据
+逐字段写清。
+
+判据只有一条：**这个字段是谁的属性**。
+
+| 字段 | 属性归属 | 处置 | 理由 |
+|---|---|---|---|
+| `models` | 站 × Key × 本次探测 | **实测替换** | 清单就是这次要更新的东西 |
+| `priority` | 站间次序 | **沿用原档** | 重探验证的是「这把 Key 还能不能用」，不是「这个站该排第几」。只有新站才定档 |
+| `proxy-url` | 站 × 段 | 探测有值优先，否则搬原值 | 重探时这个站可能直连就通，方案里为空 —— 抹掉会让必须走代理的站下次直连拿 403 |
+| `headers` | 站 × 段 | **合并**：原值为底，探测值覆盖同名键 | 见下 |
+| `weight` | 用户显式意图 | 只搬原值，探测不产生 | `weight: 0` 是「逐出调度池」的唯一表达 |
+| `prefix` | 用户显式意图 | 只搬原值 | `dominant_prefix` 只是给**新条目**猜的默认值 |
+| compat 的 `name` | CPA 的 provider 身份 | 只搬原值 | 改名作废冷却状态与能力缓存 |
+| `websockets` / `support-prompt-cache-key` | **上游能力** | 实测三态，见下 |
+| `max-context-length`（模型级） | 站 × 模型 | 本次实测 > 原值搬运 > 不写 | 不把 A 的窗口外推给 B |
+| `models[].alias` 等模型级字段 | 用户显式意图 | 只搬原值 | 段级兼容名是人配的 |
+| 白名单外字段（`request-scoped-errors` / `fingerprint-profile` / `cloak` …） | 本地策略 | carry 原文逐字搬 | 探测问不出来，也不该由探测决定 |
+
+#### headers 为什么是「合并」而不是「整字段替换」
+
+探测能产出的 `anthropic-beta` 是画像梯里写死的常量清单，里面**永远没有**两项：
+
+- `oauth-2025-04-20` —— `profiles.py` 有意去掉：api-key 探测不该声称走 oauth
+- `context-1m-2025-08-07` —— 只由 `betas.py` 在站方正文点名时才补
+
+整字段替换会把原条目里手工配的能力 beta 静默抹掉。实测 Desktop 版那份配置：
+含这两个 beta 的条目 **33** 个，其中 `anyrouter.top` 的 claude 条目 headers
+**只有** `anthropic-beta: context-1m-2025-08-07`、没有 UA —— baseline 一通过
+`need_ua=False`，`sp.headers` 是空 dict，那个站的 1m 上下文直接被关掉。
+
+所以：原值在下、探测值覆盖同名键。`anthropic-beta` 特殊处理 —— 它是逗号分隔的
+**集合**，同名覆盖会丢项，走 `betas.merge` 保序去重合并。
+
+#### 能力开关为什么是「实测优先」，方向与 headers 相反
+
+`websockets` 与 `support-prompt-cache-key` 的处置是**实测覆盖原值**，包括
+「实测不支持时把原来开着的关掉」。这与 headers 的合并方向相反，理由是后果不对称：
+
+| 配错方向 | 后果 |
+|---|---|
+| `websockets: true` 而站方不支持 | CPA 走 WS 通道且**不回落 HTTP**（`CodexAutoExecutor` 只按下游形态与该开关分流，`codex_websockets_executor.go:71-77`）—— 那个凭据的 WS 请求全废 |
+| `websockets: false` 而站方支持 | 只是用不上 WS，无害 |
+| headers 多带几个能力 beta | 站方多数忽略未知 beta |
+| headers 少了能力 beta | 那项能力关掉（1m 上下文变 200k） |
+
+两边都是「往安全的那一侧偏」，只是安全的方向不同：能力开关的安全侧是**关**，
+headers 的安全侧是**多带**。
+
+三态而不是布尔：
+
+| 实测结论 | 写回 | 界面措辞 |
+|---|---|---|
+| `True` | 写 `<字段>: true` | 「支持」+ 实测依据 |
+| `False` | **不写**（CPA 零值即关闭），原值即使是 true 也不搬 | 「实测不支持」+ 返回码 |
+| `None`（未探测） | 不写，但原值为 true 时照原值搬 | 「未探测」+ 为什么没探 |
+
+`False` 与 `None` 写回时行为相同，但界面措辞必须分开 —— 把「探过、站方明确
+拒绝」和「没探过」显示成一个样子，就是本项目反复修的那类「未验证当已验证」
+的镜像。
+
+`None` 的三个来源：关掉了 `--no-capabilities` / 该段本次判不可用 / 该段需走
+代理（本探测是直连，直连的握手结果说明不了走代理时的行为 —— 那是「拿一个
+不成立的实验下结论」）。
 
 ### 段族过滤（2026-09-02）
 
@@ -624,18 +871,30 @@ gemini 段的 `/v1beta/models` 分页，最多翻 20 页（与 CPAMP 同一上�
 
 ### 未知字段搬运（2026-09-02）
 
-`render_entry` 是白名单式渲染，只写它认识的 10 个字段。而全量重探用它**整段重写**
-—— 生产配置 121 个条目里 106 条带白名单外的字段，重写后全部静默消失
+`render_entry` 是白名单式渲染，只写它认识的 12 个字段。而全量重探用它**整段重写**
+—— 生产配置 121 个条目里 **117 条**带白名单外的字段，重写后全部静默消失
 （`validate()` 报成功、YAML 合法，只是行为变了）：
 
 ```
 request-scoped-errors  116 条   冷却规则，丢了欠费的 Key 留在轮询池
-excluded-models         39 条   ["*"] = 只用显式列的模型
-websockets               2 条   codex 的 WebSocket 开关
 fingerprint-profile      1 条   让 CPA 自己补设备指纹
-disabled                 1 条   手工停用的 provider 会复活
-proxy-url               24 条   必须走代理的站会改成直连
 ```
+
+2026-09-04 重新点过一遍这张表，改掉三处不实：
+
+| 原来写的 | 实际 |
+|---|---|
+| `excluded-models` 39 条 | **0 条**。两份生产配置里它只出现在**注释**（`# excluded-models 可选，屏蔽指定模型`），没有一个真实条目用它 |
+| `disabled` 1 条 | **0 条**。compat 段没有任何 `disabled: true` |
+| `proxy-url` 24 条 | 26 条（Desktop）/ 16 条（fsdownload），但它**在白名单里**（`render_entry` 自己写、`existing_proxies` 搬原值），不属于 carry |
+
+前两处的成因是「按 `grep -c excluded-models` 数」—— 那把注释也数进去了。
+这类计数从此都按解析后的 YAML 数，不按行数。
+
+`websockets` 与 `support-prompt-cache-key` **2026-09-04 从 carry 移出去了** ——
+它们现在由实测决定（见「能力开关靠实测决定开或不开」），原值走
+`existing_toggles` 查表。两条路同时生效会写出重复键，而 Go 的 `yaml.v3` 对
+重复键直接报 `mapping key already defined` —— CPA 起不来。
 
 `extract_carry_lines()` 按**原文行**搬运 —— 这些字段结构任意深，重新序列化要
 处理缩进、引号风格、键序，而原文行拿来就用、逐字保真。索引键是
@@ -747,8 +1006,12 @@ cpa-upstream-importer/
 │  ├ model_catalog.py 段级模型规则、同系列取最新、CPA 权威名录（三层兜底）
 │  ├ pipeline.py      四阶段探测编排 · 段/候选并行 · single-flight 形态复用 · 画像升级
 │  ├ plan.py          去重、priority 定档（单站上限 + 批量站级分配，读 weight:0 与实测注释）、影响面
-│  └ writeback.py     行级 YAML 编辑（保注释）、备份、diff、重载 CPA + 读回校验
-├ server.py           HTTP 服务（标准库，VPS 免装依赖）
+│  ├ writeback.py     行级 YAML 编辑（保注释）、备份、diff、重载 CPA + 读回校验
+│  ├ batch.py        站级并行探测、CarryTables（八张「必须原样搬」的查表）
+│  ├ betas.py        anthropic-beta 集合合并（逗号分隔，保序去重）
+│  ├ resources.py    并发数按 cgroup 实测推荐
+│  └ cpa_source_probe.py  从 CPA 源码读权威模型名录
+├ server.py           HTTP 服务（标准库 + PyYAML + bcrypt，后两个是硬依赖）
 ├ cli.py              命令行入口
 ├ web/                前端：index.html + app.js
 ├ docker-compose.yml  独立部署模板（全部走 .env 变量，零硬编码）
@@ -756,7 +1019,7 @@ cpa-upstream-importer/
 ├ .github/workflows/  CI：3 个 Python 版本跑测试 + 多架构镜像发布
 ├ LICENSE             MIT
 ├ CONTRIBUTING.md     贡献指南
-├ tests/              回归测试（九个套件 1165 项，零外网请求，自带最小样本）
+├ tests/              回归测试（九个套件 1196 项，零外网请求，自带最小样本）
 │  ├ run.py           跑全部，退出码 0/1，可接 CI。传 config.yaml 路径可加跑真实用例
 │  ├ fixture_cfg.py   自带的最小 config.yaml（各套件共用；不传路径时就用它）
 │  ├ test_probe.py    解析/判定/指纹/去重/定档/影响面/写回
@@ -786,7 +1049,7 @@ cpa-upstream-importer/
 │  └ upstream-import-spec.md   设计文档 18 节
 │    （另有 cpa-atlas.html —— 本站排障全记录，含真实站点结论，
 │     已在 .gitignore 里，不进公开仓库；零代码依赖它）
-└ legacy/             原探测脚本，原样保留可继续单独使用
+└ legacy/             原探测脚本，原样保留可继续单独使用（**判据是旧的**，见下）
    ├ audit-upstreams.py    逐组合可用性审计 · HTML 报告
    ├ probe-fix.py          四问诊断：基线→换模→最小必需头→代理
    ├ context-probe.py      二分探测上下文上限
@@ -797,6 +1060,30 @@ cpa-upstream-importer/
 
 `config.yaml` / `docker-compose.yml` / `.env` / `nginx.conf` / `mihomo/` **仍在 `/opt/deploy` 根**——
 `docker-compose.yml` 里有 `./config.yaml`、`./mihomo`、`.env` 三处相对挂载，移动会破坏部署。
+
+### `legacy/` 里那 2523 行用的是旧判据
+
+它们是本工具的前身（三个独立脚本），原样留着是因为「单独跑一个站看它要什么头」
+这件事它们做得直接。但**判据没有跟着主流程更新**，两处已经分叉：
+
+| | `legacy/` | 主流程 |
+|---|---|---|
+| 客户端画像 | `audit-upstreams.py` 自己的 `identity_headers()`，一套固定头集 | `profiles.py` 的 25 档梯子 × 4 段，族内嵌套超集 |
+| HTTP 底层 | 三个脚本三种（`urllib.request` / `subprocess curl` / …） | `client.py` 统一 |
+| gemini 段鉴权 | `?key=` 拼在 URL 上 | `x-goog-api-key` 头 —— CPA 全库无 `?key=`（`gemini_executor.go:90/190/…`） |
+| 探测文本 | `"hi"`（`audit-upstreams.py` 3 处、`swap-watch.py` 2 处） | 88 字符的技术问句 |
+
+后两行是**会改变结论**的分叉，不只是实现差异：
+
+- `?key=` 那种形态实测被一批站直接拒（前端用头能拉到几百个模型、用 query 拿 000），
+  所以 legacy 会把好站报成坏站
+- `"hi"` 正是站方反测活规则最先拦的形态。主流程有一道测试
+  （`test_probe_text_not_trivial`）钉住这件事，但它**只扫 `request.py` 与
+  `pipeline.py`**，扫不到 `legacy/` —— 那 5 处 `"hi"` 一直在
+
+所以：**拿 legacy 的结论去改配置会与主流程不一致，且它自己有封号风险**。它们适合
+「看一眼这个站返回什么原始正文」，不适合当判据。要判据就跑 `python3 cli.py` 或网页端的
+单站诊断 —— 那两条路与写回同一套规则。
 
 ---
 
@@ -1426,6 +1713,142 @@ def live_proxy(self):
 
 ---
 
+### 2026-09-05 补齐的五处「与 CPA 不一致」
+
+一轮探测流水线审计（子代理，只读，判据是 CPA 现行源码）报了 12 处，其中五处属于
+**同一形态**：探测发出去的东西与 CPA 真实发的不一样，于是测出来的结论对不上真实
+转发。这类缺陷不报错、不失败，只是把好站说成坏站或反之。
+
+每一处都跟了**撤销验证**——把修复改回旧行为，确认对应断言真的变红。
+
+#### ① codex 段的 body 差两处
+
+CPA 的 codex Execute 无条件 `stream=true`，并且在默认配置下把
+`[{"type":"image_generation","output_format":"png"}]` 塞进 `tools`
+（`codex_executor_execute.go:57` 与 `:64-66`；`config_load.go:75` 确认
+`DisableImageGenerationOff` 是**默认值**），stream 时 `Accept: text/event-stream`。
+
+探测原来发 `{"model":…,"stream":false,"input":…}`、无 tools、无 Accept。两个方向：
+
+- 站方拒收注入的工具 → 探测判「可用」、写进 `config.yaml`，而 CPA **每一次**真实
+  请求都失败
+- 站方只实现 SSE 或校验 stream → 探测拿 400/未知，判死一个可用站
+
+顺带发现 `classify` 里那条「注入」规则（认 `image_generation is not enabled`）
+**一直是死代码**——探测从不发 tools，所以永远命中不了。
+
+**为什么不直接把 baseline 改成 `stream=true`**：那样响应就是 SSE，而整条判定链读的
+是 JSON 正文（`resp_model` / `input_tokens` / `has_error_envelope` /
+`betas.wanted`）。改了等于把一种假阳性换成另一种。所以加了一档
+`codex-cpa-shape`（tier=4，排在 `codex-full` 之后），它只回答一个问题：
+「CPA 那样发，这个站收不收」。
+
+#### ② 站方在 400 上索要 beta 时，整梯与 beta 重试都不跑
+
+`classify` 对 400 没有兜底，实测这几种正文全落「未知」：
+
+```
+400 + '请启用 128k 输出后重试'                    → 未知
+400 + 'missing required header: anthropic-beta'  → 未知
+400 + 'anthropic-beta must include output-128k…' → 未知
+（同样的正文在 403 上都判「门禁」）
+```
+
+而画像梯的触发条件是「类别 ∈ {客户端, WAF, 门禁, IP封, 边缘, 鉴权} 或状态码 ∈
+{401, 403, 503}」——400 一个都不命中。更要紧的是 `_retry_with_betas` 的**唯一
+调用点在画像梯内部**，整梯不跑它就永不跑：`betas.py` 的
+`output-128k-2025-02-19` 与 `fine-grained-tool-streaming` 两条规则是**死代码**。
+1m 那条能走到纯属巧合——`classify` 恰好把「1m context」限定在 `{400, 403}` 上
+判「门禁」。
+
+更糟的是「未知」在 `_PROXY_SECOND` 里，于是处置变成**换出口 IP**——对「缺一个
+请求头」这个根因完全无关的补救。
+
+修法是触发条件加一句「正文点名要求了我们认识的 beta」。**不泛化 400**——那会让
+每个 400 都多跑一整梯，而 400 是最常见的错误码（参数错、模型名错、body 形状错
+都是 400）。端到端对照：
+
+| | 修前 | 修后 |
+|---|---|---|
+| 请求数 | 2 | 10 |
+| 带 beta 的请求 | **0** | 2 |
+| 段可用 | **False** | True |
+| 类别 | **未知** | 可用 |
+
+#### ③ 压缩过的错误正文一律判「可用」
+
+画像梯的 `cc-full` / `cc-body-*` / compat `cc-full` 几档发
+`accept-encoding: gzip, deflate, br, zstd`（抄 CPA 的形态），而 `client` 原来
+不解压——`decode(errors="replace")` 把二进制变成一串 U+FFFD，于是**整条判定链
+都失效**：
+
+```
+classify           → 无异常关键词 → 判「可用」
+has_error_envelope → False
+resp_model         → None → model_matches 放行 → _accept 收下这个模型
+betas.wanted / _limit_from_body / input_tokens / 余额 / 限频 / 时段
+                   → 关键词一个都匹配不上
+```
+
+那就是「死站带模型进 `config.yaml`」那个假阳性，只是改由压缩触发。
+
+判据：CPA 发同一套 Accept-Encoding（`claude_executor_request.go:1093`）
+**并且**解码（`claude_executor_execute.go:345`/`:373` 的 `decodeResponseBody`，
+注释明确说同时处理「头声明」与「magic byte 探测」两种）。探测只抄了前一半。
+
+现在按 magic byte 解 gzip 与 zstd，deflate 两种 wbits 各试一次
+（`zlib` 与 raw deflate **都没有可靠的 magic byte**，raw deflate 首字节实测是
+`0xab`）。br 与 zstd 标准库没有解码器（本项目零第三方依赖），探到就返回一句
+**可读的说明**——静默给 U+FFFD 会让上面那条链无声失效。
+
+#### ④ `client.send` 会抛异常，破掉自己承诺的不变式
+
+`HTTPError` 分支里原来写着 `raw = e.read(READ_LIMIT)`——它在 except 块**内部**，
+而 Python 的语义是 except 块内抛出的异常**不受同一 try 的其余 handler 保护**。
+于是下面的 `socket.timeout` 与兜底 `Exception` 都接不到它，异常一路穿出 `send()`。
+
+实测触发形态：`403 + Content-Length: 5000` 但只写 2 字节后挂住（Cloudflare
+拦截页、nginx 慢响应都是这形态）。后果不对称得很难看：
+
+- 并行路径把这个**只是回应慢的活站**写成「死路 · 探测异常」并建议降权
+- 串行路径与 `run_job` 的 `f.result()` 让整个 job 报错，一批凭据全丢
+
+修法是正文读取放进自己的 try，读失败也**不丢状态码**（403 就是 403，正文读不全
+不改变这个事实）。
+
+#### ⑤ WS 握手的 timeout 不是整体截止时间
+
+原来只 `sock.settimeout(timeout)` 然后循环 recv——那是**每次读**的超时。对端每
+0.3 秒送 1 字节且永不发空行时，每次 recv 都在 timeout 内返回，循环最多要收满
+64KB 才退出：上界是 **65536 × 每字节间隔**（约 5.5 小时），而不是调用方给的
+timeout。实测 `timeout=1` 的调用被挂住 180 秒以上仍未返回。
+
+调用方传的是 `min(self.timeout, 30)`，本意是 30 秒上限——段级线程被钉住，
+站级并发的槽位也一起占着。
+
+判据：对面 CPA 用的是真正的截止时间——`codex_websockets_connection.go:32` 的
+`dialer.HandshakeTimeout`（同文件 `:27` = 30 秒），gorilla 那个字段覆盖整次握手
+而不是单次读。
+
+现在加了 deadline，每次 recv 前把剩余时间设成 socket 超时。代码里那道
+`if left <= 0: return` **是防御性的不是承重的**（正常情形下 recv 自己的超时先
+触发），注释里写清了——否则下一个人会以为它没用而删掉，而删掉的后果是
+`settimeout(负数)` 抛 `ValueError` 让错误消息变成 Python 异常名。
+
+#### 另外三处：模型名、上下文上限、已停用凭据
+
+- **模型名会被拼进出网 URL** 且未做字符校验——见「安全」那一节
+- **`_limit_from_body` 把请求用量当上限**：`'context_length_exceeded: your
+  request has 275000 tokens'` 原来抠出 275000，那是**请求值**而不是上限，
+  比真实窗口大 → 客户端永不压缩，每个长请求都撞 400。`'max_tokens must be
+  <= 8192'` 则把**输出**上限写成上下文窗口。前者收紧了关键词与数字之间的
+  语气词要求，后者整条模式删掉——`max_tokens` 在 OpenAI 系里指的就是输出上限，
+  那条模式带来的误取比命中多
+- **已停用的凭据被当成在用站参与定档避让**：见「priority 定档」那一节的
+  `entry_out_of_pool`
+
+---
+
 ## 先诊断一个站：它到底要什么 header
 
 批量导入之前常有个更具体的问题：**这个站为什么 401？它的门票是什么？**
@@ -1618,8 +2041,50 @@ restricted to Claude Code clients`），而**真实对话完全正常**。这类
 
 ## priority 定档
 
-**数值大者优先，且分层隔离**（`sdk/cliproxy/auth/selector.go:325-333`）。
-低档凭据只在更高档**全部**不可用时才参与 —— 插错档不是「略微靠后」，而是永远轮不到。
+**数值大者优先，且分层隔离**（`sdk/cliproxy/auth/selector.go` 的
+`availableAuthsFromPriorityBuckets` 与 `highestPriorityAuths`；快路在
+`sdk/cliproxy/auth/scheduler.go` 的 `highestReadyPriorityLocked` +
+`pickReadyAtPriorityLocked`）。低档凭据只在更高档**全部**不可用时才参与 ——
+插错档不是「略微靠后」，而是永远轮不到。
+
+### 硬隔离有两条例外（2026-09-05 核实）
+
+「只取最高那一桶」这条判据是本工具整个定档算法与影响面计算的基础，
+所以它的例外必须写清：
+
+| 例外 | 触发条件 | 本部署当前 |
+|---|---|---|
+| **codex/xai + 下游 WS** | `preferWebsocket=true` 时从高到低扫，返回**第一个含 ws 凭据的档**（`scheduler.go` 的 `highestReadyPriorityLocked`，源码注释原话 "even if they are in a lower priority tier than HTTP-only credentials"） | **是活的** —— `routing.strategy: weighted-round-robin` + `session-affinity: false` 走内建选择器快路 |
+| **session-affinity** | 选择器是 `SessionAffinitySelector` 时，交给它的候选是**全部档位**（`conductor_selection.go` 的 `availableAuthsForSelector`，注释说 "so an established binding can be validated instead of being preempted by a recovered higher-priority credential"）。不限段、不限 WS | **不触发** —— 生产配置 `session-affinity: false` |
+
+第一条本工具已经会报警告（`ws_crosstier_note`）。第二条目前只有这段文档 ——
+它一旦打开，本工具对「已绑定会话」的挡站计数就不成立（对「新会话」仍成立，
+因为冷启动绑定还是从最高档开始）。
+
+两条 WS 那一路的边界，核实过一并记下：`pickMixed` 在多 provider 时一律传
+`preferWebsocket=false`，只有单一 provider 时才委派给 `pickSingle` 从而生效；
+旧路的 `preferCodexWebsocketAuths` 是在**已经收窄到最高档之后**过滤，**不跨档**
+—— 跨档只发生在 scheduler 快路。
+
+### 已被 CPA 排除在池外的条目不参与避让
+
+`build_band` 原来只看 `priority` / `models` / `weight`，于是下面这些条目被当成
+**在用站**参与定档避让 —— 而 CPA 根本不会把请求路由到它们。判据是
+`entry_out_of_pool`（`cpa_probe/plan.py`），四种形态：
+
+| 形态 | CPA 侧的判据 |
+|---|---|
+| compat 的 `disabled: true` | `internal/watcher/synthesizer/config.go` 与 `sdk/cliproxy/service_models.go` 都是遇 `Disabled` 直接 continue —— 那个 provider **连 Auth 都不合成** |
+| 任意段 `excluded-models` 含 `*` | 那正是管理面板「停用一个 config 型凭据」的实现（`config_apikey_disable.go` 的 `configAPIKeyDisablePattern = "*"`）。`applyExcludedModels` 用通配把该凭据的模型全过滤掉，清单空则 `UnregisterClient` |
+| `base-url` 为空 | **门槛按段不同**：codex 与 compat 只要 base-url 空就在加载期被删（`config_normalization.go`，compat 那句的注释原文是 "treated as removed"）；gemini 与 claude 要 **api-key 与 base-url 都空**才删 |
+| compat 的 `models` 为空 | `registerCompat` 走 `UnregisterClient`，而 `scheduledAuthMeta.supportsModel` 在 `supportedModelSet` 为空时对任何**具名**模型返回 false。**codex 段相反** —— 空 models 会回落 `GetCodexProModels()`，仍在池 |
+
+实测后果（构造三站）：一个 `disabled: true` 的 provider 在 300 档且声明 kimi-k3
+→ `model_top['kimi-k3']=300` → `suggest_priority` 把它当顶层避让，新站被压到 225，
+而理由文案说「会挡 N 个在用站」—— 其中那一个不在调度池里。
+
+生产配置里这四种形态都是 0 例，所以是补闸不是修事故。**但最后两种的段间差异
+必须分开写** —— 一视同仁会把 codex 段的正常条目误判成出池。
 
 三条硬约束：
 
@@ -2101,8 +2566,10 @@ X-Stainless 族，**管不到 beta 清单**。界面会明确标注「未覆盖�
 
 ```
 ☑ 全量重探模式
-    重新探测 config.yaml 中所有既有站，与新站一起重新生成配置
-    （headers/代理/优先级/前缀全部更新）。
+    重新探测 config.yaml 中所有既有站，与新站一起重新生成配置。
+    模型清单按实测替换；headers 合并；能力开关按实测开/关；
+    priority 沿用原档（只有新站才定档）；weight / prefix / provider name
+    只搬原值 —— 逐字段判据见「重探时每个字段以哪一侧为准」。
 
   站级并发数 [48]  [用推荐值]
     推荐 48（容器 4.0 核 / 24.0G）· 4.0 核 × 12 = 48 ·
@@ -2268,16 +2735,17 @@ headers 与 body 形态，不看模型名。假上游实测（全 403）：
 
 ### 一件要如实说明的事
 
-全量重探在假上游、单元测试（`tests/test_full_redetect.py` 40 项）、一次端到端
+全量重探在假上游、单元测试（`tests/test_full_redetect.py` 49 项）、一次端到端
 演练（`tools/e2e_redetect.py`）和两次拿真实 config.yaml 的重建对账
-（`tests/rehearse_real_rebuild.py`，各 41 项全对上）上验证过，但**没有对这 79 个
+（`tests/rehearse_real_rebuild.py`，各 52 项全对上）上验证过，但**没有对这 79 个
 真实凭据发过一次真实探测请求**——对账用的是「把既有条目原样当探测结果」，验的是
 写回链的守恒性，不是探测本身。
 
-那份对账值得单独说，因为它抓到的七处缺陷单元测试全绿：
+那份对账值得单独说，因为它抓到的十处缺陷单元测试全绿：
 
 | 缺陷 | 实测影响 |
 |---|---|
+| **`headers` 整字段消失** | Desktop 版 24/24、fsdownload 版 66/66 条目；含 `anthropic-beta` 24 条 |
 | compat 段组内没进方案的 Key 会消失 | gorouter.app 15 把、tabitoken.com 14 把 |
 | per-key `proxy-url` / `weight` 被统一成 head 那把的值 | 8 把带 per-key 代理 |
 | 同一个站两种 base-url 写法写出两个同名 provider | 同一把 Key 占两个轮询位 |
@@ -2285,10 +2753,30 @@ headers 与 body 形态，不看模型名。假上游实测（全 403）：
 | **compat 的 `name` 被改成 host** | 12/13 provider 改名，冷却与能力缓存作废 |
 | 注释索引把模型名当条目键、base-url 行尾注释没剥 | 4676 行注释里 118 行彻底丢失 |
 | **模型级 `max-context-length` 消失** | 8/8 处，客户端按 CPA 内置目录的偏大值定压缩点 |
+| **重探既有站被当新站重新定档** | claude 段 12 个站从 1000..50 变成 500..489 一片连号 |
+| **留守条目的 priority 留在旧值** | 同站被拆成两层，「多 Key 并行」退化成「主备切换」 |
 
 后四处是**逐字段 deep-equal** 才抓到的：之前只比字段的出现次数
 （`text.count("prefix:")`），而「121 个条目的 prefix 全被抹掉、同时注释里多出
 121 处提到 prefix」这种情况两边都数得对 —— 计数相等，值全错。
+
+`headers` 那一处是**判据本身的漏洞**，比上面几处更深一层：值确实逐个比过了，
+但它被列进了对账脚本的 `INTENT`（「本次有意改动，跳过」）豁免名单。于是
+52 项全绿，而 24/24 条目的 headers 全丢没有任何一项能看见。
+
+它是四段条目级字段里**唯一**「只生成、不搬运」的那一个：在 `_RENDERED_KEYS`
+里所以 carry 不搬（那是给白名单**外**的字段用的），而 `existing_*` 查表以前
+没有它。方案侧的 headers 只在探测当场判定 `need_ua` 时才有值 —— 重探时那个站
+baseline 就通的话 `sp.headers` 是空 dict，那一行整个写不出来。
+
+后果是真的改运行行为：条目级 headers 一路到达上游请求（`config.go` 的
+`addConfigHeadersToAttrs` → attribute `header:<Name>` → `util/header_helpers.go`
+的 `ApplyCustomHeadersFromAttrs`），所以丢掉
+`anthropic-beta: context-1m-2025-08-07` 就是把那个站的 1m 上下文关掉，
+而 YAML 合法、`validate` 报成功、写后验证也发现不了。
+
+修法见「重探时每个字段以哪一侧为准」；`INTENT` 也从
+`{priority, models, headers}` 收窄到 `{priority, models}`。
 
 最后那一处落在**三方都不管的空档**里：`extract_carry_lines` 有意跳过整个
 `models:` 块（清单由方案重新生成，搬原文行会与新清单打架），而方案只带**一个**
@@ -2312,25 +2800,115 @@ python3 tests/rehearse_real_rebuild.py /opt/deploy/config.yaml
 
 - 段条目数、`(凭据, 段)` 槽位数、顶层键数
 - **四段之外的全局键逐个 deep-equal**（第一版事故是 `api-keys` 整段消失）
-- **每个条目的每个字段 deep-equal**，只豁免本次有意改的 priority / models /
-  headers 三个
+- **每个条目的每个字段 deep-equal**，只豁免本次有意改的 priority 与 models
+  两个。`headers` 2026-09-04 从豁免里**拿掉** —— 它曾被当成「本次有意改」而跳过，
+  于是「24/24 与 66/66 条目的 headers 全丢」这处 P0 一直没被这一关抓到
 - 注释按**种类**比：零丢失、零多余（行数不比 —— 同一份注释在原文里被手工复制到
   同站 15 个条目上，重建后按站挂一次，行数必然减少且应该减少）
-- `weight` / `proxy-url` 逐 `(段, host, key)` 比值（行数相等还不够，跨段串了值
-  行数也不变）
+- `weight` / `proxy-url` / `headers` 逐 `(段, host, key)` 比值（行数相等还不够，
+  跨段串了值行数也不变）
+- `websockets` / `support-prompt-cache-key` 的生效行数守恒
 - compat per-key 续行逐条一致
 - **模型级 `max-context-length` 逐 `(段, host, key, 模型名)` 比值**
 - **模型级白名单外字段逐项比值**（`display-name` / `thinking` / `image` /
   `force-mapping` / `is-compat` / `*-modalities` —— 当前配置一个都没用到，
   这一项守的是「将来手工加了之后不会被整段重写抹掉」）
+- **每个 `(站, 段)` 只能有一个 `priority`**，且既有站的档位逐项不变。全勾与
+  「隔一把勾一把」两种情形都比 —— 后者才暴露留守条目留在旧值那一处
 - 外加「只勾一个段」「compat 只勾组内一把 Key」「跨段新增按证据放行」三种情形
 
 第一次实跑仍建议看完 diff 再决定是否写回——如果某个站此刻恰好在临时维护，探测会
 把它判成不可用，而 diff 里能看出来。
 
-另外它与 CPA-Manager-Plus 存在并发写的可能：CPAMP 走 CPA 的
-`PUT /config.yaml` 做全量重写，本工具的基线比对能挡住「在生成方案之后被改过」，
-但挡不住同一秒的并发。全量重探耗时几分钟，这期间不要在 CPAMP 里改配置。
+### 与 CPA-Manager-Plus 的并发写：CPAMP 会整份回滚（2026-09-05 实测订正）
+
+**先说结论**：全量重探期间不要在 CPAMP 里碰任何 provider；写回完成后等 2 秒
+再去 CPAMP 操作。
+
+2026-09-04 那一版这里写「两边都有基线比对，都挡不住**同一秒**的并发」——
+**那个结论方向是错的**。实际是 **CPAMP 覆盖本工具，而窗口宽得多**。
+
+#### 危险的那条路：provider 分段 API
+
+CPAMP 改一个 provider 走 `PUT /claude-api-key` 这类分段端点，落到 CPA 的
+`PutClaudeKeys`（`internal/api/handlers/management/config_lists.go:567-598`）：
+
+```go
+h.cfg.ClaudeKey = arr     // 只换这一段
+h.persistLocked(c)        // 但把【整个 h.cfg】重新序列化落盘
+                          // handler.go:410 SaveConfigPreserveComments
+```
+
+而 `h.cfg` 只由 fsnotify 那一路刷新，前面有 150ms 与 1s 两道 debounce
+（`internal/watcher/watcher.go:87` 与 `:89`）。这条路上**没有文件级基线比对**
+—— `GET /config` 读的是 `h.cfg`（`config_basic.go:31` 的 `new(*h.cfg)`），
+不是磁盘；30 秒前端缓存读的也是它。
+
+三步实测（真实 config.yaml、CPA 自己的 `LoadConfig` +
+`SaveConfigPreserveComments`、全在临时副本上）：
+
+| 时刻 | 发生什么 | 磁盘状态 |
+|---|---|---|
+| T0 | CPA 加载配置 | claude=65、gemini[0].priority=280 |
+| T1 | 本工具就地覆写：加一个 claude 条目、把 gemini[0] 改成 999 | claude=**66**、priority=**999** |
+| T2 | CPAMP 用**陈旧的** h.cfg 发一次 `PUT /codex-api-key`（body 原封不动） | claude **回到 65**、priority **回到 280** |
+
+新条目的 `api-key`、`prefix`，连同它那一行人工注释**一起消失**。
+HTTP 200、`validate` 通过、零警告。
+
+**所以窗口不是「同一秒」，而是「从 CPA 上一次 config 重载到现在」。**
+全量重探跑几分钟，这几分钟里 CPAMP 任何一次 provider 编辑都会整份回滚。
+
+反方向**不成立**：本工具的 `_api_apply` 在 `_apply_lock` 内做原文比对，
+CPAMP 写过就回 409 要求重新生成。
+
+#### 安全的那条路：配置页
+
+CPAMP 的配置页走 `PUT /config.yaml`（`services/api/configFile.ts:19`），
+提交整份内容，但两点都做对了：
+
+- **不丢注释**：编辑走 `yaml` 库的 `parseDocument` + `setIn` 再 `toString()`
+  （`hooks/useVisualConfig.ts:920` 的 `applyVisualChangesToYaml`）
+- **有基线比对**：提交前重新拉一次 `fetchConfigYaml()`
+  （`ConfigPage.tsx:893-912`），不一致就放弃保存、把改动重新应用到最新内容上
+  让人再确认
+
+但**这条安全通道与四段无关**：`setIn`/`deleteIn` 路径一个 provider 段都不碰
+（只动 `auth.providers.config-api-key` 一处）—— 配置页管的是全局配置。
+
+#### Accounts 页的批量操作碰不到 config.yaml 的条目
+
+上一版把「凭据字段的批量改动走 `patchFields`」算成**另一条写 config.yaml 的路**
+—— 那是错的。config.yaml 里的 api-key 条目**根本不出现在**
+`GET /auth-files` 里：`buildAuthFileEntryLocked` 要求 `attrs["path"]` 非空，
+而 config 合成器从不设它（只有文件来源的 `file.go` 设）。所以 Accounts 页的
+批量 websockets / priority / weight 对 config.yaml 条目**完全不可达**。
+
+这条待现场确认一次：
+
+```bash
+curl -s .../v0/management/auth-files \
+  | jq '[.files[].source] | group_by(.)|map({(.[0]):length})'
+```
+
+如果线上的 filestore 给 config auth 回填了 `attrs["path"]`，那就会多出第三条
+写 config.yaml 的路（`PatchAuthFileStatus` → `excluded-models: "*"`）。
+
+#### CPAMP 落盘的保真度
+
+同一轮实测：**注释不丢** —— 1758 行整行注释、152 处行尾注释、10 个空行、
+全部键计数零变化，0 行孤儿注释。此前担心的「用了 CPAMP 就丢掉 4676 行注释」
+不成立。
+
+两处要知道的副作用：
+
+- **行尾注释的列对齐被压掉**：144 行 `priority: 280        # …` 变成
+  `priority: 280 # …`。本工具下一次原文比对时这 144 行会算成「文件被改过」——
+  不是数据损坏，但会触发一次 409 让人重新生成方案。
+- **条目级与模型级的未知键会被剪掉**（`pruneMissingMapKeys`，
+  `config_yaml.go:721-750`）：比当前 CPA 版本更新的字段，经任何一次 CPAMP
+  分段保存就没了。顶层未知键保留。这与本工具 `extract_carry_lines` 的原文行
+  搬运恰好互补 —— 本工具保得住，CPAMP 保不住。
 
 ---
 
@@ -2583,7 +3161,7 @@ claude 顶层 26 个多余的 key 降到 **990** —— 仍高于 950 的 `alfa`
 `max-retry-interval` 这一改**推翻了**注释里 2026-08-27 那条「30 秒会被客户端读超时
 先打断」的判断。那条在「宁可快速失败」的目标下成立；挂机场景下等待优于失败。
 
-为 0 时的实际行为（`conductor_selection.go:977-982`）：
+为 0 时的实际行为（`conductor_selection.go:1222-1231`）：
 
 - 有立刻可用的凭据 → 立刻重试（不受这一项影响）
 - **所有候选都在冷却 → `maxWait<=0` 就停止重试，把最后那个错误原样透传**
@@ -2690,6 +3268,122 @@ config.yaml  models[].max-context-length
 - 完整 Key 只在内存；落库、日志、API 响应一律脱敏（`sk-abc...6789`）。
 - 写回必须两步：先 `/api/plan` 拿 `plan_id`，再 `/api/apply` 带同一个 id + `confirm=true`。
 - 并发保护：`config.yaml` 在生成方案后被改过则拒绝写入，要求重新生成。
+
+### 2026-09-05 这一批加固
+
+一轮安全审计（子代理，只读）报了 12 处，逐条核实后修了下面这些。每一处都跟了
+**撤销验证**：把修复改回旧行为，确认对应断言真的变红——否则那条断言等于不存在。
+
+#### 未认证可打的拒服务（唯一不需要登录的）
+
+服务只在 `127.0.0.1:8765` 监听、由 nginx 反代，于是 `client_address`
+对**每一个**访客都是 `127.0.0.1`。失败封锁按它索引 → 整张表只有一个桶：
+
+```
+任何人对任意路径连发 5 次带假 Bearer 的请求
+  → 之后 30 分钟运维本人也进不来（_authed 在比对密钥【之前】就查封锁）
+  → 容器 restart: "no"，不自愈
+```
+
+每 30 分钟重打 5 次即永久封锁，且它宣称的暴破防护对真实攻击者完全无效
+（换 IP 与不换等价）。
+
+修法是读 `X-Forwarded-For` 的**最右一跳**——nginx 用
+`$proxy_add_x_forwarded_for`，链条是 `<客户端可伪造>, <nginx 看到的真实对端>`。
+取最左（常见写法）等于让客户端自己声明 IP，那比不读还糟。只在直连对端是回环时
+才信这个头；绑 `0.0.0.0` 直接暴露时对端就是客户端，那时任何人都能伪造。
+
+同一批必须加的是**封锁表的容量上限**：修好真实 IP 之后这张表的键从「恒为
+127.0.0.1」变成攻击者可控，不加上限就是把一个 DoS 换成另一个。淘汰顺序也是判据
+——`(是否在封锁中, last)` 升序，否则攻击者能用大量新 IP 把自己的封锁记录挤掉。
+
+#### 全量重探的预览把 177 行明文凭据回给了浏览器
+
+`server.py` 开头自述「完整 key 不进 JSON 响应（一律 masked）」，而全量重探那条路的
+diff **就是重建后的整个文件**——不是增量片段。生产配置里 177 行 `api-key:` 明文 +
+1 行 `secret-key`，共 349KB 全部进浏览器 DOM，界面的「复制」按钮还会把它们写进
+系统剪贴板。
+
+修法是 `redact_yaml_secrets(text)`：按行脱敏，**只动值不动结构**。行号、缩进、
+注释、其余字段全保留，diff 仍然完全可读。落盘走的是服务端内存里的原文，不受影响。
+
+为什么不改成「不给全文」：全量重探的价值就在于「写回前看清整个文件会变成什么样」，
+给一段掐头去尾的片段等于把这个功能废掉。
+
+#### 并发与预算参数无上限
+
+`max_workers` / `timeout` / `gap` / `swap_samples` 原来只做类型转换：
+`{"full_redetect":true,"max_workers":50000}` 就是 5 万个站级线程，每个内部再开
+最多 4 个段线程。后果不止本机资源——把大量出网请求打向 121 个第三方站，
+可能触发站方的批量探测防护，**代价落在真实凭据上**（封号），那比服务挂掉更贵。
+
+现在集中在 `_LIMITS` 表里钳制，并给输入行数设了 500 的上限。静默钳制而不报 400：
+这些值多半来自前端滑块，用户手打一个大数字时更希望「按上限跑」；真正的攻击者
+也一样被压到上限。
+
+#### 内网去向
+
+探测目标 URL 与代理地址都来自请求体，而校验只看形态不管去向。两条路都带回显，
+其中代理那条更干净——`probe_proxy` 做**裸 TCP 连接**，把连通性、异常类名
+（ConnectionRefused/timeout）、毫秒数经 `proxy-precheck` 事件回到 `/api/job`。
+
+`is_private_target(host)` 挡回环、10/8、172.16/12、192.168/16、169.254/16、
+IPv6 的 `::1`/`fc00::/7`/`fe80::/10`/`::ffff:` 映射，以及 `metadata.google.internal`
+这类云元数据主机名与 `.local`/`.internal` 后缀。
+
+**这道闸挡的是内网侦察，不是全部 SSRF**：它只看字面量地址，挡不住 DNS rebinding
+（解析时公网 IP、连接时变私网）。要防那个得在 `client.py` 接管地址解析，代价不小。
+这一点必须写清，不能让人以为它挡住了一切。云元数据端点本来也打不到——出网路径
+总在 base 后追加固定后缀，拼不出 `/latest/meta-data/...`。
+
+本项目自己的假上游套件与端到端脚本打 `127.0.0.1`，所以留了
+`allow_private=True` 开关，生产的 HTTP 入口不传它。
+
+#### 上游返回的模型名会被拼进出网 URL
+
+模型名来自站方的 `/models` 目录（第三方完全可控），而它被直接拼进
+`f"{base}/v1beta/models/{model}:generateContent"`。实测通过原来全部闸门的名字：
+
+| 名字 | 后果 |
+|---|---|
+| `../../../gemini-3.1-pro` | 逃出 base 路径，打到同主机别的端点 |
+| `gemini-3.1-pro-x?a=b` | `:generateContent` 落进 query，实际请求的是另一个端点；它回 200 就成了「该模型可用」的伪证 |
+| `gemini-3.1-pro.%2e%2e%2fadmin` | 编码过的路径穿越 |
+
+而且**不需要拿到 200**：方案的 catalog 分支把目录里的名字直接当候选，
+这串字面量会进 `config.yaml`，CPA 用同样的方式拼 URL 再发一次（它也是裸拼）。
+本工具是这条链上唯一有机会校验的一环。
+
+关键约束是 **`/` 必须允许**——生产配置里 85 个模型名有 `Business/gemini-2.5-pro`、
+`anthropic/claude-opus-5` 这种分组前缀（实测那 85 个名字用到的非字母数字字符只有
+`-` `.` `/` 三个，最长 34 字符）。所以判据是「只许这三个符号 + 禁止路径穿越
++ 禁止 query/fragment 起始字符」，不是简单的「不许有 `/`」。
+
+三层拦：目录解析入口就丢掉（并在事件流里说出来，静默丢站方数据不好）、
+两个段级闸门、以及真正拼 URL 的 `build_request` 抛异常。最后一层是为了
+「将来加新调用路径时，忘了过上游闸门也不会漏出去」。
+
+#### 其余
+
+- **traceback 不再进响应体**：换成 `err-3f2a1b` 这样的引用 id，完整栈只进 stderr。
+  它原来也会进 `/api/job` 事件流**与 `/api/export` 的 txt**，而那个 txt 的设计
+  用途就是「贴给别人看」。`format_exc` 不含局部变量所以不吐密钥值，泄露的是容器内
+  文件布局与行号。
+- **`do_GET` 加兜底**：`?since=x` 原来让 `ValueError` 冒到 socketserver，客户端拿到
+  **连接重置**而不是 400，前端会把它计入「轮询失败」无限重试。现在畸形值回 400
+  （不是 500——5xx 会被前端当「服务挂了」而重试）。
+- **`push.base` 白名单**：`reload_cpa` 的请求体是整份 config.yaml、头里带管理密码。
+  地址原来完全由请求体决定，填错一次就是把 177 行明文凭据发给第三方——**而这件事
+  已经发生过一次**（前端那个输入框曾硬编码一个公网域名，那次请求确实出了公网，
+  只是被 Cloudflare 挡在 403）。现在只放行回环、私网、docker 服务名，或服务端
+  `--cpa-url` 配置的那个 host。
+- **部署模板补 CSP 与四个安全头**（`deploy/nginx-snippet.conf`）。当前前端没有可
+  利用的注入点（274 处 `esc()`、36 处 `innerHTML` 全核对过），所以这是纵深防御；
+  但这个页面渲染的是**完全由第三方上游控制**的正文摘要、模型名、错误消息。
+  CSP 必须写成**一行**——nginx 不支持反斜杠续行，续行会把真实换行塞进 HTTP 头值。
+- **`access_log` 的替代方案改对了**：原来注释里给的 `combined` **仍然记
+  `$request`**，也就是仍然把 `?token=` 写进日志。换成记 `$uri` 的自定义
+  `log_format`，并注明别用 `$request_uri`（它带 query，等于没改）。
 
 ---
 
