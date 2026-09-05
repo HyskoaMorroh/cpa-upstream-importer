@@ -1,6 +1,24 @@
 # 全量重探功能设计
 
-**需求**：前端勾选框控制，全量重新探测 config.yaml 所有既有站，与新站一起重新生成配置（headers/代理/优先级/前缀全部更新）。
+**需求**：前端勾选框控制，全量重新探测 config.yaml 所有既有站，与新站一起
+重新生成配置。
+
+**「全部更新」这个初版说法已经作废（2026-09-04）**。逐字段的处置不一致，
+而且必须不一致 —— 判据是「这个字段是谁的属性」：
+
+| 字段 | 处置 |
+|---|---|
+| `models` | 实测替换 |
+| `priority` | **沿用原档**，只有新站才定档 |
+| `proxy-url` | 探测有值优先，否则搬原值 |
+| `headers` | **合并**：原值为底、探测值覆盖同名键、`anthropic-beta` 走 `betas.merge` |
+| `websockets` / `support-prompt-cache-key` | **实测三态**（True 写 / False 连原值一起关 / 未探测按原值搬） |
+| `weight` / `prefix` / compat 的 `name` / `models[].alias` | 只搬原值 |
+| `max-context-length`（模型级） | 本次实测 > 原值搬运 > 不写 |
+| 白名单外字段 | carry 原文逐字搬 |
+
+完整理由（含为什么 headers 是合并而能力开关是实测优先，两者方向相反）见
+README 的「重探时每个字段以哪一侧为准」。
 
 **实测数据**（2026-09-01，真实 config.yaml）：
 - YAML 条目 121 个（compat 13 个 provider、claude 65、codex 27、gemini 16）
@@ -16,17 +34,60 @@
 
 ### CLIProxyAPI（config.yaml 的消费方）
 
-**四段共同字段**：`api-key`、`base-url`、`priority`、`prefix`、`headers`、`proxy-url`、`weight`
+> **2026-09-05 补全**：下面这份清单此前停在旧版，漏掉 11 个字段（`excluded-models`、
+> `request-scoped-errors`、`cloak`、`websockets`、`alpha-search` 等）。
+> 逐个结构体核对 `internal/config/config_types.go` 后重列。
+> README 的「能力开关靠实测决定开或不开」那一节有一份**按性质分类**的表，
+> 两份互补：这里回答「有哪些字段」，那里回答「哪些该由探测决定」。
 
-**段专属字段**：
-- claude-api-key：`fingerprint-profile`（可选值 `claude-code-cli`）
-- openai-compatibility：`name`、`models`、`api-key-entries`、`disabled`、`support-prompt-cache-key`、`disable-cooling`、`request-retry`
+**四段共同字段**
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `api-key` | string | 上游凭据（compat 段在 `api-key-entries` 里） |
+| `base-url` | string | 形态按段不同，见下 |
+| `priority` | *int | 数值越大越优先，未设置时 `authPriority` 返回 0 |
+| `prefix` | string | 路由前缀（`force-model-prefix: false` 时是加别名而非替换） |
+| `headers` | map | 一路到达上游请求（`header_helpers.go` 的 `Set` 覆盖） |
+| `proxy-url` | string | claude/codex/gemini 是条目级，**compat 是 per-key** |
+| `weight` | *int | 只在 `weighted-round-robin` 下读；`<=0` 与 `>1000000` 都归零 |
+| `excluded-models` | []string | 屏蔽指定模型；含 `"*"` 时等于**停用该凭据**（管理面板的停用按钮就写这个） |
+| `disable-cooling` | bool | 本地策略：出错不冷却 |
+| `request-retry` | *int | 本地策略：重试次数 |
+| `request-scoped-errors` | []object | 按状态码 + 正文正则定制冷却（生产配置 116 条） |
+
+**段专属字段**
+
+| 段 | 字段 | 性质 |
+|---|---|---|
+| claude | `fingerprint-profile` | 让 CPA 自己补设备指纹（可选值 `claude-code-cli`） |
+| claude | `rebuild-mid-system-message` | 本地行为：把 role=system 消息挪到顶层 system |
+| claude | `experimental-cch-signing` | 本地行为：CCH 签名 |
+| claude | `cloak`（含 `strict-mode` / `sensitive-words` / `cache-user-id`） | 本地改写行为 |
+| codex | `websockets` | **上游能力**，本工具实测握手后写入 |
+| codex | `alpha-search` | 授权类，只搬不探（探它要发计费的搜索请求） |
+| compat | `name` | **CPA 的 provider 身份**（`provider_key` 由它算），改名作废冷却与能力缓存 |
+| compat | `api-key-entries` | 多 Key 挂在一个 provider 下 |
+| compat | `disabled` | 用户显式停用；CPA 遇它直接 continue，连 Auth 都不合成 |
+| compat | `support-prompt-cache-key` | **上游能力**，本工具实测请求后写入 |
+
+**模型级字段**（`models[]` 里，四段都有）
+
+| 字段 | 说明 |
+|---|---|
+| `name` | 必填（compat 段的 `Models` 无 `omitempty`，`config_types.go:679`） |
+| `alias` | 空串回落到 `name`（`service_models.go:678-682`） |
+| `max-context-length` | token 数，客户端按它定压缩点 |
+| `thinking` | 思考档位声明；compat 段留空时 CPA 自动给 `["low","medium","high"]` |
+| `is-compat`（codex） | **上游能力**，但只在 `codex.optimize-multi-agent-v2` 也为 true 时生效 —— 生产配置那个是 false，所以只搬不探 |
+| `is-compat`（claude） | **上游能力且无条件生效**（`config_types.go:443-447`：保留空签名的 thinking 块 + 签名回放）。仍然只搬不探 —— 判断一个站接不接受空签名 thinking 要**两轮有状态对话**（先拿到带签名的块，再回放），而探测每次请求都独立 |
+| `display-name` / `force-mapping` / `image` / `input-modalities` / `output-modalities` | 声明与本地映射 |
 
 **base-url 规范**（按段不同）：
 - gemini / claude：裸域名，不带 `/v1`
 - codex / compat：必须带 `/v1`
 
-**priority 语义**：数值**越大越优先**（`priorityOrder` 降序排，`scheduler.go:1197-1199`；取层用 `priority > bestPriority`，`scheduler.go:402` 与 `selector.go:541-543`）。未设置时 `authPriority` 返回 0（`selector.go:365-372`），是**最低**优先。
+**priority 语义**：数值**越大越优先**（`priorityOrder` 降序排，`scheduler.go:1229-1231`；取层用 `priority > bestPriority`，`scheduler.go:402` 与 `selector.go:541-543`）。未设置时 `authPriority` 返回 0（`selector.go:365-372`），是**最低**优先。
 
 > 2026-09-03 更正：此前本文与 README、tutorial 都写成「越小越优先（升序排列，`scheduler.go:1085`）」。那个行号上不是排序代码，结论也与源码相反。
 
