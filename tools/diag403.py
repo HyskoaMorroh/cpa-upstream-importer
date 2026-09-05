@@ -147,7 +147,7 @@ def main() -> int:
     findings: list[str] = []
 
     # 以下判定全部基于读源码确认的行为，不是猜测：
-    #   isCredentialRetryRoundStatus  conductor_selection.go:1038-1051
+    #   isCredentialRetryRoundStatus  conductor_selection.go:1281-1294
     #       403/408/429/500/502/503/504 都算「该换凭据」—— 403 在内
     #   MarkResult                    conductor_cooldown.go:813-821
     #       普通 403 → suspendReason="payment_required"，冷却 **30 分钟硬编码**
@@ -160,7 +160,7 @@ def main() -> int:
         findings.append(
             f"{C_BAD}request-retry = {rr}{C_END} —— 额外重试轮数（默认 3）。\n"
             f"      403 本身是「该换凭据」的状态码"
-            f"（conductor_selection.go:1038-1051 里 403 在列），\n"
+            f"（conductor_selection.go:1281-1294 里 403 在列），\n"
             f"      但 {rr} 轮意味着换凭据的机会极少。你有 200+ 凭据，"
             f"却几乎在第一个 403 上就放弃。\n"
             f"      {C_OK}建议 3~5{C_END}")

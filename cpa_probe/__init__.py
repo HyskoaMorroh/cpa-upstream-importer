@@ -59,13 +59,14 @@ from .plan import (
     score_verdict,
     suggest_priority,
 )
-from .writeback import (
+from .writeback import (  # noqa
     Diff,
     owned_sections,
     compat_key_blocks,
     compat_provider_key,
     is_new_section,
     mark_new_sections,
+    merge_entry_headers,
     new_section_admitted,
     apply_diffs,
     backup,
@@ -76,7 +77,11 @@ from .writeback import (
     verify_upstream,
     write_local,
 )
-from .batch import BatchProber
+from .batch import (BatchProber, existing_headers, existing_toggles,
+                    existing_model_context, existing_model_extras,
+                    existing_prefixes, existing_provider_names,
+                    existing_proxies, existing_weights,
+                    entry_scope, provider_name_for)
 from .resources import Resources, detect as detect_resources
 from .cpa_source_probe import check as check_profile_drift
 
@@ -114,6 +119,16 @@ __all__ = [
     "credential_pair",
     "dominant_prefix",
     "existing_fingerprints",
+    "existing_headers",
+    "existing_toggles",
+    "existing_model_context",
+    "existing_model_extras",
+    "existing_prefixes",
+    "existing_provider_names",
+    "existing_proxies",
+    "existing_weights",
+    "entry_scope",
+    "provider_name_for",
     "existing_pairs",
     "extract_existing_entries",
     "entry_all_zero_weight",
@@ -139,6 +154,7 @@ __all__ = [
     "apply_diffs",
     "push_to_cpa",
     "rebuild_config_full",
+    "merge_entry_headers",
     "validate",
     "verify_upstream",
     "write_local",

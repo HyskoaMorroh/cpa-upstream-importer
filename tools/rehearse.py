@@ -225,7 +225,9 @@ def main() -> int:
         print(f"     {C_DIM}{l}{C_END}")
 
     # ---------------- ② 解析 ----------------
-    parsed = cp.parse_lines(io.open(acc, encoding="utf-8").read())
+    # 假上游在 127.0.0.1 —— 见 parse.is_private_target
+    parsed = cp.parse_lines(io.open(acc, encoding="utf-8").read(),
+                            allow_private=True)
     print(f"\n{C_CYAN}② 解析{C_END}  有效 {len(parsed.valid)} · "
           f"无效 {len(parsed.invalid)}")
     for r in parsed.invalid:
@@ -363,9 +365,16 @@ def main() -> int:
         for sec, sp in plan.sections.items():
             if not sp.writable or not sp.models:
                 continue
-            prof = plan.host.split(":")[-1] if ":" in plan.host else plan.host
+            # 从 base_url 还原画像名。**不能用 `.rstrip("/v1")`** ——
+            # rstrip 的参数是**字符集合**而不是后缀：它会把尾部所有 `/`、`v`、
+            # `1` 都咬掉。这七个画像名恰好都不以这三个字符结尾，所以现在看不出
+            # 问题；但 `api1` → `api`、`proxy1` → `proxy`、`relay-v1` → `relay-`
+            # 都会错，而画像名将来是会加的。
+            tail = sp.base_url.rstrip("/")
+            if tail.endswith("/v1"):
+                tail = tail[:-3].rstrip("/")
             vok, vmsg = cp.verify_upstream(
-                f"{base}/{sp.base_url.rstrip('/v1').split('/')[-1]}",
+                f"{base}/{tail.split('/')[-1]}",
                 "sk-fake-client-key", sec, sp.models[0], timeout=10,
             )
             mark = f"{C_OK}✓{C_END}" if vok else f"{C_BAD}✗{C_END}"

@@ -265,7 +265,8 @@ def main() -> int:
                   "--section claude-api-key")
             return 2
         from cpa_probe.parse import parse_lines
-        res = parse_lines(f"{direct_url},{direct_key}")
+        # --direct 是排障入口，运维显式给的地址（可能是内网的 CPA 自己）
+        res = parse_lines(f"{direct_url},{direct_key}", allow_private=True)
         if not res.valid:
             why = res.invalid[0].error if res.invalid else "解析失败"
             print(f"解析不了：{why}")

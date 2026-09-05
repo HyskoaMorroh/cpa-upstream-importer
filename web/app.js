@@ -107,14 +107,29 @@ function defOn(sec, m) {
   return famOk(sec, m);
 }
 
-// 版本 token 与 kimi 的 k 前缀。与 Python 侧 _VERSION_RE 同一个模式。
 // 版本 token。`k?` 是 kimi 的 k2/k3（属于系列名），`o?` 是 OpenAI 的 4o
 // 代号后缀 —— 与 Python 侧 _VERSION_RE 同一个模式。
 const VERSION_RE = /(?:^|[^A-Za-z0-9.])(k?)(\d+(?:[.\-]\d+)*)(o?)(?![A-Za-z0-9])/;
 
+// OpenAI 推理系列的世代：o1 / o3 / o4-mini 里紧贴开头 o 的数字。
+// 与 Python 侧 _O_SERIES_RE 同一套。
+//
+// 为什么单独一条（2026-09-04 现场截图：codex 段同时勾着 o1 与 o3）：
+// VERSION_RE 要求版本数字前不紧贴字母，而这一族的数字紧贴开头的 o，于是
+// 七个名字全部「认不出版本」，newestGenerationPerLine 的「整组认不出就全留」
+// 兜底把 o1 与 o3 一起勾上 —— 与 gpt-4o 那次同一个形态，换了一族。
+// 锚在开头 + 紧跟数字，`omni-3` / `oss-20b` 不受影响。
+const O_SERIES_RE = /^o(\d+(?:[.\-]\d+)*)(?![A-Za-z0-9])/;
+
 // 拆成 [系列, 版本数组]。认不出版本时版本为 null。
 function seriesAndVersion(m) {
   const n = bareName(m);
+  const mo = O_SERIES_RE.exec(n);
+  if (mo) {
+    const nums = mo[1].split(/[.\-]/).map((x) => parseInt(x, 10));
+    if (nums.some((x) => Number.isNaN(x))) return [n, null];
+    return [`o*${n.slice(mo[0].length)}`, nums];
+  }
   const mm = VERSION_RE.exec(n);
   if (!mm) return [n, null];
   // exec 的 index 指向前置分隔符，真正的版本从 mm[1] 起算
@@ -158,6 +173,10 @@ const LINE_STRIP = new RegExp(
 
 function productLine(m) {
   let n = bareName(m);
+  // 推理系列的世代数字紧贴开头的 o，LINE_STRIP 的版本支路读不到它。
+  // 不先剥掉的话 o1 / o3 / o4-mini 各成一条线，「每条线取最高世代」无从
+  // 比较，七个名字全留。剥完统一叫 `o`，于是同线不同代。与 Python 侧一致。
+  n = n.replace(O_SERIES_RE, 'o');
   let prev = null;
   // 反复剥到不动为止 —— gemini-3.1-pro-preview-customtools 要剥三次。
   // 版本 token 那一支会吃掉前置分隔符，所以剥完要补回一个 `-`，
@@ -213,21 +232,48 @@ function newestGenerationPerLine(names) {
 // 为什么不换成市面最新清单：那个站的目录里没有 5.6 系的名字，写进去
 // CPA 路由不到，把「有老模型可用」变成死条目。所以只降级预勾，清单照旧
 // 列出，确知可用的人仍可手工勾。与后端 catalog_is_stale 同一套判据。
+//
+// 判「落后」必须**逐产品线**比（2026-09-04，与后端同步改）：o 系列与 gpt
+// 系列是互不相干的编号体系，`o3` 的 3 不代表它比 `gpt-5.6` 老一代。按全局
+// 最高世代比会把「目录里只有 o 系列」的站误判成落后、一个都不预勾。
+// 只对两侧都有的产品线比较，全部落后才算落后；没有可比的线就不判。
 function pickDefaults(sec, catalog) {
+  return staleCheck(sec, catalog).keep;
+}
+
+// pickDefaults 的完整结论：预勾清单 + 判落后时**具体是哪条线落后到几**。
+// 界面那句「整份目录都落后于市面最新（本段最新已到 X）」要的是后者 ——
+// 逐线比之后「本段最新」不再是一个全局数字（o 线 4.0、gpt 线 5.6 并存），
+// 拿全局值去填那句话会显示一个与判据无关的数（2026-09-04 自查）。
+function staleCheck(sec, catalog) {
   const fit = (catalog || []).filter((m) => defOn(sec, m));
   const keep = newestGenerationPerLine(fit);
-  const mkt = (S.ctx && S.ctx.market_top_gen && S.ctx.market_top_gen[sec]) || null;
-  if (mkt && keep.length) {
-    let top = null;
+  const lines = (S.ctx && S.ctx.market_top_gen_lines
+                 && S.ctx.market_top_gen_lines[sec]) || null;
+  if (lines && keep.length) {
+    // 目录侧也按线取最高世代
+    const catTop = {};
     keep.forEach((m) => {
       const g = generationOf(m);
-      if (g && (!top || genGreater(g, top))) top = g;
+      if (!g) return;
+      const ln = productLine(m);
+      if (!catTop[ln] || genGreater(g, catTop[ln])) catTop[ln] = g;
     });
-    // 只有「目录最高世代确实低于市面最新」才不勾。认不出版本时照常勾 ——
-    // 无从比较不该惩罚它。
-    if (top && genGreater(mkt, top)) return [];
+    const shared = Object.keys(catTop).filter((ln) => lines[ln]);
+    if (shared.length) {
+      const behind = shared.filter((ln) => genGreater(lines[ln], catTop[ln]));
+      if (behind.length === shared.length) {
+        // 报最能说明问题的那条线：市面世代最高的
+        let worst = behind[0];
+        behind.forEach((ln) => {
+          if (genGreater(lines[ln], lines[worst])) worst = ln;
+        });
+        return { keep: [], line: worst,
+                 cat: catTop[worst].join('.'), mkt: lines[worst].join('.') };
+      }
+    }
   }
-  return keep;
+  return { keep };
 }
 
 const SECTION_LABEL = {
@@ -255,6 +301,61 @@ const SRC_TAG = {
   manual: { t: '手填', c: 'p-b' },
   seed: { t: '猜测', c: 'p-m' },
 };
+
+// 段专属能力开关这一格。三态各自一种措辞 —— 「实测不支持」与「未探测」
+// 写回时都不写那个字段，但一个是结论、一个是缺口，显示成一个样子就是
+// 「未验证当已验证」的镜像错误（本项目反复修的那一类）。
+//
+// 哪个段有哪个开关取自 CPA 的结构体：codex 有 websockets
+// （config_types.go:486），compat 有 support-prompt-cache-key（:685）；
+// gemini / claude 段没有上游能力类开关，显示「—」。
+const SECTION_TOGGLES = {
+  'codex-api-key': [['websockets', 'websockets', 'websockets_note']],
+  'openai-compatibility': [['support-prompt-cache-key',
+                            'prompt_cache_key', 'prompt_cache_note']],
+};
+
+function toggleCell(sec, sp) {
+  const specs = SECTION_TOGGLES[sec];
+  if (!specs) return '<span class="hint">本段无此类开关</span>';
+  return specs.map(([label, field, noteField]) => {
+    const val = sp[field];
+    const note = sp[noteField] || '';
+    const prior = (sp.prior_toggles || {})[label];
+    if (val === true) {
+      return `<div><span class="pill p-ok">${esc(label)}: true</span>`
+        + (note ? `<div class="hint">${esc(note)}</div>` : '') + '</div>';
+    }
+    if (val === false) {
+      return `<div><span class="pill p-m">不开 ${esc(label)}</span>`
+        + `<div class="hint">${esc(note || '实测不支持')}</div></div>`;
+    }
+    // 未探测：分「原值有」与「原值也没有」两种说法 —— 前者会照原值写回，
+    // 后者是真的什么都不写。
+    if (prior) {
+      return `<div><span class="pill p-w">${esc(label)}: true</span>`
+        + '<div class="hint">本次未探测此开关，按原值搬运</div></div>';
+    }
+    return `<div><span class="pill p-m">未探测</span>`
+      + `<div class="hint">${esc(note || '本次没有探这个开关 —— '
+        + '不写该字段，CPA 按关闭处理')}</div></div>`;
+  }).join('');
+}
+
+// 结果表「处置」格里的能力开关徽标。比 toggleCell 短 —— 那一列窄，
+// 只给结论不给完整说明（完整说明在诊断页的「能力开关」列与写回 diff 的行尾注释）。
+//
+// 未探测时**什么都不显示**：结果表每段一行、79 个站就是 316 行，
+// 给每一行都挂一个「未探测 websockets」会把真正的信息淹掉。
+// 「实测不支持」也不显示 —— 那是常态（中转站多数不支持 WS）。
+// 只显示确认支持的那一个，它是「这个站比别的站多一项能力」的信息。
+function capBadge(sec, v) {
+  const specs = SECTION_TOGGLES[sec];
+  if (!specs) return '';
+  return specs.map(([label, field]) => (v[field] === true
+    ? `<div><span class="pill p-ok">支持 ${esc(label)}</span></div>` : ''))
+    .join('');
+}
 
 const THEMES = ['midnight', 'parchment', 'neon'];
 
@@ -530,6 +631,7 @@ function updateBudget() {
   const reuse = $('#o_reuse_verdict').checked;
   const attempts = parseInt($('#o_max_attempts').value, 10) || 10;
   const ctx = $('#o_ctx').checked;
+  const caps = $('#o_caps') ? $('#o_caps').checked : false;
   const swap = parseInt($('#o_swap').value, 10) || 0;
 
   // 最坏：四段全不通。baseline 每段每种子 1 次 + 画像梯
@@ -541,8 +643,13 @@ function updateBudget() {
     worst += LADDER_LEN[k] * (reuse ? 1 : seeds);     // 画像梯
     best += 1;                                        // 首个种子就通
   }
-  // 通的段还要验模型 + 换模采样 + 上下文二分
-  const perOkSection = attempts + (swap > 1 ? swap : 0) + (ctx ? 6 : 0);
+  // 通的段还要验模型 + 换模采样 + 上下文二分 + 能力开关
+  //
+  // 能力开关按 1 次算而不是 4 次：codex 的 WS 握手与 compat 的
+  // prompt_cache_key 各只作用于自己那一段，四段合计 2 次；这里按段算平均，
+  // 取 1 是就近的高估（gemini / claude 段不发）。
+  const perOkSection = attempts + (swap > 1 ? swap : 0) + (ctx ? 6 : 0)
+    + (caps ? 1 : 0);
   best += perOkSection * 4;
 
   const sites = (S.ctx && S.ctx.existing_count) || 0;
@@ -570,7 +677,7 @@ function updateBudget() {
   el.textContent = txt;
 }
 
-['#o_max_models', '#o_max_attempts', '#o_reuse_verdict', '#o_ctx',
+['#o_max_models', '#o_max_attempts', '#o_reuse_verdict', '#o_ctx', '#o_caps',
  '#o_swap', '#o_gap', '#o_max_workers', '#o_full_redetect'].forEach((sel) => {
   const el = $(sel);
   if (el) el.addEventListener('change', updateBudget);
@@ -919,6 +1026,7 @@ function renderDiag(d) {
           : (v.min_body_kind ? 'fingerprint-profile' : '—')}</td>
         <td class="num">${sp.max_context_length ? fmt(sp.max_context_length) : '—'}
           ${sp.context_model ? `<div class="hint">@${esc(sp.context_model)}</div>` : ''}</td>
+        <td class="m">${toggleCell(sec, sp)}</td>
         <td>${tag}
           <div class="hint">${esc(sp.recommend_reason || '')}</div>
           ${(sp.warnings || []).map((w) =>
@@ -940,7 +1048,8 @@ function renderDiag(d) {
           <th style="width:150px">priority</th><th style="width:66px">前缀</th>
           <th style="width:190px">模型</th><th style="width:120px">代理</th>
           <th style="width:150px">headers</th><th style="width:120px">请求指纹</th>
-          <th style="width:110px">上下文上限</th><th>系统建议</th>
+          <th style="width:110px">上下文上限</th>
+          <th style="width:150px">能力开关</th><th>系统建议</th>
         </tr></thead>
         <tbody>${rows}</tbody></table></div>`;
   }
@@ -1014,6 +1123,7 @@ $('#btnprobe').onclick = async () => {
     text: $('#input').value,
     opts: {
       probe_context: $('#o_ctx').checked,
+      probe_capabilities: $('#o_caps').checked,
       proxy: $('#o_proxy').checked ? 'http://mihomo:7890' : '',
       gap: parseFloat($('#o_gap').value) || 0,
       swap_samples: parseInt($('#o_swap').value, 10) || 0,
@@ -1263,6 +1373,19 @@ function renderStream(events) {
         + `复用主机形态${e.verified ? (e.ok ? '（凭证已验）' : `（凭证不通：${esc(e.reason || '')}）`)
           : `（${esc(e.reason || '')}）`}</div>`;
     }
+    // 站+段级不通的复用（2026-09-05）。与 shape-reused 分开显示 ——
+    // 那个仍打一次基线验凭证，这个**一次请求都不发**，措辞不能一样。
+    if (e.kind === 'shape-reuse-dead') {
+      if (!S.reuseSeen) S.reuseSeen = new Set();
+      const dk = `dead|${e.t}|${e.section}|${e.host || ''}`;
+      if (!S.reuseSeen.has(dk)) {
+        S.reuseSeen.add(dk);
+        S.reuseSaved += 1;
+      }
+      return `<div class="note">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `复用同段结论 ${esc(e.category || '')}${e.action ? ' · ' + esc(e.action) : ''} `
+        + `<span class="dim">（这类拒绝与凭据无关，零请求）</span></div>`;
+    }
     if (e.kind === 'shape-reuse-abort') {
       return `<div class="s4">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
         + `${esc(e.reason || '')}</div>`;
@@ -1344,6 +1467,13 @@ function renderStream(events) {
       return `<div class="s4">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
         + `/models 目录不可读（${esc(e.status)}），改用种子模型试探</div>`;
     }
+    // 代理救活后补取目录（2026-09-05）。直连拿不到目录、经代理拿到了 ——
+    // 这一行很重要：没有它的话，用户看到的是「目录不可读 → 用种子」，
+    // 而实际上后来拿到了真实目录，写进 config.yaml 的模型名来源完全不同。
+    if (e.kind === 'catalog-via-proxy') {
+      return `<div class="s2">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
+        + `经代理补取到目录 ${esc(String(e.count))} 个模型 —— ${esc(e.why || '')}</div>`;
+    }
     if (e.kind === 'swap') {
       return `<div class="s4">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
         + `静默换模 ${e.rate_pct}%（${esc(e.model)}）</div>`;
@@ -1357,6 +1487,27 @@ function renderStream(events) {
       // 请求）。这件事值得显示：它解释了为什么这个段没跑满二分轮次。
       return `<div class="s2">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
         + `上游自报上限 ${fmt(e.limit)} —— 免掉二分（${esc(e.model)}）</div>`;
+    }
+    if (e.kind === 'capability') {
+      // 段专属能力开关的实测结论（codex 的 websockets、compat 的
+      // support-prompt-cache-key）。三态各自一种措辞 —— 「实测不支持」与
+      // 「未探测」显示成一个样子就是「未验证当已验证」的镜像错误。
+      const cls = e.result === true ? 's2' : (e.result === false ? 's4' : 'note');
+      let what;
+      if (e.result === true) {
+        what = `<b>支持</b> ${esc(e.name)}`
+          + (e.status ? `（握手 ${esc(e.status)}` : '')
+          + (e.elapsed_ms ? ` · ${e.elapsed_ms}ms）` : (e.status ? '）' : ''));
+      } else if (e.result === false) {
+        what = `不支持 ${esc(e.name)}（返回 ${esc(e.status || '—')}）—— 不写这个字段`;
+      } else {
+        what = `未探测 ${esc(e.name)}`
+          + (e.why === 'need_proxy'
+            ? '：该段需走代理，直连的结果说明不了走代理时的行为'
+            : (e.status ? `：未得到有效响应（${esc(e.status)}）` : ''));
+      }
+      return `<div class="${cls}">${esc(tag(e.host))} `
+        + `${pad(SECTION_LABEL[e.section], 8)} ${what}</div>`;
     }
     if (e.kind === 'rate-limit-learned') {
       // 站方在正文里自报了探测节奏阈值（N 个模型 / M 秒），工具据此自动
@@ -1479,7 +1630,8 @@ function siteCard(r) {
       // gpt-5.5 与 gpt-5.6 时只勾 5.6。这是用户 2026-09-02 的要求，
       // 现场截图里 codex 段 8 个全勾（含 gpt-4o / gpt-oss-*）就是它缺位的后果。
       const rec = (S.forced[rid] || {})[sec];
-      const picked = new Set(rec !== undefined ? rec : pickDefaults(sec, cat));
+      const stale = staleCheck(sec, cat);
+      const picked = new Set(rec !== undefined ? rec : stale.keep);
       // 预勾的结果要立刻回写 S.forced，否则「勾选即注册」只是视觉上的 ——
       // 提交时读的是 S.forced，不读 DOM。
       if (rec === undefined && picked.size) {
@@ -1511,9 +1663,9 @@ function siteCard(r) {
               （gemini / gpt / claude / kimi）内的任何模型，上面列的是它自己报的。
               退这一步是因为另一个选项更糟：写工具猜的名字，而这个站从没报过它们。
               能不能用取决于上游认不认 —— 本工具没有验证过</div>` : ''}
-            ${picked.size === 0 && cat.length && !catOff ? `<div class="hint">
-              整份目录都落后于市面最新（本段最新已到
-              ${(S.ctx && S.ctx.market_top_gen && S.ctx.market_top_gen[sec] || []).join('.')}）
+            ${picked.size === 0 && cat.length && !catOff && stale.line ? `<div class="hint">
+              整份目录都落后于市面最新：<code>${esc(stale.line)}</code> 线的目录最高
+              世代是 ${esc(stale.cat)}，市面已到 ${esc(stale.mkt)}
               —— 默认不勾。确知该站只卖这些且够用，手工勾上即可</div>` : ''}
           </div>`
             // 目录读不到（或目录里的名字全被规则滤掉）—— 这里**留一个空容器**，
@@ -1549,6 +1701,7 @@ function siteCard(r) {
           ${v.context_model ? `<div class="hint">@${esc(v.context_model)}</div>` : ''}</td>
         <td>${esc(v.action || '不写入')}
           ${v.need_proxy ? '<div><span class="pill p-w">需代理</span></div>' : ''}
+          ${capBadge(sec, v)}
           ${last && last.excerpt
             ? `<div class="mlist">${esc(last.status)} · ${esc(last.excerpt.slice(0, 90))}</div>`
             : ''}</td>
@@ -1667,7 +1820,8 @@ function siteCard(r) {
       <td class="num">${v.max_context_length ? fmt(v.max_context_length) : '—'}
         ${v.context_untrusted ? '<div class="hint">截断反推</div>' : ''}
         ${v.context_model ? `<div class="hint">@${esc(v.context_model)}</div>` : ''}</td>
-      <td>${flags.join(' ') || '<span class="hint">直连即可</span>'}</td>
+      <td>${flags.join(' ') || '<span class="hint">直连即可</span>'}
+        ${capBadge(sec, v)}</td>
       <td class="prio">
         <div class="pedit"><input type="number" class="pi"
           data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}" placeholder="待定"></div>
@@ -2100,11 +2254,18 @@ async function refreshPlan(silent) {
       // fill-first 根本不读 weight，那时这个站照常参与轮询。
       // 说成「一定不参与调度」在后两种策略下是错的。
       //
-      // 措辞里**不提 CPAMP 面板怎么显示**（2026-09-03 核实 CPAMP 源码后删）：
-      // 上一版写「CPAMP 面板显示为『未启用』」，那是编的。CPAMP 只在凭据编辑
-      // 表单的提示文字里说明语义（i18n 的 `config_weight_hint`：「0 会将该凭证
-      // 排除出加权调度」），没有任何列表视图按 weight 渲染启用状态 ——
-      // `health_status_disabled` 只出现在 dashboard 的采集器与版本卡片上。
+      // 措辞里**不提 CPAMP 面板怎么显示**（2026-09-03 核实 CPAMP 源码后删，
+      // 2026-09-04 复核仍然成立）：上一版写「CPAMP 面板显示为『未启用』」，
+      // 那是编的。CPAMP 里与 weight 有关的只有凭据编辑表单的提示文字
+      // （i18n `accounts.config_weight_hint`：「仅在加权轮询策略下生效；
+      // 留空使用默认权重 1，0 会将该凭证排除出加权调度」），没有任何列表视图
+      // 按 weight 渲染启用状态。
+      //
+      // CPAMP 那个「已停用」徽标（`ai_providers.config_disabled_badge`，
+      // ProviderDetailDrawer.tsx:229）读的是 `row.enabled`，而它的两个来源
+      // （rowData.ts:114 / :152）分别是「`excluded-models` 含 `*`」与
+      // 「compat 的 `disabled: true`」—— 与 weight 无关。
+      // `dashboard.health_status_disabled` 则只出现在采集器与版本卡片上。
       if (sp.weight === 0) {
         const pc = tr.querySelector('.prio');
         if (pc && !pc.querySelector('.w0')) {

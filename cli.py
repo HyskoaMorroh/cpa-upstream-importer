@@ -32,7 +32,7 @@
         --workers 1 --candidate-workers 1
 
 $MGMT 必须是 CPA 后台的**原始密码**，不是 config.yaml 里那串 $2a$ 哈希 ——
-PUT 端点用 bcrypt.CompareHashAndPassword 校验（handler.go:387），哈希必然 401。
+PUT 端点用 bcrypt.CompareHashAndPassword 校验（handler.go:389），哈希必然 401。
 
 输入格式：每行 `url,key`。url 带不带 /v1 都行，服务按段自动规范化。
 """
@@ -127,6 +127,21 @@ def _print_result(res, plan) -> None:
                     print(f"        {C_WARN}⚠ {w}{C_END}")
                 if sp.models:
                     print(f"        {C_DIM}模型：{', '.join(sp.models)}{C_END}")
+                # 段专属能力开关。三态各自一种措辞 —— 三条途径的字段必须齐平，
+                # 网页端显示而 CLI 静默就是同一份输入两条途径表现不一致。
+                for _lbl, _val, _note in (
+                    ("websockets", sp.websockets, sp.websockets_note),
+                    ("support-prompt-cache-key",
+                     sp.prompt_cache_key, sp.prompt_cache_note),
+                ):
+                    if _val is True:
+                        print(f"        {C_OK}{_lbl}: true{C_END}"
+                              f" {C_DIM}{_note}{C_END}")
+                    elif _val is False:
+                        print(f"        {C_DIM}不开 {_lbl} —— {_note}{C_END}")
+                    elif sp.prior_toggles.get(_lbl):
+                        print(f"        {C_WARN}{_lbl}: true{C_END}"
+                              f" {C_DIM}本次未探测，按原值搬运{C_END}")
                 # 逐模型影响面。抢顶层与挡下层是两件事，都要能看见 ——
                 # 层级隔离下「挡住」意味着那些站整层被跳过。
                 for imp in sp.impacts:
@@ -171,6 +186,10 @@ def main() -> None:
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--no-context", action="store_true",
                     help="关掉 max-context-length 二分探测（省钱）")
+    ap.add_argument("--no-capabilities", action="store_true",
+                    help="关掉段专属能力开关探测（codex 的 websockets、"
+                         "compat 的 support-prompt-cache-key）。每段最多 1 次"
+                         "额外请求；关掉后那两个字段按原值搬运而不是实测")
     ap.add_argument("--swap-samples", type=int, default=3,
                     help="静默换模采样次数。单次测不出来，<2 则跳过")
     ap.add_argument("--by-score", action="store_true",
@@ -265,6 +284,7 @@ def main() -> None:
         gap=args.gap,
         timeout=args.timeout,
         probe_context=not args.no_context,
+        probe_capabilities=not args.no_capabilities,
         swap_samples=args.swap_samples,
         workers=args.workers,
         on_event=on_event,
@@ -417,7 +437,7 @@ def main() -> None:
         print()
         print(f"  {C_WARN}⚠ 没有管理密码，未触发 CPA 重载。{C_END}")
         print(f"  {C_DIM}原因：PUT /v0/management/config.yaml 要用 bcrypt 比对"
-              f"原始密码（handler.go:387）。{C_END}")
+              f"原始密码（handler.go:389）。{C_END}")
         print()
         print("  让它确定生效，选一条：")
         print(f"    {C_OK}A{C_END} 重启容器（最直接，约 8 秒）")
@@ -425,7 +445,8 @@ def main() -> None:
         print(f"    {C_OK}B{C_END} 本命令补上密码重跑（不重启）")
         print("        --mgmt-key '<你在 CPA 后台输的原始密码>'")
         print(f"       {C_DIM}或 export MGMT='<原始密码>' 后重跑{C_END}")
-        print(f"  {C_DIM}CPAMP 面板另有 30 秒前端缓存（constants.ts:13），"
+        print(f"  {C_DIM}CPAMP 面板另有 30 秒前端缓存"
+              f"（CACHE_EXPIRY_MS，apps/web/src/utils/constants.ts:13），"
               f"生效后等 30 秒再硬刷新。{C_END}")
         return
 
@@ -436,7 +457,7 @@ def main() -> None:
         sys.exit("  --mgmt-key 收到的是 config.yaml 里那串 bcrypt 哈希，"
                  "不是原始密码。\n"
                  "  PUT 端点用 bcrypt.CompareHashAndPassword 校验"
-                 "（handler.go:387），哈希当密码传必然 401。\n"
+                 "（handler.go:389），哈希当密码传必然 401。\n"
                  "  请传你在 CPA 后台输的那个原始密码。")
 
     print(f"\n  触发 CPA 重载 {cpa_base}")
@@ -458,7 +479,7 @@ def main() -> None:
         print(f"  {C_DIM}重载成功只说明 CPA 收下了配置。要确认能出活，"
               f"补上 config.yaml 里 api-keys 之一{C_END}")
     else:
-        print(f"\n  端到端验证（打 CPA 自己的业务端点）")
+        print("\n  端到端验证（打 CPA 自己的业务端点）")
         bad = 0
         for plan in plans:
             for sec, sp in plan.sections.items():
