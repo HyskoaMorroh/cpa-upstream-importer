@@ -108,8 +108,103 @@ def mask_key(key: str) -> str:
     return f"{k[:6]}...{k[-4:]}"
 
 
-def _normalize_url(u: str) -> tuple[str, str]:
-    """返回 (bare, error)。"""
+# 默认拒绝的出网目标网段（2026-09-05 加）。
+#
+# 为什么需要（审计发现）
+# -------------------
+# 探测目标 URL 与代理地址都来自请求体，而 `_normalize_url` 原来只校验形态
+# （`^https?://` 或域名样子），不管**去向**。于是已登录的人能把服务端当扫描器：
+#
+#   POST /api/diag {"url": "http://127.0.0.1:8317", "key": "x"}
+#     → 服务端向内网发请求，非 200 时把 400 字节正文摘要放进
+#       rungs[].excerpt 同步返回
+#   POST /api/probe {"opts": {"proxy": "http://10.0.0.5:22"}}
+#     → probe_proxy 的连通性、异常类名（ConnectionRefused / timeout）与毫秒数
+#       经 proxy-precheck 事件回到 /api/job —— 比 HTTP 路径更干净的端口
+#       扫描 oracle
+#
+# 云元数据端点基本打不到：出网路径总在 base 后面追加固定后缀
+# （`/v1/models`、`/v1beta/models`、`/v1/messages`、`/responses`、
+# `/chat/completions`，见 request.py），拼不出 `/latest/meta-data/...`；
+# GCP 所需的 `Metadata-Flavor` 头也不会发。所以这是**内网侦察**而不是
+# 直接偷云凭据 —— 但侦察本身就该挡。
+#
+# 为什么不做 DNS 解析后再判：那会引入 DNS rebinding 的时间窗（解析时是公网 IP、
+# 真正连接时变私网），而正确处理它要接管 socket 的地址解析。这里只挡**字面量**
+# 私网地址，够覆盖「拿它扫内网」这个用法；真要防 rebinding 得在 client.py
+# 那一层做，且代价不小。这一点必须写明，不能让人以为这道闸挡住了全部 SSRF。
+_PRIVATE_NETS = (
+    # IPv4
+    "10.", "127.", "169.254.", "192.168.",
+    "0.",                    # 0.0.0.0/8，本机的另一种写法
+    # 172.16.0.0/12 单独判（172.16-172.31）
+)
+
+_LOOPBACK_NAMES = frozenset({
+    "localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback",
+    # 云元数据的惯用主机名
+    "metadata", "metadata.google.internal", "metadata.goog",
+    "instance-data",
+})
+
+
+def is_private_target(host: str) -> str:
+    """这个主机是不是私网 / 回环 / 链路本地。是则返回原因，否则空串。
+
+    `host` 是 `host_of()` 的产物（可能带端口）。只看**字面量** —— 见
+    `_PRIVATE_NETS` 上方关于 DNS rebinding 的说明。
+    """
+    h = (host or "").strip().lower()
+    if not h:
+        return ""
+    # 去端口。IPv6 字面量形如 `[::1]:8080`
+    if h.startswith("["):
+        end = h.find("]")
+        if end > 0:
+            h = h[1:end]
+    elif h.count(":") == 1:
+        h = h.split(":")[0]
+
+    if h in _LOOPBACK_NAMES:
+        return f"{h} 指向本机或云元数据服务"
+    if h.endswith(".localhost") or h.endswith(".local") \
+            or h.endswith(".internal"):
+        return f"{h} 是本机 / 内网域名后缀"
+
+    # IPv6
+    if ":" in h:
+        if h in ("::1", "::"):
+            return f"{h} 是 IPv6 回环"
+        if h.startswith(("fc", "fd")):          # fc00::/7 唯一本地地址
+            return f"{h} 在 IPv6 唯一本地地址段"
+        if h.startswith("fe8") or h.startswith("fe9") \
+                or h.startswith("fea") or h.startswith("feb"):
+            return f"{h} 在 IPv6 链路本地段"
+        if h.startswith("::ffff:"):             # IPv4 映射
+            return is_private_target(h[len("::ffff:"):])
+        return ""
+
+    for pre in _PRIVATE_NETS:
+        if h.startswith(pre):
+            return f"{h} 在私网段 {pre}x"
+    # 172.16.0.0/12
+    if h.startswith("172."):
+        try:
+            second = int(h.split(".")[1])
+        except (IndexError, ValueError):
+            return ""
+        if 16 <= second <= 31:
+            return f"{h} 在私网段 172.16-31.x"
+    return ""
+
+
+def _normalize_url(u: str, *, allow_private: bool = False) -> tuple[str, str]:
+    """返回 (bare, error)。
+
+    `allow_private=True` 时跳过私网去向检查 —— 本项目自己的假上游套件与
+    端到端脚本都打 `127.0.0.1`，那是合法用法。生产的 HTTP 入口不传这个参数，
+    所以默认拒。见 `is_private_target` 上方的说明（含它挡不住什么）。
+    """
     s = (u or "").strip().strip('"').strip("'")
     if not s:
         return "", "url 为空"
@@ -119,13 +214,22 @@ def _normalize_url(u: str) -> tuple[str, str]:
             s = "https://" + s
         else:
             return "", f"url 形态无法识别：{s[:40]}"
-    if not host_of(s):
+    h = host_of(s)
+    if not h:
         return "", f"取不到主机名：{s[:40]}"
+    if not allow_private:
+        why = is_private_target(h)
+        if why:
+            return "", f"拒绝内网目标：{why}"
     return strip_v1(s), ""
 
 
-def parse_lines(text: str) -> ParseResult:
-    """解析多行 `url,key`。空行与 # 开头行忽略。"""
+def parse_lines(text: str, *, allow_private: bool = False) -> ParseResult:
+    """解析多行 `url,key`。空行与 # 开头行忽略。
+
+    `allow_private` 透传给 `_normalize_url` —— 只有本项目自己的测试与端到端
+    脚本该传 True（它们打本机假上游）。
+    """
     result = ParseResult()
     for i, raw in enumerate((text or "").splitlines(), start=1):
         line = raw.strip()
@@ -138,7 +242,7 @@ def parse_lines(text: str) -> ParseResult:
             continue
         # 首个逗号左侧为 url，右侧全部为 key（key 内不允许逗号）
         url_part, key_part = line.split(",", 1)
-        bare, err = _normalize_url(url_part)
+        bare, err = _normalize_url(url_part, allow_private=allow_private)
         key = key_part.strip().strip('"').strip("'")
         if err:
             row.error = err
