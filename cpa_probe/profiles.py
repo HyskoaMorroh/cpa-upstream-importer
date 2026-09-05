@@ -248,6 +248,41 @@ def _codex_ladder(d: dict) -> list[Profile]:
                          "accept": "application/json",
                          "connection": "Keep-Alive"},
                 why="另查 Version 与传输协商头"),
+        # CPA 真实发出的形态（2026-09-05 加）。
+        #
+        # 前面几档只改 headers，body 一直是探测自己的
+        # `{"model":…,"stream":false,"input":…}`。而 CPA 的 codex Execute：
+        #
+        #   codex_executor_execute.go:57   无条件 stream=true
+        #   :64-66  cfg==nil || DisableImageGeneration==Off 就注入
+        #           [{"type":"image_generation","output_format":"png"}]
+        #           （config_load.go:75 确认 Off 是**默认值**）
+        #   codex_executor_request.go:344  stream 时 Accept: text/event-stream
+        #
+        # 不对齐的两个后果：
+        #   · 站方拒收注入的工具 → 探测判「可用」、写进 config.yaml，而 CPA
+        #     每一次真实请求都失败。classify 有「注入」这一类专门认这个
+        #     （classify.py:95），而它在**不发 tools 的探测形态下永远不可能
+        #     命中** —— 那条规则一直是死代码。
+        #   · 站方只实现 SSE 或校验 stream → 探测拿 400/未知，判死一个可用站
+        #
+        # 为什么单独一档而不是改 baseline：stream=true 的响应是 SSE，
+        # 而整条判定链读 JSON 正文（resp_model / input_tokens /
+        # has_error_envelope / betas.wanted）。改 baseline 等于换一种假阳性。
+        # 这一档只回答「CPA 那样发，这个站收不收」，判定只看状态码与首帧。
+        #
+        # tier=4 排在 codex-full(3) 之后：它是「headers 全给齐**再加** body
+        # 形态」，族内嵌套超集关系成立。
+        Profile("codex-cpa-shape", 4, family="codex",
+                headers={"user-agent": ua_tui,
+                         "originator": _CODEX_ORIGINATOR_DEFAULT,
+                         "version": "0.146.0",
+                         "accept": "text/event-stream",
+                         "connection": "Keep-Alive"},
+                body_patch={"stream": True,
+                            "tools": [{"type": "image_generation",
+                                       "output_format": "png"}]},
+                why="CPA 真实形态：stream=true + 注入 image_generation 工具"),
         Profile("browser-ua", 9, family="browser",
                 headers={"user-agent": _BROWSER_UA}, alt=True,
                 why="站方只认浏览器"),
@@ -445,7 +480,24 @@ def config_advice(section: str, prof: Profile) -> tuple[dict[str, str], list[str
     hdrs = dict(prof.headers)
     notes: list[str] = []
     if prof.body_patch:
-        if section == "claude-api-key":
+        # 按 body_patch 的**内容**分岔，不按段（2026-09-05 修）。
+        #
+        # 原来只按段分：claude 段说「设 fingerprint-profile」，其余段说
+        # 「配置层无法表达」。而 codex 的 `codex-cpa-shape` 档的 body_patch 是
+        # `stream` + `tools` —— 那是**CPA 自己会加**的东西，不是站方要求的门票。
+        # 按段分岔会把它报成「该站要 metadata.user_id，配置层无法表达，
+        # 只能人工接管」，结论正好相反：那一档通过说明**什么都不用做**。
+        patch_keys = set(prof.body_patch)
+        cpa_own = patch_keys <= {"stream", "tools"}
+        if cpa_own:
+            notes.append(
+                "这一档验的是 **CPA 自己会加的东西**（stream=true 与注入的 "
+                "image_generation 工具，见 codex_executor_execute.go:57/64-66）"
+                "—— 它通过说明这个站接受 CPA 的默认形态，"
+                "**不需要往 config.yaml 写任何额外字段**。"
+                "反过来，只有它不通而前面几档通，说明站方拒收注入的工具："
+                "那时要在全局配置里设 `codex.disable-image-generation`。")
+        elif section == "claude-api-key":
             notes.append(
                 "该站还要 metadata.user_id（请求体字段，headers 表达不了）。"
                 "在这个条目上设 `fingerprint-profile: \"claude-code-cli\"`，"
