@@ -48,15 +48,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cpa_probe as cp  # noqa: E402
 from cpa_probe.pipeline import Prober, SEED_MODELS  # noqa: E402
 from cpa_probe.batch import (  # noqa: E402
-    BatchProber, existing_model_context, existing_model_extras,
-    existing_prefixes, existing_provider_names, existing_proxies,
-    existing_weights,
-    extract_existing_entries,
+    BatchProber, CarryTables, extract_existing_entries,
 )
 from cpa_probe.writeback import (  # noqa: E402
+    redact_yaml_secrets,
     apply_diffs,
     build_diffs,
-    push_to_cpa,
     reload_cpa,
     validate,
     verify_upstream,
@@ -98,6 +95,18 @@ class Job:
         # 实际并发度。**决定 ETA 给不给**，见 _ETA_MAX_WORKERS 的说明。
         # 两条路径的默认值差 7.5 倍（普通 4 / 全量重探 30），各自回填。
         self.workers: int = 1
+        # 因事件表上限而省略的条数（累计）。见 emit。
+        self.dropped: int = 0
+
+    # 事件表的条数上限（2026-09-05 加）。长任务每次 attempt 一条 ——
+    # 79 个凭据最坏 2370 次请求，加上画像升级与重试，实测量级在几千条；
+    # 而一次全量重探跑几分钟，浏览器可能整夜挂着不关。
+    #
+    # 超上限时丢**中间**那一段而不是最早的：开头几条是「任务怎么起的」
+    # （参数、候选数、并发数），排障时最有用；末尾是「现在在干什么」。
+    # 中间那些逐个 attempt 的细节可以丢，且丢了要留痕（插一条 truncated）。
+    MAX_EVENTS = 6000
+    KEEP_HEAD = 200
 
     def emit(self, kind: str, data: dict) -> None:
         with self.lock:
@@ -105,6 +114,26 @@ class Job:
                                 "kind": kind, **data})
             if kind == "attempt":
                 self.calls += 1
+            if len(self.events) > self.MAX_EVENTS:
+                drop = len(self.events) - self.MAX_EVENTS
+                head = self.events[:self.KEEP_HEAD]
+                cut = self.events[self.KEEP_HEAD:self.KEEP_HEAD + drop + 1]
+                tail = self.events[self.KEEP_HEAD + drop + 1:]
+                # 省略计数**累加**存在字段上，不能从本轮的 drop 现算 ——
+                # 现算永远显示「省略 2 条」，而实际可能省了几千条，
+                # 那比不显示更糟（读日志的人会以为只丢了 2 条）。
+                #
+                # 只数**真实事件**：被切掉的那一段里可能含上一轮的留痕条
+                # （它就在 KEEP_HEAD 位置上，每轮都会被吃掉再重建）。
+                # 把它也算进去的话计数会翻倍。
+                self.dropped += sum(1 for e in cut if not e.get("_trunc"))
+                self.events = head + [{
+                    "t": head[-1]["t"] if head else 0.0,
+                    "kind": "info",
+                    "_trunc": True,
+                    "msg": f"（省略 {self.dropped} 条中间事件 —— 事件表上限 "
+                           f"{self.MAX_EVENTS} 条。完整记录在服务端 stderr）",
+                }] + tail
 
     def mark_unit_start(self, name: str) -> None:
         """一个工作单元开始。name 必须是**脱敏**的站名，不能带 api_key。"""
@@ -279,35 +308,137 @@ class ApplyTask:
 
 
 class Store:
+    """任务 / 方案 / 写回任务三张表。**都有容量上限与 TTL**。
+
+    为什么必须有（2026-09-05 量化）
+    ---------------------------
+    `/api/plan` 每次调用存两份**整份配置**（`preview` 与 `base_raw`）。
+    生产 config.yaml 约 857KB，即每次约 1.7MB，而 `plan_id` 每次新生成、
+    旧条目原来永不释放。nginx 对 `/` 放行 240r/m（`nginx.conf:727`），
+    即约 400MB/分钟；容器内存上限 512M（`docker-compose.yml:531`）且
+    `restart: "no"` 不自愈 —— 约 90 秒 OOM。
+
+    **非恶意也会撞上**：前端每次勾选变化都防抖 180ms 后调一次 `/api/plan`
+    （`web/app.js:2136-2140`），一轮正常操作就积累几十份。
+
+    淘汰策略按各表的语义分开：
+      · plans   —— 一次性凭据（apply 成功即作废）。最容易涨，上限最小
+      · jobs    —— 探测任务，用户可能回看事件流。跑着的绝不淘汰
+      · applies —— 写回任务，同样跑着的不淘汰
+
+    TTL 从**最后一次访问**算，不是创建时间 —— 用户盯着一个任务看半小时，
+    不该因为「创建于 30 分钟前」被清掉。
+    """
+
+    # 上限按「一条占多少」定：plan 约 1.7MB × 8 ≈ 14MB，够一轮交互
+    MAX_PLANS = 8
+    MAX_JOBS = 32
+    MAX_APPLIES = 32
+    TTL = 2 * 3600          # 2 小时没人碰就清
+
     def __init__(self) -> None:
         self.jobs: dict[str, Job] = {}
         self.plans: dict[str, dict] = {}
         self.applies: dict[str, ApplyTask] = {}
+        # {表名: {id: 最后访问时间}} —— 与数据分开存，避免污染 payload
+        self._touched: dict[str, dict[str, float]] = {
+            "jobs": {}, "plans": {}, "applies": {}}
         self.lock = threading.Lock()
+
+    def _touch(self, table: str, key: str) -> None:
+        """记一次访问。**调用方必须已持锁**。"""
+        self._touched[table][key] = time.time()
+
+    def _evict(self, table: str, data: dict, cap: int,
+               busy=None) -> None:
+        """清过期条目，仍超上限时淘汰最久未访问的。**调用方必须已持锁**。
+
+        `busy(item) -> bool` 返回 True 的条目不淘汰（正在跑的任务）。
+        """
+        now = time.time()
+        seen = self._touched[table]
+        for k in [k for k, t in list(seen.items())
+                  if now - t > self.TTL and not (busy and busy(data.get(k)))]:
+            data.pop(k, None)
+            seen.pop(k, None)
+        # 同步掉已经不在数据表里的时间戳
+        for k in [k for k in seen if k not in data]:
+            seen.pop(k, None)
+        if len(data) <= cap:
+            return
+        # 按「是否在跑, 最后访问」升序 —— 空闲且最久未碰的先走
+        order = sorted(data.keys(),
+                       key=lambda k: (bool(busy and busy(data.get(k))),
+                                      seen.get(k, 0.0)))
+        for k in order[:len(data) - cap]:
+            if busy and busy(data.get(k)):
+                break              # 剩下的全在跑，宁可超上限也不动它们
+            data.pop(k, None)
+            seen.pop(k, None)
+
+    @staticmethod
+    def _job_busy(job) -> bool:
+        return bool(job is not None and getattr(job, "state", "") == "running")
+
+    @staticmethod
+    def _apply_busy(task) -> bool:
+        return bool(task is not None
+                    and getattr(task, "state", "") == "running")
 
     def add_job(self, job: Job) -> None:
         with self.lock:
+            self._evict("jobs", self.jobs, self.MAX_JOBS, self._job_busy)
             self.jobs[job.id] = job
+            self._touch("jobs", job.id)
 
     def get_job(self, jid: str) -> Job | None:
         with self.lock:
-            return self.jobs.get(jid)
+            got = self.jobs.get(jid)
+            if got is not None:
+                self._touch("jobs", jid)
+            return got
 
     def add_plan(self, pid: str, payload: dict) -> None:
         with self.lock:
+            self._evict("plans", self.plans, self.MAX_PLANS)
             self.plans[pid] = payload
+            self._touch("plans", pid)
 
     def get_plan(self, pid: str) -> dict | None:
         with self.lock:
-            return self.plans.get(pid)
+            got = self.plans.get(pid)
+            if got is not None:
+                self._touch("plans", pid)
+            return got
+
+    def drop_plan(self, pid: str) -> None:
+        """写回成功后主动释放。那份 plan 已被基线比对作废，留着只占内存。
+
+        每份 plan 持有两份整份配置（约 1.7MB），是这三张表里最重的。
+        """
+        with self.lock:
+            self.plans.pop(pid, None)
+            self._touched["plans"].pop(pid, None)
 
     def add_apply(self, task: "ApplyTask") -> None:
         with self.lock:
+            self._evict("applies", self.applies, self.MAX_APPLIES,
+                        self._apply_busy)
             self.applies[task.id] = task
+            self._touch("applies", task.id)
 
     def get_apply(self, tid: str) -> "ApplyTask | None":
         with self.lock:
-            return self.applies.get(tid)
+            got = self.applies.get(tid)
+            if got is not None:
+                self._touch("applies", tid)
+            return got
+
+    def sizes(self) -> dict[str, int]:
+        """三张表的条数。给 /api/context 用，便于运维看有没有堆积。"""
+        with self.lock:
+            return {"jobs": len(self.jobs), "plans": len(self.plans),
+                    "applies": len(self.applies)}
 
 
 STORE = Store()
@@ -355,6 +486,13 @@ def verdict_json(v) -> dict:
         "max_context_length": v.max_context_length,
         "context_untrusted": v.context_untrusted,
         "context_model": v.context_model,
+        # 段专属能力开关的实测结论（三态 + 说明）。界面「请求指纹」那一列
+        # 旁边显示它 —— 「支持 WebSocket」是可用性信息，「实测不支持」是
+        # 结论，「未探测」是缺口，三者不能长一个样。
+        "websockets": v.websockets,
+        "websockets_note": v.websockets_note,
+        "prompt_cache_key": v.prompt_cache_key,
+        "prompt_cache_note": v.prompt_cache_note,
         "category": v.category,
         "action": v.action,
         "summary": v.summary(),
@@ -412,6 +550,15 @@ def plan_json(p) -> dict:
                 "headers": sp.headers,
                 "max_context_length": sp.max_context_length,
                 "context_model": sp.context_model,
+                # 段专属能力开关的三态结论。界面要能区分「实测不支持」与
+                # 「未探测」—— 两者写回时都不写那个字段，但一个是结论、
+                # 一个是缺口，显示成一个样子就是「未验证当已验证」的镜像。
+                "websockets": sp.websockets,
+                "websockets_note": sp.websockets_note,
+                "prompt_cache_key": sp.prompt_cache_key,
+                "prompt_cache_note": sp.prompt_cache_note,
+                # 原条目里这两个开关的值 —— 界面要显示「本次未探测，沿用原值」。
+                "prior_toggles": sp.prior_toggles,
                 "score": sp.score,
                 "duplicate": sp.duplicate,
                 "duplicate_note": sp.duplicate_note,
@@ -461,8 +608,22 @@ def _resolve_proxy(requested: str) -> str | None:
     if not requested:
         return None
     from cpa_probe.client import probe_proxy
-    # 显式给了别的地址就只试那个，不擅自改成别的
+    from cpa_probe.parse import host_of, is_private_target
+    # 显式给了别的地址就只试那个，不擅自改成别的 —— 但要挡内网去向。
+    #
+    # 为什么这里也要挡（2026-09-05，与探测目标同一批）：`probe_proxy` 做的是
+    # **裸 TCP 连接**，然后把连通性、异常类名（ConnectionRefused / timeout）
+    # 与毫秒数经 `proxy-precheck` 事件回到 `/api/job`。那是比 HTTP 路径更干净
+    # 的端口扫描 oracle —— `{"opts":{"proxy":"http://10.0.0.5:22"}}` 就能问
+    # 「那台机器的 22 端口开着吗」。
+    #
+    # 两个白名单地址是例外：`mihomo:7890` 是 compose 里的服务名，
+    # `127.0.0.1:7890` 是宿主机上的映射端口 —— 那正是本工具**要用**的代理，
+    # 由服务端自己写死，不来自请求体。
     if requested not in ("http://mihomo:7890", "auto"):
+        why = is_private_target(host_of(requested) or requested)
+        if why:
+            return None
         return requested
     for cand in ("http://mihomo:7890", "http://127.0.0.1:7890"):
         ok, _detail = probe_proxy(cand, timeout=3)
@@ -471,18 +632,156 @@ def _resolve_proxy(requested: str) -> str | None:
     return None
 
 
+# 请求体里的数值参数各自的合法区间（2026-09-05 加）。
+#
+# 为什么必须钳（审计发现，实测成立）
+# ------------------------------
+# 这些值原来只做类型转换、不做区间检查，而它们直接决定线程数与等待时长：
+#
+#   {"full_redetect": true, "max_workers": 50000}
+#     → BatchProber 开 5 万个站级线程，每个内部再开最多 4 个段线程
+#   {"timeout": 9999999, "gap": 1e9}
+#     → 线程被钉住；nginx 600 秒断连后 Python 侧仍在跑，重复几次即线程耗尽
+#
+# 而后果不止本机资源：把大量出网请求打向 121 个第三方站，可能触发站方的
+# 批量探测防护 —— 代价落在真实凭据上（封号），那比服务挂掉更贵。
+#
+# 上界取普通用法的 2-4 倍：留足手工调优空间，又把最坏情形压成常数。
+# max_workers 的 128 对应「cgroup 推荐值（4 核算出 48）的 2.6 倍」，
+# 而 resources.detect 自己的 cap 是 64。
+_LIMITS: dict[str, tuple[float, float]] = {
+    "max_workers": (1, 128),
+    "workers": (1, 16),            # 段级并行，四段最多 4，给 16 的余量
+    "timeout": (1, 300),           # 秒。单次请求，nginx 侧 600 秒断连
+    "gap": (0.0, 60.0),            # 节流间隔
+    "swap_samples": (0, 10),       # 换模采样次数
+    "max_models": (1, 20),         # 每段验几个模型
+    "max_model_attempts": (1, 40),
+}
+
+# 一次能提交多少行凭据。8MB 请求体全是 `url,key` 约 20 万行 —— 那些行会各自
+# 展开成 4 段探测，最坏 80 万次出网请求。500 行覆盖「一次导入一整批新站」
+# 的真实用法（生产配置总共 121 个条目）。
+MAX_INPUT_LINES = 500
+
+
+def _clamp(opts: dict, name: str, default):
+    """取一个数值参数并钳进合法区间。类型错或缺失时用 default。
+
+    返回类型跟 default 走（int 默认给 int，float 默认给 float）——
+    `Prober(gap=...)` 与 `workers=...` 对类型敏感。
+
+    静默钳制而不是报 400：这些参数多半来自前端的滑块与输入框，用户手打一个
+    大数字时更希望「按上限跑」而不是「整个请求失败」。真正的攻击者也一样被
+    压到上限，目的达到了。钳过就在事件流里说一句，不静默。
+    """
+    lo, hi = _LIMITS[name]
+    raw = opts.get(name, default)
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if val != val:                      # NaN
+        return default
+    val = max(lo, min(hi, val))
+    return int(val) if isinstance(default, int) else val
+
+
+def _clamped_note(opts: dict) -> list[str]:
+    """哪些参数被钳过了。给事件流用 —— 静默改用户给的值不好。"""
+    out = []
+    for name, (lo, hi) in _LIMITS.items():
+        if name not in opts:
+            continue
+        try:
+            val = float(opts[name])
+        except (TypeError, ValueError):
+            out.append(f"{name}={opts[name]!r} 不是数字，用默认值")
+            continue
+        if val != val or val < lo or val > hi:
+            out.append(f"{name}={opts[name]} 超出 [{lo:g}, {hi:g}]，已钳制")
+    return out
+
+
+def _error_ref(where: str) -> str:
+    """记一次异常：完整 traceback 只进 stderr，返回一个短 id 供对外引用。
+
+    为什么不把 traceback 回给客户端（2026-09-05 改）
+    ------------------------------------------
+    原来 500 响应体里直接带 `traceback.format_exc(limit=4)`，而 `job.error`
+    也是它 —— 后者会进 `/api/job` 事件流**与 `/api/export` 的 txt**，
+    而那个 txt 的设计用途就是「贴给别人看」（见 `_api_export` 的 docstring）。
+
+    `format_exc` 不含局部变量，所以不会直接吐出密钥值。泄露的是容器内文件
+    布局、模块结构与代码行号 —— 那降低后续利用的成本。任何畸形入参都能拿到
+    一段（如 `{"overrides":{"1":{"claude-api-key":{"priority":"abc"}}}}`
+    → `int("abc")`）。
+
+    换成 id 之后排障链路没变短：运维 `docker compose logs | grep <id>` 就能
+    定位到完整栈，而客户端只看到「服务内部错误（err-3f2a1b）」。
+    """
+    ref = secrets.token_hex(3)
+    sys.stderr.write(
+        f"[{time.strftime('%H:%M:%S')}] ERROR err-{ref} at {where}\n"
+        + traceback.format_exc() + "\n")
+    sys.stderr.flush()
+    return f"err-{ref}"
+
+
+def _cap_lines(text: str) -> tuple[str, str]:
+    """把输入截到 MAX_INPUT_LINES 行。返回 (截断后的文本, 提示或空串)。
+
+    为什么需要（2026-09-05 加）：`_body` 只挡 8MB，而 8MB 全是 `url,key`
+    约 20 万行 —— 那些行各自展开成 4 段探测，最坏 80 万次出网请求打向
+    第三方站。真实用法一次几十行，生产配置总共 121 个条目。
+
+    截断而不是报 400：粘贴多了更希望「先处理前 500 行」而不是整个请求失败。
+    但必须**说出来** —— 静默丢掉用户的输入行是最坏的处理方式。
+    """
+    lines = (text or "").splitlines()
+    if len(lines) <= MAX_INPUT_LINES:
+        return text, ""
+    kept = "\n".join(lines[:MAX_INPUT_LINES])
+    return kept, (f"输入 {len(lines)} 行，超过单次上限 {MAX_INPUT_LINES} 行，"
+                  f"只处理前 {MAX_INPUT_LINES} 行；其余请分批提交")
+
+
+def _emit_opt_notices(job: Job) -> None:
+    """把「参数被钳了」与「输入被截断了」写进事件流。两条探测路径都要调。
+
+    抽成函数而不是内联在两个 try 块里（2026-09-05）：内联时测试只能断言
+    「源码里有没有这几行」，而那挡不住把条件改成 `if False:` —— 行还在、
+    字符串还在，断言照样过。撤销实验证实过这一点。
+
+    静默改用户给的值是最坏的处理方式：他填 50000 并发、我按 128 跑，
+    而界面上什么都不说，那他下次还会填 50000。
+    """
+    for note in _clamped_note(job.opts):
+        job.emit("info", {"msg": "参数越界：" + note})
+    trunc = job.opts.get("_truncated")
+    if trunc:
+        job.emit("info", {"msg": str(trunc)})
+
+
 def run_job(job: Job, cfg_path: str) -> None:
     job.state = "running"
     try:
+        _emit_opt_notices(job)
         prober = Prober(
             proxy=_resolve_proxy(str(job.opts.get("proxy") or "")),
-            gap=float(job.opts.get("gap", 3.0)),
-            timeout=int(job.opts.get("timeout", 120)),
+            gap=_clamp(job.opts, "gap", 3.0),
+            timeout=_clamp(job.opts, "timeout", 120),
             probe_context=bool(job.opts.get("probe_context", True)),
-            swap_samples=int(job.opts.get("swap_samples", 3)),
-            workers=int(job.opts.get("workers", 4)),
-            max_models=int(job.opts.get("max_models", 4)),
-            max_model_attempts=int(job.opts.get("max_model_attempts", 10)),
+            # 能力开关探测（codex 的 websockets、compat 的
+            # support-prompt-cache-key）。默认开 —— 每段最多 1 次额外请求，
+            # 而这两个开关配错的后果不对称：websockets 开错会让那个凭据的
+            # WS 请求全废（CPA 不回落 HTTP）。
+            probe_capabilities=bool(
+                job.opts.get("probe_capabilities", True)),
+            swap_samples=_clamp(job.opts, "swap_samples", 3),
+            workers=_clamp(job.opts, "workers", 4),
+            max_models=_clamp(job.opts, "max_models", 4),
+            max_model_attempts=_clamp(job.opts, "max_model_attempts", 10),
             reuse_profile_verdict=bool(
                 job.opts.get("reuse_profile_verdict", True)),
             on_event=job.emit,
@@ -533,7 +832,7 @@ def run_job(job: Job, cfg_path: str) -> None:
         job.state = "done"
     except Exception:
         job.state = "error"
-        job.error = traceback.format_exc(limit=4)
+        job.error = _error_ref(f"job {job.id}")
     finally:
         job.finished = time.time()
 
@@ -635,12 +934,21 @@ def _clean_override_models(section: str, raw_models: list) -> list[str]:
     return kept or got
 
 
-def _market_top_gen(cfg: dict) -> dict:
-    """各段「当前市面最新」的最高世代，如 {"codex-api-key": [5, 6]}。
+def _market_top_gen(cfg: dict) -> tuple[dict, dict]:
+    """各段「当前市面最新」的最高世代。返回 (全局, 逐产品线)。
+
+    全局形如 `{"codex-api-key": [5, 6]}`，逐产品线形如
+    `{"codex-api-key": {"gpt": [5, 6], "o": [4, 0]}}`。
 
     前端拿它判断「站方目录是不是整体落后」—— 落后一个世代以上时不预勾
     （2026-09-02 现场：某站 codex 目录只有 gpt-4 系而市面已到 5.6，
     「取最高世代」把四个老款全留下还默认全勾）。
+
+    为什么必须给逐产品线的那一份（2026-09-04）：o 系列（`o1` / `o3-mini`）与
+    gpt 系列是**互不相干的编号体系**，`o3` 的 3 不代表它比 `gpt-5.6` 老一代。
+    只给全局最高世代时，「目录里只有 o 系列」的站会被判成落后从而一个都不预勾。
+    后端 `catalog_is_stale` 已改成逐产品线比，前端必须用同一套数据，否则
+    界面预勾与落盘清单再次分叉。
 
     后端在 build_plan 里判同一件事（catalog_is_stale），但结果表在勾选**之前**
     就渲染了，那时还没有 /api/plan 的响应 —— 所以两边都要能判。
@@ -649,6 +957,7 @@ def _market_top_gen(cfg: dict) -> dict:
     /api/context；拉不到时返回空 dict，前端退化成「不判落后、照常预勾」。
     """
     out: dict[str, list[int]] = {}
+    by_line: dict[str, dict[str, list[int]]] = {}
     try:
         remote, _why = cp.model_catalog.remote_names()
         for sec in cp.SECTIONS:
@@ -657,11 +966,14 @@ def _market_top_gen(cfg: dict) -> dict:
             top = cp.model_catalog.top_generation(names)
             if top:
                 out[sec] = [top[0], top[1]]
+            per = cp.model_catalog.top_generation_per_line(names)
+            if per:
+                by_line[sec] = {ln: [g[0], g[1]] for ln, g in per.items()}
     except Exception:                                    # noqa: BLE001
         # 这只是个增强信号，绝不能让它影响 /api/context 的可用性 ——
         # 与漂移检测同一条原则（那次它把首屏卡成了白屏）。
-        return {}
-    return out
+        return {}, {}
+    return out, by_line
 
 
 def _cpa_runtime_commit(base: str) -> str:
@@ -702,6 +1014,8 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
     """
     job.state = "running"
     try:
+        _emit_opt_notices(job)
+
         # 加载 config
         with open(cfg_path, "r", encoding="utf-8") as f:
             raw = f.read()
@@ -765,20 +1079,26 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
         # 创建 Prober
         prober = Prober(
             proxy=_resolve_proxy(str(job.opts.get("proxy") or "")),
-            gap=float(job.opts.get("gap", 3.0)),
-            timeout=int(job.opts.get("timeout", 120)),
+            gap=_clamp(job.opts, "gap", 3.0),
+            timeout=_clamp(job.opts, "timeout", 120),
             probe_context=bool(job.opts.get("probe_context", True)),
-            swap_samples=int(job.opts.get("swap_samples", 3)),
-            workers=int(job.opts.get("workers", 4)),
-            max_models=int(job.opts.get("max_models", 4)),
-            max_model_attempts=int(job.opts.get("max_model_attempts", 10)),
+            # 能力开关探测（codex 的 websockets、compat 的
+            # support-prompt-cache-key）。默认开 —— 每段最多 1 次额外请求，
+            # 而这两个开关配错的后果不对称：websockets 开错会让那个凭据的
+            # WS 请求全废（CPA 不回落 HTTP）。
+            probe_capabilities=bool(
+                job.opts.get("probe_capabilities", True)),
+            swap_samples=_clamp(job.opts, "swap_samples", 3),
+            workers=_clamp(job.opts, "workers", 4),
+            max_models=_clamp(job.opts, "max_models", 4),
+            max_model_attempts=_clamp(job.opts, "max_model_attempts", 10),
             reuse_profile_verdict=bool(
                 job.opts.get("reuse_profile_verdict", True)),
             on_event=job.emit,
         )
 
         # 使用 BatchProber（站级并发）
-        max_workers = int(job.opts.get("max_workers", 30))
+        max_workers = _clamp(job.opts, "max_workers", 30)
         batch_prober = BatchProber(prober, max_workers=max_workers)
         with job.lock:
             job.workers = max(1, min(len(all_rows), max_workers))
@@ -849,7 +1169,7 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
         job.state = "done"
     except Exception:
         job.state = "error"
-        job.error = traceback.format_exc(limit=4)
+        job.error = _error_ref(f"job {job.id}")
         job.emit("error", {"msg": job.error})
     finally:
         job.finished = time.time()
@@ -907,8 +1227,21 @@ class Handler(BaseHTTPRequestHandler):
     # 投喂台的凭据等价于 CPA 写权限，不能给在线暴破留缺口。
     MAX_FAILURES = 5
     BAN_SECONDS = 30 * 60
+    # 表的容量上限（2026-09-05 加）。键是**攻击者可控**的来源 IP，没有上限时
+    # 一个 IPv6 段就能塞爆内存 —— 而这条路径是未认证可达的。
+    # 满了先淘汰已过期的，再淘汰最早的；上限取 4096（正常用不到 10 个）。
+    MAX_FAIL_ENTRIES = 4096
+    # 未封锁但有失败计数的条目，多久之后忘掉。不忘的话「一天里零散失败 5 次」
+    # 也会触发封锁，那不是暴破。
+    FAIL_TTL = 30 * 60
     _failures: dict[str, dict] = {}
     _fail_lock = threading.Lock()
+
+    # 直连对端是这些地址时，才信任 X-Forwarded-For / X-Real-IP。
+    # 服务只在 127.0.0.1:8765 监听、由 nginx 反代，所以可信代理就是回环。
+    # 绑到 0.0.0.0 直接暴露时对端是真实客户端，那时**不能**信这两个头 ——
+    # 否则任何人都能伪造来源 IP 绕过封锁。
+    _LOOPBACK = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"})
 
     # ---- 基础设施 ----
 
@@ -991,7 +1324,49 @@ class Handler(BaseHTTPRequestHandler):
             return False
 
     def _client_ip(self) -> str:
-        return (self.client_address or ("?",))[0]
+        """真实来源 IP。经 nginx 时读 X-Forwarded-For 的**最右一跳**。
+
+        为什么必须读（2026-09-05 修，未认证可打的 DoS）
+        ------------------------------------------
+        服务只在 `127.0.0.1:8765` 监听，所有请求经 nginx `proxy_pass`
+        （`nginx.conf:715/721/728`），于是 `client_address` 对**每一个**访客
+        都是 `127.0.0.1`。失败封锁按它索引，结果整张表只有一个桶：
+
+            任何人对任意路径连发 5 次带假 Bearer 的请求
+              → `_failures["127.0.0.1"]` 触发 until
+              → 之后 30 分钟运维本人也进不来（`_authed` 在比对密钥**之前**
+                就查封锁），而容器 `restart: "no"` 不会自愈
+
+        每 30 分钟重打 5 次即永久封锁，且不需要任何凭据。
+        同时它宣称的暴破防护对真实攻击者完全无效 —— 换 IP 与不换等价。
+
+        为什么取**最右**一跳
+        -----------------
+        nginx 用的是 `$proxy_add_x_forwarded_for`（`nginx.conf:700`），
+        语义是「把 `$remote_addr` 追加到客户端已有的 XFF 后面」。所以链条是
+
+            <客户端可伪造的任意内容>, <nginx 看到的真实对端>
+             └─ 不可信 ─┘              └─ 可信，最右 ─┘
+
+        取最左（常见写法）等于让客户端自己声明 IP —— 那比不读还糟：
+        攻击者每次换一个伪造 IP 就绕过了封锁，而运维的真实 IP 反而会被封。
+
+        为什么要先判对端是回环
+        -------------------
+        只有「请求确实来自我们自己的 nginx」时这个头才可信。绑到 0.0.0.0
+        直接暴露（README 明确不建议，但会有人这么做）时对端就是客户端本身，
+        那时任何人都能自带 XFF 伪造来源。
+        """
+        peer = (self.client_address or ("?",))[0]
+        if peer not in self._LOOPBACK:
+            return peer                       # 直连：对端就是真实来源
+        xff = self.headers.get("X-Forwarded-For", "")
+        if xff:
+            hops = [h.strip() for h in xff.split(",") if h.strip()]
+            if hops:
+                return hops[-1]               # nginx 追加的那一跳
+        real = (self.headers.get("X-Real-IP") or "").strip()
+        return real or peer
 
     @classmethod
     def _locked_out(cls, ip: str) -> float:
@@ -1009,22 +1384,78 @@ class Handler(BaseHTTPRequestHandler):
                 # 尚未封锁。这里**绝不能**碰 count —— _authed 每次都调本方法，
                 # 顺手清零会让失败计数永远回到 0，封锁永不触发（实测踩过）。
                 return 0.0
-            left = until - time.time()
+            now = time.time()
+            left = until - now
             if left <= 0:
-                # 封锁期已过：解封并重新计数
+                # 封锁期已过：解封并重新计数。`last` 也要更新 ——
+                # 不更新的话这个条目立刻满足 FAIL_TTL 而被 _prune 忘掉，
+                # 那本身没问题，但解封瞬间的时间戳更准。
                 info["until"] = 0.0
                 info["count"] = 0
+                info["first"] = now
+                info["last"] = now
                 return 0.0
             return left
 
     @classmethod
+    def _prune_failures(cls, now: float) -> None:
+        """清掉过期条目；仍然超上限时淘汰最早的。**调用方必须已持锁**。
+
+        为什么需要（2026-09-05，与真实 IP 提取同一批改动）
+        --------------------------------------------
+        修好 `_client_ip` 之后这张表的键从「恒为 127.0.0.1」变成**攻击者
+        可控的来源 IP**。没有上限时一个 IPv6 /64 段就能塞进天文数字的条目，
+        而这条路径是**未认证可达**的（`_authed` 在校验密钥之前就记失败）。
+        那等于把一个 DoS 换成另一个。
+
+        两条淘汰规则：
+          · 已解封、且最后一次失败早于 FAIL_TTL 的 —— 直接忘掉。不忘的话
+            「一天里零散失败 5 次」也会触发封锁，那不是暴破。
+          · 仍然超 MAX_FAIL_ENTRIES 时按 last 最早的淘汰。**正在封锁中的
+            条目排在最后**才淘汰 —— 否则攻击者可以用大量新 IP 把自己的
+            封锁记录挤掉。
+        """
+        f = cls._failures
+        if len(f) <= cls.MAX_FAIL_ENTRIES:
+            # 未超上限也顺手清过期的，避免长期驻留
+            dead = [k for k, v in f.items()
+                    if not v.get("until") and now - v.get("last", 0) > cls.FAIL_TTL]
+            for k in dead:
+                f.pop(k, None)
+            return
+        dead = [k for k, v in f.items()
+                if not v.get("until") and now - v.get("last", 0) > cls.FAIL_TTL]
+        for k in dead:
+            f.pop(k, None)
+        if len(f) <= cls.MAX_FAIL_ENTRIES:
+            return
+        # 还是超：按 (是否在封锁中, last) 排序，先淘汰未封锁且最早的
+        victims = sorted(f.items(),
+                         key=lambda kv: (bool(kv[1].get("until")),
+                                         kv[1].get("last", 0.0)))
+        for k, _v in victims[:len(f) - cls.MAX_FAIL_ENTRIES]:
+            f.pop(k, None)
+
+    @classmethod
     def _note_failure(cls, ip: str) -> None:
+        now = time.time()
         with cls._fail_lock:
-            info = cls._failures.setdefault(ip, {"count": 0, "until": 0.0})
+            info = cls._failures.get(ip)
+            if info is None:
+                cls._prune_failures(now)      # 只在**新增**键时才需要腾位置
+                info = cls._failures.setdefault(
+                    ip, {"count": 0, "until": 0.0, "last": now})
+            info["last"] = now
+            # 距上次失败超过 TTL 的，计数重新开始 —— 零散失败不该累积成封锁
+            if now - info.get("first", now) > cls.FAIL_TTL:
+                info["count"] = 0
+                info["first"] = now
+            info.setdefault("first", now)
             info["count"] += 1
             if info["count"] >= cls.MAX_FAILURES:
-                info["until"] = time.time() + cls.BAN_SECONDS
+                info["until"] = now + cls.BAN_SECONDS
                 info["count"] = 0
+                info["first"] = now
 
     @classmethod
     def _note_success(cls, ip: str) -> None:
@@ -1119,6 +1550,25 @@ class Handler(BaseHTTPRequestHandler):
     # ---- 路由 ----
 
     def do_GET(self) -> None:  # noqa: N802
+        """GET 路由。**整体包在 try 里** —— 与 do_POST 对称。
+
+        为什么必须包（2026-09-05 修）：`since` 那一步的
+        `int(parse_qs(...)["since"])` 原来在 try 之外，于是
+        `GET /api/job/<jid>?since=x` 让 ValueError 冒到 socketserver 的
+        `handle_error` —— 客户端拿到的是**连接重置**而不是 400。
+
+        前端会把连接重置计入「轮询失败」并重试（`web/app.js` 的轮询容错），
+        于是一个打错的参数变成无限重试；而 stderr 里堆的是无归属的 traceback。
+        """
+        try:
+            self._do_get()
+        except Exception:
+            ref = _error_ref(f"GET {self.path.split('?')[0]}")
+            self._json(500, {"error": f"服务内部错误（{ref}）",
+                             "error_ref": ref,
+                             "hint": "完整堆栈在服务端日志，按这个 id 检索"})
+
+    def _do_get(self) -> None:
         p = urllib.parse.urlparse(self.path)
         route = p.path.rstrip("/") or "/"
 
@@ -1143,7 +1593,16 @@ class Handler(BaseHTTPRequestHandler):
             self._api_export(route[len("/api/export/"):])
         elif route.startswith("/api/job/"):
             jid = route[len("/api/job/"):]
-            since = int((urllib.parse.parse_qs(p.query).get("since") or ["0"])[0])
+            raw_since = (urllib.parse.parse_qs(p.query).get("since")
+                         or ["0"])[0]
+            try:
+                since = max(0, int(raw_since))
+            except (TypeError, ValueError):
+                # 400 而不是 500：这是调用方的参数问题，不是服务的故障。
+                # 前端的轮询容错会把 5xx 当「服务挂了」而无限重试。
+                self._json(400, {"error": f"since 必须是非负整数，"
+                                          f"收到 {raw_since[:40]!r}"})
+                return
             self._api_job(jid, since)
         else:
             self._json(404, {"error": f"未知路由 {route}"})
@@ -1173,8 +1632,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(404, {"error": f"未知路由 {route}"})
         except Exception:
-            self._json(500, {"error": "服务内部错误",
-                             "trace": traceback.format_exc(limit=4)})
+            # 完整 traceback 只进 stderr；响应只带引用 id。
+            # 见 _error_ref —— 那段栈会泄露容器内文件布局与行号。
+            ref = _error_ref(f"POST {route}")
+            self._json(500, {"error": f"服务内部错误（{ref}）",
+                             "error_ref": ref,
+                             "hint": "完整堆栈在服务端日志，按这个 id 检索"})
 
     # ---- 端点实现 ----
 
@@ -1285,6 +1748,9 @@ class Handler(BaseHTTPRequestHandler):
         existing_entries = cp.extract_existing_entries(cfg)
         existing_count = len(existing_entries)
 
+        # 「市面最新世代」的两份：全局与逐产品线。见 _market_top_gen。
+        mkt_top, mkt_top_lines = _market_top_gen(cfg)
+
         # 运行环境与推荐并发数。前端要显示「为什么是这个数」，所以连
         # 依据（cpus/memory/来源/reason）一起给，不只给一个数字。
         # 容器里 os.cpu_count() 是宿主机核数，必须读 cgroup —— 见 resources 模块。
@@ -1331,15 +1797,27 @@ class Handler(BaseHTTPRequestHandler):
             #
             # 走 model_catalog 自己的缓存（成功 6 小时 / 失败 10 分钟），
             # 所以不会因为它拖慢 /api/context。
-            "market_top_gen": _market_top_gen(cfg),
+            "market_top_gen": mkt_top,
+            # 同一批数据的**逐产品线**版本。判「落后」必须按线比 ——
+            # o 系列与 gpt 系列的编号互不相干（`o3` 不比 `gpt-5.6` 老一代）。
+            # 见 _market_top_gen 与 catalog_is_stale。
+            "market_top_gen_lines": mkt_top_lines,
+            # 三张内存表的条数。有上限与 TTL（见 Store 的 docstring），
+            # 这里露出来是为了让运维看得见有没有堆积 —— 那三张表里
+            # plans 每份持有两份整份配置，是 OOM 的主要来源。
+            "store": STORE.sizes(),
         })
 
     def _api_parse(self, body: dict) -> None:
-        res = cp.parse_lines(body.get("text") or "")
-        self._json(200, {
+        text, over = _cap_lines(body.get("text") or "")
+        res = cp.parse_lines(text)
+        out = {
             "valid": [row_json(r) for r in res.valid],
             "invalid": [row_json(r) for r in res.invalid],
-        })
+        }
+        if over:
+            out["truncated"] = over
+        self._json(200, out)
 
     def _api_diag(self, body: dict) -> None:
         """单站诊断：只跑画像梯，回答「这个站要什么头」。
@@ -1367,9 +1845,12 @@ class Handler(BaseHTTPRequestHandler):
         raw, cfg = self._load_cfg()
         prober = Prober(
             proxy=_resolve_proxy(str(body.get("proxy") or "")),
-            gap=float(body.get("gap", 0.5)),
-            timeout=int(body.get("timeout", 60)),
+            gap=_clamp(body, "gap", 0.5),
+            timeout=_clamp(body, "timeout", 60),
             probe_context=False,       # 诊断不探上下文 —— 那是百万字符的大 body
+            # 诊断也不探能力开关：它只回答「这个站要什么 header」，
+            # 不生成写回方案，那两个开关没有落点。
+            probe_capabilities=False,
             swap_samples=0,            # 也不采样换模，那要 3 次额外请求
             workers=len(secs),
             cfg_snapshot=cfg,
@@ -1439,10 +1920,12 @@ class Handler(BaseHTTPRequestHandler):
             # 模型」是必须让人看见的结论。
             fp = Prober(
                 proxy=_resolve_proxy(str(body.get("proxy") or "")),
-                gap=float(body.get("gap", 0.5)),
-                timeout=int(body.get("timeout", 60)),
+                gap=_clamp(body, "gap", 0.5),
+                timeout=_clamp(body, "timeout", 60),
                 probe_context=bool(body.get("probe_context", False)),
-                swap_samples=int(body.get("swap_samples", 3)),
+                probe_capabilities=bool(
+                    body.get("probe_capabilities", True)),
+                swap_samples=_clamp(body, "swap_samples", 3),
                 workers=len(secs),
                 cfg_snapshot=cfg,
             )
@@ -1474,7 +1957,8 @@ class Handler(BaseHTTPRequestHandler):
         full_redetect = body.get("full_redetect", False)
         max_workers = body.get("max_workers")
 
-        res = cp.parse_lines(body.get("text") or "")
+        text, over = _cap_lines(body.get("text") or "")
+        res = cp.parse_lines(text)
         if not res.valid and not full_redetect:
             self._json(400, {"error": "没有可用行",
                              "invalid": [row_json(r) for r in res.invalid]})
@@ -1487,6 +1971,8 @@ class Handler(BaseHTTPRequestHandler):
         # 从不执行。表现是「等了 5 分钟重探，最后只追加了新站」，而且不报错：
         # diffs 为空、lines_before == lines_after，看起来像「没什么要改的」。
         opts["full_redetect"] = full_redetect
+        if over:
+            opts["_truncated"] = over
         if full_redetect and max_workers is not None:
             opts["max_workers"] = max_workers
 
@@ -1586,6 +2072,19 @@ class Handler(BaseHTTPRequestHandler):
                       f"{'，截断反推不可信' if v.context_untrusted else ''}）")
                 if v.swap:
                     w(f"    静默换模        {v.swap}")
+                # 段专属能力开关。三态各自一种写法 —— 导出日志是交接材料，
+                # 「实测不支持」与「未探测」必须能区分开。
+                for _lbl, _val, _note in (
+                    ("websockets", v.websockets, v.websockets_note),
+                    ("support-prompt-cache-key",
+                     v.prompt_cache_key, v.prompt_cache_note),
+                ):
+                    if _val is None and not _note:
+                        continue
+                    _state = ("支持" if _val is True
+                              else ("不支持" if _val is False else "未探测"))
+                    w(f"    {_lbl:<15} {_state}"
+                      + (f" —— {_note}" if _note else ""))
                 for a in v.attempts:
                     w(f"      · {a.status:>3} {a.model:<28} {a.combo:<18}"
                       f" {a.elapsed_ms:>6}ms"
@@ -1659,35 +2158,18 @@ class Handler(BaseHTTPRequestHandler):
             bands: dict = {}
             seen = cp.existing_fingerprints(cfg)
             all_plans = {}  # {(base_url, api_key): ImportPlan}
-            # 既有条目的 weight，按 (段, host, api_key) 查。`weight: 0` 是
-            # 「把这个站逐出调度池」的唯一表达，而 CPA 缺这个字段时默认 1 ——
-            # 不搬运它等于让手工封禁的站全部复活。
+            # 八张「探测问不出来、必须原样搬」的查表，一次建好。
             #
-            # 键含段（2026-09-03 对账发现，与 proxy-url 同一个成因）：实测
-            # facai 的 3 把 Key 在 codex/claude 段是 weight:0（那两条路径静默
-            # 换模，已封），compat 段**故意没写**；100xlabs 同理只封 claude。
-            # 按 (host, key) 搬会把 0 灌进那些没封的段 —— 6 个 (凭据, 段)
-            # 组合被无声逐出调度池，而 YAML 合法、写后验证也发现不了。
-            weights = existing_weights(cfg)
-            # proxy-url 同理。它只在探测当场判定「需要代理」时才有值，而重探时
-            # 那个站可能这次直连就通 —— 方案里 proxy_url 为空，整段重写就把原有
-            # 的 26 条 mihomo 代理全抹掉。见 existing_proxies 的说明。
-            proxies = existing_proxies(cfg)
-            # prefix 与 compat 的 provider name 同样必须搬原值。
+            # 抽成 CarryTables（2026-09-04）：这段搬运逻辑原来在这里与演练脚本
+            # 各写一遍。两处分叉的后果实测过两次（演练自己也搬 headers，所以
+            # 「server 不搬」这个缺陷演练照样对上账）；更要紧的是内联时只能靠
+            # AST 断言「这一行在不在」，挡不住「行还在、传的是空」—— 撤销实验里
+            # 把 `old = hdrs.get(...)` 改成 `old = None`，1198 项测试全绿。
             #
-            # 2026-09-03 拿真实文件逐字段 deep-equal 才抓到（之前只比字段
-            # **出现次数**，两处都数得对、值全错）：
-            #   · prefix 121/121 被抹掉 —— dominant_prefix 只是给新条目猜的
-            #     默认值，既有条目自己写的才是真的
-            #   · compat 的 name 12/13 被改成 host —— 那是 CPA 的 provider
-            #     身份（provider_key），改名作废冷却状态与能力缓存
-            prefixes = existing_prefixes(cfg)
-            pnames = existing_provider_names(cfg)
-            # 每个模型自己的 max-context-length（在 models 块里，carry 搬不到）
-            mctx = existing_model_context(cfg)
-            # 模型级白名单外字段（当前配置为空，补闸）
-            mextra = existing_model_extras(cfg)
-
+            # 每张表少一张的后果、以及各字段为什么按不同方向搬（原值优先 /
+            # 实测优先 / 合并），见 cpa_probe/batch.py 的 CarryTables 与
+            # README 的「重探时每个字段以哪一侧为准」。
+            carry = CarryTables(cfg)
             for res in job.results:
                 fh = _by_row(forced, res.row)
                 # rebuild=True 关掉去重判定 —— 全量重探的输入**就是** cfg 里的
@@ -1702,55 +2184,8 @@ class Handler(BaseHTTPRequestHandler):
                                   force={str(k): [str(m) for m in (v or [])]
                                          for k, v in fh.items()} if fh else None)
                 for sec, sp in p.sections.items():
-                    # weight 与 proxy-url 都按 (段, host, key) 搬 —— 同一个
-                    # 凭据在不同段的这两个字段是**独立配置**，跨段共用会
-                    # 静默改行为（见 existing_weights / existing_proxies）。
-                    w = weights.get((sec, res.row.host, res.row.api_key))
-                    if w is not None:
-                        sp.weight = w
-                    # 探测判定需要代理时它已有值，不覆盖 —— 那是本次实测
-                    # 结论；只补「原来有、这次没探出来」的情形。
-                    #
-                    # 键含段（2026-09-02 修）：kktoken.cc 的 Key 在 compat 段
-                    # 有代理、在 claude 段故意没有（那条路径直连可用）。
-                    # 按 (host, key) 搬会把 compat 的代理灌进 claude ——
-                    # 多一跳不会失败，所以 validate 与写后验证都发现不了。
-                    if not sp.proxy_url:
-                        got = proxies.get(
-                            (sec, res.row.host, res.row.api_key))
-                        if got:
-                            sp.proxy_url = got
-                    # prefix：既有条目自己写的优先于 dominant_prefix 猜的。
-                    # `"" in prefixes` 与「键不存在」要分开 —— 前者是操作员
-                    # 显式写了空串，也该照原样。
-                    pk_ = (sec, res.row.host, res.row.api_key)
-                    if pk_ in prefixes:
-                        sp.prefix = prefixes[pk_]
-                    # compat 的 provider name（按 host，组内共用）
-                    if sec == "openai-compatibility":
-                        sp.provider_name = pnames.get(res.row.host, "")
-                    # 每个模型自己的 max-context-length。
-                    #
-                    # 它在 models 块里，carry 有意跳过那一块（清单由方案重新
-                    # 生成），而方案只带本次实测的那**一个**。不搬的话本次没探
-                    # 上下文时历史实测值全丢 —— 实测生产配置 8 处，客户端会按
-                    # CPA 内置目录的偏大值定压缩点。
-                    sp.prior_context = {
-                        name: val
-                        for (s2, h2, k2, name), val in mctx.items()
-                        if s2 == sec and h2 == res.row.host
-                        and k2 == res.row.api_key
-                    }
-                    # 模型级的白名单外字段（display-name / thinking / image /
-                    # force-mapping / is-compat / *-modalities）—— 同一个空档，
-                    # carry 跳过 models 块、render_entry 只写三个字段。
-                    # 当前配置一个都没用到，这是补闸不是修事故。
-                    sp.prior_model_extras = {
-                        name: dict(val)
-                        for (s2, h2, k2, name), val in mextra.items()
-                        if s2 == sec and h2 == res.row.host
-                        and k2 == res.row.api_key
-                    }
+                    carry.apply(sp, res.row.api_key)
+
                 all_plans[(res.row.bare, res.row.api_key)] = p
 
             # 用户覆盖分**两批**应用，中间夹着新增段判定与批量定档。
@@ -1890,7 +2325,21 @@ class Handler(BaseHTTPRequestHandler):
                     "section": "全量重建",
                     "host": f"{len(all_plans)} 个站",
                     "insert_at": 0,
-                    "lines": preview.splitlines(keepends=True),
+                    # **脱敏后**才进 JSON（2026-09-05 修的 P1）。
+                    #
+                    # 这条路的 diff 是重建后的**整个文件**，不是增量片段 ——
+                    # 生产配置里那是 177 行 api-key 明文 + 1 行 secret-key、
+                    # 共 349KB，全部会进浏览器 DOM，而界面的「复制」按钮
+                    # 会把它连同 177 个 Key 一起写进系统剪贴板。
+                    #
+                    # 本文件开头第 15 行写着「完整 key 只在内存里，不落日志、
+                    # 不进 JSON 响应（一律 masked）」—— 那条纪律在这条路径上
+                    # 一直没有兑现。
+                    #
+                    # 落盘走的是 entry["preview"]（服务端内存里的原文），
+                    # 不受这里影响；脱敏只作用于发给客户端的那一份。
+                    "lines": redact_yaml_secrets(preview).splitlines(
+                        keepends=True),
                     "text": f"全量重建整个 config.yaml\n警告：{len(warnings)} 个\n" + "\n".join(warnings) if warnings else "全量重建整个 config.yaml"
                 }],
                 "valid": ok,
@@ -2136,6 +2585,83 @@ class Handler(BaseHTTPRequestHandler):
 
 
 
+def _push_target_ok(base: str, configured: str) -> str:
+    """这个地址能不能作为 PUT /config.yaml 的目标。不能则返回拒绝原因。
+
+    为什么必须有白名单（2026-09-05 加）
+    -----------------------------
+    `reload_cpa` 的请求体是**整份 config.yaml**，头里带
+    `Authorization: Bearer <CPA 管理密码>`。地址原来完全由请求体决定
+    （`push.base` 优先于服务端配置），所以填错一次就是：
+
+        177 行明文上游凭据 + 管理密码，以一次 PUT 发给第三方
+
+    这件事**已经发生过**：前端那个输入框曾硬编码 `https://cpa.example.com`，
+    那次请求确实出了公网，只是被 Cloudflare 挡在 403（见下方 cpa_base 取值
+    处的注释）。当时改的是「服务端配置优先」的取值顺序 —— 那降低了误配概率，
+    但没有关掉这条出口。
+
+    能触发的人已经掌握 CPA 管理密码（`mgmt` 非空的前提），所以这**不是**权限
+    提升；这道闸防的是误配与内部人一次性外发。
+
+    放行三类：
+      · 回环与 compose 服务名 —— CPA 与本服务在同一个 docker 网络里，
+        那是唯一的正常形态
+      · 服务端 `--cpa-url` 显式配置的那个 host —— 运维在启动参数里写死的，
+        比请求体可信
+      · 私网地址 —— CPA 可能部署在同一内网的另一台机器上。这里与
+        `is_private_target` 的判断**方向相反**：那边挡私网（防拿服务端扫内网），
+        这边只放私网（防把凭据发出公网）。两者不矛盾 —— 判据都是「这个地址
+        该不该是这条路的目标」，只是两条路的正常目标恰好互补。
+    """
+    from cpa_probe.parse import host_of, is_private_target
+
+    import re as _re
+
+    b = (base or "").strip()
+    if not b:
+        return ""                       # 空地址由调用方另行处理（跳过重载）
+    if not _re.match(r"^https?://", b, _re.I):
+        return f"地址必须以 http:// 或 https:// 开头：{b[:60]}"
+    h = host_of(b)
+    if not h:
+        return f"取不到主机名：{b[:60]}"
+
+    # 运维在启动参数里写死的那个 —— 比请求体可信
+    ch = host_of((configured or "").strip())
+    if ch and h == ch:
+        return ""
+
+    # 回环 / 私网 / compose 服务名（无点号的单段主机名，如 cli-proxy-api:8317）
+    if is_private_target(h):
+        return ""
+    bare = h.split(":")[0]
+    if "." not in bare and ":" not in bare:
+        return ""                       # docker 网络内的服务名
+
+    return (f"拒绝把整份配置与管理密码发往 {h} —— 只允许回环、私网、"
+            f"docker 服务名，或服务端 --cpa-url 配置的那个地址"
+            f"（当前配置：{ch or '未配置'}）")
+
+
+def _push_result(base: str, configured: str) -> dict | None:
+    """目标地址被拒时该回给前端的那几个字段；放行则返回 None。
+
+    抽成函数而不是内联在 `_run_apply_tail` 里（2026-09-05）：内联时测试只能
+    断言「源码里有没有 push_ok 这个键」，而那挡不住把值赋成 True ——
+    撤销实验证实过。
+
+    四个字段都要给：`reload_ok`/`reload_msg` 是当前口径，
+    `push_ok`/`push_msg` 是前端既有字段（兼容）。少给一对就会让界面
+    显示成「已生效」，而实际上重载根本没发出去。
+    """
+    why = _push_target_ok(base, configured)
+    if not why:
+        return None
+    return {"reload_ok": False, "reload_msg": why,
+            "push_ok": False, "push_msg": why}
+
+
 def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
                     cfg_path: str, cfg_cpa_url: str,
                     mgmt: str, auto_client_key: str) -> None:
@@ -2176,6 +2702,14 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
         # 只有用户明确填了别的地址才用他填的。
         cpa_base = ((push.get("base") or "").strip()
                     or (cfg_cpa_url or "").strip())
+        # 地址白名单（2026-09-05 加）。上面那个「服务端配置优先」的顺序降低了
+        # 误配概率，但没关掉出口 —— 用户明确填一个公网地址仍然会把整份配置
+        # 与管理密码发出去。见 _push_target_ok。
+        refused = _push_result(cpa_base, cfg_cpa_url)
+        if refused:
+            result.update(refused)
+            task.set_stage("目标地址被拒")
+            cpa_base = ""               # 后面的验证也一并跳过
         # 管理密码由调用方算好传入（见 _cpa_password_for）
 
         if cpa_base and mgmt:
@@ -2271,7 +2805,7 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
                         for f in futs:
                             try:
                                 f.result()
-                            except Exception as e:      # noqa: BLE001
+                            except Exception:           # noqa: BLE001
                                 pass                    # 下面统一补空位
                 elif todo:
                     try:
@@ -2308,10 +2842,17 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
         task.set_stage("全部完成")
     except Exception:
         task.state = "error"
-        task.error = traceback.format_exc(limit=4)
+        task.error = _error_ref(f"apply {task.id}")
         task.set_stage("收尾出错")
     finally:
         task.finished = time.time()
+        # 那份 plan 已经作废（上面把 base_raw 置成 preview，重放会被 409 挡）。
+        # 主动释放它 —— 每份持有两份**整份配置**（生产文件约 857KB，即约
+        # 1.7MB），是三张表里最重的，而前端每次勾选变化都会新生成一份。
+        pid = str(body.get("plan_id") or "")
+        if pid:
+            STORE.drop_plan(pid)
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="upstream-importer-server")
@@ -2367,8 +2908,8 @@ def main() -> None:
 
     cpa_hash = Handler._cpa_mgmt_hash()
     try:
-        import bcrypt as _bcrypt   # noqa: F401
-        has_bcrypt = True
+        import importlib.util
+        has_bcrypt = importlib.util.find_spec("bcrypt") is not None
     except ImportError:
         has_bcrypt = False
 
@@ -2395,7 +2936,11 @@ def main() -> None:
     else:
         print("  已禁用 CPA 密码登录（--no-cpa-key）")
     print(f"  失败封锁    : {Handler.MAX_FAILURES} 次 / "
-          f"{Handler.BAN_SECONDS // 60} 分钟（按来源 IP）")
+          f"{Handler.BAN_SECONDS // 60} 分钟（按来源 IP，最多记 "
+          f"{Handler.MAX_FAIL_ENTRIES} 个）")
+    if args.host in ("127.0.0.1", "localhost", "::1"):
+        print("                经 nginx 反代时按 X-Forwarded-For 最右一跳判 —— "
+              "反代必须转发该头")
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         print()
         print("  ⚠ 非本机监听。这个服务持有明文上游 Key 且能改写 config.yaml，")
