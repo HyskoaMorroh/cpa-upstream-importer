@@ -2245,6 +2245,18 @@ def build_plan(
             catalog_stale_why=stale_why,
         )
 
+        # codex 段必须包含 originator（2026-09-06）
+        # --------------------------------------------
+        # zzzcoding 等站方限制「仅 Codex 官方客户端可调用」。CPA 转发 codex
+        # 请求时，条目 headers 里的 originator 必须原样传到上游，否则 403。
+        # 判死的 codex 段会回落标准档（codex-tui），_fallback_headers 逻辑
+        # 已保证回落后的 headers 包含 originator。但若后续写回路径（CPAMP
+        # 前端保存、或 CPA executor 转发）有 bug，这条门禁能提前抓到。
+        if section == "codex-api-key" and "originator" not in headers:
+            raise ValueError(
+                f"codex 段条目缺少 originator 头。base={base}, "
+                f"headers={list(headers.keys())}")
+
         # 全量重探不判重：输入就是既有条目，撞上是必然而非异常。
         # 见 docstring 里 rebuild 那一节。
         if rebuild:

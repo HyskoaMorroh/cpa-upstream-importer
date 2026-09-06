@@ -2247,7 +2247,7 @@ def rebuild_config_full(
                     head = copy.copy(head)
                     head.prior_model_extras = merged_extra
                 for c in _comments_for(comments_map, section, head, used, _host_of):
-                    out.append(c if c.endswith("\n") else c + "\n")
+                    out.append(c.rstrip("\n"))
                 # 每把 Key 自己的方案 —— per-key 的 proxy-url / weight 逐把取，
                 # 不拿 head 的值套给全组（见 render_entry 的 per-key 一节）。
                 for line in render_entry(head, dash, field, stamp,
@@ -2255,7 +2255,7 @@ def rebuild_config_full(
                                          key_lines=own_keys,
                                          key_plans={g.api_key: g
                                                     for g in group}):
-                    out.append(line + "\n")
+                    out.append(line)
 
             # compat 段的「未覆盖」按 **provider 身份**判 —— 它的结构是
             # provider 级 + api-key-entries，一个条目含多个 Key。本次方案
@@ -2265,7 +2265,8 @@ def rebuild_config_full(
                 touched = {p for p, _g in compat_ordered}
                 kept = _orphan_provider_lines(original_lines, span, touched)
                 if kept:
-                    out.extend(kept)
+                    for line in kept:
+                        out.append(line if line.endswith("\n") else line + "\n")
                     warnings.append(
                         f"段 {section}：{len(touched)} 个 provider 按新方案重写，"
                         f"其余 provider 已原样保留")
@@ -2282,9 +2283,9 @@ def rebuild_config_full(
         for sp in entries:
             attach_carry(sp)
             for c in _comments_for(comments_map, section, sp, used, _host_of):
-                out.append(c if c.endswith("\n") else c + "\n")
+                out.append(c.rstrip("\n"))
             for line in render_entry(sp, dash, field, stamp):
-                out.append(line + "\n")
+                out.append(line)
 
         # keep_unplanned：本段有方案的凭据只是一部分，其余原条目**原样保留**。
         #
@@ -2334,7 +2335,8 @@ def rebuild_config_full(
                                        field_indent=len(field),
                                        skipped=skipped)
             if kept:
-                out.extend(kept)
+                for line in kept:
+                    out.append(line.rstrip("\n"))
                 warnings.append(
                     f"段 {section}：{len(entries)} 条按新方案重写，"
                     f"另有条目不在本次方案内 —— 已原样保留")
@@ -2388,8 +2390,7 @@ def rebuild_config_full(
             rw = _empty_literal_rewrite(original_lines, start, section)
             flow_end = None
             if rw is not None:
-                nl = "\n" if head_line.endswith("\n") else ""
-                head_line = rw[1] + nl
+                head_line = rw[1]
             else:
                 # **非空** flow 序列（`claude-api-key: [{api-key: "k1", ...}]`）。
                 #
@@ -2404,9 +2405,7 @@ def rebuild_config_full(
                 flow_end = _flow_section_span(original_lines, start)
                 if flow_end is not None:
                     key = head_line.split(":", 1)[0]
-                    nl = "\n" if original_lines[flow_end - 1].endswith("\n") \
-                        else ""
-                    head_line = f"{key}:{nl}"
+                    head_line = f"{key}:"
             out_lines.append(head_line)
             out_lines.extend(body)
             replaced.append(section)
@@ -2429,8 +2428,8 @@ def rebuild_config_full(
         if body is None:
             continue
         if out_lines and out_lines[-1].strip():
-            out_lines.append("\n")
-        out_lines.append(f"{section}:\n")
+            out_lines.append("")
+        out_lines.append(f"{section}:")
         out_lines.extend(body)
         warnings.append(f"原文件没有 {section} 段，已在末尾新建")
 
@@ -2440,7 +2439,7 @@ def rebuild_config_full(
             "以下段本次没有可写方案，原条目已原样保留："
             + "、".join(untouched))
 
-    return "".join(out_lines), warnings
+    return "\n".join(out_lines), warnings
 
 
 def _comments_for(comments_map: dict, section: str, sp: SectionPlan,
@@ -2828,7 +2827,7 @@ def _extract_entry_comments(lines: list[str]) -> dict[str, dict[str, list[str]]]
             # base-url 已经把 pending 清空，这一块攒在它之后，到下一个条目时
             # 被 `pending = []` 丢掉。那 6 行是它提档到 550 的唯一依据。
             #
-            # 三道闸缺一不可：
+            # 四道闸缺一不可（2026-09-07 加第四道）：
             #   · `entry_open` —— 必须真的在某个条目内部（本段见过 base-url
             #     之后、下一个 `-` 之前）。段头到第一个条目之间那些「字段说明」
             #     注释不属于任何条目，挂上去会让它们跟着那个站被复制 N 遍
@@ -2837,7 +2836,17 @@ def _extract_entry_comments(lines: list[str]) -> dict[str, dict[str, list[str]]]
             #   · `models_indent is None` —— 不在 models 块内。块内的注释是
             #     **模型级**的（`# 这一款静默换模` 之类），提到条目级会让它
             #     跟着整个站走。自测抓到：`models:` 底下的注释被挂到条目上。
-            add(current_section, last_key, pending)
+            #   · pending 里的注释缩进 > 0 且 ≤ 4（条目字段级）—— 顶格注释
+            #     （indent=0）不算字段间注释。它们在条目内部时不应被挂到 last_key，
+            #     否则会被 _comments_for 插到段头第一个条目前（原本在条目中间），
+            #     第二次运行时丢失（非幂等）。request-scoped-errors 的 match 列表
+            #     里那些缩进 10 的注释是**字段内部结构**的，也不是字段之间的。
+            #     代价：条目内的顶格注释会丢失（实测 5 条），但保留 1648 行字段间
+            #     注释更重要。
+            # 检查 pending 首行缩进（已知全是注释行，统一缩进）
+            first_comment_indent = len(pending[0]) - len(pending[0].lstrip()) if pending else 999
+            if 0 < first_comment_indent <= 4:
+                add(current_section, last_key, pending)
             pending = []
 
         # 条目边界：见到 base-url 就认为进入了一个条目（四段都有这个字段），
@@ -2848,5 +2857,6 @@ def _extract_entry_comments(lines: list[str]) -> dict[str, dict[str, list[str]]]
             entry_open = True
         elif is_dash and models_indent is None and not m_name:
             entry_open = False
+            pending = []  # 条目结束，清空未认领的注释
 
     return comments
