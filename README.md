@@ -221,6 +221,29 @@ docker compose pull cpa-upstream-importer && docker compose up -d
 
 ## 核心机制
 
+### codex 段 headers 转发修复（2026-09-06）
+
+**问题**：用户在 CPAMP 管理界面配置 `api.zzzcoding.org` 的 codex 段，
+手动填写了正确的 `originator: codex-tui` 和 User-Agent，测试连通性时仍返回 403
+"This account only allows Codex official clients"。同一个 URL 和 Key 在
+cc-switch 直连时正常。
+
+**根因**：CPA 的 `codex_executor_request.go` 第 369 行调用
+`applyCodexCloakingHeaders`，该函数在 `ApplyCustomHeadersFromAttrs`
+（应用配置文件自定义 headers）**之后**执行，**无条件覆盖**了 User-Agent 和
+Originator，导致配置文件的自定义值被丢弃。
+
+**修复**：
+1. **CPA 侧**：修改 `applyCodexCloakingHeaders` 为条件设置（只在 header
+   不存在时设置默认值），尊重配置文件的自定义 headers
+2. **upstream-importer 侧**：在 `plan.py` 第 2248 行添加 codex 段 originator
+   门禁，提前发现配置错误
+
+**通用性**：此修复适用于所有要求特定客户端标识的上游站点。CPA 的条件设置逻辑
+确保：配置了自定义 headers → 使用配置值；未配置 → 使用默认值（向后兼容）。
+
+详见[图文教程 FIX 章节](docs/tutorial.html#s-fix-403)。
+
 ### 批量定档（2026-09-02）
 
 **问题**：79 个凭据写回后 `claude` 段 74 个条目**全是 175**、`gemini` 段 76 个全是

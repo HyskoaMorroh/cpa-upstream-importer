@@ -152,6 +152,7 @@ footer code{background:none;padding:0}
   <a href="#s7">07 写回</a>
   <a href="#s7-5">07.5 全量重探</a>
   <a href="#s7-8">07.8 对齐与加固</a>
+  <a href="#s7-9">07.9 headers 转发链</a>
   <a href="#s8">08 生效链</a>
   <a href="#s9">09 上手</a>
   <a href="#s10">10 发布</a>
@@ -3043,6 +3044,132 @@ git ls-files | grep -iE 'scrub|domain'    <span class="c"># 清理器别在里�
     <p>另外，测试里当作<b>前缀误匹配反例</b>的几个域名刻意<b>不</b>替换 ——
     换成占位符后那条断言会恒真。</p>
   </div>
+</div></section>
+
+<section id="s-fix-403"><div class="wrap">
+  <div class="sech">
+    <span class="no">FIX</span>
+    <h2>修复案例：zzzcoding codex 403 客户端限制</h2>
+  </div>
+  <p class="sub">真实修复过程：从表象到根因，跨三个项目的联合排查</p>
+
+  <h3>问题表象</h3>
+  <p>用户在 CPAMP 管理界面添加了 <code>api.zzzcoding.org</code> 的 codex 段配置，
+  手动填写了 <code>originator: codex-tui</code> 和完整的 User-Agent，
+  但测试连通性时仍然返回 403：</p>
+
+  <div class="cmd">
+    <div class="bar">错误响应</div>
+<pre>{
+  "error": {
+    "message": "This account only allows Codex official clients",
+    "type": "forbidden_error"
+  }
+}</pre>
+  </div>
+
+  <div class="note b">
+    <div class="t">关键线索</div>
+    <p>同一个 URL 和 Key，在本机 cc-switch <b>直连时正常</b>，
+    通过 CPA 转发后 <b>403</b>。说明问题不在上游站本身，而在 CPA 的转发逻辑。</p>
+  </div>
+
+  <h3>排查路径</h3>
+  <p>按照数据流向，逐层排查三个项目：</p>
+
+  <div class="tw"><table>
+    <thead><tr>
+      <th>层</th>
+      <th>项目</th>
+      <th>检查点</th>
+      <th>结果</th>
+    </tr></thead>
+    <tbody>
+      <tr>
+        <td class="n">1</td>
+        <td class="m">upstream-importer</td>
+        <td>探测时识别客户端要求，写入 headers 配置</td>
+        <td><span class="pill p-ok">✓ 正确</span></td>
+      </tr>
+      <tr>
+        <td class="n">2</td>
+        <td class="m">CPA</td>
+        <td>加载 config.yaml，将 headers 转为 auth.Attributes</td>
+        <td><span class="pill p-ok">✓ 正确</span></td>
+      </tr>
+      <tr>
+        <td class="n">3</td>
+        <td class="m">CPA</td>
+        <td>codex executor 转发时应用 headers</td>
+        <td><span class="pill p-b">✗ 覆盖</span></td>
+      </tr>
+      <tr>
+        <td class="n">4</td>
+        <td class="m">CPAMP</td>
+        <td>前端表单传递 headers 到后端</td>
+        <td><span class="pill p-ok">✓ 正确</span></td>
+      </tr>
+    </tbody>
+  </table></div>
+
+  <h3>根因定位</h3>
+  <p>在 <code>CLIProxyAPI-main/internal/runtime/executor/codex_executor_request.go</code>
+  找到问题代码：</p>
+
+  <div class="cmd">
+    <div class="bar">修复前（第 368-378 行）</div>
+<pre><span class="c">// 第 368 行：应用配置文件的自定义 headers</span>
+util.ApplyCustomHeadersFromAttrs(r, attrs, ginHeaders)
+
+<span class="c">// 第 369 行：立即被 cloaking 覆盖！</span>
+applyCodexCloakingHeaders(r.Header, cfg)
+
+<span class="c">// applyCodexCloakingHeaders 无条件覆盖</span>
+func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config) {
+    if headers == nil || cfg == nil || cfg.Codex.DisableCodexCloaking {
+        return
+    }
+    <span class="k">headers.Set("User-Agent", codexUserAgent)</span>    <span class="c">// 无条件覆盖</span>
+    <span class="k">headers.Set("Originator", codexOriginator)</span>   <span class="c">// 无条件覆盖</span>
+}</pre>
+  </div>
+
+  <div class="note b">
+    <div class="t">问题本质</div>
+    <p><code>applyCodexCloakingHeaders</code> 在 <code>ApplyCustomHeadersFromAttrs</code>
+    <b>之后</b>执行，<b>无条件覆盖</b>了配置文件里的自定义 headers。</p>
+  </div>
+
+  <h3>修复方案</h3>
+  <div class="cmd">
+    <div class="bar">修复后（2026-09-06）</div>
+<pre>func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config) {
+    <span class="c">// Only set defaults if not already present</span>
+    <span class="k">if headers.Get("User-Agent") == "" {</span>
+        headers.Set("User-Agent", codexUserAgent)
+    <span class="k">}</span>
+    <span class="k">if headers.Get("Originator") == "" {</span>
+        headers.Set("Originator", codexOriginator)
+    <span class="k">}</span>
+}</pre>
+  </div>
+
+  <h3>验证方法</h3>
+  <div class="cmd">
+    <div class="bar">测试修复效果</div>
+<pre>curl -X POST http://cpa.chiangma.com:15721/v1/responses?beta=true \
+  -H "Authorization: Bearer cpachma-codex-fake-key" \
+  -d '{"model":"gpt-6-astra","instructions":"test","input":[...]}'
+
+<span class="c"># 预期：HTTP 200，返回 SSE 流</span>
+<span class="c"># 修复前：HTTP 403</span></pre>
+  </div>
+
+  <div class="note g">
+    <div class="t">修复完成</div>
+    <p>2026-09-06 修复完成。适用于所有要求特定客户端标识的上游站点。</p>
+  </div>
+
 </div></section>
 
 <footer><div class="wrap">
