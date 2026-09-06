@@ -33,6 +33,7 @@ from typing import Callable
 # 那样 cls 拿到的是函数，cls.classify(...) 必然 AttributeError。
 # 这条路径只有真发请求时才会走到，纯逻辑用例覆盖不到，所以必须写死成函数导入。
 from . import betas
+from .classify import MODEL_CHANNEL_BODY as _MODEL_CHANNEL_BODY
 from .classify import body_excerpt as _body_excerpt
 from .classify import classify as _classify
 from .classify import has_error_envelope as _has_error_envelope
@@ -208,11 +209,15 @@ def _body_kind(prof) -> str:
 #
 # 这句话确实来自上游而非 CPA：CLIProxyAPI 全仓库搜 "No available channel"
 # 零命中，它自己的措辞是 conductor_selection.go:496 的 auth_unavailable。
+# 与 classify 的「分组无该模型渠道」规则**同一份正文判据**（2026-09-06）。
+# 原来这里手写了一份平行的措辞表，与 classify.py:130 那条渐渐分叉：
+# 「分组无该模型渠道」「当前分组下无此模型的渠道」这两种正文 classify 认、
+# 这里不认，于是 `_model_specific_dead_end` 返回 False → `_stage1` 判整段死。
+# 实测那正是全量重探日志里最常见的一句（78 卡片中 23 个全灭段报的就是它），
+# 换个模型本来可能就通。措辞表只留一处，从 classify 导入，杜绝再次分叉。
 _MODEL_SPECIFIC_DEAD_END = re.compile(
-    r"model_not_found"
-    r"|no available channel"          # 上游中转站：该分组无此模型的活跃通道
-    r"|无可用渠道|可用渠道不存在"
-    r"|model .{0,80}(?:not (?:supported|found)|does not exist)"
+    _MODEL_CHANNEL_BODY
+    + r"|model .{0,80}(?:not (?:supported|found)|does not exist)"
     r"|不支持所选模型|模型不存在",
     re.I,
 )
@@ -249,6 +254,24 @@ _MODEL_SPECIFIC_CODES = frozenset({
     "400", "403", "404",
     "500", "502", "503", "504",
 })
+
+
+# 探测发的是**字符**，`max-context-length` 要的是 **token**（CPA 直接把它
+# 当 context_window 报给客户端，见 `_bisect` 的 docstring）。两者差一个系数。
+#
+# 取 4：探测正文是 `"x" * n`，ASCII 单字符串。GPT/Claude 系 BPE 对这种重复
+# ASCII 的压缩率高于 4（`xxxx…` 会被合并成长 token），所以按 4 折算是
+# **保守**方向 —— 报出的窗口不大于真实窗口。而这个值的用途是让客户端定压缩点，
+# 宁小勿大：小了只是早压缩一点，大了就是请求直接被上游截断（那条 400）。
+#
+# 不做 tokenizer 精算的理由：真实窗口取决于站方后端用哪个 tokenizer，
+# 探测无从得知；而任何 3-4 之间的系数都落在「保守」这一侧。
+_CHARS_PER_TOKEN = 4
+
+
+def _chars_to_tokens(chars: int) -> int:
+    """字符数 → token 数（保守折算）。见 `_CHARS_PER_TOKEN` 的说明。"""
+    return max(1, int(chars) // _CHARS_PER_TOKEN)
 
 
 def _model_specific_dead_end(att) -> bool:
@@ -1742,7 +1765,26 @@ class Prober:
         return None
 
     def _bisect(self, row: ParsedRow, v: SectionVerdict, model: str) -> tuple[int | None, bool]:
-        """二分实际可接受上下文。返回 (上限, 是否因截断而不可信)。
+        """二分实际可接受上下文。返回 (上限**以 token 计**, 是否因截断而不可信)。
+
+        单位（2026-09-06 修正，这是一处真实的数据错误）
+        ----------------------------------------
+        `lo` / `hi` / `mid` 是**发送的字符数**，而返回值要进
+        `models[].max-context-length` —— CPA 把它当 **token 数**用：
+        model_registry.go:1440 写进 `/v1/models` 的 `max_context_length`，
+        codex/models/models.go:206-211 写进 `context_window` /
+        `max_context_window`。两个单位差约 4 倍（英文文本）。
+
+        原实现把字符数直接返回，于是「上游能吃 98.75 万字符」被写成
+        「窗口 987500 token」—— 虚报约 4 倍。生产 config.yaml 里那 6 处
+        `max-context-length: 987500` 正是本函数第三个二分中点
+        （(875000+1100000)//2）的字符数，不是任何站声明的窗口。
+        后果与那 8 处丢失相反也更糟：客户端按虚高的窗口定压缩点，
+        塞到真实上限之外才被上游截断 —— 正是第 08 章那条 400。
+
+        所以字符路径一律经 `_chars_to_tokens` 折算；
+        `declared`（上游正文自报）与 `tok`（上游回的 input_tokens）
+        本来就是 token，原样返回、**不得**再折算。
 
         截断校验：200 但 input_tokens < 发送量*0.5 说明上游截了，那个 200
         不算通过。relay-m 发 105 万字符只回 132,696 tokens，模型还被换成
@@ -1795,7 +1837,8 @@ class Prober:
         # 期望请求数从 2-6 降到 1-2。
         ok_hi, trunc_hi = check(hi)
         if ok_hi:
-            return hi, False
+            # hi 是字符数，返回值要 token —— 折算。见 docstring 的单位一节。
+            return _chars_to_tokens(hi), False
         if trunc_hi:
             return trunc_hi, True
         if declared is not None:
@@ -1825,7 +1868,8 @@ class Prober:
                 return declared, False
             else:
                 right = mid
-        return left, False
+        # left 是「实测能吃下的最大字符数」，同样要折算成 token。
+        return _chars_to_tokens(left), False
 
     # ---------- 形态复用 ----------
 
