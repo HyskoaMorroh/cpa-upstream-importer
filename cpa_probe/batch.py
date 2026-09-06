@@ -724,6 +724,42 @@ def existing_model_extras(cfg: dict) -> dict[tuple[str, str, str, str], dict]:
     return out
 
 
+# 旧版 `_bisect` 返回的是**字符数**而不是 token 数（2026-09-06 修的单位错误），
+# 于是它写进 config.yaml 的 `max-context-length` 虚高约 4 倍。那些值现在还躺在
+# 文件里，而 `existing_model_context` 会把它们原样搬回来 —— 不识别就等于把
+# 一个已知的错误值一轮轮传下去。
+#
+# 识别办法：旧二分的取值集合是**封闭且可枚举的** —— lo=200000、hi=1100000、
+# 四轮二分，全部可能返回值只有 17 个（200000、256250、…、987500、1043750、
+# 1100000，公差 56250 的等差数列）。真实的上游自报窗口不会恰好落在这个格子上
+# （实测那份配置里 15515 就不在格子里，987500 在）。
+#
+# 命中格子的值按同一个系数折回 token；不在格子里的原样保留 —— 那是上游正文
+# 自报的 token 数，本来就是对的。
+#
+# **200000 有意排除**：它既是旧二分的下界，也是现役模型里最常见的真实窗口
+# （Claude 与 GPT 两系都正好 200k token）。把它当旧值折成 5 万会把一个正确的
+# 声明值改错，而误差方向是「报小」—— 那会让客户端过早压缩，是真实损失。
+# 反过来把一个旧的 20 万字符值留着，误差方向是「报大 4 倍」，但只在
+# 「这个站真的只能吃 20 万字符」时才发生，而那种站会在正文里自报窗口
+# （那条路径不经二分）。两害相权取其轻。
+_LEGACY_CHAR_GRID = frozenset(
+    {1_100_000} | {200_000 + 56_250 * i for i in range(1, 16)}
+)
+
+
+def _fix_legacy_char_context(val: int) -> int:
+    """把旧版按字符写下的窗口值折算成 token。不是旧值就原样返回。
+
+    折算系数与 `pipeline._CHARS_PER_TOKEN` 必须一致 —— 从那里导入，
+    不在这里再写一个 4（两处各写一份的分叉在本项目发生过多次）。
+    """
+    if val not in _LEGACY_CHAR_GRID:
+        return val
+    from .pipeline import _chars_to_tokens
+    return _chars_to_tokens(val)
+
+
 def existing_model_context(cfg: dict) -> dict[tuple[str, str, str, str], int]:
     """既有条目里每个模型自己的 `max-context-length`，按
     **(段, host, api_key, 模型名)** 索引。只收正整数。
@@ -758,7 +794,8 @@ def existing_model_context(cfg: dict) -> dict[tuple[str, str, str, str], int]:
             name = str(m.get("name") or "").strip()
             val = m.get("max-context-length")
             if name and isinstance(val, int) and val > 0:
-                out[(section, h, k, name)] = val
+                # 旧版写下的字符数在这里折回 token。见 _fix_legacy_char_context。
+                out[(section, h, k, name)] = _fix_legacy_char_context(val)
 
     for section in ("gemini-api-key", "codex-api-key", "claude-api-key"):
         for e in cfg.get(section) or []:

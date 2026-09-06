@@ -62,6 +62,7 @@ _DEDUP_SECTIONS = {"gemini-api-key"}
 # 与 writeback._SRC_LABEL 措辞一致（那份用在写回警告里）。
 _SRC_LABEL_CN = {
     "probed": "本次实测通过",
+    "prior": "沿用原有清单",
     "catalog": "站方目录声称有",
     "manual": "手填",
     "seed": "工具猜测",
@@ -179,6 +180,54 @@ def extract_existing_entries(cfg: dict) -> list[tuple[str, str, str, dict]]:
                     entries.append(("compat", base_url, api_key, e))
 
     return entries
+
+
+def existing_models_for(cfg: dict, section: str, base_url: str,
+                        api_key: str) -> list[str]:
+    """这个 (段, 站, Key) 在原 config.yaml 里注册着哪些模型。没有就空列表。
+
+    给兜底分支用：判死 + 目录读不到时，原清单比「市面最新」的猜测硬 ——
+    它是先前一轮实测沉淀的。见 build_plan 里 seed 分支的说明。
+
+    「站」这一维与 CarryTables 同口径（`entry_scope`）：前三段是 host，
+    compat 段是含路径的 provider 身份 —— 同一主机可按路径挂多个 provider，
+    用 host 查会串到另一个上游的清单上（这个键分叉在本项目发生过两次）。
+    """
+    from .batch import entry_scope
+
+    scope = entry_scope(section, base_url)
+
+    def names(models) -> list[str]:
+        out = []
+        for m in models or []:
+            if isinstance(m, dict):
+                n = str(m.get("name") or "").strip()
+                if n and n not in out:
+                    out.append(n)
+        return out
+
+    if section == "openai-compatibility":
+        # compat 的 models 在 provider 级，组内所有 Key 共用同一份 ——
+        # 所以只要这个 Key 在这个 provider 的 api-key-entries 里就算命中。
+        for prov in cfg.get("openai-compatibility") or []:
+            if not isinstance(prov, dict):
+                continue
+            if entry_scope(section, str(prov.get("base-url") or "")) != scope:
+                continue
+            for ke in prov.get("api-key-entries") or []:
+                if isinstance(ke, dict) and str(ke.get("api-key") or "") == api_key:
+                    return names(prov.get("models"))
+        return []
+
+    for e in cfg.get(section) or []:
+        if not isinstance(e, dict):
+            continue
+        if str(e.get("api-key") or "") != api_key:
+            continue
+        if entry_scope(section, str(e.get("base-url") or "")) != scope:
+            continue
+        return names(e.get("models"))
+    return []
 
 
 def existing_pairs(cfg: dict) -> dict[str, set[str]]:
@@ -1042,6 +1091,10 @@ def score_verdict(v) -> int:
         s -= 5
     if len(v.models) <= 1:
         s -= 10
+    # 阈值单位是 **token**，与 `max_context_length` 一致（2026-09-06 校对）。
+    # 200k token 是现役模型里最小的窗口 —— 低于它说明上游确实截窄了。
+    # 此前 `_bisect` 返回的是字符数，那时这条判据实际比的是 20 万字符
+    # （≈5 万 token），几乎永不触发；单位修正后它才真的生效。
     if v.max_context_length and v.max_context_length < 200_000:
         s -= 10
     return max(s, 1)
@@ -1234,6 +1287,76 @@ class Impact:
                 if h not in seen:
                     seen.append(h)
         return seen
+
+
+def session_affinity_on(cfg: dict) -> bool:
+    """`routing.session-affinity` 开没开。开着时 priority 硬隔离有第二条例外。
+
+    为什么要单独问这一句（2026-09-05 契约审计发现）
+    -----------------------------------------
+    本模块的影响面计算（`compute_impact` / `_shadow_count`）全都基于
+    **priority 硬隔离**：只有最高那一桶参与选择。而这条判据有两个例外，
+    本模块原来只认了第一个：
+
+      ① codex/xai + 下游 WS —— `scheduler.go` 的
+         `highestReadyPriorityLocked` 在 `preferWebsocket=true` 时从高到低扫，
+         返回第一个含 ws 凭据的档（源码注释："even if they are in a lower
+         priority tier than HTTP-only credentials"）。见 `ws_crosstier_note`。
+
+      ② **session-affinity** —— `conductor_selection.go` 的
+         `availableAuthsForSelector`：selector 是 `*SessionAffinitySelector`
+         时，交给它的候选是 `getAvailableAuthsAcrossPriorities`（**全部档位**），
+         注释写着「so an established binding can be validated instead of being
+         preempted by a recovered higher-priority credential」。
+
+    ② 与 ① 的关键区别：**它不限段、不限 WS**。任何段、任何请求，只要会话
+    已经绑定过某个凭据，那个凭据就留在候选里 —— 哪怕它在很低的档。
+
+    为什么只加文案不改算法
+    ------------------
+    冷启动绑定仍然从最高档开始（`SessionAffinitySelector.Pick` 的绑定建立
+    路径），所以「新站插这一档会挡住谁」这个结论对**新会话**完全成立，
+    只对**已绑定会话**不成立。而「已绑定」是运行时状态 —— 定档时无从得知
+    有多少会话绑在哪些凭据上。
+
+    把算法改成依赖会话状态会让「新站该插哪一档」从一个静态问题变成动态问题，
+    而那个问题没有正确答案。加一句话说清边界，是这里能给的最准确的东西。
+
+    生产配置当前是 `false`，所以此刻不触发 —— 但那是配置的巧合，
+    与 `weight_zero_excludes` 同一条理由。
+    """
+    routing = (cfg or {}).get("routing")
+    if not isinstance(routing, dict):
+        return False
+    return routing.get("session-affinity") is True
+
+
+def affinity_crosstier_note(cfg: dict, band: Band, new_priority: int) -> str:
+    """session-affinity 开着时的跨档说明。关着或无下层站时返回空串。
+
+    与 `ws_crosstier_note` 平行 —— 那个说 codex 段的 WS 请求，这个说所有段的
+    已绑定会话。两者可以同时出现（codex 段 + WS + affinity），措辞不重复：
+    前者讲「WS 请求去哪个档」，后者讲「已绑定的会话不换档」。
+    """
+    if not session_affinity_on(cfg):
+        return ""
+    lower = [p for p in band.tiers if p < new_priority]
+    if not lower:
+        # 没有更低的档 —— 「低档凭据仍在候选里」这件事没有对象，不必说
+        return ""
+    ttl = ""
+    routing = (cfg or {}).get("routing") or {}
+    if isinstance(routing, dict) and routing.get("session-affinity-ttl"):
+        ttl = f"（TTL {routing['session-affinity-ttl']}）"
+    return (
+        f"routing.session-affinity 开着{ttl} —— 上面「挡住 N 个」的计数只对"
+        f"**新会话**成立。已经绑定到下层 {len(lower)} 个档"
+        f"（{', '.join(str(p) for p in sorted(lower, reverse=True)[:4])}"
+        f"{' 等' if len(lower) > 4 else ''}）的会话会继续用原凭据，"
+        f"不因为这个新站出现而改档（conductor_selection.go 的 "
+        f"availableAuthsForSelector 把**全部档位**交给亲和选择器）。"
+        f"这条例外不限段、不限 WS。"
+    )
 
 
 def ws_crosstier_note(band: Band, new_priority: int,
@@ -1665,6 +1788,10 @@ class SectionPlan:
                     " —— 参数已按试用期算全，确知可用再勾")
         if self.model_source == "manual":
             return f"手填 {len(self.models)} 个模型，工具未验证 —— 参数已算全"
+        if self.model_source == "prior":
+            return (f"推理未通过、目录也读不到，已沿用原 config.yaml 里这个"
+                    f"条目的 {len(self.models)} 个模型 —— 那是先前一轮的实测"
+                    "沉淀，比工具猜测硬；但本次没验过，默认不勾")
         if self.model_source == "seed":
             return ("推理未验证到可用模型（探测未通过，或端点通但返回的模型"
                     f"对不上），清单取自「当前市面最新」（{len(self.models)} 个）"
@@ -2071,6 +2198,25 @@ def build_plan(
             # 记成 seed 让界面照实说，别让它顶着「实测」的徽标。
             model_source = "seed"
 
+            # 重探既有条目时，**原清单优先于猜测**（2026-09-06）。
+            #
+            # 为什么必须加这一条：兜底清单是「当前市面最新」，它与「这个站
+            # 实际卖什么」无关。而重探一个既有条目时，原条目里的清单是先前
+            # 一轮实测沉淀下来的 —— 它比工具的猜测硬。原来这里无条件用猜测
+            # 清单，于是判死段（中转站关 /models 是常态）的既有条目在写回时
+            # 清单被整份换掉。实测这份生产配置：tabitoken claude 条目的
+            # claude-opus-4-8 / claude-opus-4-8-thinking 两个模型消失，
+            # 换进 claude-fable-5-1 等四个这个站从没验过的名字 ——
+            # 那让 CPA 每次轮到它都对着不存在的模型发请求。
+            #
+            # 判据用「原清单存不存在」而不是 rebuild 标志：手工把既有站
+            # 重新粘一遍也是同一个处境，不该因入口不同而两种行为。
+            # 仍然记 seed —— 依据强度没有变（原清单也不是**本次**实测的），
+            # 界面照实说、默认不勾，只是不再拿猜测覆盖既有事实。
+            prior = existing_models_for(cfg, section, base, row.api_key)
+            if prior:
+                models, model_source = prior, "prior"
+
         score = score_verdict(v)
         pri, reason = suggest_priority(band, score, models=models,
                                        probation=probation)
@@ -2141,6 +2287,7 @@ def build_plan(
             if not forced_models:
                 whence = {"probed": "本次实测到的清单",
                           "catalog": "站方目录",
+                          "prior": "原 config.yaml 的清单",
                           "seed": "市面最新清单"}.get(model_source, "工具兜底清单")
                 fallback_note = (f"。手填的全部不合规，已改用{whence} —— "
                                  "要指定别的模型请改成符合规则的名字")
@@ -2219,6 +2366,19 @@ def build_plan(
                     "**从没报过**它们，CPA 路由过去大概率 404。"
                     "compat 段走 /chat/completions，CPA 对模型名零校验 —— "
                     "能不能用取决于上游认不认，本工具没有验证过")
+        elif model_source == "prior":
+            # 判死 + 目录读不到 + 原条目有清单 —— 沿用原清单而不是猜测。
+            # 措辞要说清三件事：为什么没有本次依据、清单从哪来、风险是什么。
+            sp.priority_reason = (
+                f"未验证（探测判「{v.category or '不可用'}」，"
+                f"沿用原清单）· {reason}")
+            sp.warnings.append(
+                f"探测未通过（{v.category or '不可用'} — {v.action or ''}）"
+                f"，且站方 /models 目录读不到 —— 模型清单**沿用原 "
+                f"config.yaml 里这个条目已有的**：{', '.join(models)}。"
+                "没有拿本工具猜的「市面最新」覆盖它：原清单是先前一轮实测"
+                "沉淀下来的，比猜测硬。但本次没验过，这些模型现在是否还能用"
+                "未知 —— 要换清单请在右侧手填")
         elif model_source == "seed":
             # 走到这里有两种处境，措辞要分开 —— 说错一种就是误导：
             #   · v.usable=False：探测没通过（判死/门禁/限频…），目录也读不到
@@ -2269,6 +2429,12 @@ def build_plan(
                                     v.websockets is True)
         if ws_note:
             sp.warnings.append(ws_note)
+        # session-affinity 的跨档说明（2026-09-05）。与上面那条平行 ——
+        # 那条讲 codex 段的 WS 请求去哪个档，这条讲所有段的已绑定会话不换档。
+        # 见 affinity_crosstier_note。
+        aff_note = affinity_crosstier_note(cfg, band, sp.priority)
+        if aff_note:
+            sp.warnings.append(aff_note)
         if v.swap_detected:
             sw = v.swap
             detail = f"{sw.get('rate_pct', 0)}%（{sw.get('swap')}/{sw.get('same', 0) + sw.get('swap', 0)} 次）"
@@ -2302,7 +2468,9 @@ def build_plan(
 #   0  probed         本次实测跑通推理
 #   1  manual/catalog 手填 / 站方目录声称有
 #   2  seed           工具猜测，零依据
-_EVID = {"probed": 0, "manual": 1, "catalog": 1, "seed": 2}
+# prior 与 catalog 同档（1）：原清单是先前一轮的实测沉淀，比工具猜测（2）硬，
+# 但不是**本次**实测（0）。2026-09-06 加。
+_EVID = {"probed": 0, "manual": 1, "catalog": 1, "prior": 1, "seed": 2}
 
 
 def _evid(sps: list[SectionPlan]) -> int:

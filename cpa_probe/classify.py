@@ -56,6 +56,18 @@ DISPOSITION = {
 
 # 判定顺序即列表顺序。第一条命中即返回。
 # (类别, 说明, 正则, 限定状态码集合或 None 表示不限)
+# 「这个分组里没有**这个模型**」的正文措辞表。单独提出来是因为
+# `pipeline._model_specific_dead_end` 要用同一份判据 —— 它决定「换个模型再试」
+# 还是「整段判死」。两处各写一份的后果实测过：措辞分叉后 classify 把正文判成
+# 模型专属，pipeline 认不出来，于是一个换模型就能通的站被判成整段没救
+# （2026-09-06 修，此前两处已分叉出「分组无该模型渠道」等两种说法）。
+MODEL_CHANNEL_BODY = (
+    r"无可用渠道|no available channel|model_not_found|可用渠道不存在"
+    r"|分组.*无.*渠道"
+    r"|当前 ?API ?不支持所选模型"
+)
+
+
 _RULES: list[tuple[str, str, str, set[str] | None]] = [
     # ---- 余额类：必须排在 CF/门禁之前。403 也可以是余额 ----
     #
@@ -90,6 +102,18 @@ _RULES: list[tuple[str, str, str, set[str] | None]] = [
     # ---- 站方硬拒 ----
     ("死路", "敏感词拦截", r"sensitive_words", None),
     ("鉴权", "需特定客户端标识", r"unauthorized client", None),
+
+    # ---- 405 Method Not Allowed：站方维护或协议不支持 ----
+    #
+    # 实测 zzzcoding 维护期间对所有 POST 一律回 405 + nginx HTML，GET 回 200 HTML
+    # 维护页。405 在 CPA 里既不自动重试也不在用户 config 的 request-scoped-errors
+    # 里，导致 CPA 直接把 405 返给客户端而不轮换下一凭据，明明有 29 个健康 codex
+    # 凭据却因为优先级最高的这个站返回 405 而全失败（2026-09-06 实测）。
+    # 405 从性质上看是「站方临时不可用」（维护）或「协议错配」（POST 到只认 GET
+    # 的端点），不是凭据问题，应该降级 / 轮换 / 重试。分类定为「临时」，让 CPA
+    # 写出 continue-and-cooldown 规则（与 500/502/503 同处理）。
+    ("临时", "405 Method Not Allowed",
+     r"405 not allowed|method not allowed|405 method", {"405"}),
 
     # ---- CPA 自注入工具被拒 ----
     ("注入", "image_generation 工具被拒",
@@ -127,10 +151,7 @@ _RULES: list[tuple[str, str, str, set[str] | None]] = [
     ("死路", "Key 分组不匹配",
      r"group platform is not|api key group"
      r"|分组不匹配|密钥分组|key.{0,10}分组.{0,10}(?:不|错)", None),
-    ("死路", "分组无该模型渠道",
-     r"无可用渠道|no available channel|model_not_found|可用渠道不存在"
-     r"|分组.*无.*渠道"
-     r"|当前 ?API ?不支持所选模型", None),
+    ("死路", "分组无该模型渠道", MODEL_CHANNEL_BODY, None),
 
     # ---- 临时 ----
     ("临时", "站方负载上限", r"负载已经?达到?上限", None),
@@ -166,6 +187,9 @@ def classify(status: str, body: str) -> tuple[str, str]:
         return "门禁", "403 且无余额/CF 特征，判为站方策略"
     if s == "404":
         return "死路", "404 路径或模型不存在"
+    if s == "405":
+        # 405 兜底：关键词规则没命中时的裸 405
+        return "临时", "405 Method Not Allowed"
     if s == "429":
         return "限流", "429 限流"
     if s.startswith("5"):

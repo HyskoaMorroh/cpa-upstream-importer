@@ -2241,7 +2241,11 @@ async function refreshPlan(silent) {
         // 不回写也不会丢：后端本来就会写它自己算出的 sp.models，界面显示的
         // 就是同一份。用户真的取消勾选时 change 事件会写 S.forced（那时
         // 记成手填是对的 —— 操作员显式做了决定）。
-        if (rec === undefined && sp.model_source !== 'seed') {
+        // prior 与 seed 同办（2026-09-06）：那份清单也不是操作员填的，
+        // 而是从原 config.yaml 搬回来的。回写会让后端当成手填，
+        // 徽标与跨段闸都跟着变 —— 与 seed 完全同一个坑。
+        if (rec === undefined && sp.model_source !== 'seed'
+            && sp.model_source !== 'prior') {
           (S.forced[p.line_no] = S.forced[p.line_no] || {})[sec] = [...on];
         }
       }
@@ -2300,6 +2304,11 @@ async function refreshPlan(silent) {
         if (sp.model_source === 'seed') {
           extra = '<div class="hint">种子兜底：站方目录也没报模型，'
             + '这几个名字是本工具猜的，勾选前请确认</div>';
+        }
+        if (sp.model_source === 'prior') {
+          extra = '<div class="hint">沿用原清单：本次没探通、目录也读不到，'
+            + '这几个名字是原 config.yaml 里已经写着的（先前一轮的实测沉淀），'
+            + '没有被工具猜的「市面最新」覆盖 —— 但本次未验证</div>';
         }
         if (sp.new_section && !sp.write_blocked) {
           extra += '<div class="hint">原 config.yaml 里这个凭据没配这一段 ——'

@@ -112,6 +112,7 @@ _SECTION_KEYS = (
 # 「新增这一段的依据有多硬」，而 `probed` / `catalog` 这类内部值看不出来。
 _SRC_LABEL = {
     "probed": "本次实测通过",
+    "prior": "沿用原 config.yaml 的清单",
     "catalog": "站方目录声称有",
     "manual": "你手填的清单",
     "seed": "工具猜测",
@@ -900,8 +901,12 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
             # 本次没探上下文时历史值全丢。实测生产配置 8 处，客户端会按 CPA
             # 内置目录的偏大值定压缩点，塞满才发现被上游截断。
             if sp.max_context_length and m == sp.context_model:
+                # 行尾注明单位与来路：这个数是**折算成 token** 的实测容量
+                # （探测发字符、CPA 读 token，见 pipeline._bisect 的单位一节）。
+                # 原来只写「实测值」，而文件里同时存在旧的字符数值 ——
+                # 读文件的人无从分辨哪一个是哪一种。
                 rows.append(f"{indent}  max-context-length: {sp.max_context_length}"
-                            f"   # 实测值")
+                            f"   # 实测容量（token）")
             elif sp.prior_context.get(m):
                 rows.append(f"{indent}  max-context-length: "
                             f"{sp.prior_context[m]}   # 原值搬运")

@@ -20,6 +20,7 @@ compat 重名 provider、撞已有站、同 Key 重复导入，三者都在真�
     ⑩ 撞已有站 + 多个新 Key     一次追加多个
     ⑪ 已存在的 Key 再导一次     两段都判重（含五元组撞不上的情形）
     ⑫ prefix 沿用该段主导值     gemini=GLE / codex=CDX / claude=ANT，compat 留空
+    ⑬ 405 分类                  关键词与兜底都判「临时」
 """
 
 from __future__ import annotations
@@ -609,6 +610,24 @@ def main() -> int:
     section("判不可用的段：勾选后参数不许留「未定」")
     _dead_section_params()
     _fallback_headers_per_protocol()
+
+    section("⑬ 405 分类")
+    # 405 在 CPA 里既不自动重试也不在用户 config 的 request-scoped-errors 里，
+    # 导致站方维护期间一律返回 405 时 CPA 直接把 405 返给客户端而不轮换下一凭据
+    # （2026-09-06 实测 zzzcoding 维护期间对所有 POST 回 405 + nginx HTML）。
+    # 分类定为「临时」，让 CPA 写出 continue-and-cooldown 规则。
+    from cpa_probe.classify import classify
+    tests_405 = [
+        ('405', '405 not allowed'),
+        ('405', 'method not allowed'),
+        ('405', '405 method not allowed'),
+        ('405', ''),
+        ('405', 'some other text'),
+    ]
+    for s, b in tests_405:
+        cat, act = classify(s, b)
+        eq(f"405 + {b[:20]!r} → 临时", cat, '临时')
+        eq(f"405 + {b[:20]!r} → action 含 405", '405' in act, True)
 
     print("\n" + "=" * 62)
     if _fail:

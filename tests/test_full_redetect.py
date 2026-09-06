@@ -1499,10 +1499,16 @@ openai-compatibility:
         max-context-length: 531667
 ''')
     mc = existing_model_context(cfg)
-    assert mc[("claude-api-key", "a.example.com", "kA", "claude-opus-5")] == 987500, mc
+    # 987500 是旧版按**字符数**写下的值（旧 _bisect 的第三个二分中点），
+    # 搬运时折算成 token —— CPA 把这个字段当 token 读。见
+    # batch._fix_legacy_char_context 与 pipeline._bisect 的单位一节。
+    assert mc[("claude-api-key", "a.example.com", "kA",
+               "claude-opus-5")] == 246875, mc
     # 没写窗口的模型不该出现在表里（与「写了 0」区分）
     assert ("claude-api-key", "a.example.com", "kA", "claude-sonnet-5") not in mc, mc
     # compat 的 models 在 provider 级 —— 组内每把 Key 都查得到
+    # 531667 不在旧二分的取值格子里 —— 那是上游正文自报的 token 数，
+    # 本来就对，必须原样保留（折算它会把一个正确值改错）。
     for k in ("kA", "kB"):
         assert mc[("openai-compatibility", "a.example.com", k,
                    "claude-opus-5")] == 531667, mc
@@ -1514,7 +1520,7 @@ openai-compatibility:
                      prior_context={"claude-opus-5": 987500})
     rows = render_entry(sp, "  ", "    ", "x")
     txt = "\n".join(rows)
-    assert "max-context-length: 987500" in txt, txt
+    assert "max-context-length: 987500" in txt, txt   # prior_context 直接给值，不经折算
     assert txt.count("max-context-length") == 1, (
         f"只有 claude-opus-5 有窗口值，不该外推给 sonnet：{txt}")
     assert "原值搬运" in txt, txt
@@ -1526,7 +1532,9 @@ openai-compatibility:
                       context_model="claude-opus-5",
                       prior_context={"claude-opus-5": 987500})
     t2 = "\n".join(render_entry(sp2, "  ", "    ", "x"))
-    assert "max-context-length: 1100000" in t2 and "实测值" in t2, t2
+    assert "max-context-length: 1100000" in t2, t2
+    # 行尾注明单位：文件里同时存在旧的字符数值，只写「实测值」读不出是哪一种。
+    assert "实测容量（token）" in t2, t2
     assert "987500" not in t2, f"实测值该盖掉原值：{t2}"
 
     # 本次实测的是**另一个**模型：两个各自写自己的值，不互相外推
@@ -3968,6 +3976,258 @@ def test_context_limit_lower_bound():
     print("[OK] Context floor: input_tokens=10 被丢弃、60k 正常采信")
 
 
+def test_context_unit_is_tokens():
+    """`max-context-length` 必须以 **token** 计，不是发送的字符数。
+
+    2026-09-06 抓到的真实数据错误：`_bisect` 的 lo/hi/mid 是**字符数**
+    （探测发 `"x" * n`），而返回值直接进 `models[].max-context-length`，
+    而 CPA 把那个字段当 **token** 用：
+      model_registry.go:1440         → /v1/models 的 max_context_length
+      codex/models/models.go:206-211 → context_window / max_context_window
+    于是「上游能吃 110 万字符」被写成「窗口 1100000 token」，虚报约 4 倍。
+    客户端按虚高的窗口定压缩点，塞到真实上限之外才被上游截断 —— 那条 400。
+
+    生产 config.yaml 里 6 处 `max-context-length: 987500` 就是旧二分第三个
+    中点 (875000+1100000)//2 的**字符数**，不是任何站声明的窗口。
+
+    守三件事：
+      ① 字符路径（hi 通过 / 二分收敛）经折算，不得原样返回
+      ② declared 与 input_tokens 本来就是 token，不得再折算
+      ③ 折算方向保守 —— 报出的窗口不大于真实窗口
+    """
+    from cpa_probe import pipeline as pl
+    from cpa_probe.pipeline import Attempt, SectionVerdict
+
+    row = cp.parse_lines("https://unit.example,sk-u").valid[0]
+
+    # ① hi 一发通过：110 万字符不能写成 1100000
+    #
+    # `input_tokens` 必须 >= 发送字符数的一半，否则 `check()` 判成「截断」，
+    # 走的是 `return trunc_hi, True`（那条路返回上游给的 token 数，本来就
+    # 不该折算）。撤销验证抓到过这个假绿：按 chars//4 造 input_tokens 时
+    # 275000 < 550000 命中截断分支，返回值恰好等于折算结果，于是把
+    # `return _chars_to_tokens(hi)` 改回 `return hi` 测试照样通过。
+    # 这里让上游报「全收下了」——那才是走 ok_hi 那条路的唯一形态。
+    prober = Prober(gap=0.0, probe_context=True, swap_samples=0)
+    prober._call = lambda section, base, key, model, **kw: Attempt(  # type: ignore[assignment]
+        section=section, model=model, combo=kw.get("combo", ""),
+        status="200", category="可用", action="", elapsed_ms=1,
+        input_tokens=len(kw.get("text") or ""),   # = 发送量，未截断
+        sent_chars=len(kw.get("text") or ""))
+    v = SectionVerdict(section="claude-api-key", usable=True,
+                       base_url="https://unit.example", models=["m"])
+    prober._stage4_context(row, v)
+    assert v.context_untrusted is False, "这一发是正常通过，不是截断反推"
+    assert v.max_context_length == pl._chars_to_tokens(1_100_000), (
+        f"字符数没折算成 token：{v.max_context_length}")
+    assert v.max_context_length < 1_100_000, v.max_context_length
+
+    # ①b 二分收敛那条路也要折算 —— 与 hi 一发通过是**两个** return。
+    # 撤销验证抓到：只测 hi 时把 `return _chars_to_tokens(left)` 改回
+    # `return left` 照样全绿。这里让 hi 失败、lo 通过，逼二分走完。
+    #
+    # 形态：正文不提上限（否则走 declared 那条路直接返回），
+    # 超过 60 万字符就 400、以下全收 —— 于是二分在 lo..hi 之间收敛。
+    LIMIT_CHARS = 600_000
+
+    def stepped(section, base, key, model, **kw):
+        n = len(kw.get("text") or "")
+        if n > LIMIT_CHARS:
+            return Attempt(section=section, model=model,
+                           combo=kw.get("combo", ""), status="400",
+                           category="门禁", action="超限", elapsed_ms=1,
+                           excerpt="request too large")   # 不提数字
+        return Attempt(section=section, model=model, combo=kw.get("combo", ""),
+                       status="200", category="可用", action="", elapsed_ms=1,
+                       input_tokens=n, sent_chars=n)
+
+    p1b = Prober(gap=0.0, probe_context=True, swap_samples=0)
+    p1b._call = stepped        # type: ignore[assignment]
+    v1b = SectionVerdict(section="claude-api-key", usable=True,
+                         base_url="https://unit.example", models=["m"])
+    p1b._stage4_context(row, v1b)
+    assert v1b.context_untrusted is False, "二分收敛不是截断反推"
+    got = v1b.max_context_length or 0
+    assert got < LIMIT_CHARS // 3, (
+        f"二分结果没折算成 token（{got} 看着像字符数）")
+    # 二分逼近 LIMIT_CHARS（从下方），折算后必须落在 token 量级：
+    #   下界 lo=200000 字符 → 50000 token
+    #   上界 LIMIT_CHARS    → 150000 token
+    assert pl._chars_to_tokens(200_000) <= got <= pl._chars_to_tokens(LIMIT_CHARS), (
+        f"折算后应在 50000..150000 token 之间，实得 {got}")
+
+    # ② 上游正文自报的窗口：那是 token，原样返回
+    p2 = Prober(gap=0.0, probe_context=True, swap_samples=0)
+    p2._call = lambda section, base, key, model, **kw: Attempt(  # type: ignore[assignment]
+        section=section, model=model, combo=kw.get("combo", ""),
+        status="400", category="门禁", action="超限", elapsed_ms=1,
+        excerpt="maximum context length is 262144 tokens")
+    v2 = SectionVerdict(section="claude-api-key", usable=True,
+                        base_url="https://unit.example", models=["m"])
+    p2._stage4_context(row, v2)
+    assert v2.max_context_length == 262_144, (
+        f"上游自报的 token 数不该被折算：{v2.max_context_length}")
+
+    # ③ 截断反推：input_tokens 也是 token，原样返回
+    p3 = Prober(gap=0.0, probe_context=True, swap_samples=0)
+    p3._call = lambda section, base, key, model, **kw: Attempt(  # type: ignore[assignment]
+        section=section, model=model, combo=kw.get("combo", ""),
+        status="200", category="可用", action="", elapsed_ms=1,
+        input_tokens=131_072, sent_chars=len(kw.get("text") or ""))
+    v3 = SectionVerdict(section="claude-api-key", usable=True,
+                        base_url="https://unit.example", models=["m"])
+    p3._stage4_context(row, v3)
+    assert v3.max_context_length == 131_072, v3.max_context_length
+    assert v3.context_untrusted is True
+
+    # 旧值迁移：格子上的字符数折回 token，格子外的原样留
+    from cpa_probe.batch import _fix_legacy_char_context as fix
+    assert fix(987_500) == pl._chars_to_tokens(987_500), fix(987_500)
+    assert fix(1_100_000) == pl._chars_to_tokens(1_100_000)
+    assert fix(15_515) == 15_515, "上游自报值不在格子里，不许动"
+    assert fix(262_144) == 262_144, "2^18 是常见真实窗口，不许动"
+    # 200000 有意排除 —— 同时是旧下界与最常见的真实窗口（Claude/GPT 两系）
+    assert fix(200_000) == 200_000, "折它会把一个正确的声明值改小"
+
+    print("[OK] Context unit: 字符经折算、declared 与 input_tokens 原样、旧值迁移")
+
+
+def test_dead_end_matcher_shared_with_classify():
+    """「这个分组没有这个模型」的措辞表只能有一处。
+
+    2026-09-06 抓到：`classify` 的「分组无该模型渠道」规则与 pipeline 的
+    `_MODEL_SPECIFIC_DEAD_END` 各写一份平行措辞表，已经分叉 ——
+    「分组无该模型渠道」「当前分组下无此模型的渠道」两种正文
+    classify 认、pipeline 不认。
+
+    后果是**方向反了的误判**：`_stage1_baseline` 靠
+    `_model_specific_dead_end` 决定「换个模型再试」还是「整段判死」。
+    不认 = 立即收敛整段，而那本来是换个模型就可能通的站。
+    """
+    import re
+    from cpa_probe.classify import MODEL_CHANNEL_BODY, _RULES
+    from cpa_probe.pipeline import _MODEL_SPECIFIC_DEAD_END as MS
+
+    row = [r for r in _RULES if r[1] == "分组无该模型渠道"]
+    assert len(row) == 1, _RULES
+    assert row[0][2] is MODEL_CHANNEL_BODY, (
+        "classify 的规则又抄了一份措辞 —— 必须引用 MODEL_CHANNEL_BODY")
+
+    pat = re.compile(MODEL_CHANNEL_BODY, re.I)
+    bodies = [
+        "分组无该模型渠道",
+        "当前分组下无此模型的渠道",
+        "该分组无可用渠道",
+        "无可用渠道",
+        "model_not_found",
+        "可用渠道不存在",
+        "当前API不支持所选模型",
+    ]
+    for b in bodies:
+        assert bool(pat.search(b)) == bool(MS.search(b)), (
+            f"两处判据对「{b}」不一致 —— 措辞表又分叉了")
+
+    # 真正与模型无关的死路仍然不许豁免（否则整段永不收敛，白发请求）
+    for b in ("Key 分组不匹配", "sensitive words detected", "404 page not found"):
+        assert not MS.search(b), f"「{b}」与模型无关，不该当成模型专属"
+
+    print("[OK] Dead-end matcher: classify 与 pipeline 同一份措辞，7 种正文一致")
+
+
+def test_seed_does_not_overwrite_existing_models():
+    """判死 + 目录读不到时，既有条目的模型清单不许被猜测清单覆盖。
+
+    2026-09-06 用生产 config.yaml 实测抓到：tabitoken 的 claude 条目原有
+    claude-opus-5 / -thinking / claude-opus-4-8 / -4-8-thinking 四个，
+    重探判死后 `models` 被换成 claude-fable-5-1 等六个**这个站从没验过**的
+    名字 —— 后两个模型直接消失，新写进去的名字 CPA 路由过去大概率 404。
+
+    兜底清单是「当前市面最新」，与「这个站卖什么」无关；原清单是先前一轮
+    实测沉淀的。所以原清单优先，`model_source` 记 `prior`。
+
+    仍要守的边界：
+      · 新凭据（原文件里没有）没有原清单可沿用 → 仍走 seed
+      · 同站**另一把** Key 的清单不许串过来（键含 api_key）
+      · prior 不是操作员的显式意图 —— 不许当手填，也不许凭它新增段
+    """
+    import yaml
+    from cpa_probe.plan import existing_models_for
+
+    cfg = yaml.safe_load('''
+claude-api-key:
+  - api-key: "kA"
+    base-url: "https://seed.example"
+    priority: 990
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+      - name: "claude-opus-4-8"
+        alias: ""
+  - api-key: "kB"
+    base-url: "https://seed.example"
+    priority: 990
+    models:
+      - name: "claude-sonnet-5"
+        alias: ""
+openai-compatibility:
+  - name: "p"
+    base-url: "https://seed.example/v1"
+    api-key-entries:
+      - api-key: "kA"
+      - api-key: "kB"
+    models:
+      - name: "kimi-k3"
+        alias: ""
+''')
+    # 逐 Key 隔离：kA 拿不到 kB 的清单
+    assert existing_models_for(cfg, "claude-api-key", "https://seed.example",
+                               "kA") == ["claude-opus-5", "claude-opus-4-8"]
+    assert existing_models_for(cfg, "claude-api-key", "https://seed.example",
+                               "kB") == ["claude-sonnet-5"]
+    # 新 Key / 新站：没有原清单
+    assert existing_models_for(cfg, "claude-api-key", "https://seed.example",
+                               "kZ") == []
+    assert existing_models_for(cfg, "claude-api-key", "https://other.example",
+                               "kA") == []
+    # compat 的 models 在 provider 级 —— 组内每把 Key 都查得到同一份
+    for k in ("kA", "kB"):
+        assert existing_models_for(cfg, "openai-compatibility",
+                                   "https://seed.example/v1", k) == ["kimi-k3"]
+
+    # 整条链：判死 + 目录读不到 → 沿用原清单，标 prior，默认不勾
+    import cpa_probe as cpa
+    from cpa_probe.pipeline import CandidateResult, SectionVerdict
+
+    row = cp.parse_lines("https://seed.example,kA").valid[0]
+    res = CandidateResult(row=row)
+    for sec in cpa.SECTIONS:
+        v = SectionVerdict(section=sec,
+                           base_url=cpa.base_for_section(row.bare, sec))
+        v.usable = False
+        v.category, v.action = "死路", "分组无该模型渠道"
+        res.sections[sec] = v
+    plan = cpa.build_plan(row, res, cfg, rebuild=True)
+    sp = plan.sections["claude-api-key"]
+    assert sp.model_source == "prior", sp.model_source
+    assert sp.models == ["claude-opus-5", "claude-opus-4-8"], sp.models
+    assert sp.recommended is False, "沿用原清单不等于本次验过，不许默认勾"
+    assert sp.writable is True, "原清单是确定值，该让操作员能勾"
+    assert any("沿用原" in w for w in sp.warnings), sp.warnings
+
+    # 原文件里没有的段：没有原清单 → 仍走 seed（不许凭空说「沿用」）
+    assert plan.sections["gemini-api-key"].model_source == "seed"
+
+    # prior 与 seed 一样不够格新增一个原本不存在的段
+    from cpa_probe.writeback import new_section_admitted
+    assert not new_section_admitted("prior"), (
+        "prior 不是本次实测依据，不许凭它新增段")
+    assert not new_section_admitted("seed")
+    for src in ("probed", "manual", "catalog"):
+        assert new_section_admitted(src), src
+
+    print("[OK] Seed floor: 原清单优先于猜测、逐 Key 隔离、prior 不得新增段")
+
+
 def test_assign_priorities_site_level():
     """批量定档：站与站不同值、同站所有 Key 同值，且不越过安全上限。
 
@@ -4925,6 +5185,11 @@ if __name__ == "__main__":
         ("落后目录不默认勾", test_stale_catalog_not_recommended),
         ("限频阈值自动学习", test_rate_limit_learned),
         ("上下文上限下限校验", test_context_limit_lower_bound),
+        ("上下文上限单位是 token", test_context_unit_is_tokens),
+        ("死路措辞表与 classify 共用",
+         test_dead_end_matcher_shared_with_classify),
+        ("兜底不覆盖既有清单",
+         test_seed_does_not_overwrite_existing_models),
         ("能力开关实测与写回",
          test_capability_toggles_probed_and_written),
         ("compat 同 host 多路径隔离", test_compat_same_host_multi_path_isolated),
