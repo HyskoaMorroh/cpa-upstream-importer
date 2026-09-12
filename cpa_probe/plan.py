@@ -3076,30 +3076,37 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
         # - 健康分数替换原来的"组内最高分"（从静态检测分转为动态运行状态）
         # - 主机名保持稳定性（同输入同输出）
 
-        from .runtime_health import (
-            fetch_cpa_runtime_health,
-            get_domain_health_scores,
-        )
+        # 尝试导入 runtime_health（需 requests 模块，测试环境可能缺失）
+        try:
+            from .runtime_health import (
+                fetch_cpa_runtime_health,
+                get_domain_health_scores,
+            )
+            runtime_health_available = True
+        except ImportError:
+            runtime_health_available = False
+            logger.debug("runtime_health 模块不可用（缺少 requests），将回退到静态检测分")
 
         # 尝试查询 CPA 运行时状态（默认端口 8317，从 config.yaml 读取）
-        cpa_base_url = None
-        if cfg.get("port"):
-            cpa_base_url = f"http://localhost:{cfg['port']}"
+        domain_health = {}
+        if runtime_health_available:
+            cpa_base_url = None
+            if cfg.get("port"):
+                cpa_base_url = f"http://localhost:{cfg['port']}"
 
-        runtime_health = fetch_cpa_runtime_health(cpa_base_url)
+            runtime_health = fetch_cpa_runtime_health(cpa_base_url)
 
-        if runtime_health:
-            logger.info(f"段 {section}：已获取 CPA 运行时健康数据，将基于实际运行状态分配优先级")
-            # 计算每个域名的健康分数
-            domain_health = get_domain_health_scores(
-                [sp for sps in by_host.values() for sp in sps],
-                runtime_health,
-                cfg,
-                section
-            )
-        else:
-            logger.info(f"段 {section}：CPA 运行时数据不可用，将基于检测结果预测健康分数")
-            domain_health = {}
+            if runtime_health:
+                logger.info(f"段 {section}：已获取 CPA 运行时健康数据，将基于实际运行状态分配优先级")
+                # 计算每个域名的健康分数
+                domain_health = get_domain_health_scores(
+                    [sp for sps in by_host.values() for sp in sps],
+                    runtime_health,
+                    cfg,
+                    section
+                )
+            else:
+                logger.info(f"段 {section}：CPA 运行时数据不可用，将基于检测结果预测健康分数")
 
         # 构建排序键：每个站取其健康分数（运行时或预测）
         def _sort_key(kv):
