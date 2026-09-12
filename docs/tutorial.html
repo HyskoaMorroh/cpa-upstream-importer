@@ -150,6 +150,7 @@ footer code{background:none;padding:0}
   <a href="#s6">06 定档</a>
   <a href="#s6-5">06.5 前缀</a>
   <a href="#s7">07 写回</a>
+  <a href="#tuning">08 全局调优</a>
   <a href="#s7-5">07.5 全量重探</a>
   <a href="#s7-8">07.8 对齐与加固</a>
   <a href="#s-fix-403">07.9 headers 转发链</a>
@@ -3345,6 +3346,273 @@ func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config) {
   <div class="note g">
     <div class="t">修复完成</div>
     <p>2026-09-06 修复完成。适用于所有要求特定客户端标识的上游站点。</p>
+  </div>
+
+</div></section>
+
+<section id="tuning"><div class="wrap">
+  <div class="sech"><span class="no">08</span><h2>全局调优体检（Web 面板）</h2></div>
+  <div class="sub">用图形面板检查并修正 CPA 重试预算配置</div>
+
+  <p>CPA 的 <code>max-retry-credentials</code> 与本工具写入的 <code>priority</code>
+  是<b>耦合</b>的 —— 预算要覆盖顶层池所有凭据，但顶层池每次重探后可能变化。
+  原来只写在 <code>config.yaml</code> 注释里靠人工核对，现在面板自动算出建议值。</p>
+
+  <h3>为什么需要这个面板</h3>
+  <div class="tw"><table>
+    <thead><tr>
+      <th>问题</th>
+      <th>后果</th>
+      <th>面板怎么解决</th>
+    </tr></thead>
+    <tbody>
+      <tr>
+        <td>预算 &lt; 顶层池</td>
+        <td><span class="pill p-b">透传 403</span> —— 有可用凭据但轮不到</td>
+        <td>算出顶层池实际凭据数，建议调大预算</td>
+      </tr>
+      <tr>
+        <td>预算 ≫ 顶层池</td>
+        <td><span class="pill p-w">客户端 524</span> —— 越过反代回源窗口</td>
+        <td>根据回源窗口和单次失败时长算上限</td>
+      </tr>
+      <tr>
+        <td>连续同站过多</td>
+        <td><span class="pill p-w">同一个站连打</span> —— 触发站级限流</td>
+        <td>展示每段最长连续同站长度和站点</td>
+      </tr>
+      <tr>
+        <td><code>priority</code> 变了</td>
+        <td>顶层池变化，旧预算可能失效</td>
+        <td>每次体检重新计算当前顶层池</td>
+      </tr>
+    </tbody>
+  </table></div>
+
+  <h3>访问面板</h3>
+  <div class="cmd">
+    <div class="bar">Docker 部署</div>
+<pre>docker run -d --name upstream-importer \
+  -p 8765:8765 \
+  -v /opt/deploy/config.yaml:/app/config.yaml \
+  -e CONFIG_PATH=/app/config.yaml \
+  ghcr.io/your-org/upstream-importer:latest
+
+<span class="c"># 浏览器访问</span>
+http://your-server-ip:8765/</pre>
+  </div>
+
+  <div class="cmd">
+    <div class="bar">CentOS 9 直接运行</div>
+<pre><span class="c"># 安装依赖</span>
+sudo dnf install -y python3.12 python3.12-pip
+python3.12 -m pip install pyyaml
+
+<span class="c"># 启动 Web 服务</span>
+cd /opt/upstream-importer
+CONFIG_PATH=/opt/deploy/config.yaml python3.12 web/run.py
+
+<span class="c"># 浏览器访问</span>
+http://127.0.0.1:8765/</pre>
+  </div>
+
+  <h3>使用流程</h3>
+
+  <figure>
+    <svg width="900" height="480" viewBox="0 0 900 480">
+      <defs>
+        <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+          <path d="M0,0 L0,6 L9,3 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+
+      <rect x="40" y="40" width="180" height="80" rx="6" fill="var(--card)" stroke="var(--line)" stroke-width="2"/>
+      <text x="130" y="70" text-anchor="middle" fill="var(--ink)" font-size="15" font-weight="600">1. 点「开始体检」</text>
+      <text x="130" y="95" text-anchor="middle" fill="var(--ink-3)" font-size="12">读取 config.yaml</text>
+      <text x="130" y="110" text-anchor="middle" fill="var(--ink-3)" font-size="12">计算顶层池实况</text>
+
+      <path d="M 220 80 L 260 80" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrow)"/>
+
+      <rect x="260" y="40" width="180" height="120" rx="6" fill="var(--card)" stroke="var(--line)" stroke-width="2"/>
+      <text x="350" y="70" text-anchor="middle" fill="var(--ink)" font-size="15" font-weight="600">查看实况与建议</text>
+      <rect x="275" y="82" width="150" height="70" rx="4" fill="var(--accent-soft)" stroke="var(--line)"/>
+      <text x="350" y="100" text-anchor="middle" fill="var(--accent)" font-size="13" font-weight="600">claude-api-key</text>
+      <text x="350" y="118" text-anchor="middle" fill="var(--ink-2)" font-size="11">顶层档位 900 · 9 个凭据</text>
+      <text x="350" y="133" text-anchor="middle" fill="var(--warn)" font-size="11">连续同站 3 个</text>
+
+      <path d="M 350 160 L 350 200" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrow)"/>
+
+      <rect x="260" y="200" width="180" height="100" rx="6" fill="var(--card)" stroke="var(--line)" stroke-width="2"/>
+      <text x="350" y="225" text-anchor="middle" fill="var(--ink)" font-size="15" font-weight="600">改动建议</text>
+      <rect x="275" y="235" width="150" height="55" rx="4" fill="var(--bad-bg)" stroke="var(--bad)"/>
+      <text x="350" y="253" text-anchor="middle" fill="var(--bad)" font-size="12" font-weight="600">max-retry-credentials</text>
+      <text x="350" y="268" text-anchor="middle" fill="var(--ink)" font-size="11">4 → 9  【必改】</text>
+      <text x="350" y="282" text-anchor="middle" fill="var(--ink-3)" font-size="10">预算 &lt; 顶层池</text>
+
+      <path d="M 440 250 L 480 250" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrow)"/>
+
+      <rect x="480" y="200" width="180" height="100" rx="6" fill="var(--card)" stroke="var(--line)" stroke-width="2"/>
+      <text x="570" y="225" text-anchor="middle" fill="var(--ink)" font-size="15" font-weight="600">2. 预览 diff</text>
+      <rect x="495" y="235" width="150" height="55" rx="4" fill="var(--code-bg)"/>
+      <text x="570" y="253" text-anchor="middle" fill="#E68080" font-size="10" font-family="monospace">-max-retry-credentials: 4</text>
+      <text x="570" y="268" text-anchor="middle" fill="#8FD1A8" font-size="10" font-family="monospace">+max-retry-credentials: 9</text>
+      <text x="570" y="283" text-anchor="middle" fill="var(--ink-3)" font-size="9">注释 / 空行 / 缩进保留</text>
+
+      <path d="M 570 300 L 570 340" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrow)"/>
+
+      <rect x="480" y="340" width="180" height="100" rx="6" fill="var(--card)" stroke="var(--line)" stroke-width="2"/>
+      <text x="570" y="365" text-anchor="middle" fill="var(--ink)" font-size="15" font-weight="600">3. 确认写回</text>
+      <text x="570" y="390" text-anchor="middle" fill="var(--ink-2)" font-size="12">✓ 自动备份</text>
+      <text x="570" y="408" text-anchor="middle" fill="var(--ink-2)" font-size="12">✓ 写回 YAML</text>
+      <text x="570" y="426" text-anchor="middle" fill="var(--ink-2)" font-size="12">✓ 触发 CPA 重载</text>
+
+      <rect x="40" y="360" width="380" height="60" rx="6" fill="var(--ok-bg)" stroke="var(--ok)" stroke-width="2"/>
+      <text x="230" y="385" text-anchor="middle" fill="var(--ok)" font-size="14" font-weight="600">✓ 已写回,备份 config.yaml.20260912_143052</text>
+      <text x="230" y="405" text-anchor="middle" fill="var(--ink-2)" font-size="11">CPA 已重载配置,新预算生效</text>
+
+      <path d="M 480 390 L 420 390" stroke="var(--accent)" stroke-width="2" marker-end="url(#arrow)"/>
+    </svg>
+    <figcaption>Web 面板操作流程 —— 从诊断到写回全程可视化,中间任意环节可取消</figcaption>
+  </figure>
+
+  <h3>顶层池实况示例</h3>
+  <div class="cmd">
+    <div class="bar">体检报告 —— 顶层池构成</div>
+<pre><span class="k">claude-api-key</span>  顶层档位 <b>900</b> · <b>9</b> 个凭据 · 3 个站
+                最长连续同站 <span style="color:var(--warn)"><b>3</b> 个</span>（relay-l.example）—— 会连打同一个站
+
+<span class="k">openai-compatibility</span>  顶层档位 <b>500</b> · <b>12</b> 个凭据 · 4 个站
+                      最长连续同站 <span style="color:var(--warn)"><b>5</b> 个</span>（aggregator.example）—— 会连打同一个站
+
+<span class="k">azure-openai</span>  顶层档位 <b>800</b> · <b>6</b> 个凭据 · 2 个站
+             最长连续同站 2 个</pre>
+  </div>
+
+  <p><b>总凭据数</b>：9 + 12 + 6 = <b>27</b> 个 —— 这是 <code>max-retry-credentials</code> 的<b>最小值</b></p>
+
+  <h3>改动建议示例</h3>
+  <div class="cmd">
+    <div class="bar">诊断结果 —— 3 条建议</div>
+<pre><span class="pill p-b">必改</span> <b>max-retry-credentials</b>
+    当前 <code>4</code> → 建议 <code>27</code>
+    <span class="c">预算 4 &lt; 顶层池 27,有可用凭据轮不到 —— 耗尽后透传 403</span>
+
+<span class="pill p-w">建议</span> <b>max-retry-interval</b>
+    当前 <code>0</code> → 建议 <code>8</code>
+    <span class="c">所有候选冷却时直接透传,不等 8 秒让部分凭据退出冷却</span>
+
+<span style="color:var(--ink-3)">无需改动</span> <b>streaming.bootstrap-retries</b>
+    当前 <code>3</code> 已是建议值</pre>
+  </div>
+
+  <h3>对比：CLI 工具 vs Web 面板</h3>
+  <div class="tw"><table>
+    <thead><tr>
+      <th>项目</th>
+      <th>CLI <code>diag403.py</code></th>
+      <th>Web 面板</th>
+    </tr></thead>
+    <tbody>
+      <tr>
+        <td><b>输入</b></td>
+        <td>手工指定配置文件路径</td>
+        <td>自动读 <code>.env</code> 的 <code>CONFIG_PATH</code></td>
+      </tr>
+      <tr>
+        <td><b>输出</b></td>
+        <td>纯文本报告</td>
+        <td>分类卡片 + 彩色标签 + diff 预览</td>
+      </tr>
+      <tr>
+        <td><b>操作</b></td>
+        <td>只读,不能写回</td>
+        <td>预览 → 确认 → 自动备份 → 写回 → 触发 CPA 重载</td>
+      </tr>
+      <tr>
+        <td><b>依据展示</b></td>
+        <td>简要说明</td>
+        <td>每条建议带完整判据原文（为什么要改、不改的后果）</td>
+      </tr>
+      <tr>
+        <td><b>适用场景</b></td>
+        <td>CI / 定时巡检 / 脚本集成</td>
+        <td>人工调优 / 快速修正 / 探索式诊断</td>
+      </tr>
+    </tbody>
+  </table></div>
+
+  <div class="note">
+    <div class="t">为什么改值要保留注释</div>
+    <p><code>config.yaml</code> 里的注释记录着每次调参的<b>实测依据</b> ——
+    为什么是这个档位、这个预算、这个冷却时间,都是<b>踩坑后的真实教训</b>。
+    面板只改 YAML 的值,键序 / 注释 / 空行 / 缩进逐字保留,那些注释就是
+    「为什么是这个数」的唯一记录。</p>
+  </div>
+
+  <h3>CentOS 9 部署完整步骤</h3>
+  <div class="cmd">
+    <div class="bar">从零部署到 CentOS 9 VPS</div>
+<pre><span class="c"># 1. 安装 Python 3.12（CentOS 9 默认 3.9,需升级）</span>
+sudo dnf install -y python3.12 python3.12-pip git
+
+<span class="c"># 2. 克隆仓库</span>
+cd /opt
+sudo git clone https://github.com/your-org/upstream-importer.git
+cd upstream-importer
+
+<span class="c"># 3. 安装依赖</span>
+python3.12 -m pip install --user pyyaml
+
+<span class="c"># 4. 准备配置文件（指向 CPA 的 config.yaml）</span>
+cat &gt; .env &lt;&lt;'EOF'
+CONFIG_PATH=/opt/cpa/config.yaml
+CPA_RELOAD_CMD=systemctl reload cpa
+EOF
+
+<span class="c"># 5. 启动 Web 服务（前台测试）</span>
+python3.12 web/run.py
+
+<span class="c"># 浏览器访问 http://your-vps-ip:8765/</span>
+<span class="c"># 展开「全局调优体检」面板,点「开始体检」</span></pre>
+  </div>
+
+  <div class="cmd">
+    <div class="bar">systemd 守护进程（生产部署）</div>
+<pre><span class="c"># 创建 systemd 服务</span>
+sudo tee /etc/systemd/system/upstream-importer.service &lt;&lt;'EOF'
+[Unit]
+Description=CPA Upstream Importer Web Service
+After=network.target
+
+[Service]
+Type=simple
+User=deploy
+WorkingDirectory=/opt/upstream-importer
+Environment="CONFIG_PATH=/opt/cpa/config.yaml"
+Environment="CPA_RELOAD_CMD=systemctl reload cpa"
+ExecStart=/usr/bin/python3.12 /opt/upstream-importer/web/run.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+<span class="c"># 启动并设为开机自启</span>
+sudo systemctl daemon-reload
+sudo systemctl enable upstream-importer
+sudo systemctl start upstream-importer
+
+<span class="c"># 查看状态</span>
+sudo systemctl status upstream-importer</pre>
+  </div>
+
+  <div class="note w">
+    <div class="t">防火墙配置</div>
+    <p>CentOS 9 默认启用 <code>firewalld</code>,需放行 8765 端口：</p>
+<pre>sudo firewall-cmd --permanent --add-port=8765/tcp
+sudo firewall-cmd --reload</pre>
+    <p>生产环境建议配置反向代理（Nginx / Caddy）+ HTTPS。</p>
   </div>
 
 </div></section>
