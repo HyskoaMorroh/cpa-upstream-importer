@@ -3446,47 +3446,58 @@ def extract_prior_context(cfg: dict, section: str, base_url: str,
 def _needs_tls_proxy(base_url: str, section: str) -> tuple[bool, str]:
     """
     检测上游是否需要 TLS 代理以绕过指纹检测
-    
+
+    某些上游站点通过 TLS Client Hello 指纹（JA3/JA4）或 HTTP/2 指纹识别客户端，
+    拒绝非 Claude Code 的请求。CPA 使用 Go http.Client，其指纹与 Electron/Chromium
+    不同，导致 503 "Only Claude Code clients" 错误。
+
+    解决方案：通过本地 nginx 反向代理（127.0.0.1:8443）改变 TLS 握手指纹。
+    nginx 用 OpenSSL 指纹重新握手到上游，上游看到的是 nginx 指纹而非 Go 指纹。
+
+    配置位置：nginx.conf 末尾的 "TLS 指纹代理服务器" 块
+
     Args:
-        base_url: 上游基址
-        section: 段名
-    
+        base_url: 上游基址（如 https://api.zzzcoding.org/v1）
+        section: 段名（codex-api-key / claude-api-key 等，保留用于未来扩展）
+
     Returns:
-        (需要代理, 代理URL)
-        
-    检测逻辑：
-    1. 黑名单匹配 - 已知的指纹检测站点
-    2. 可扩展：检测历史错误信息中的关键字
+        (needs_proxy: bool, proxy_url: str)
+        - needs_proxy: 是否需要注入代理
+        - proxy_url: 代理地址（http://127.0.0.1:8443）
+
+    已知受限站点：
+        - api.zzzcoding.org / zzzcoding.org
+        - api.grok2.com / grok2.com（可扩展）
     """
     from urllib.parse import urlparse
-    
+
     # 已知需要 TLS 代理的站点（黑名单）
-    # 这些站点使用 TLS Client Hello 指纹或 HTTP/2 指纹识别客户端
     KNOWN_FINGERPRINT_SITES = [
         "api.zzzcoding.org",
         "zzzcoding.org",
-        # 可以添加更多已知站点
+        "api.grok2.com",
+        "grok2.com",
     ]
-    
-    # 默认代理端点（nginx TLS proxy，现有 nginx.conf 的 127.0.0.1:8443）
+
+    # 默认代理端点（nginx TLS proxy，nginx.conf 中的 127.0.0.1:8443）
     DEFAULT_PROXY_URL = "http://127.0.0.1:8443"
-    
+
     try:
         parsed = urlparse(base_url)
         hostname = parsed.netloc or parsed.path
-        
+
         # 去除端口号
         if ':' in hostname:
             hostname = hostname.split(':')[0]
-        
+
         # 检查黑名单
         for site in KNOWN_FINGERPRINT_SITES:
             if site in hostname.lower():
                 return True, DEFAULT_PROXY_URL
-        
+
         # 未来可扩展：检测 v.category 或错误信息中的关键字
         # 例如：if "fingerprint" in error_msg or "Claude Code" in error_msg
-        
+
     except Exception as e:
         # 解析失败，不注入代理
         import logging
