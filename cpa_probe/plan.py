@@ -2492,6 +2492,18 @@ def build_plan(
             # 段真的探通了就是 probed，补齐几个同族同档变体不改变这件事。
 
         score = score_verdict(v)
+
+        # P0-3: 提取历史 max-context-length 值（2026-09-12）
+        # -------------------------------------------------------
+        # 为什么要单独一份（2026-09-03 逐字段对账发现）：这个值在 `models:` 块里，
+        # 而 extract_carry_lines 有意跳过整个 models 块（清单由方案重新生成）。
+        # 于是它落进空档 —— carry 不搬，方案只带本次实测的那**一个**
+        # （max_context_length + context_model）。本次没探上下文时，历史实测值
+        # 全部消失。实测生产配置 8 处，kilo.example 的 987500 就在其中。
+        #
+        # 优先级：本次实测（context_model 那一个）> 原值搬运 > 不写。
+        # 见 render_entry 的 model_lines。
+        prior_ctx = extract_prior_context(cfg, section, base, row.api_key)
         pri, reason = suggest_priority(band, score, models=models,
                                        probation=probation)
 
@@ -2510,6 +2522,7 @@ def build_plan(
             prefix=prefix,
             headers=headers,
             max_context_length=v.max_context_length,
+            prior_context=prior_ctx,
             context_model=v.context_model,
             # 段专属能力开关的实测结论。三态原样带过来 —— False（实测不支持）
             # 与 None（未探测）在写回时行为相同，但界面措辞必须分开。
@@ -3250,3 +3263,78 @@ def priority_split_within_host(plans: list[ImportPlan]) -> list[str]:
             f"同协议内高档优先、低档作冷备；跨协议仍须满足同站约束。"
             f"请统一到同一档再写回")
     return out
+
+
+def extract_prior_context(cfg: dict, section: str, base_url: str,
+                          api_key: str) -> dict[str, int]:
+    """从原 config.yaml 提取该凭据的历史 max-context-length 值
+    
+    为什么需要这个函数（2026-09-03 逐字段对账发现）：
+    max-context-length 在 models: 块里，而 extract_carry_lines 有意跳过
+    整个 models 块（清单由方案重新生成）。于是它落进空档 —— carry 不搬，
+    方案只带本次实测的那**一个**（max_context_length + context_model）。
+    本次没探上下文时，历史实测值全部消失。
+    
+    实测生产配置 8 处，kilo.example 的 987500 就在其中。
+    
+    优先级：本次实测（context_model 那一个）> 原值搬运 > 不写。
+    见 writeback.py 的 render_entry 中 model_lines 函数。
+    
+    Args:
+        cfg: config.yaml 解析后的 dict
+        section: "gemini-api-key" | "codex-api-key" | "claude-api-key" | "openai-compatibility"
+        base_url: 站点 base-url
+        api_key: API key
+    
+    Returns:
+        {model_name: max_context_length} 字典，只包含有 max-context-length 的模型
+    """
+    scope = _source_url(base_url)
+    
+    def extract_from_models(models) -> dict[str, int]:
+        """从 models 列表提取 max-context-length"""
+        result = {}
+        for m in models or []:
+            if not isinstance(m, dict):
+                continue
+            
+            name = str(m.get("name") or "").strip()
+            if not name:
+                continue
+            
+            # max-context-length 可能写成各种形式（YAML 解析后统一成 max-context-length）
+            ctx = m.get("max-context-length")
+            
+            if ctx is not None:
+                try:
+                    ctx_int = int(ctx)
+                    if ctx_int > 0:
+                        result[name] = ctx_int
+                except (ValueError, TypeError):
+                    pass
+        return result
+    
+    if section == "openai-compatibility":
+        # compat 段的 models 在 provider 级，组内所有 Key 共用同一份
+        for prov in cfg.get("openai-compatibility") or []:
+            if not isinstance(prov, dict):
+                continue
+            if _source_url(str(prov.get("base-url") or "")) != scope:
+                continue
+            # 只要这个 Key 在这个 provider 的 api-key-entries 里就算命中
+            for ke in prov.get("api-key-entries") or []:
+                if isinstance(ke, dict) and str(ke.get("api-key") or "") == api_key:
+                    return extract_from_models(prov.get("models"))
+        return {}
+    
+    # 前三段：每个条目一个 api-key
+    for e in cfg.get(section) or []:
+        if not isinstance(e, dict):
+            continue
+        if str(e.get("api-key") or "") != api_key:
+            continue
+        if _source_url(str(e.get("base-url") or "")) != scope:
+            continue
+        return extract_from_models(e.get("models"))
+    
+    return {}
