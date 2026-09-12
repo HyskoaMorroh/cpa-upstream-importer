@@ -22,9 +22,9 @@
 
 - 177 个条目 → 79 个凭据（去重键 `(host, api_key)`）→ 14 个站
 - 快照里 78 张卡片 / 14 个站，**逐站数量完全对得上**：
-  gorouter 15、tabitoken 14、agentrouter 7、runanytime 7、muyuan 6、
-  justwoker 5、kktoken 5、其余各 3
-- 唯一缺口：`chiangma.com sk-Wxy…ic59`（只配在 gemini 段）——
+  gorou 15、tango 14、golf 7、romeo 7、muyuan 6、
+  juliet 5、kilo 5、其余各 3
+- 唯一缺口：`cielo.example sk-Wxy…ic59`（只配在 gemini 段）——
   与「两份不同快照」一致，不是去重缺陷
 - 日志写「177 → 78 个凭据，省掉 99 次」而代码算出 79/98，同一个来源差异
 
@@ -55,7 +55,7 @@
 
 ### 2. 兜底清单覆盖既有条目的模型清单（数据丢失）
 
-- 实测：tabitoken 的 claude 条目原有 4 个模型
+- 实测：tango 的 claude 条目原有 4 个模型
   （`claude-opus-5` / `-thinking` / `claude-opus-4-8` / `-4-8-thinking`），
   重探判死后 `models` 被换成 `claude-fable-5-1` 等 6 个**这个站从没验过**的名字
   → `claude-opus-4-8` 与 `-4-8-thinking` 直接消失
@@ -106,8 +106,8 @@
 
 ### 4. 405 Method Not Allowed 判定缺失（第四个真缺陷）
 
-- **现象**：zzzcoding 维护期间对所有 POST 一律回 `405 Method Not Allowed` + nginx HTML，
-  GET 回 200 HTML 维护页。用户有 29 个健康 codex 凭据，却因优先级最高的 zzzcoding
+- **现象**：zulu 维护期间对所有 POST 一律回 `405 Method Not Allowed` + nginx HTML，
+  GET 回 200 HTML 维护页。用户有 29 个健康 codex 凭据，却因优先级最高的 zulu
   返回 405 而全失败 —— CPA 直接把 405 返给客户端而不轮换下一凭据。
 - **根因**：405 在 CPA 里既不是客户端错误（`clienterror/client_error.go:95-112` 仅覆盖
   400/401/402/403/404/406/408/409/410/413/414/415/422/429，**不含 405**），
@@ -166,8 +166,8 @@ if s == "405":
 
 ## 六、复现用的临时脚本（都在 `%TEMP%`，可重跑）
 
-- `full.py` —— 用真实 config 跑 tabitoken 整链，看模型清单丢没丢
+- `full.py` —— 用真实 config 跑 tango 整链，看模型清单丢没丢
 - `mig.py` —— 看 `existing_model_context` 对真实 config 的折算结果
-  （12 处：kktoken 10 处 987500→246875、zzzcoding 2 处 15515 原样）
+  （12 处：kilo 10 处 987500→246875、zulu 2 处 15515 原样）
 - `d6.py` —— 两处措辞表的分叉对比
 - `newsite.py` —— 新站 / 既有站新 Key 不许继承别人清单

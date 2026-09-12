@@ -77,6 +77,11 @@ def make_result(row, *, compat_ok=True, claude_ok=True,
                 headers=None, proxy=False, models=None):
     """造一个探测结果。gemini/codex 固定不通 —— 那两段的形状已被别处覆盖。"""
     m = models if models is not None else MODELS
+    # 代理地址由**探测结果**带出来，不再由 plan.py 硬编码（2026-09-12）。
+    # 用户第 6 条禁止硬编码，而 `http://mihomo:7890` 是那套部署自己的
+    # docker 服务名 —— 写死在工具里，换一套部署就是错的。
+    # 这里模拟「via-proxy 那一跳成功了」的实测结果。
+    prox = "http://mihomo:7890" if proxy else ""
     res = CandidateResult(row=row)
     res.sections = {
         "gemini-api-key": SectionVerdict(
@@ -92,6 +97,7 @@ def make_result(row, *, compat_ok=True, claude_ok=True,
             # 需不需要代理是**主机**级属性（站方的边缘防护），不是段级 ——
             # 所以两段都要带上，否则测不到 claude 段的 proxy-url 落点。
             need_proxy=proxy,
+            successful_proxy_url=prox,
             min_headers=dict(headers or {}),
             category="可用"),
         "openai-compatibility": SectionVerdict(
@@ -99,7 +105,8 @@ def make_result(row, *, compat_ok=True, claude_ok=True,
             base_url=row.base_for("openai-compatibility"),
             models=list(m) if compat_ok else [],
             min_headers=dict(headers or {}),
-            need_proxy=proxy, category="可用"),
+            need_proxy=proxy,
+            successful_proxy_url=prox, category="可用"),
     }
     return res
 
@@ -353,7 +360,14 @@ def main() -> int:
     eq("provider 唯一", len(prov), 1)
     eq("100 个 Key 全在 api-key-entries",
        len(prov[0].get("api-key-entries") or []), 100)
-    eq("模型清单不重复", len(prov[0].get("models") or []), len(MODELS))
+    # 本意是「100 把 Key 归并后模型不被写 100 遍」。2026-09-10 起实测清单也过
+    # 「就高」闸：MODELS = ["claude-opus-5", "claude-opus-4-8"] 同属产品线
+    # claude-opus，(5,0) 高于 (4,8)，故只留前者。用集合判据钉住「不重复」，
+    # 用显式清单钉住「就高」。
+    _mm = prov[0].get("models") or []
+    _mn = [m.get("name") if isinstance(m, dict) else m for m in _mm]
+    eq("模型清单不重复", len(_mn), len(set(_mn)))
+    eq("模型清单就高后只剩最高世代", _mn, ["claude-opus-5"])
     eq("无重名 provider", h.no_dup_names(r["new"]), [])
 
     # ---------------------------------------------------------------- ②
@@ -614,7 +628,7 @@ def main() -> int:
     section("⑬ 405 分类")
     # 405 在 CPA 里既不自动重试也不在用户 config 的 request-scoped-errors 里，
     # 导致站方维护期间一律返回 405 时 CPA 直接把 405 返给客户端而不轮换下一凭据
-    # （2026-09-06 实测 zzzcoding 维护期间对所有 POST 回 405 + nginx HTML）。
+    # （2026-09-06 实测 zulu 维护期间对所有 POST 回 405 + nginx HTML）。
     # 分类定为「临时」，让 CPA 写出 continue-and-cooldown 规则。
     from cpa_probe.classify import classify
     tests_405 = [

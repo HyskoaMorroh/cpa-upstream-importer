@@ -306,6 +306,25 @@ def main() -> int:
             # 规格后缀不该自成产品线（32k / nano / codex）
             "specs": ["gpt-4-32k", "gpt-5.4-nano", "gpt-5.6",
                       "gpt-5.3-codex", "gpt-5-codex"],
+            # ── 用户 2026-09-12 亲自裁定的三个判例 ──
+            # 这三条同时钉住「族内比主版本 + 线内比完整世代」两阶段与
+            # 「带 mini 一律排除」。两侧逐条比，单边改立刻红。
+            "verdict1": ["o1", "o3", "gpt-5.6"],           # → o3, gpt-5.6
+            "verdict2": ["o3", "o4-mini", "gpt-6", "gpt-6-codex"],
+            "verdict3": ["o1-pro", "o3-pro", "o4-mini"],   # → o3-pro
+            # 族内比主版本：gpt-6 出现时 5.6 那一代全走，不看产品线
+            # （docx 第 4 条「codex 当前最高为 gpt-6 系列所有模型名称」）
+            "majorwins": ["gpt-5.6-codex", "gpt-5.6-sol", "gpt-6"],
+            # 线内比完整世代：claude 同档三条线都要留，不许被 fable 的
+            # 小版本号挤掉
+            "claudetier": ["claude-opus-5", "claude-sonnet-5",
+                           "claude-fable-5-1"],
+            # mini 的 token 边界：gemini / kimi 的字面里含 mini/imi，
+            # 裸 includes 判会把这两族全挡掉
+            "minisafe": ["gemini-3.1-pro", "gemini-3.1-pro-preview",
+                         "kimi-k3", "kimi-k3-256k"],
+            "minidrop": ["gpt-6", "gpt-6-mini", "gpt-6-nano",
+                         "gpt-6-lite"],
         }
         payload = _json.dumps({"secs": list(_SECS), "models": _SAMPLES,
                                "gen": _GEN_CASES})
@@ -337,20 +356,41 @@ console.log(JSON.stringify(out));
                 want_p = [m for m in _SAMPLES
                           if _mc.section_protocol_ok(s, m)]
                 eq(f"{s} 手填放行集合两侧一致", got["proto"][s], want_p)
-            # 两者的差别必须**只在四族之外**，且只在 compat 段放开。
+            # 两者的差别必须与 Python 侧**逐条相同**，且只在 compat 段放开。
             # 写死这条不变式：将来任一侧改了族判定，这里立刻炸。
+            #
+            # 2026-09-12：原来断言「多放行的全是四族之外」，那条在 Python 侧
+            # 本来就不成立 —— compat 的 `section_protocol_ok` 只挡协议层，
+            # 不做 gemini 的 pro / >=2.5 过滤（那是选型偏好，归 section_allows），
+            # 所以 gemini-2.0-pro / -3.5-flash / -pro-agent 也在差集里。
+            # 当时能过是因为前端 famOk 漏了族级 gemini 闸，两边一起错才对上。
+            # 改成与 Python 的差集逐条比：既守住「前端不能自己宽/严一档」，
+            # 也不再把一条 Python 从未满足的不变式写死。
             for s in _SECS:
                 extra = [m for m in got["proto"][s] if m not in got["allow"][s]]
+                want_extra = [m for m in _SAMPLES
+                              if _mc.section_protocol_ok(s, m)
+                              and not _mc.section_allows(s, m)]
+                # 四段一律与 Python 的差集逐条比（2026-09-12 再改一次）。
+                #
+                # 前三段原来断言差集为空。「带 mini 的一律不勾」落地后那条不再
+                # 成立，而且**本来就该不成立**：mini 是选型偏好，归
+                # `section_allows`；`section_protocol_ok` 只挡协议层，手填的
+                # mini 要放行（与放行四族之外的 grok-4.6 是同一条原则，
+                # 见 plan.py 的 forced_kept 与 keep_low_tier）。
+                #
+                # 这一项要守的始终是「前端不能自己宽一档或严一档」，
+                # 那就是与后端差集逐条相等 —— 不是某个具体集合的形状。
+                eq(f"{s} 手填多放行的与后端逐条一致", extra, want_extra)
                 if s == "openai-compatibility":
-                    truthy(f"{s} 手填多放行的全是四族之外",
-                           all(_mc.family(_mc.bare_name(m)) not in _mc.FAMILIES
-                               for m in extra),
-                           f"实得 {extra}")
                     truthy(f"{s} 手填确实放开了四族之外（grok/glm 这类）",
-                           len(extra) > 0,
+                           any(_mc.family(_mc.bare_name(m)) not in _mc.FAMILIES
+                               for m in extra),
                            "放不开就等于操作员没法写回已知可用的 grok-4.6")
-                else:
-                    eq(f"{s} 手填与工具选型同集合（前三段按族拒）", extra, [])
+                if s == "codex-api-key":
+                    truthy(f"{s} 手填放开了 mini 档",
+                           any("mini" in m for m in extra),
+                           "工具不挑 mini 是选型偏好，不该连手填也堵死")
             for k, ms in _GEN_CASES.items():
                 eq(f"取最高世代 · {k}", got["gen"][k],
                    _mc.newest_generation_per_line(ms))
@@ -473,7 +513,7 @@ console.log(JSON.stringify(out));
     # 手填框与勾选框是同一个段的两个入口，任一侧变化都要**合并**另一侧
     # ── ③i 目录里一个四族的都没有时收站方自己报的 ──────────────────────
     #
-    # 2026-09-03：runanytime 与 facai 的 compat 段目录里只有 grok-4.6 /
+    # 2026-09-03：romeo 与 facai 的 compat 段目录里只有 grok-4.6 /
     # glm-5.2，而 grok-4.6 是那个站唯一端到端验证过的模型。按族过滤后目录变空
     # → 前端只显示手填框、后端写工具猜的名字（这个站从没报过它们）。
     # 前后端要用同一条规则退这一步。
@@ -578,11 +618,18 @@ console.log(JSON.stringify(out));
         # 算成普通变量，别塞进 f-string 的表达式里 —— Python 3.9 的 f-string
         # 表达式部分**不允许出现反斜杠**（3.12 才放开），而 CI 的下限是 3.9。
         # 本机 3.14 上编译得过、CI 3.9 上 SyntaxError，是最容易漏的一类。
+        #
+        # 2026-09-12：只认带引号的字面量会误判。`written` / `backup` 是
+        # `task.result.update(backup=bak, written=cfg_path, ...)` 写进去的
+        # —— 关键字参数形态，`snapshot()` 序列化后 JSON 里确实有这两个键，
+        # 但源码里永远不出现 `"written"`。所以再认一种 `update(... f=` /
+        # `f=` 的关键字写法，两种命中任一即可。
         quoted = '"' + f + '"'
+        kwarg = re.search(r"[(,]\s*" + f + r"\s*=", srv) is not None
         in_js = "有" if ("d." + f) in js else "无"
-        in_srv = "有" if quoted in srv else "无"
+        in_srv = "有" if (quoted in srv or kwarg) else "无"
         truthy(f"d.{f} 前后端都有",
-               ("d." + f) in js and quoted in srv,
+               ("d." + f) in js and (quoted in srv or kwarg),
                f"前端 {in_js} / 后端 {in_srv}")
 
     # ── ④ 长任务防护 ───────────────────────────────────────────────

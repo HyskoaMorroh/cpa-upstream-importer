@@ -416,9 +416,20 @@ def test_plan_response_redacts_secrets():
            "redact_yaml_secrets(preview)" in window,
            "diff 是整份文件，不脱敏就是 177 行明文 key 进浏览器")
     # 落盘那一份**不能**脱敏 —— 写进去就把配置毁了
+    #
+    # 2026-09-12：判据从「找 `write_local(type(self).cfg_path, entry["preview"]`
+    # 这一行字面量」改成「write_local 的第二个实参不是脱敏过的东西」。
+    # 那一行已经重构成先取 `preview = entry.get("preview", …)` 再
+    # `write_local(cfg_path, preview, …)`，字面量匹配不到，但行为没变。
+    # 真正要守的是「落盘用的不是 redact 后的文本」。
+    import re as _re
+    write_calls = _re.findall(r"write_local\(\s*([^,]+),\s*([^,\n]+)", src)
+    truthy("找到落盘调用", bool(write_calls))
     truthy("落盘用的是未脱敏原文",
-           'write_local(type(self).cfg_path, entry["preview"]' in src,
-           "落盘若用脱敏后的文本，config.yaml 里的 Key 会变成 sk-xxx...yyyy")
+           all("redact" not in arg and "_public" not in arg and "_safe_text" not in arg
+               for _path, arg in write_calls),
+           f"落盘若用脱敏后的文本，config.yaml 里的 Key 会变成 sk-xxx...yyyy；"
+           f"实得 {write_calls!r}")
 
     print("[OK] Plan redaction: 结构与注释不动、五种凭据形态全抹除、"
           "URL 只抹密码段、server 真的调它、落盘仍用原文")
@@ -483,7 +494,12 @@ def test_request_numbers_are_clamped():
     # 两条探测路径都要调 —— 只修一条等于没修（这个项目踩过两次）
     import io as _io
     src = _io.open(os.path.join(ROOT, "server.py"), encoding="utf-8").read()
-    eq("_clamp 在 job 参数上用了 13 处", src.count("_clamp(job.opts"), 13)
+    # 判「不少于」而不是「恰好等于」（2026-09-12）：写死 13 时，
+    # **多加**一处夹取（更严的防护）也会让这一项失败，把正向改动判成回归。
+    # 要守的是「每条取 job 参数的路径都夹过」，多夹一处没有坏处。
+    truthy("_clamp 在 job 参数上至少用了 13 处",
+           src.count("_clamp(job.opts") >= 13,
+           f"实得 {src.count('_clamp(job.opts')} 处")
     truthy("单站诊断也钳", src.count("_clamp(body") >= 5,
            f"实得 {src.count('_clamp(body')} 处")
     eq("两条 job 路径都调 _emit_opt_notices（它内部报越界）",
@@ -684,7 +700,7 @@ def test_push_target_is_whitelisted():
         eq(f"放行 {base}", F(base, ""), "")
 
     # 拒：公网地址
-    for base in ("http://cpa.chiangma.com",
+    for base in ("http://cielo-cpa.example",
                  "https://evil.example.com",
                  "https://api.openai.com"):
         why = F(base, "")
@@ -695,9 +711,9 @@ def test_push_target_is_whitelisted():
 
     # 服务端 --cpa-url 显式配置的那个 host 放行 —— 运维写死的比请求体可信
     eq("配置过的公网 host 放行",
-       F("https://cpa.chiangma.com", "https://cpa.chiangma.com"), "")
+       F("https://cielo-cpa.example", "https://cielo-cpa.example"), "")
     truthy("配了 A 却要发给 B → 拒",
-           bool(F("https://evil.example.com", "https://cpa.chiangma.com")))
+           bool(F("https://evil.example.com", "https://cielo-cpa.example")))
 
     # 形态错的一律拒
     for base in ("ftp://x", "not-a-url", "//no-scheme.example.com",
@@ -712,9 +728,21 @@ def test_push_target_is_whitelisted():
     src = _io.open(os.path.join(ROOT, "server.py"), encoding="utf-8").read()
     idx = src.find("refused = _push_result(")
     truthy("apply 收尾里调了白名单", idx > 0)
-    window = src[idx:idx + 700]
-    truthy("被拒后把 cpa_base 清空（后续验证也跳过）",
-           'cpa_base = ""' in window,
+    # 现在有**两处**调用点（2026-09-12）：
+    #   ① 写盘前那处 —— 被拒直接 `raise`，连 config.yaml 都不写；
+    #   ② 收尾验证那处 —— 被拒清空 cpa_base，后面的 reload 被
+    #      `if cpa_base and mgmt` 挡住。
+    # 原来只取第一处之后 700 字符的窗口，扫不到 ② 的 `cpa_base = ""`。
+    # 改成在**全部**调用点之后合起来找：任一处兑现「被拒就不发」即可，
+    # 而 ① 的 raise 比清空更强。
+    windows = []
+    scan = idx
+    while scan >= 0:
+        windows.append(src[scan:scan + 900])
+        scan = src.find("refused = _push_result(", scan + 1)
+    joined = "\n".join(windows)
+    truthy("被拒后不再往外发（清空 cpa_base 或直接中止）",
+           'cpa_base = ""' in joined or "raise ValueError" in joined,
            "只记消息不清空的话，下面的 reload_cpa 照样会发出去")
     # 行为断言：源码里「有没有这几个键」挡不住「赋的值是 True」。
     # 直接跑那段逻辑 —— 把它抽成 _push_result 才测得动。
@@ -880,8 +908,19 @@ def test_errors_do_not_leak_stack_traces():
             if idx < 0:
                 break
             line = code[idx:code.find("\n", idx)]
-            truthy(f"{field.strip()} 用 _error_ref 而非 format_exc",
-                   "_error_ref" in line,
+            # 判据是「这一行不会把栈塞进去」，不是「必须写 _error_ref」。
+            #
+            # 2026-09-12：原来要求每一行都出现 `_error_ref`，于是把
+            # `job.error = "探测工作线程无法启动"` 这种**固定文案**也判成
+            # 失败 —— 而固定文案比短 id 还安全（它连行号都不暴露）。
+            # 这一项要守的是「导出的 txt 里不会出现 traceback」，
+            # 所以直接查那件事：行里不许有 format_exc / format_tb /
+            # format_exception，也不许直接塞 traceback 对象。
+            leaky = any(bad in line for bad in
+                        ("format_exc", "format_tb", "format_exception",
+                         "traceback."))
+            truthy(f"{field.strip()} 不把栈写进去",
+                   not leaky,
                    f"实得 {line.strip()!r} —— 它会进导出的 txt")
             idx += 1
 

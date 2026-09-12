@@ -35,6 +35,9 @@ from __future__ import annotations
 import io
 import os
 import re
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 
@@ -55,6 +58,38 @@ HARD_CAP = 64
 
 # 下界：至少 4，否则 175 个站要跑太久。
 FLOOR = 4
+
+
+class HostLimiter:
+    """Process-wide host admission and start pacing, shared by all jobs."""
+
+    def __init__(self, concurrency: int = 4):
+        self.concurrency = concurrency
+        self.condition = threading.Condition()
+        self.active = {}
+        self.started = {}
+
+    @contextmanager
+    def slot(self, host: str, gap: float, check_cancel):
+        with self.condition:
+            while True:
+                check_cancel()
+                wait = self.started.get(host, 0) + gap - time.monotonic()
+                if self.active.get(host, 0) < self.concurrency and wait <= 0:
+                    self.active[host] = self.active.get(host, 0) + 1
+                    self.started[host] = time.monotonic()
+                    break
+                self.condition.wait(timeout=min(max(wait, 0.01), 0.05))
+        try:
+            check_cancel()
+            yield
+        finally:
+            with self.condition:
+                self.active[host] -= 1
+                self.condition.notify_all()
+
+
+HOST_LIMITER = HostLimiter()
 
 
 @dataclass

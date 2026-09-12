@@ -15,11 +15,15 @@ READ_LIMIT 为什么是 4MB
 
 from __future__ import annotations
 
+import http.client
+import io
 import socket
 import ssl
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from functools import partial
 
 READ_LIMIT = 4 * 1024 * 1024
 
@@ -37,15 +41,96 @@ class Response:
         return f"<Response {self.status} {len(self.body)}B {self.elapsed_ms}ms>"
 
 
-def _opener(proxy: str | None):
-    handlers: list = []
+def _origin(url: str) -> tuple[str, str | None, int | None]:
+    parsed = urllib.parse.urlsplit(url)
+    return (parsed.scheme.lower(), parsed.hostname,
+            parsed.port if parsed.port is not None
+            else {"http": 80, "https": 443}.get(parsed.scheme.lower()))
+
+
+class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _origin(req.full_url) != _origin(newurl):
+            fp.close()
+            raise urllib.error.URLError("cross-origin redirect blocked")
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        # urllib otherwise drains the unused redirect body without a size limit.
+        fp.close()
+        return redirected
+
+
+def _time_left(deadline: float) -> float:
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("timeout")
+    return left
+
+
+class _DeadlineReader(io.RawIOBase):
+    def __init__(self, sock, deadline: float):
+        self._sock = sock
+        self._deadline = deadline
+        self._raw = sock.makefile("rb", buffering=0)
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        # Enforce the deadline below buffering, including headers/chunk framing.
+        self._sock.settimeout(_time_left(self._deadline))
+        return self._raw.readinto(buffer)
+
+    def close(self):
+        try:
+            self._raw.close()
+        finally:
+            super().close()
+
+
+class _DeadlineHTTPResponse(http.client.HTTPResponse):
+    def __init__(self, sock, *args, deadline: float, **kwargs):
+        super().__init__(sock, *args, **kwargs)
+        self.fp.close()
+        self.fp = io.BufferedReader(_DeadlineReader(sock, deadline))
+
+
+def _deadline_connection(connection_type, deadline: float, host, **kwargs):
+    class DeadlineConnection(connection_type):
+        def _tunnel(self):
+            super()._tunnel()
+            # CONNECT consumed part of the budget; TLS must not reuse it.
+            self.sock.settimeout(_time_left(deadline))
+
+    kwargs["timeout"] = _time_left(deadline)
+    connection = DeadlineConnection(host, **kwargs)
+    connection.response_class = partial(_DeadlineHTTPResponse, deadline=deadline)
+    return connection
+
+
+def _opener(proxy: str | None, *, deadline: float | None = None):
+    handlers: list = [_SameOriginRedirectHandler()]
     if proxy:
         handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
     else:
         # 显式空 dict：避免继承环境变量里的代理，否则「直连」组不是真直连
         handlers.append(urllib.request.ProxyHandler({}))
     ctx = ssl.create_default_context()
-    handlers.append(urllib.request.HTTPSHandler(context=ctx))
+    if deadline is None:
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+    else:
+        class DeadlineHTTPHandler(urllib.request.HTTPHandler):
+            def http_open(self, req):
+                return self.do_open(
+                    partial(_deadline_connection, http.client.HTTPConnection, deadline),
+                    req)
+
+        class DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+            def https_open(self, req):
+                return self.do_open(
+                    partial(_deadline_connection, http.client.HTTPSConnection, deadline),
+                    req, context=self._context)
+
+        handlers.extend([DeadlineHTTPHandler(), DeadlineHTTPSHandler(context=ctx)])
     op = urllib.request.build_opener(*handlers)
     # 关键：清空 addheaders。urllib 的 AbstractHTTPHandler.do_request_ 会在
     # 请求没有 User-Agent 时自动补 `User-Agent: Python-urllib/3.x`。
@@ -57,6 +142,15 @@ def _opener(proxy: str | None):
     # 清空后，UA 完全由调用方决定：给了就发，没给就真的不发。
     op.addheaders = []
     return op
+
+
+def _read_body(resp) -> bytes:
+    raw = resp.read(READ_LIMIT + 1)
+    if len(raw) > READ_LIMIT:
+        raise ValueError(f"response body exceeds {READ_LIMIT}-byte limit (truncated)")
+    if getattr(resp, "length", None):
+        raise ValueError("response body truncated before Content-Length")
+    return raw
 
 
 def send(
@@ -77,6 +171,7 @@ def send(
         req.add_header(k, v)
 
     t0 = time.monotonic()
+    deadline = t0 + timeout
     # 状态码与正文分两步取（2026-09-05 修）。
     #
     # 为什么不能在 except 里读正文
@@ -94,16 +189,24 @@ def send(
     err = ""
     raw = b""
     status = ""
+    content_encoding = ""
+    http_error = False
     try:
-        with _opener(proxy).open(req, timeout=timeout) as resp:
+        with _opener(proxy, deadline=deadline).open(
+            req, timeout=_time_left(deadline)
+        ) as resp:
             status = str(resp.status)
-            raw = resp.read(READ_LIMIT)
+            content_encoding = resp.headers.get("Content-Encoding", "")
+            raw = _read_body(resp)
     except urllib.error.HTTPError as e:
         # 状态码先记下 —— 它已经到手且有价值（403 就是 403，正文读不全
         # 不改变这个事实）。正文单独一段读，失败也不丢状态码。
         status = str(e.code)
+        http_error = True
         try:
-            raw = e.read(READ_LIMIT) if hasattr(e, "read") else b""
+            with e:
+                content_encoding = e.headers.get("Content-Encoding", "")
+                raw = _read_body(e)
         except Exception as read_err:      # noqa: BLE001
             err = f"正文读取失败：{read_err!r}"
     except urllib.error.URLError as e:
@@ -116,8 +219,20 @@ def send(
         return Response("000", "", int((time.monotonic() - t0) * 1000),
                         repr(e))
 
+    text = ""
+    if not err:
+        try:
+            _time_left(deadline)
+            if method.upper() != "HEAD" and status not in ("204", "304"):
+                text = _decode_body(raw, content_encoding=content_encoding,
+                                    strict=True, deadline=deadline)
+            _time_left(deadline)
+        except Exception as decode_err:      # noqa: BLE001
+            err = f"正文解码失败：{decode_err!r}"
+            text = ""
+            if not http_error:
+                status = "000"
     elapsed = int((time.monotonic() - t0) * 1000)
-    text = _decode_body(raw)
     return Response(status, text, elapsed, err)
 
 
@@ -127,12 +242,51 @@ def send(
 # --------------------------------------------------------
 # 实测有中转站压缩了却不声明，也有声明了却没压。CPA 自己的
 # `decodeResponseBody`（claude_executor_execute.go）注释明确说它**两种都处理**。
-# 按 magic byte 判更稳，且不需要把 headers 传进这一层。
+# 优先按 magic byte 判；Content-Encoding 补充识别没有 magic 的压缩格式。
 _MAGIC_GZIP = b"\x1f\x8b"
 _MAGIC_ZSTD = b"\x28\xb5\x2f\xfd"
 
 
-def _decode_body(raw: bytes) -> str:
+def _decode_gzip(raw: bytes, deadline: float | None) -> bytes:
+    import zlib
+
+    chunks = []
+    size = 0
+    decoder = None
+    pending = b""
+    offset = 0
+    while pending or offset < len(raw):
+        if deadline is not None:
+            _time_left(deadline)
+        if not pending:
+            pending = raw[offset:offset + 65536]
+            offset += len(pending)
+        if decoder is None:
+            # Gzip permits zero padding after/between complete members.
+            pending = pending.lstrip(b"\x00")
+            if not pending:
+                continue
+            decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        out = decoder.decompress(pending, READ_LIMIT + 1 - size)
+        size += len(out)
+        if size > READ_LIMIT:
+            raise ValueError("decompressed body exceeds response limit (truncated)")
+        if out:
+            chunks.append(out)
+        if decoder.eof:
+            pending = decoder.unused_data
+            decoder = None
+        else:
+            pending = decoder.unconsumed_tail
+    if decoder is not None:
+        raise ValueError("truncated gzip compressed body")
+    return b"".join(chunks)
+
+
+def _decode_body(
+    raw: bytes, *, content_encoding: str = "", strict: bool = False,
+    deadline: float | None = None,
+) -> str:
     """把响应正文解成文本。压缩过的先解压。
 
     为什么必须解压（2026-09-05 修）
@@ -150,42 +304,81 @@ def _decode_body(raw: bytes) -> str:
 
     也就是「死站带模型进 config.yaml」那个假阳性，只是改由压缩触发。
 
-    br 与 zstd 标准库没有解码器（本项目零第三方依赖）。探到就返回一句
-    可读的说明而不是替换字符 —— 静默给 U+FFFD 会让上面那条链**无声**失效，
-    而一句「本工具读不了这种压缩」至少能在日志里看见。
+    br 与 zstd 不解码。默认保留原有可读说明接口；send 使用 strict=True，
+    将损坏、超限或不支持的压缩明确写入 Response.error，不能当作成功正文。
     """
-    if not raw:
-        return ""
-    if raw[:2] == _MAGIC_GZIP:
-        import gzip
-        try:
-            return gzip.decompress(raw).decode("utf-8", errors="replace")
-        except Exception:                       # noqa: BLE001
-            pass                                # 落到下面按原样解
-    elif raw[:4] == _MAGIC_ZSTD:
-        return ("<zstd 压缩正文，本工具不解码 —— 探测不该收下这个响应>")
-    else:
-        # zlib（`deflate` 的常见形态）与 raw deflate。
-        #
-        # 两者都**没有可靠的 magic byte**：zlib 头首字节常见 0x78，
-        # raw deflate 第一个字节是压缩块头，什么值都可能（实测 0xab）。
-        # 所以不按首字节筛，直接两种 wbits 各试一次 —— 解不开就按原样解。
-        # 代价是每个未压缩正文多两次失败的 decompress 调用，那很便宜
-        # （zlib 在头两个字节就能判定不合法）。
-        import zlib
-        for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
-            try:
-                out = zlib.decompress(raw, wbits)
-            except Exception:                   # noqa: BLE001
-                continue
-            return out.decode("utf-8", errors="replace")
-    text = raw.decode("utf-8", errors="replace")
-    # br 没有 magic byte，只能按「解出来全是替换字符」反推。
-    # 阈值取 30%：正常正文里 U+FFFD 极少（真有非法字节也是零星几个）。
-    if len(text) >= 16 and text.count("\ufffd") > len(text) * 0.3:
-        return ("<正文无法解码（可能是 br 压缩），本工具不解码 —— "
-                "探测不该收下这个响应>")
-    return text
+    import re
+    import zlib
+
+    try:
+        if deadline is not None:
+            _time_left(deadline)
+        encoding = content_encoding.strip().lower()
+        if encoding not in ("", "identity", "gzip", "x-gzip", "deflate"):
+            raise ValueError("unsupported Content-Encoding，本工具不解码")
+        if len(raw) > READ_LIMIT:
+            raise ValueError(f"response body exceeds {READ_LIMIT}-byte limit (truncated)")
+        if not raw:
+            return ""
+        if raw[:2] == _MAGIC_GZIP:
+            raw = _decode_gzip(raw, deadline)
+        elif raw[:4] == _MAGIC_ZSTD:
+            raise ValueError("zstd 压缩正文，本工具不解码")
+        else:
+            # Try both zlib and raw deflate, including unlabelled responses.
+            zlib_header = (len(raw) >= 2 and raw[0] & 0x0f == 8
+                           and raw[0] >> 4 <= 7
+                           and int.from_bytes(raw[:2], "big") % 31 == 0)
+            for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+                if deadline is not None:
+                    _time_left(deadline)
+                decoder = zlib.decompressobj(wbits)
+                try:
+                    out = decoder.decompress(raw, READ_LIMIT + 1)
+                except zlib.error:
+                    if zlib_header and wbits == zlib.MAX_WBITS:
+                        # Two printable bytes can look like a zlib header.
+                        break
+                    continue
+                if len(out) > READ_LIMIT:
+                    raise ValueError("decompressed body exceeds response limit (truncated)")
+                if not decoder.eof:
+                    if zlib_header and wbits == zlib.MAX_WBITS:
+                        break
+                    continue
+                if decoder.unused_data:
+                    raise ValueError("invalid trailing data after deflate body")
+                raw = out
+                break
+            if not decoder.eof:
+                # Every plaintext fallback, including short/unlabelled bodies,
+                # must be UTF-8 text, never replacement-decoded binary.
+                #
+                # 2026-09-12：`raw.decode("utf-8")` 抛的是 UnicodeDecodeError，
+                # 它虽然是 ValueError 的子类、会被下面的 except 接住，但带出去的
+                # 是 codec 原文（`'utf-8' codec can't decode byte 0x80 …`）——
+                # 那句话既不说明「本工具不解码这种压缩」，也不告诉排查的人
+                # 该怎么办，而本函数的契约就是「解不了要**明说**」。
+                # 所以在这里换成与下方 br 分支同一句人话。
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    raise ValueError(
+                        "正文无法解码（可能是 br 压缩），本工具不解码") from None
+                # Unicode spaces/format characters are valid text, not binary.
+                if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", text):
+                    raise ValueError("invalid or truncated compressed body")
+        if len(raw) > READ_LIMIT:
+            raise ValueError("decompressed body exceeds response limit (truncated)")
+        text = raw.decode("utf-8", errors="replace")
+        # br has no magic; retain the existing fallback for unlabelled binary data.
+        if len(text) >= 16 and text.count("\ufffd") > len(text) * 0.3:
+            raise ValueError("正文无法解码（可能是 br 压缩），本工具不解码")
+        return text
+    except (ValueError, OSError, EOFError, zlib.error) as error:
+        if strict:
+            raise
+        return f"<{error}>"
 
 
 def probe_proxy(proxy: str, *, timeout: int = 4) -> tuple[bool, str]:

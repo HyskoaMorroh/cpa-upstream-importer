@@ -79,7 +79,7 @@ https://nokey.com,
     eq("有效行 3", len(res.valid), 3)
     eq("无效行 3", len(res.invalid), 3)
     eq("裸域名自动补 https", res.valid[2].bare, "https://bare-domain.io")
-    eq("尾部 /v1 被剥离", res.valid[1].bare, "https://api.example.org")
+    eq("保留输入的 /v1 路径", res.valid[1].bare, "https://api.example.org/v1")
 
     r = res.valid[0]
     # 12 站 206 条目零例外：段决定 base-url 形态，用户不必记
@@ -632,9 +632,9 @@ def test_request() -> None:
     url, hdr, body = rq.build_request("claude-api-key", "https://a.com",
                                       "claude-opus-5", "K3")
     eq("claude 路径", url, "https://a.com/v1/messages?beta=true")
-    # 中转站实现不一：只发一种可能让通的站误判 401，所以两种都发
-    eq("claude 同时发 Bearer", hdr["Authorization"], "Bearer K3")
-    eq("claude 同时发 x-api-key", hdr["x-api-key"], "K3")
+    # CPA 第三方基址基线只发 Bearer；双头成功不能证明 CPA 能重现。
+    eq("claude 第三方发 Bearer", hdr["Authorization"], "Bearer K3")
+    eq("claude 不额外发 x-api-key", "x-api-key" in hdr, False)
     eq("claude 带 anthropic-version", hdr["anthropic-version"], "2023-06-01")
 
     url, _, _ = rq.build_request("openai-compatibility", "https://o.com/v1",
@@ -648,6 +648,7 @@ def test_request() -> None:
     eq("默认探测文本非 hi", rq.PROBE_TEXT.startswith("Reply with one short"), True)
 
     _, hdr, _ = rq.build_request("codex-api-key", "https://c.com/v1", "m", "k",
+                                 cfg={"codex": {"disable-codex-cloaking": True}},
                                  extra_headers={"Originator": "codex_vscode"})
     eq("额外头被合入", hdr["Originator"], "codex_vscode")
 
@@ -702,10 +703,24 @@ def test_request() -> None:
     from cpa_probe import model_catalog as _mc
 
     # codex 只收 gpt 系
-    for m in ("gpt-5.6-sol", "gpt-5.6", "gpt-4o", "o3-mini"):
+    for m in ("gpt-5.6-sol", "gpt-5.6", "gpt-4o", "o3"):
         eq(f"codex 收 {m}", _mc.section_allows("codex-api-key", m), True)
     for m in ("claude-opus-5", "gemini-3.1-pro", "kimi-k3", "deepseek-v4f"):
         eq(f"codex 拒 {m}", _mc.section_allows("codex-api-key", m), False)
+
+    # mini / nano / lite 一律不挑（用户 2026-09-12：「本项目无论什么类型，
+    # 凡是模型名称中带 mini 的就算版本很高也不应该勾选应该排除」）。
+    # 这里用 `o3-mini`：它的**族**是 gpt（`model_allowed` 上面那一节仍放行
+    # 它），被拒的理由是档次不是族 —— 两层判据不能混。
+    for m in ("o3-mini", "o4-mini", "gpt-6-mini", "gpt-6-nano", "gpt-6-lite"):
+        eq(f"codex 拒降级档 {m}", _mc.section_allows("codex-api-key", m), False)
+        eq(f"但手填放行 {m}",
+           _mc.section_protocol_ok("codex-api-key", m), True)
+    # token 边界：gemini / kimi 的字面里含 mini / imi，不能被误伤
+    eq("gemini 不被 mini 规则误伤", _mc.is_low_tier("gemini-3.1-pro"), False)
+    eq("kimi 不被 mini 规则误伤", _mc.is_low_tier("kimi-k3"), False)
+    eq("claude 段仍收 opus-5",
+       _mc.section_allows("claude-api-key", "claude-opus-5"), True)
 
     # claude 只收 claude 系
     for m in ("claude-opus-5", "claude-fable-5", "claude-sonnet-5"):
@@ -769,18 +784,38 @@ def test_request() -> None:
        ngl(["gpt-4-32k", "gpt-5.4-nano", "gpt-5.6"]), ["gpt-5.6"])
     eq("codex 是同一条线上的变体",
        ngl(["gpt-5-codex", "gpt-5.3-codex"]), ["gpt-5.3-codex"])
-    # 整组都认不出版本 —— 全留，无从比较不淘汰。
-    # 用真正没有版本记号的名字：o1 / o3-mini 现在解析得出世代（见下面那组）。
-    eq("无版本的整组保留",
-       ngl(["gpt-oss:120b", "gpt-oss:20b"]), ["gpt-oss:120b", "gpt-oss:20b"])
+    # 无版本号 = 低等级，一律不保留（2026-09-11 用户明确口径，所有类型一视同仁）。
+    # 原来这里断言「整组都认不出版本就全留，无从比较不淘汰」，但那条兜底让
+    # 每一个无版本号的名字（它们各自自成一条产品线，永远没有对手）永久保留 ——
+    # 现场就是 `gpt-reserve` 与 `gpt-6` / `gpt-6-astra` 一起被勾上，而该型号
+    # 并不存在。用真正没有版本记号的名字：o1 / o3-mini 解析得出世代（见下面那组）。
+    # 注：`gpt-oss:*` 另有 NON_CHAT 闸拦在更上游，这里只测本函数的孤立行为。
+    eq("无版本的一律丢弃", ngl(["gpt-oss:120b", "gpt-oss:20b"]), [])
+    eq("无版本的不与有版本的共存",
+       ngl(["gpt-6", "gpt-6-astra", "gpt-reserve"]), ["gpt-6", "gpt-6-astra"])
     # o 系列（2026-09-04 现场截图：codex 段同时勾着 o1 与 o3）。
     # 那一族的世代数字紧贴开头的 o，_VERSION_RE 读不出来，于是七个名字
     # 「整组认不出版本」被兜底全留、默认全勾 —— 与 gpt-4o 那次同一个形态。
-    eq("o3 挤掉 o1", ngl(["o1", "o3-mini"]), ["o3-mini"])
-    eq("o 系列同线取最高世代",
+    #
+    # 2026-09-12 用户裁定「凡是模型名称中带 mini 的就算版本很高也不应该
+    # 勾选应该排除」（is_low_tier），所以下面两组里的 mini 款先出局，
+    # 剩下的才参与世代比较。这两条断言原来的期望值全是 mini 款。
+    eq("mini 档直接出局，只剩 o1 时 o1 也没有版本优势可言",
+       ngl(["o1", "o3-mini"]), ["o1"])
+    eq("o 系列同线取最高世代（mini 款已被 is_low_tier 剔除）",
        ngl(["o1", "o1-pro", "o3", "o3-mini", "o3-pro", "o4-mini",
             "o4-mini-high"]),
-       ["o3-pro", "o4-mini", "o4-mini-high"])
+       ["o3", "o3-pro"])
+    # 用户判例三：o4-mini 出局后挤不掉 o3-pro
+    eq("用户判例三：o4-mini 挤不掉 o3-pro",
+       ngl(["o1-pro", "o3-pro", "o4-mini"]), ["o3-pro"])
+    # 用户判例二：族内比主版本，gpt-6 那一代胜出；o 系列自成一族不受牵连
+    eq("用户判例二",
+       ngl(["o3", "o4-mini", "gpt-6", "gpt-6-codex"]),
+       ["o3", "gpt-6", "gpt-6-codex"])
+    # 手填不受选型偏好约束 —— 与放行四族之外的 grok-4.6 是同一条原则
+    eq("手填保留 mini 档",
+       ngl(["o3-pro", "o4-mini"], keep_low_tier=True), ["o4-mini"])
     eq("o 系列的世代来自紧跟 o 的数字",
        (_mc.series_and_version("o3-mini"), _mc._product_line("o3-mini")),
        (("o*-mini", (3,)), "o"))
@@ -860,6 +895,14 @@ def test_real_config(path: str) -> None:
                                          category="死路",
                                          action="分组无该模型渠道"),
         "codex-api-key": mk("codex-api-key", ["gpt-5.6-sol"], need_proxy=True,
+                            # 代理地址由**探测结果**带出来，不再由 plan.py
+                            # 硬编码（2026-09-12）。用户第 6 条明确禁止硬编码，
+                            # 而 `http://mihomo:7890` 是这套部署自己的地址 ——
+                            # 写死在工具里，换一套部署就是错的。
+                            # 现在的来源顺序见 plan.py：cpa_proxy_url →
+                            # successful_proxy_url → proxy_url → $PROBE_PROXY。
+                            # 这里模拟「via-proxy 那一跳成功了」的实测结果。
+                            successful_proxy_url="http://mihomo:7890",
                             min_headers={"Originator": "codex_vscode"}),
         "claude-api-key": mk("claude-api-key", ["claude-opus-5"],
                              max_context_length=928106,
@@ -993,7 +1036,16 @@ def test_real_config(path: str) -> None:
        len(kk[0].get("api-key-entries") or []), 5)
     eq("entries 里的 Key 与输入一致",
        [x["api-key"] for x in kk[0]["api-key-entries"]], multi_keys)
-    eq("模型清单没重复", len(kk[0].get("models") or []), 2)
+    # 这一项的本意是「5 把 Key 归并进一个 provider 后，模型不被重复写 5 遍」，
+    # 数字本身是夹具的副产物。2026-09-10 起实测清单也要过「每条产品线只留最高
+    # 世代」（plan.py 的 probed 分支）—— 夹具给的
+    # `["claude-opus-5", "claude-opus-4-8"]` 是同一产品线 claude-opus 的
+    # (5,0) 与 (4,8) 两个世代，按「就高」只留 claude-opus-5，所以是 1 个。
+    # 「不重复」这层本意用集合判据单独钉住，不再依赖具体数字。
+    _mm = kk[0].get("models") or []
+    _mn = [m.get("name") if isinstance(m, dict) else m for m in _mm]
+    eq("模型清单没重复", len(_mn), len(set(_mn)))
+    eq("模型清单就高后只剩最高世代", _mn, ["claude-opus-5"])
     eq("headers 只写一次", kk[0].get("headers"),
        {"User-Agent": "cli-proxy-openai-compat"})
 
@@ -1669,7 +1721,7 @@ def test_ws_crosstier_note_for_codex():
 
     生产实测（fsdownload 版 codex 段）：425 档带 ws 且是最高档，所以此刻不越档；
     但 350/349/348 三档全无 ws，425 一冷却，WS 请求会直接跳到 154 档的
-    anyrouter.top，越过三个健康档。
+    alfa.example，越过三个健康档。
 
     **处置是「只改文案与计数、不改定档算法」**，理由写在 `ws_crosstier_note`
     的 docstring 里：跨档只发生在下游用 WS 连接时（少数路径），HTTP 请求的
@@ -1823,13 +1875,13 @@ def test_field_names_are_not_mistaken_for_hosts():
         eq(f"字段名不当站名 · {field}", _L(field), False)
 
     # ② 真站名与它们的点分标签不能被误排除
-    for host in ("chiangma.com", "anyrouter.top", "api.123nhh.com",
-                 "runanytime.hxi.me", "muyuan.do", "ai.hybgzs.com",
-                 "api.facai.cloudns.org", "agentrouter.org", "gorouter.app",
-                 "kktoken.cc", "tabitoken.com", "justwoker.top"):
+    for host in ("cielo.example", "alfa.example", "nova.example",
+                 "romeo.example", "mike.example", "hotel.example",
+                 "foxtrot.example", "golf.example", "gorou.example",
+                 "kilo.example", "tango.example", "juliet.example"):
         truthy(f"真站名仍认 · {host}", _L(host))
-    for label in ("chiangma", "anyrouter", "muyuan", "facai", "gorouter",
-                  "kktoken", "hybgzs", "123nhh"):
+    for label in ("cielo", "alfa", "muyuan", "facai", "gorou",
+                  "kilo", "hotel", "nova"):
         truthy(f"站名标签仍认 · {label}", _L(label))
 
     # ③ 端到端：字段名注释不该产出 unhealthy_hosts

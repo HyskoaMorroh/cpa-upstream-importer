@@ -56,6 +56,7 @@ from .plan import (
     host_matches_note,
     name_alias_map,
     priority_collisions,
+    priority_split_within_host,
     score_verdict,
     suggest_priority,
 )
@@ -83,6 +84,8 @@ from .batch import (BatchProber, existing_headers, existing_toggles,
                     existing_proxies, existing_weights,
                     entry_scope, provider_name_for)
 from .resources import Resources, detect as detect_resources
+from . import bulk
+from . import tuning
 from .cpa_source_probe import check as check_profile_drift
 
 __all__ = [
@@ -141,7 +144,10 @@ __all__ = [
     "ImportPlan",
     "build_plan",
     "assign_priorities",
+    "bulk",
+    "tuning",
     "priority_collisions",
+    "priority_split_within_host",
     "owned_sections",
     "compat_key_blocks",
     "compat_provider_key",

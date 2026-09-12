@@ -174,7 +174,7 @@ def main() -> int:
     # ── ③b 警告与算法必须同口径 ────────────────────────────────────
     #
     # 2026-09-02 演练发现：警告只报「挡了几个现有站」，不分活死。实测输出
-    # 「priority 280 会把 2 个现有站挡在其后（ai.hybgzs.com、muyuan.do）」，
+    # 「priority 280 会把 2 个现有站挡在其后（hotel.example、mike.example）」，
     # 而那两个站注释里都记着实测不可用，算法数出的在用站是 0。
     # 同一件事，警告说挡 2 个、算法说无代价 —— 用户看前者，去调低一个本来
     # 最优的档位。README 那时已经写着「这条警告会区分活站死站」，代码没做。
@@ -289,43 +289,43 @@ def main() -> int:
     # ── ⑥b 括号形态（2026-09-03） ────────────────────────────────────
     #
     # 生产 config.yaml 的 claude 段与 compat 段的死站结论**全部**是这个形态：
-    #     # 同时压过 123nhh（分组无渠道，实测 503）与 100xlabs、hybgzs。
-    #     # 990 仍高于 950 的 100xlabs（实测超时 90 秒），所以它仍轮不到。
+    #     # 同时压过 nova（分组无渠道，实测 503）与 xray、hotel。
+    #     # 990 仍高于 950 的 xray（实测超时 90 秒），所以它仍轮不到。
     # 严格路（`# 站名：结论`）一条都抓不到 —— 于是那两段的 unhealthy_hosts
     # 恒为空集，「读注释拿健康度」在真实文件上完全失效，而且不报错。
     section("⑥b 站名后紧跟括号、括号里是失败依据")
-    _KN = {"123nhh", "api.123nhh.com", "100xlabs", "sub.100xlabs.space",
+    _KN = {"nova", "nova.example", "xray", "xray.example",
            "live", "live.example"}
     paren_yes = [
-        "# 同时压过 123nhh（分组无渠道，实测 503）与别的站。",
-        "# 990 仍高于 950 的 100xlabs（实测超时 90 秒），所以它仍轮不到。",
-        "# 123nhh（实测 403 WAF）已降档。",
-        "# 100xlabs(超时 90 秒) 半角括号也要认。",
+        "# 同时压过 nova（分组无渠道，实测 503）与别的站。",
+        "# 990 仍高于 950 的 xray（实测超时 90 秒），所以它仍轮不到。",
+        "# nova（实测 403 WAF）已降档。",
+        "# xray(超时 90 秒) 半角括号也要认。",
     ]
     for f in paren_yes:
         raw4 = f"claude-api-key:\n{f}\nother: 1"
         got = unhealthy_from_comments(raw4, "claude-api-key", known=_KN)
         truthy(f"认得「{f[2:34]}…」",
-               bool(got & {"123nhh", "100xlabs"}), f"实得 {got}")
+               bool(got & {"nova", "xray"}), f"实得 {got}")
 
     # 不给 known 就不启用这一路 —— 老调用方的行为一字不变
     eq("不传 known 时括号路不生效",
        unhealthy_from_comments(
-           "claude-api-key:\n# 压过 123nhh（实测 503）\nother: 1",
+           "claude-api-key:\n# 压过 nova（实测 503）\nother: 1",
            "claude-api-key"),
        set())
 
     # 三类反例。前两类是这一路特有的误判风险，第三类是共有的。
     paren_no = [
         # ① 括号内没有失败结论 —— 整行有 503 也不能算到它头上
-        ("# live（实测 200，3.6 秒）比 123nhh 快，后者实测 503", "live",
+        ("# live（实测 200，3.6 秒）比 nova 快，后者实测 503", "live",
          "括号内是正常结论，不该因为同一行提到别人的 503 就判它死"),
         # ② 站名不在本段真实主机名里 —— 认不出的一律丢弃
         ("# priority（实测 503）", "priority", "YAML 键名不是站名"),
         ("# deepseek-v4-flash-202605（印证永久排除结论）", "deepseek-v4-flash-202605",
          "模型名不是站名"),
         # ③ 括号内已恢复
-        ("# 123nhh（实测 503，已于 2026-09-01 恢复正常）", "123nhh",
+        ("# nova（实测 503，已于 2026-09-01 恢复正常）", "nova",
          "括号内说已恢复就不算当前不可用"),
     ]
     for note, name, hint in paren_no:
@@ -335,28 +335,28 @@ def main() -> int:
 
     # 括号内「已恢复但又挂了」仍算不可用 —— 与严格路同一条转折规则
     raw6 = ("claude-api-key:\n"
-            "# 123nhh（实测 503，站方称已恢复，实测仍 503）\nother: 1")
+            "# nova（实测 503，站方称已恢复，实测仍 503）\nother: 1")
     truthy("括号内带转折时仍判不可用",
-           "123nhh" in unhealthy_from_comments(
+           "nova" in unhealthy_from_comments(
                raw6, "claude-api-key", known=_KN))
 
     # 括号路抓到的名字必然在 known 里，所以不该落进 unmatched_notes
     # （那个字段是给严格路的漏判信号，混进来就成了噪声）
     _cfgp = {"claude-api-key": [
-        {"api-key": "k", "base-url": "https://api.123nhh.com", "priority": 200,
+        {"api-key": "k", "base-url": "https://nova.example", "priority": 200,
          "models": [{"name": "claude-opus-5"}]},
         {"api-key": "k2", "base-url": "https://live.example", "priority": 900,
          "models": [{"name": "claude-opus-5"}]},
     ]}
     _rawp = ("claude-api-key:\n"
-             "# 压过 123nhh（分组无渠道，实测 503）\n"
+             "# 压过 nova（分组无渠道，实测 503）\n"
              '  - api-key: "k"\n'
-             '    base-url: "https://api.123nhh.com"\n'
+             '    base-url: "https://nova.example"\n'
              "    priority: 200\n"
              "other: 1\n")
     _bp = cp.build_band(_cfgp, "claude-api-key", raw=_rawp)
     truthy(f"build_band 用得上括号路（{sorted(_bp.unhealthy_hosts)}）",
-           "123nhh" in _bp.unhealthy_hosts,
+           "nova" in _bp.unhealthy_hosts,
            "括号路没接进 build_band 等于只改了函数没改行为")
     eq("括号路的命中不进 unmatched_notes", _bp.unmatched_notes, [])
 
@@ -400,7 +400,7 @@ def main() -> int:
     #
     # 2026-09-03 真实探测暴露：`score_verdict` 对 usable=False 一律返回 0，
     # 于是「四段全灭」与「探测通过但扣满分」排在同一档，之后只按主机名排 ——
-    # 字母序在前的就上去了。实测 hybgzs 四段全灭（WAF ×12）却在 claude 段拿到
+    # 字母序在前的就上去了。实测 hotel 四段全灭（WAF ×12）却在 claude 段拿到
     # 该段第 2 名，claude-sonnet-5 的顶层因此换到一个刚被判死的站上；
     # 顶层站不可用时那一层整个白撞一轮（层级隔离，scheduler.go:402 只取最高桶）。
     #
@@ -450,7 +450,7 @@ def main() -> int:
     truthy(f"probed > catalog > seed（{got}）", got[2] > got[1] > got[0])
 
     # 组内证据不一致时要在 priority_reason 里点出来 —— 档位不改（同站同档是
-    # 对的），但「这一档由谁的实测撑起来」必须可见。实测 agentrouter 的
+    # 对的），但「这一档由谁的实测撑起来」必须可见。实测 golf 的
     # claude 段 7 把里 6 把实测通过、1 把余额耗尽走种子，那一把把 3 个自己
     # 都没验过的模型顶上了顶层。
     pm = _IP(host="mix.example", masked_key="m", line_no=1)

@@ -10,6 +10,12 @@ import os
 import re
 import sys
 import time
+from unittest import mock as _mock
+
+# 钉住「当前市面最新」用：几处用例的断言落在具体型号上，而
+# `model_catalog.remote_names()` 会去拉真实名录 —— 不钉的话既要外网，
+# 断言又随名录漂移。用 `_patch.object(model_catalog, "remote_names", ...)`。
+_patch = _mock.patch
 
 # 与其余套件一致：自己插 sys.path，不依赖调用方设 PYTHONPATH。
 # 漏了这两行 CI 上直接 ModuleNotFoundError —— 本地靠 PYTHONPATH=. 跑不会暴露。
@@ -974,7 +980,8 @@ const (
 ''')
 
     ident = csp.extract(root)
-    assert ident.ok, f"应能解析，errors={ident.errors}"
+    assert ident.claude_betas_unconditional, f"应能解析 beta，errors={ident.errors}"
+    assert not ident.ok, "只有头文件的夹具不能声称请求体与停用规则已覆盖"
 
     # 无条件序列：claudeCodeBeta + 切片(跳过未定义常量) + midconv + effort
     assert ident.claude_betas_unconditional == [
@@ -1461,8 +1468,8 @@ def test_rebuild_keeps_model_context_length():
       · 方案只带**一个**值（`max_context_length` + `context_model`），那是本次
         探测实测的那一个模型。
       · 于是本次没探上下文（`--no-context`、或那个模型没被验、或探测判死）时，
-        历史实测值全部消失。实测生产配置 8 处，kktoken.cc 的 987500 与
-        zzzcoding 的 15515 都在其中。
+        历史实测值全部消失。实测生产配置 8 处，kilo.example 的 987500 与
+        zulu 的 15515 都在其中。
 
     丢了不会让站不可用，而是**客户端按错的窗口定压缩点**：CPA 把它写进
     `/v1/models` 的 `context_length`（model_registry.go:1437-1438）与 Codex 的
@@ -1499,6 +1506,12 @@ openai-compatibility:
         max-context-length: 531667
 ''')
     mc = existing_model_context(cfg)
+    # compat 段这一维是 entry_scope 算出的 provider 身份，不是裸 host
+    # （2026-09-12：_source_identity 保留 scheme 并折叠尾部 /v1，见
+    # writeback._source_identity；归一化规则本身由
+    # tests/test_writeback_compliance.py 钉住，这里只钉「表按那个键索引」）。
+    from cpa_probe.batch import entry_scope as _scope
+    CSCOPE = _scope("openai-compatibility", "https://a.example.com/v1")
     # 987500 是旧版按**字符数**写下的值（旧 _bisect 的第三个二分中点），
     # 搬运时折算成 token —— CPA 把这个字段当 token 读。见
     # batch._fix_legacy_char_context 与 pipeline._bisect 的单位一节。
@@ -1510,7 +1523,7 @@ openai-compatibility:
     # 531667 不在旧二分的取值格子里 —— 那是上游正文自报的 token 数，
     # 本来就对，必须原样保留（折算它会把一个正确值改错）。
     for k in ("kA", "kB"):
-        assert mc[("openai-compatibility", "a.example.com", k,
+        assert mc[("openai-compatibility", CSCOPE, k,
                    "claude-opus-5")] == 531667, mc
 
     # 渲染：本次没探上下文 → 搬原值，且标「原值搬运」
@@ -1656,7 +1669,7 @@ def test_rebuild_keeps_prefix_and_provider_name():
         冷却（conductor_cooldown.go:73）、模型能力
         （api_key_model_capabilities.go:186）、执行路由三处都按它索引。
         render_entry 原来用 `host_of(base_url)` 现编，实测 12/13 个 provider
-        被改名（`runanytime` → `runanytime.hxi.me`）—— 冷却状态与能力缓存
+        被改名（`romeo` → `romeo.example`）—— 冷却状态与能力缓存
         全部作废，而且本项目自己的 `name_alias_map`（注释里的人读短名 →
         域名）也跟着失效，下一轮读注释拿健康度就大面积漏判。
     """
@@ -1695,10 +1708,18 @@ openai-compatibility:
     # kB 没写 prefix —— 键不该存在（与「写了空串」要能区分）
     assert ("claude-api-key", "b.example.com", "kB") not in pf, pf
     # compat 的 prefix 在 provider 级，组内每把 Key 都查得到
-    assert pf[("openai-compatibility", "a.example.com", "kA")] == "CHMA", pf
+    # compat 段这一维是 entry_scope 算出的 provider 身份，不是裸 host
+    # （2026-09-12：_source_identity 保留 scheme 并折叠尾部 /v1，见
+    # writeback._source_identity；归一化规则本身由
+    # tests/test_writeback_compliance.py 钉住，这里只钉「表按那个键索引」）。
+    from cpa_probe.batch import entry_scope as _scope
+    cscope = _scope("openai-compatibility", "https://a.example.com/v1")
+    assert pf[("openai-compatibility", cscope, "kA")] == "CHMA", pf
 
     pn = existing_provider_names(cfg)
-    assert pn == {"a.example.com": "shortname"}, pn
+    # 键是 compat_provider_key（provider 身份：保留 scheme、折叠尾部
+    # /v1），不是裸 host —— 见 writeback._source_identity 的说明。
+    assert pn == {cscope: "shortname"}, pn
 
     # render_entry：给了 provider_name 就用它，没给才回落到 host
     sp = SectionPlan(section="openai-compatibility",
@@ -1782,7 +1803,7 @@ openai-compatibility:
         alias: ""
 """)
     P = existing_proxies(cfg)
-    # 键含段（2026-09-02 二次对账后改）：实测 kktoken.cc 的 5 把 Key 在
+    # 键含段（2026-09-02 二次对账后改）：实测 kilo.example 的 5 把 Key 在
     # compat 段有 proxy-url、在 claude 段**故意没有**（那条路径直连可用）。
     # 按 (host, key) 两元组搬运会把 compat 的代理灌进 claude 段 ——
     # 实测 claude 段 proxy-url 从 3 条涨到 8 条。多一跳不会让请求失败，
@@ -1794,9 +1815,15 @@ openai-compatibility:
     assert ("gemini-api-key", "g.example.com", "g2") not in P, P
     assert ("gemini-api-key", "g.example.com", "g3") not in P, P
     # compat 段的 proxy-url 在 api-key-entries 上，不在 provider 级
-    assert P.get(("openai-compatibility", "o.example.com", "k1")) \
+    # compat 段这一维是 entry_scope 算出的 provider 身份，不是裸 host
+    # （2026-09-12：_source_identity 保留 scheme 并折叠尾部 /v1，见
+    # writeback._source_identity；归一化规则本身由
+    # tests/test_writeback_compliance.py 钉住，这里只钉「表按那个键索引」）。
+    from cpa_probe.batch import entry_scope as _scope
+    o_scope = _scope("openai-compatibility", "https://o.example.com/v1")
+    assert P.get(("openai-compatibility", o_scope, "k1")) \
         == "http://mihomo:7890", P
-    assert ("openai-compatibility", "o.example.com", "k2") not in P, P
+    assert ("openai-compatibility", o_scope, "k2") not in P, P
 
     # 同一个 (host, key) 在两段一有一无时，不许互相污染
     cfg2 = yaml.safe_load("""
@@ -1817,8 +1844,10 @@ openai-compatibility:
     P2 = existing_proxies(cfg2)
     assert ("claude-api-key", "both.example", "same") not in P2, (
         "claude 段本来没有代理，不该从 compat 段继承过来")
-    assert P2.get(("openai-compatibility", "both.example", "same")) \
-        == "http://mihomo:7890", P2
+    assert P2.get((
+        "openai-compatibility",
+        _scope("openai-compatibility", "https://both.example/v1"),
+        "same")) == "http://mihomo:7890", P2
 
     print("[OK] Proxy preserved: 有值的搬回，空串与未写的不凭空添加，"
           "段与段之间不互相污染")
@@ -1844,7 +1873,7 @@ def test_rebuild_skips_dedup():
     import cpa_probe as cp
     from cpa_probe.pipeline import CandidateResult, SectionVerdict
 
-    # 同一个站三个 Key —— 现场最常见的形态（gorouter 15 个、tabitoken 14 个）
+    # 同一个站三个 Key —— 现场最常见的形态（gorou 15 个、tango 14 个）
     cfg = yaml.safe_load("""
 claude-api-key:
   - api-key: "sk-A"
@@ -1928,10 +1957,10 @@ def test_compat_group_key_preservation():
       ① 组内没进方案的 Key 消失。`_orphan_provider_lines` 只保留「整个
          provider 都没被碰到」的条目，被碰到的整条重写。前三段有
          `_orphan_entry_lines` 兜这个，compat 段没有。实测生产配置
-         gorouter.app 15 把 Key、tabitoken.com 14 把，只要一把探测抛异常
+         gorou.example 15 把 Key、tango.example 14 把，只要一把探测抛异常
          （BatchProber 把那个凭据整个从 results 去掉）就丢一把。
       ② per-key 的 proxy-url / weight 被统一成 head 那把的值。实测
-         kktoken.cc 5 把、ai.hybgzs.com 3 把带 per-key proxy-url；
+         kilo.example 5 把、hotel.example 3 把带 per-key proxy-url；
          组内不一致时全组按 head 写 —— 多一跳不会失败，validate 与写后
          验证都发现不了。weight 更糟：0 会把那把 Key 整个逐出调度池。
     """
@@ -1969,13 +1998,18 @@ openai-compatibility:
 
     # 解析：per-key 续行按 (host, key) 索引，且只收该 Key 自己那几行
     kb = compat_key_blocks(lines)
-    assert set(kb) == {"p.example.com", "q.example.com"}, kb
-    assert set(kb["p.example.com"]) == {"k1", "k2", "k3"}, kb["p.example.com"]
-    assert [x.strip() for x in kb["p.example.com"]["k1"]] == [
-        'proxy-url: "http://mihomo:7890"'], kb["p.example.com"]["k1"]
-    assert kb["p.example.com"]["k2"] == [], "k2 没有续行，不该染到别人的"
-    assert [x.strip() for x in kb["p.example.com"]["k3"]] == [
-        "weight: 0"], kb["p.example.com"]["k3"]
+    # provider 键是 compat_provider_key —— provider 身份（保留 scheme、
+    # 折叠尾部 /v1），不是裸 host。见 writeback._source_identity。
+    from cpa_probe.writeback import compat_provider_key as _pk
+    PK = _pk("https://p.example.com/v1")
+    QK = _pk("https://q.example.com/v1")
+    assert set(kb) == {PK, QK}, kb
+    assert set(kb[PK]) == {"k1", "k2", "k3"}, kb[PK]
+    assert [x.strip() for x in kb[PK]["k1"]] == [
+        'proxy-url: "http://mihomo:7890"'], kb[PK]["k1"]
+    assert kb[PK]["k2"] == [], "k2 没有续行，不该染到别人的"
+    assert [x.strip() for x in kb[PK]["k3"]] == [
+        "weight: 0"], kb[PK]["k3"]
 
     # 只有 k2 进方案（k1 未勾、k3 探测抛异常）—— 三把都要在，各自的字段照旧
     p = ImportPlan(host="p.example.com", masked_key="k2", line_no=1)
@@ -2241,8 +2275,14 @@ openai-compatibility:
     # 只收显式写了的：g2 与 k2 没写，不该出现在表里
     assert w.get(("gemini-api-key", "g.example.com", "g1")) == 0, w
     assert ("gemini-api-key", "g.example.com", "g2") not in w, w
-    assert w.get(("openai-compatibility", "o.example.com", "k1")) == 0, w
-    assert ("openai-compatibility", "o.example.com", "k2") not in w, w
+    # compat 段这一维是 entry_scope 算出的 provider 身份，不是裸 host
+    # （2026-09-12：_source_identity 保留 scheme 并折叠尾部 /v1，见
+    # writeback._source_identity；归一化规则本身由
+    # tests/test_writeback_compliance.py 钉住，这里只钉「表按那个键索引」）。
+    from cpa_probe.batch import entry_scope as _scope
+    o_scope = _scope("openai-compatibility", "https://o.example.com/v1")
+    assert w.get(("openai-compatibility", o_scope, "k1")) == 0, w
+    assert ("openai-compatibility", o_scope, "k2") not in w, w
     # 键必须含段（2026-09-03）：同一个 (host, key) 在 gemini 段封了、在
     # claude 段没封 —— 跨段共用会把 0 灌进 claude。实测生产 config.yaml 有
     # 6 个 (凭据, 段) 组合会被这样无声逐出调度池。
@@ -2332,6 +2372,11 @@ def test_model_catalog_three_layers():
     #    站方特供型号（远程名录里没有）必须能通过这一层进来 —— 实测用户的
     #    config.yaml 里有 gemini-3.1-pro-high / -preview-search /
     #    -preview-customtools / gpt-5.6，四个都不在 CPA 名录里。
+    #    门槛：一个名字要被当作「本段通用候选」，至少得有 **2 个不同的站**
+    #    在用（2026-09-11 加，修 claude-fake-5 跨站外推）。所以夹具必须是
+    #    **两个站**才反映真实形态 —— 生产 config.yaml 里那几个特供型号
+    #    （gemini-3.1-pro-high / -preview-search / -preview-customtools）
+    #    实测就是多站共用的，门槛照样放行它们。
     cfg = yaml.safe_load("""
 gemini-api-key:
   - api-key: "g1"
@@ -2341,11 +2386,42 @@ gemini-api-key:
         alias: ""
       - name: "gemini-3.5-flash"
         alias: ""
+      - name: "gemini-3.1-pro-onlyhere"
+        alias: ""
+  - api-key: "g2"
+    base-url: "https://g2.example"
+    models:
+      - name: "gemini-3.1-pro-high"
+        alias: ""
 """)
     got, src = mc.latest_models("gemini-api-key", cfg=cfg, remote=[])
     assert got == ["gemini-3.1-pro-high"], got
     assert "本地 config.yaml" in src, src
     assert "gemini-3.5-flash" not in got, "flash 不符合 gemini 段规则"
+    #    只有一个站在用的名字**不外推** —— 这就是 claude-fake-5 的来路：
+    #    某个站条目里的手误被当成候选推荐给了另一个站。
+    #    name_is_safe 只挡非法字符，挡不住「合法但不存在」。
+    assert "gemini-3.1-pro-onlyhere" not in got,         f"只有 1 个站在用的名字不该外推给别的站：{got}"
+
+    # ── ②b claude-fake-5 回归：单站手误绝不外推 ──
+    fake_cfg = yaml.safe_load("""
+claude-api-key:
+  - api-key: "k1"
+    base-url: "https://a.example"
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+      - name: "claude-fake-5"
+        alias: ""
+  - api-key: "k2"
+    base-url: "https://b.example"
+    models:
+      - name: "claude-opus-5"
+        alias: ""
+""")
+    got, _src = mc.latest_models("claude-api-key", cfg=fake_cfg, remote=[])
+    assert "claude-fake-5" not in got, f"fake 名字被外推了：{got}"
+    assert "claude-opus-5" in got, f"多站共用的真名不该被误伤：{got}"
 
     # ── ③ 两层都空，落到内置兜底 ──
     for sec, want in (
@@ -2366,14 +2442,30 @@ gemini-api-key:
     full_remote = ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra",
                    "claude-opus-5", "claude-sonnet-5", "claude-fable-5",
                    "gemini-3.1-pro-preview", "gemini-3.1-pro-low"]
+    #    每个特供型号都给**两个站** —— 第 2 层有「≥2 个站在用」的门槛
+    #    （见 ② 的说明）。生产 config.yaml 里这些名字实测就是多站共用的。
     full_cfg = yaml.safe_load("""
 codex-api-key:
   - api-key: "c1"
     base-url: "https://c.example"
     models: [{name: "gpt-5.6", alias: ""}]
+  - api-key: "c2"
+    base-url: "https://c2.example"
+    models: [{name: "gpt-5.6", alias: ""}]
 gemini-api-key:
   - api-key: "g1"
     base-url: "https://g.example"
+    models:
+      - name: "gemini-3.1-pro"
+        alias: ""
+      - name: "gemini-3.1-pro-high"
+        alias: ""
+      - name: "gemini-3.1-pro-preview-search"
+        alias: ""
+      - name: "gemini-3.1-pro-preview-customtools"
+        alias: ""
+  - api-key: "g2"
+    base-url: "https://g2.example"
     models:
       - name: "gemini-3.1-pro"
         alias: ""
@@ -2495,14 +2587,18 @@ claude-api-key:
 
     # usable=True 且实测清单为空、但**站方目录有**：清单要取目录，不是种子。
     #
-    # 2026-09-03 真实探测抓到：123nhh 的 compat 段正是这个状态，站方目录报了
+    # 2026-09-03 真实探测抓到：nova 的 compat 段正是这个状态，站方目录报了
     # 16 个名字，而方案里写的是 6 个种子猜测 —— 界面列目录那 16 个（一个没勾）、
     # 落盘写种子那 6 个，两个集合不相交。成因是分支判据写的是 `elif v.usable:`
     # 而不是「实测清单空不空」，与「兜底放在 else 里」是同一类错误。
     #
     # 目录里的名字是这个站自己报的，种子是本工具猜的、与这个站无关 ——
     # 写后者进去，CPA 路由过去大概率 404。
-    def plan_cat(usable, catalog):
+    # 市面名录钉死：下面的断言落在具体型号上，不钉就要外网、还会随名录漂移。
+    MARKET = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "kimi-k3",
+              "kimi-k3-256k", "claude-opus-5", "gemini-3.1-pro"]
+
+    def plan_cat(usable, catalog, market=MARKET):
         row = cpa.parse_lines("https://t.example,sk-t").valid[0]
         res = CandidateResult(row=row)
         for s in cpa.SECTIONS:
@@ -2510,9 +2606,11 @@ claude-api-key:
                 section=s, usable=usable, base_url=row.base_for(s),
                 models=[], catalog=list(catalog),
                 category=("可用" if usable else "死路"), action="x")
-        return cpa.build_plan(row, res, cfg, bands={},
-                              seen=cpa.existing_fingerprints(cfg),
-                              probation=True)
+        with _patch.object(model_catalog, "remote_names",
+                           return_value=(list(market), "")):
+            return cpa.build_plan(row, res, cfg, bands={},
+                                  seen=cpa.existing_fingerprints(cfg),
+                                  probation=True)
 
     CAT = ["gpt-5.6-luna", "gpt-5.6-terra", "kimi-k3", "gpt-4o"]
     for usable in (True, False):
@@ -2520,8 +2618,20 @@ claude-api-key:
         assert sp.model_source == "catalog", (
             f"usable={usable} 且目录非空时清单该取目录，实得 {sp.model_source}"
             f"：{sp.models}")
-        assert set(sp.models) <= set(CAT), (
-            f"清单混进了目录之外的名字：{sp.models}")
+        # 目录报过的同代成员一个都不能少 —— 那正是用户点名的
+        # 「勾了 gpt-5.6 却没勾 gpt-5.6-sol」的反面
+        assert {"gpt-5.6-luna", "gpt-5.6-terra", "kimi-k3"} <= set(sp.models), sp.models
+        # 旧世代被剔除（同产品线取最高世代）
+        assert "gpt-4o" not in sp.models, sp.models
+        # 目录之外的名字只能是**目录报过的产品线**里的同代补齐，
+        # 且必须标未验证。这一条原来断言 `set(sp.models) <= set(CAT)`，
+        # 钉的是 2026-09-02 的旧规则；docx 第 4 条已推翻它，
+        # 见 test_model_rules_no_dead_end 的说明。
+        extra = set(sp.models) - set(CAT)
+        assert extra <= {"gpt-5.6-sol", "kimi-k3-256k"}, (
+            f"补进了这个站没报过的产品线：{extra}")
+        for m in extra:
+            assert sp.model_provenance.get(m) == "inferred", (m, sp.model_provenance)
     # 可用那一种的措辞不能说「推理请求未通过」—— 它通了，只是模型对不上
     wc = " ".join(plan_cat(True, CAT).sections["openai-compatibility"].warnings)
     assert "端点响应正常" in wc and "推理请求未通过" not in wc, wc[:220]
@@ -2613,7 +2723,7 @@ def test_offfamily_manual_and_catalog():
     选型偏好：只挑 gemini / gpt / claude / kimi）被当成硬闸用在三条路上，
     于是操作员没有任何办法把一个**已知可用**的四族之外模型写回去。
 
-    真实反例：runanytime 的 compat 段唯一端到端验证过的模型就是 grok-4.6
+    真实反例：romeo 的 compat 段唯一端到端验证过的模型就是 grok-4.6
     （配置注释：「整个 vip 分组当前只有 grok-4.6 有渠道，已通过端到端验证的
     只有它」），facai 段有 grok-4.6 + glm-5.2。按族拒掉之后那两段会从
     「有一个确认可用的模型」变成「只剩两个确认 503 的」。
@@ -2695,7 +2805,7 @@ def test_offfamily_manual_and_catalog():
 def test_stale_catalog_not_recommended():
     """站方目录整体落后一个世代以上时列出但不建议勾。
 
-    2026-09-02 现场：runanytime.hxi.me 的 codex 段目录只有 gpt-4 /
+    2026-09-02 现场：romeo.example 的 codex 段目录只有 gpt-4 /
     gpt-4-32k / gpt-4o / gpt-4o-mini —— 四个都是世代 (4,0)，「同产品线取
     最高世代」把四个全留下并默认全勾，违反用户「最新是 gpt-5.6 时 gpt-4o
     不该默认勾选」的要求。
@@ -2728,9 +2838,14 @@ codex-api-key:
                 models=[], catalog=(list(catalog) if s == "codex-api-key"
                                     else []),
                 category="死路", action="x")
-        return cpa.build_plan(row, res, cfg, bands={},
-                              seen=cpa.existing_fingerprints(cfg),
-                              probation=True).sections["codex-api-key"]
+        # build_plan 内部也会问 remote_names（补齐与落后判定各一次），
+        # 一起钉住 —— 否则断言随真实名录漂移，还要外网。
+        with _patch.object(model_catalog, "remote_names",
+                           return_value=(list(remote), "")):
+            return cpa.build_plan(
+                row, res, cfg, bands={},
+                seen=cpa.existing_fingerprints(cfg),
+                probation=True).sections["codex-api-key"]
 
     # ── 落后：清单保留，但不建议勾 ──
     stale, why = model_catalog.catalog_is_stale(
@@ -2742,15 +2857,28 @@ codex-api-key:
     sp = plan(["gpt-4", "gpt-4-32k", "gpt-4o", "gpt-4o-mini"])
     assert sp.models, "清单不该被清空 —— 那会让段勾不上"
     assert sp.writable, "仍要能手工勾"
-    assert sp.catalog_stale is True, "落后标记没传到方案上"
-    assert not sp.recommended, "落后目录不该默认勾"
-    assert "老款" in sp.recommend_reason, sp.recommend_reason
+    # 落后目录的**处置**在 2026-09-11 被用户推翻（docx 第 4 条）：
+    # 原方案是「列出但不预勾」（catalog_stale 把 recommended 降级），
+    # 新口径是「检测出来没有高级模型就按该系列该类型的最高级填充勾选」。
+    # 所以整份目录都是老款时，清单直接被市面最高级顶掉，不再留老款。
+    #
+    # `catalog_is_stale` 本身保留、上面仍逐项测 —— 它现在的用途是解释性的：
+    # 界面要说得出「你这份目录整体落后，所以清单里的名字是补进去的」。
+    assert set(sp.models) <= set(remote), (
+        f"落后目录该被顶成市面最高级，实得 {sp.models}")
+    assert not any(m.startswith("gpt-4") for m in sp.models), sp.models
+    for m in sp.models:
+        assert sp.model_provenance.get(m) == "inferred", (m, sp.model_provenance)
+    assert not sp.recommended, "补进去的名字未经实测，不该默认勾"
 
-    # ── 不落后：照常（recommended 仍受 model_source != probed 约束）──
+    # ── 不落后：照常 ──
     fresh = plan(["gpt-4o", "gpt-5.1", "gpt-5.5", "gpt-5.6-luna",
                   "gpt-5.6-terra"])
     assert fresh.catalog_stale is False, "含 5.6 的目录不该判落后"
-    assert fresh.models == ["gpt-5.6-luna", "gpt-5.6-terra"], fresh.models
+    # 目录报过的两个同代成员都在，名录里的第三个（gpt-5.6-sol）按
+    # 「所有相同等级系列的模型全部都要勾选上」补齐
+    assert set(fresh.models) == {"gpt-5.6-luna", "gpt-5.6-terra",
+                                 "gpt-5.6-sol"}, fresh.models
 
     # ── 边界：目录里全是认不出版本的名字 → 不判落后（无从比较）──
     st2, _w2 = model_catalog.catalog_is_stale(
@@ -2845,6 +2973,12 @@ claude-api-key:
     models: [{name: "claude-opus-5", alias: ""}]
 """)
 
+    # 市面名录钉死（测试零外网，也让断言不随远程名录漂移）。
+    # 内容取自 2026-09-12 的真实名录形态：codex 线最高是 gpt-6 世代。
+    MARKET = ["gpt-6-astra", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-luna",
+              "claude-opus-5", "claude-sonnet-5",
+              "gemini-3.1-pro", "gemini-3.1-pro-preview"]
+
     def plan_with(catalog, force=None):
         row = cpa.parse_lines("https://t.example,sk-t").valid[0]
         res = CandidateResult(row=row)
@@ -2852,9 +2986,11 @@ claude-api-key:
             res.sections[s] = SectionVerdict(
                 section=s, usable=False, base_url=row.base_for(s),
                 models=[], catalog=list(catalog), category="死路", action="x")
-        return cpa.build_plan(row, res, cfg, bands={},
-                             seen=cpa.existing_fingerprints(cfg),
-                             probation=True, force=force)
+        with _patch.object(model_catalog, "remote_names",
+                           return_value=(list(MARKET), "")):
+            return cpa.build_plan(row, res, cfg, bands={},
+                                  seen=cpa.existing_fingerprints(cfg),
+                                  probation=True, force=force)
 
     # ── ① 目录非空但全不合规 ──
     dirty = ["gemini-3.5-flash", "gpt-oss-120b", "grok-4.6", "gpt-image-2"]
@@ -2873,10 +3009,26 @@ claude-api-key:
              "gemini-2.5-pro", "gemini-3.1-pro"]
     p2 = plan_with(mixed)
     assert p2.sections["codex-api-key"].model_source == "catalog"
-    assert p2.sections["codex-api-key"].models == ["gpt-5.6"], (
-        f"同系列旧版没被剔除：{p2.sections['codex-api-key'].models}")
+    # 同产品线旧版被剔除（5.5 让位给 5.6），再按用户 2026-09-11 的规则补到
+    # 该系列的**市面最高级**：codex 线当前最高是 gpt-6 世代，所以目录只报到
+    # gpt-5.6 的站会被填成 gpt-6-astra。
+    #
+    # 这一条曾断言结果是 `["gpt-5.6"]`，那钉的是 2026-09-02 的旧规则
+    # 「不写目录之外的名字」。docx 第 4 条明确推翻它：
+    #   「如codex当前最高为gpt-6系列所有模型名称」
+    #   「为了排除有时候检测模型BUG实际上能够使用，如果检测出来没有高级模型
+    #     按该系列该类型模型的最高级进行填充勾选」
+    # 风险（填的名字站方没报过、CPA 可能 404）由用户明示承担；工具这边要守的
+    # 是「填了什么说得出来」—— 见下面的 model_provenance 断言。
+    assert p2.sections["codex-api-key"].models == ["gpt-6-astra"], (
+        f"没补到该系列市面最高级：{p2.sections['codex-api-key'].models}")
+    assert p2.sections["codex-api-key"].model_provenance == {
+        "gpt-6-astra": "inferred"}, "填进去的名字必须标成未验证"
+    assert "gpt-5.5" not in p2.sections["codex-api-key"].models
     assert p2.sections["claude-api-key"].models == ["claude-opus-5"]
-    assert p2.sections["gemini-api-key"].models == ["gemini-3.1-pro"]
+    assert p2.sections["gemini-api-key"].models == [
+        "gemini-3.1-pro", "gemini-3.1-pro-preview"], (
+        p2.sections["gemini-api-key"].models)
 
     # ── ② 手填全不合规：仍要报「已丢弃」 ──
     p3 = plan_with([], force={"gemini-api-key":
@@ -3027,7 +3179,12 @@ def test_capability_toggles_probed_and_written():
         return Attempt(section=section, model=model, combo=kw.get("combo", ""),
                        status=pc_state["status"], category="", action="",
                        elapsed_ms=3, excerpt=pc_state.get("excerpt", ""),
-                       error_envelope=pc_state.get("envelope", False))
+                       error_envelope=pc_state.get("envelope", False),
+                       # Attempt.ok 现在还要 response_valid（真 _call 里由
+                       # classify.validate_success 判好存下来）。这里跟着
+                       # status 走，好让 400 / 错误体 / 000 三行仍各自测
+                       # 它们声称的那件事。
+                       response_valid=pc_state["status"] == "200")
 
     pc._call = fake_call                     # type: ignore[assignment]
     for status, envelope, want, why in (
@@ -3111,8 +3268,12 @@ openai-compatibility:
     assert ("codex-api-key", "t.example", "kf") not in tg, (
         "false 与不写在 CPA 侧等价，不必收")
     assert ("codex-api-key", "t.example", "kn") not in tg
+    # compat 段这一维是 entry_scope 的 provider 身份（保留 scheme、折叠尾部
+    # /v1），不是裸 host —— 见 writeback._source_identity。
+    from cpa_probe.batch import entry_scope as _scope
+    t_scope = _scope("openai-compatibility", "https://t.example/v1")
     for k in ("c1", "c2"):
-        assert tg[("openai-compatibility", "t.example", k)] == {
+        assert tg[("openai-compatibility", t_scope, k)] == {
             "support-prompt-cache-key": True}
 
     # ── (8) 不能与 carry 重复写 ──
@@ -3232,7 +3393,7 @@ def test_find_compat_provider_strips_trailing_comments():
                       ("  # 直连，不走网关", "多空格 + 中文注释")):
         src = f'''openai-compatibility:
   - name: "chma" # 短名，与 host 不同
-    base-url: "https://chiangma.com/v1"{tail}
+    base-url: "https://cielo.example/v1"{tail}
     api-key-entries:
       - api-key: "sk-a" # 2026-08-20 新增
       - api-key: "sk-b"
@@ -3241,7 +3402,7 @@ def test_find_compat_provider_strips_trailing_comments():
         alias: ""
 '''
         got = find_compat_provider(src.splitlines(keepends=True),
-                                   "https://chiangma.com/v1")
+                                   "https://cielo.example/v1")
         assert got is not None, f"{why}：没命中现有 provider —— 会新建重复条目"
         assert got["name"] == "chma", f"{why}：name 带上了注释 {got['name']!r}"
         assert got["existing_keys"] == ["sk-a", "sk-b"], (
@@ -3539,7 +3700,7 @@ def test_merge_entry_headers_behaviour():
     """
     from cpa_probe.writeback import merge_entry_headers as M
 
-    # ① 原值独有的键保留 —— 这正是 anyrouter.top 丢 1m 上下文的形态
+    # ① 原值独有的键保留 —— 这正是 alfa.example 丢 1m 上下文的形态
     got = M({"anthropic-beta": "context-1m-2025-08-07"}, {})
     assert got == {"anthropic-beta": "context-1m-2025-08-07"}, (
         f"探测为空时原值必须整份保留，实得 {got}")
@@ -3673,7 +3834,7 @@ def test_capability_probe_is_actually_invoked():
                    probe_capabilities=True)
     real2._call = lambda section, base, key, model, **kw: Attempt(  # type: ignore
         section=section, model=model, combo=kw.get("combo", ""), status="200",
-        category="", action="", elapsed_ms=2)
+        category="", action="", elapsed_ms=2, response_valid=True)
     vc = SectionVerdict(section="openai-compatibility", usable=True,
                         base_url="https://wire.example/v1", models=["m"])
     real2._stage5_capabilities(row, vc)
@@ -3760,7 +3921,19 @@ def test_flow_style_section_head_rebuilds():
     assert not any(ln.strip() == "]" for ln in new_z.splitlines()), (
         f"悬挂的 ] 没被吃掉：\n{new_z[:300]}")
     got_z = _yaml.safe_load(new_z)
-    assert len(got_z.get("claude-api-key") or []) == 1, got_z
+    # 本次方案只覆盖 k1，k2 是留守条目 —— 必须原样还在（2026-09-12 改）。
+    #
+    # 这一行原来断言「只剩 1 条」，那钉住的是**删除留守条目**的旧行为，
+    # 与 keep_unplanned 的既定契约正相反：删除只该由操作员显式操作，不该是
+    # 「没勾」的副作用（2026-09-02 生产事故，13 个 provider 被删到剩 1 个，
+    # 见 render_section 里 keep_unplanned 那一段）。本用例真正要守的是
+    # 「flow 段头能重建成合法 YAML、不重复输出 flow 内容行、不留悬挂的 ]」
+    # —— 那三条断言在上面，与条目数无关。
+    got_entries = {e.get("api-key"): e for e in got_z.get("claude-api-key") or []}
+    assert set(got_entries) == {"k1", "k2"}, got_z
+    assert got_entries["k2"]["base-url"] == "https://b.example", got_z
+    # k2 是**另一个站**，不参与同站档位对齐 —— 原值 800 照旧
+    assert got_entries["k2"]["priority"] == 800, got_z
 
     CASES = {
         "单行 flow":
@@ -3794,18 +3967,37 @@ def test_flow_style_section_head_rebuilds():
     }
     for why, raw in CASES.items():
         cfg = _yaml.safe_load(raw)
+        # 方案的 base-url 取原文里 k1 那条自己的写法。
+        #
+        # 不能写死成 `https://a.example`（2026-09-12 改）：「flow 值里含方括号」
+        # 那一例原文写的是 `https://a.example/[x]`，两者是**不同的上游身份**
+        # （路径不同，见 writeback._source_identity）。写死会让 k1 既作为
+        # 方案条目写一遍、又作为留守条目留一遍 —— 同一把 Key 在 CPA 的
+        # 轮询池里占两个位。用例本身要测的是段头形态，不是跨路径归并。
+        rows0 = cfg.get("claude-api-key") or []
+        base0 = next((str(e.get("base-url")) for e in rows0
+                      if e.get("api-key") == "k1"), "https://a.example")
         p = ImportPlan(host="a.example", masked_key="k1", line_no=1)
         p.sections["claude-api-key"] = SectionPlan(
-            section="claude-api-key", base_url="https://a.example",
+            section="claude-api-key", base_url=base0,
             api_key="k1", models=["claude-opus-5"], priority=900,
             model_source="probed")
         new, _w = rebuild_config_full(
-            cfg, {("https://a.example", "k1"): p}, raw.splitlines(True))
+            cfg, {(base0, "k1"): p}, raw.splitlines(True))
         ok, msg = validate(new)
         assert ok, f"{why}：产出非法 YAML —— {msg[:120]}"
         got = _yaml.safe_load(new)
-        assert len(got.get("claude-api-key") or []) == 1, (
-            f"{why}：条目数不对 —— {got.get('claude-api-key')}")
+        # 方案覆盖 k1；原文里的其他条目是留守条目，原样保留（keep_unplanned，
+        # 见 render_section 那一段）。所以判据是「k1 在且只有一条 k1」，
+        # 不是「整段只剩一条」—— 后者钉的是删留守条目的旧行为。
+        rows = got.get("claude-api-key") or []
+        k1_rows = [e for e in rows if e.get("api-key") == "k1"]
+        assert len(k1_rows) == 1, (
+            f"{why}：k1 条目数不对 —— {rows}")
+        orig_keys = {e.get("api-key")
+                     for e in (_yaml.safe_load(raw).get("claude-api-key") or [])}
+        assert {e.get("api-key") for e in rows} == (orig_keys | {"k1"}), (
+            f"{why}：留守条目丢了或多出条目 —— {rows}")
         assert "other" in got and "api-keys" in got, (
             f"{why}：其他顶层键丢了 —— {sorted(got)}")
         # 段头不能还留着 flow 的残骸
@@ -3949,7 +4141,10 @@ def test_context_limit_lower_bound():
         att = Attempt(section=section, model=model, combo=kw.get("combo", ""),
                       status="200", category="可用", action="", elapsed_ms=1,
                       input_tokens=state["tokens"],
-                      sent_chars=len(kw.get("text") or ""))
+                      sent_chars=len(kw.get("text") or ""),
+                      # Attempt.ok 现在还要 response_valid —— 真 _call 里由
+                      # classify.validate_success 判好存下来，假 _call 得自己带。
+                      response_valid=True)
         return att
 
     prober._call = fake_call        # type: ignore[assignment]
@@ -4013,7 +4208,8 @@ def test_context_unit_is_tokens():
         section=section, model=model, combo=kw.get("combo", ""),
         status="200", category="可用", action="", elapsed_ms=1,
         input_tokens=len(kw.get("text") or ""),   # = 发送量，未截断
-        sent_chars=len(kw.get("text") or ""))
+        sent_chars=len(kw.get("text") or ""),
+        response_valid=True)
     v = SectionVerdict(section="claude-api-key", usable=True,
                        base_url="https://unit.example", models=["m"])
     prober._stage4_context(row, v)
@@ -4039,7 +4235,7 @@ def test_context_unit_is_tokens():
                            excerpt="request too large")   # 不提数字
         return Attempt(section=section, model=model, combo=kw.get("combo", ""),
                        status="200", category="可用", action="", elapsed_ms=1,
-                       input_tokens=n, sent_chars=n)
+                       input_tokens=n, sent_chars=n, response_valid=True)
 
     p1b = Prober(gap=0.0, probe_context=True, swap_samples=0)
     p1b._call = stepped        # type: ignore[assignment]
@@ -4073,7 +4269,8 @@ def test_context_unit_is_tokens():
     p3._call = lambda section, base, key, model, **kw: Attempt(  # type: ignore[assignment]
         section=section, model=model, combo=kw.get("combo", ""),
         status="200", category="可用", action="", elapsed_ms=1,
-        input_tokens=131_072, sent_chars=len(kw.get("text") or ""))
+        input_tokens=131_072, sent_chars=len(kw.get("text") or ""),
+        response_valid=True)
     v3 = SectionVerdict(section="claude-api-key", usable=True,
                         base_url="https://unit.example", models=["m"])
     p3._stage4_context(row, v3)
@@ -4137,7 +4334,7 @@ def test_dead_end_matcher_shared_with_classify():
 def test_seed_does_not_overwrite_existing_models():
     """判死 + 目录读不到时，既有条目的模型清单不许被猜测清单覆盖。
 
-    2026-09-06 用生产 config.yaml 实测抓到：tabitoken 的 claude 条目原有
+    2026-09-06 用生产 config.yaml 实测抓到：tango 的 claude 条目原有
     claude-opus-5 / -thinking / claude-opus-4-8 / -4-8-thinking 四个，
     重探判死后 `models` 被换成 claude-fable-5-1 等六个**这个站从没验过**的
     名字 —— 后两个模型直接消失，新写进去的名字 CPA 路由过去大概率 404。
@@ -4206,10 +4403,24 @@ openai-compatibility:
         v.usable = False
         v.category, v.action = "死路", "分组无该模型渠道"
         res.sections[sec] = v
-    plan = cpa.build_plan(row, res, cfg, rebuild=True)
+    from cpa_probe import model_catalog as _mc
+    # 市面名录钉死成一份**完整**的 claude 清单 —— 本用例要守的正是
+    # 「原清单不被这批猜测覆盖」，名录里有 sonnet / fable / haiku 才测得出来。
+    MARKET = ["claude-opus-5", "claude-sonnet-5", "claude-fable-5-1",
+              "claude-haiku-4-5-20251001"]
+    with _patch.object(_mc, "remote_names", return_value=(list(MARKET), "")):
+        plan = cpa.build_plan(row, res, cfg, rebuild=True)
     sp = plan.sections["claude-api-key"]
     assert sp.model_source == "prior", sp.model_source
-    assert sp.models == ["claude-opus-5", "claude-opus-4-8"], sp.models
+    # ① 这个站从没报过的产品线（sonnet / fable / haiku）一个都不许进来 ——
+    #    那正是 tango 事故的形态（写进去 CPA 路由过去大概率 404）
+    for m in ("claude-sonnet-5", "claude-fable-5-1",
+              "claude-haiku-4-5-20251001"):
+        assert m not in sp.models, f"补进了这个站没报过的产品线：{sp.models}"
+    # ② claude-opus-4-8 与 claude-opus-5 同产品线、世代更低 —— 按用户
+    #    「每种类型只选该类型最高级别模型」剔除。原清单里**这个站验过的
+    #    最高一档**必须留下。
+    assert sp.models == ["claude-opus-5"], sp.models
     assert sp.recommended is False, "沿用原清单不等于本次验过，不许默认勾"
     assert sp.writable is True, "原清单是确定值，该让操作员能勾"
     assert any("沿用原" in w for w in sp.warnings), sp.warnings
@@ -4461,8 +4672,8 @@ def test_existing_hosts_keep_their_tier():
          站都躲开自己原来的值往下掉。拿生产 config.yaml 实测：claude 段 12 个站
          从 1000/995/990/985/700/650/630/600/400/350/300/50 变成 500..489 一片连号。
       ② 留守条目（用户没勾 / 判不可写 / 探测异常）由 `_orphan_entry_lines` 原样
-         搬回旧值，与被重探那几把的新值并存 —— kktoken claude 3 把→164 + 2 把
-         留在 372；tabitoken claude 9 把→167 + 5 把留在 371。
+         搬回旧值，与被重探那几把的新值并存 —— kilo claude 3 把→164 + 2 把
+         留在 372；tango claude 9 把→167 + 5 把留在 371。
 
     后果与「同站同档」那条约束冲突：CPA 的层级隔离只取最高可用桶
     （selector.go:527-553 availableAuthsFromPriorityBuckets 只收 bestPriority），
@@ -4654,7 +4865,7 @@ def test_orphan_entries_realign_priority():
     显式操作）。但**原样**包含 priority，于是当同站另几把 Key 拿到新值时，
     落盘结果里这一个站有两个 priority。
 
-    2026-09-04 现场截图就是这个形态：kktoken.cc 的 claude 段 5 条里 3 条 372、
+    2026-09-04 现场截图就是这个形态：kilo.example 的 claude 段 5 条里 3 条 372、
     2 条 164。CPA 的层级隔离只取最高可用桶（selector.go:527-553），
     两层意味着低档那批只在高档全部不可用时才轮到 —— 「多 Key 并行轮询」变成
     「主备切换」。

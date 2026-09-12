@@ -152,7 +152,8 @@ footer code{background:none;padding:0}
   <a href="#s7">07 写回</a>
   <a href="#s7-5">07.5 全量重探</a>
   <a href="#s7-8">07.8 对齐与加固</a>
-  <a href="#s7-9">07.9 headers 转发链</a>
+  <a href="#s-fix-403">07.9 headers 转发链</a>
+  <a href="#s7-95">07.95 批量管理</a>
   <a href="#s8">08 生效链</a>
   <a href="#s9">09 上手</a>
   <a href="#s10">10 发布</a>
@@ -1231,7 +1232,7 @@ footer code{background:none;padding:0}
     <p><code>score_verdict</code> 对 <code>usable=False</code> 一律返回 0，而站级排序
        原来是「组内最高分降序，同分按主机名」—— 于是「探测全灭」与「探测通过但扣满
        分」落在同一档，之后主机名的字母序就成了唯一判据。</p>
-    <p>2026-09-03 那次真实探测：<code>ai.hybgzs.com</code> 四段全灭（WAF ×12）却在
+    <p>2026-09-03 那次真实探测：<code>hotel.example</code> 四段全灭（WAF ×12）却在
        claude 段拿到该段第 2 名、gemini 段第 2 名，纯粹因为 <code>ai.</code> 开头。
        <code>claude-sonnet-5</code> 与 <code>gemini-3.1-pro</code> 的顶层承载因此换到
        一个<b>刚被判死的站</b>上 —— 层级隔离下顶层站不可用时那一层整个白撞一轮
@@ -1246,7 +1247,7 @@ footer code{background:none;padding:0}
      站掉到 170-175；两个热门模型的顶层回到实测通过的站上。</p>
   <p><b>组内证据不一致时点出来</b>：同站多 Key 共用一档是对的（同一个上游、能力
      相同），但「这一档由谁的实测撑起来」得说清。实测
-     <code>agentrouter.org</code> 的 claude 段 7 把 Key 里 6 把实测通过、1 把余额
+     <code>golf.example</code> 的 claude 段 7 把 Key 里 6 把实测通过、1 把余额
      耗尽走了种子猜测 —— 那一把因此拿到与实测同档的 494，并把 3 个它自己都没验过的
      模型顶上了顶层。档位不改（改了就违反「同站同档」），但
      <code>priority_reason</code> 里会写「本 Key 的清单来自工具猜测，同档是同站
@@ -1255,8 +1256,8 @@ footer code{background:none;padding:0}
   <h3>重探既有站不改它的档位</h3>
   <div class="note b">
     <div class="t">同一个上游地址、只是 token 不同的几条，priority 不一致</div>
-    <p>2026-09-04 现场截图：<code>kktoken.cc</code> 的 claude 段 5 条里 3 条 372、
-       2 条 164；<code>tabitoken.com</code> 14 条里 9 条 371、5 条 167。这与上面刚说
+    <p>2026-09-04 现场截图：<code>kilo.example</code> 的 claude 段 5 条里 3 条 372、
+       2 条 164；<code>tango.example</code> 14 条里 9 条 371、5 条 167。这与上面刚说
        的「同站同档」直接矛盾 —— 定档函数本身是对的，问题出在它<b>处理的对象</b>
        与<b>落盘那一步</b>。</p>
     <p>两个独立成因，各自都足以造成拆档：</p>
@@ -1421,7 +1422,7 @@ footer code{background:none;padding:0}
        （<code>profiles.py</code> 有意去掉：api-key 探测不该声称走 oauth）与
        <code>context-1m-2025-08-07</code>（只由 <code>betas.py</code> 在站方正文
        点名时才补）。整字段替换会把手工配的能力 beta 静默抹掉 —— 实测含这两个
-       beta 的条目 33 个，其中 anyrouter.top 的 claude 条目 headers <b>只有</b>
+       beta 的条目 33 个，其中 alfa.example 的 claude 条目 headers <b>只有</b>
        <code>anthropic-beta: context-1m-2025-08-07</code>、没有 UA，baseline 一
        通过 <code>need_ua=False</code>，那个站的 1m 上下文就被关掉。</p>
     <p>能力开关<b>实测优先</b>（含「实测不支持时把原来开着的关掉」）：那个开关
@@ -1697,7 +1698,7 @@ h.persistLocked(c)        ← 但把<b>整个 h.cfg</b> 重新序列化落盘</p
   <p><b>它的查表键必须含段</b>（2026-09-03 对账发现，与 <code>proxy-url</code> 同一个
      成因）：原来按 <code>(host, api_key)</code> 索引、跨段共用一个值。实测 facai 的
      3 把 Key 在 codex 与 claude 段是 <code>weight: 0</code>（那两条路径静默换模，
-     已封），在 compat 段<b>故意没写</b>（那条路径可用）；100xlabs 的 3 把同样只封
+     已封），在 compat 段<b>故意没写</b>（那条路径可用）；xray 的 3 把同样只封
      claude 段。按两元组搬会把 0 灌进那些没封的段 —— 6 个 <code>(凭据, 段)</code>
      组合被无声逐出调度池，而 YAML 合法、写后验证也发现不了。</p>
   <p>还有一处只在 compat 段出现：它的 <code>weight</code> 挂在
@@ -1715,9 +1716,9 @@ h.persistLocked(c)        ← 但把<b>整个 h.cfg</b> 重新序列化落盘</p
        这一段没有。</p>
     <p>而「没进方案」有三种完全无害的成因：用户只勾了一部分、那个段判不可写、探测抛
        异常（<code>BatchProber</code> 会把那个凭据整个从 results 里去掉）。实测生产
-       配置 gorouter.app 15 把、tabitoken.com 14 把 —— 一把出问题就丢一把。</p>
+       配置 gorou.example 15 把、tango.example 14 把 —— 一把出问题就丢一把。</p>
     <p>同一处还藏着第二个缺陷：per-key 的 <code>proxy-url</code> 被统一成组内
-       <code>head</code> 那把的值。实测 kktoken.cc 5 把、ai.hybgzs.com 3 把带 per-key
+       <code>head</code> 那把的值。实测 kilo.example 5 把、hotel.example 3 把带 per-key
        代理，组内不一致时全组按 head 写 —— 多一跳不会失败，所以
        <code>validate</code> 与写后验证都发现不了。</p>
   </div>
@@ -1818,8 +1819,8 @@ h.persistLocked(c)        ← 但把<b>整个 h.cfg</b> 重新序列化落盘</p
 
   <div class="note b">
     <div class="t">同站同值，站间不同 —— 这是 CPA 的调度语义，不是审美选择</div>
-    <p>原 config.yaml 三段无一例外：<code>kktoken.cc</code> 5 个 Key 全 1000、
-       <code>tabitoken.com</code> 14 个全 990、<code>gorouter.app</code> 15 个全 985。</p>
+    <p>原 config.yaml 三段无一例外：<code>kilo.example</code> 5 个 Key 全 1000、
+       <code>tango.example</code> 14 个全 990、<code>gorou.example</code> 15 个全 985。</p>
     <p><code>priority</code> 决定<b>哪一层</b>先被尝试，同层内部按 <code>weight</code>
        轮询（<code>selector.go:539-549</code> 只取最高那一桶）。同站多 Key 指向同一个
        上游、能力相同，本该在同一层。给它们不同值会让第 2 把 Key 只在第 1 把不可用时
@@ -2096,7 +2097,7 @@ h.persistLocked(c)        ← 但把<b>整个 h.cfg</b> 重新序列化落盘</p
        （<code>openai_compat_executor.go:107</code>），CPA 侧对模型名<b>零校验</b>
        （<code>buildOpenAICompatibilityConfigModels</code> 照单注册，
        <code>service_models.go:713-739</code>）—— 能不能用只取决于上游认不认。</p>
-    <p>而生产 config.yaml 里 <code>runanytime</code> 的 compat 段<b>唯一通过端到端
+    <p>而生产 config.yaml 里 <code>romeo</code> 的 compat 段<b>唯一通过端到端
        验证的模型就是 <code>grok-4.6</code></b>（注释原文：「整个 vip 分组当前只有
        grok-4.6 有渠道，已通过端到端验证的只有它」），<code>facai</code> 段还有
        <code>grok-4.6</code> + <code>glm-5.2</code>。</p>
@@ -2266,7 +2267,7 @@ h.persistLocked(c)        ← 但把<b>整个 h.cfg</b> 重新序列化落盘</p
 
   <h3>proxy-url 搬运必须按段</h3>
   <p><code>existing_proxies</code> 原来按 <code>(host, api_key)</code> 索引，跨段共用一个值。
-     实测 <code>kktoken.cc</code> 的 5 把 Key 在 compat 段有
+     实测 <code>kilo.example</code> 的 5 把 Key 在 compat 段有
      <code>proxy-url: http://mihomo:7890</code>，在 claude 段<b>故意没有</b> ——
      那个站的 claude 路径直连可用，走代理反而多一跳。</p>
   <p>按两元组搬运会把 compat 的代理灌进 claude 段，实测 claude 段 proxy-url 从 3 条
@@ -2277,7 +2278,7 @@ h.persistLocked(c)        ← 但把<b>整个 h.cfg</b> 重新序列化落盘</p
   <p>「挡住了谁」这条警告原来只报总数，不分活死。演练实测输出：</p>
   <div class="note b">
     <div class="t">警告说挡 2 个，算法说无代价 —— 同一件事两个答案</div>
-    <p><code>priority 280 会把 2 个现有站挡在其后（ai.hybgzs.com、muyuan.do）</code></p>
+    <p><code>priority 280 会把 2 个现有站挡在其后（hotel.example、mike.example）</code></p>
     <p>而那两个站在 config.yaml 的注释里都记着实测不可用，定档算法数出的<b>在用</b>站
        是 <b>0</b>（第 05 章：挡住一个已经不可用的站代价为零）。用户看到的是警告，
        于是会去调低一个本来最优的档位。</p>
@@ -2323,7 +2324,7 @@ h.persistLocked(c)        ← 但把<b>整个 h.cfg</b> 重新序列化落盘</p
     <p>那份对账值得单独说，因为它抓到的十处缺陷单元测试全绿：<b>headers 整字段消失</b>
        （Desktop 版 24/24、fsdownload 版 66/66 条目，含 <code>anthropic-beta</code>
        24 条 —— 见下方单独一段）、compat 段组内没进方案
-       的 Key 会消失（生产配置 gorouter.app 15 把、tabitoken.com 14 把）、per-key
+       的 Key 会消失（生产配置 gorou.example 15 把、tango.example 14 把）、per-key
        的 <code>proxy-url</code> 与 <code>weight</code> 被统一成组内 head 那把的值
        （8 把带 per-key 代理）、同一个站两种 base-url 写法会写出两个同名 provider、
        <code>prefix</code> 被 <code>dominant_prefix</code> 猜的值覆盖（121/121 条目，
@@ -3046,15 +3047,191 @@ git ls-files | grep -iE 'scrub|domain'    <span class="c"># 清理器别在里�
   </div>
 </div></section>
 
+<section id="s-7-95-anchor"></section>
+<section id="s7-95"><div class="wrap">
+  <div class="sech"><span class="no">07.95</span><h2>路由批量管理：为什么要自己做</h2></div>
+  <p class="sub">CPAMP 只能一条一条改。而「同一网址的多把 Key 档位是否一致」
+     这个唯一重要的结构，在它的扁平分页表里恰好看不见。</p>
+
+  <h3>问题：158 条上游，16 页，看不出结构</h3>
+  <p>CPAMP 的「AI 提供商」页把所有上游拍成一张扁平表，默认 10 条一页。
+  158 条就是 16 页。它的表格<b>没有多选列</b>（<code>ProviderTable</code> 的
+  props 全是单行回调），后端 <code>router.go</code> 的 provider 段只有
+  <code>GET / PUT / DELETE</code> 三个动词、<b>没有任何 bulk 路径</b>。
+  它自己的「按结果应用」是 <code>for</code> 循环逐条 read-modify-write ——
+  每改一条都要 <code>GET /config</code> 再 <code>PUT</code> 回整个 158 条数组。</p>
+
+  <p>更要紧的是：<b>翻 16 页也看不出「同一个网址下几把 Key 的档位一不一致」</b>。
+  而这恰恰是最容易出错、后果也最重的地方。</p>
+
+  <figure>
+  <svg viewBox="0 0 940 250" role="img"
+       aria-label="对比图：左侧 CPAMP 扁平分页表，同一网址的条目散落在不同页；右侧本项目按网址分组的卡片，档位分裂一眼可见">
+    <g font-family="var(--f-body)" font-size="12" color="#6B7C8E">
+      <text x="10" y="18" font-size="13" font-weight="600" fill="#B04A44">CPAMP：扁平分页</text>
+      <rect x="10" y="30" width="420" height="200" rx="8" fill="none" stroke="#D8DEE6"/>
+      <text x="24" y="52" fill="#6B7C8E">第 3 页</text>
+      <rect x="24" y="60" width="392" height="22" rx="4" fill="#F4F6F8"/>
+      <text x="32" y="75" font-size="11.5" fill="#3A4550">codex · romeo · sk-oPS…  priority 147</text>
+      <rect x="24" y="86" width="392" height="22" rx="4" fill="#F4F6F8"/>
+      <text x="32" y="101" font-size="11.5" fill="#3A4550">codex · romeo · sk-ILh…  priority 147</text>
+      <text x="24" y="130" fill="#6B7C8E">…翻 4 页…</text>
+      <text x="24" y="156" fill="#6B7C8E">第 7 页</text>
+      <rect x="24" y="164" width="392" height="22" rx="4" fill="#FDECEA" stroke="#E4A9A4"/>
+      <text x="32" y="179" font-size="11.5" fill="#B04A44">codex · romeo · sk-Jtk…  priority 350  ← 分裂了</text>
+      <text x="24" y="210" font-size="11.5" fill="#B04A44">同一个站被拆在两页，没人会发现</text>
+
+      <text x="510" y="18" font-size="13" font-weight="600" fill="#2E7D4F">本项目：按网址分组</text>
+      <rect x="510" y="30" width="420" height="200" rx="8" fill="none" stroke="#E4A9A4" stroke-width="2"/>
+      <rect x="510" y="30" width="420" height="34" rx="8" fill="#FDECEA"/>
+      <text x="526" y="52" font-size="12.5" font-weight="600" fill="#B04A44">
+        Codex · romeo.example　　档位 350 / 147</text>
+      <rect x="526" y="76" width="388" height="20" rx="4" fill="#F4F6F8"/>
+      <text x="534" y="90" font-size="11.5" fill="#3A4550">sk-oPS…　4 型　147</text>
+      <rect x="526" y="100" width="388" height="20" rx="4" fill="#F4F6F8"/>
+      <text x="534" y="114" font-size="11.5" fill="#3A4550">sk-ILh…　4 型　147</text>
+      <rect x="526" y="124" width="388" height="20" rx="4" fill="#F4F6F8"/>
+      <text x="534" y="138" font-size="11.5" fill="#3A4550">sk-kEO…　4 型　147</text>
+      <rect x="526" y="148" width="388" height="20" rx="4" fill="#FDECEA" stroke="#E4A9A4"/>
+      <text x="534" y="162" font-size="11.5" fill="#B04A44">sk-Jtk…　4 型　350</text>
+      <text x="526" y="192" font-size="11.5" fill="#B04A44">红框直接顶出来：4 条同址，档位不一致</text>
+      <text x="526" y="212" font-size="11.5" fill="#2E7D4F">勾选 → 统一优先级 → 一次写回</text>
+    </g>
+  </svg>
+  <figcaption>同一批数据的两种呈现。左边不是「不好看」，是<b>结构性地看不见问题</b>。</figcaption>
+  </figure>
+
+  <h3>这个分裂到底有什么后果</h3>
+  <p>CPA 按<b>层级</b>调度：只取 priority 最高那一桶
+  （<code>selector.go</code> 的 <code>availableAuthsFromPriorityBuckets</code>
+  只收 <code>bestPriority</code>）。所以上图那 4 把 Key 里：</p>
+  <ul>
+    <li><b>350 那一条被永远优先抽中</b>，先被打光配额；</li>
+    <li>另外 3 把停在 147，要等 155 / 154 / 153 / 150 / 149 / 148
+        这些档位全部冷却之后才轮得到 —— <b>实质是冷备</b>。</li>
+  </ul>
+  <p>而这 4 条的 <code>models</code>、<code>headers</code>、<code>proxy-url</code>
+  <b>逐字相同</b>，唯独 priority 不同。它不是有意配置，是漂移。</p>
+
+  <div class="note bad">
+    <b>实测对账（2026-09-10）</b>：拿部署前后两份 <code>config.yaml</code> 逐组比对 ——
+    <b>注入前 40 组 0 组分裂，注入后 3 组分裂</b>。也就是说，这些分裂是本项目
+    自己在写入时造成的。根因见下一节。
+  </div>
+
+  <h3>根因：不变式在 assign_priorities 之后被破坏</h3>
+  <p><code>assign_priorities</code> 本身是对的：它按
+  <code>host_of(base_url)</code> 分组，同一 host 的所有 SectionPlan
+  复制同一个值。问题出在它<b>之后</b>：</p>
+  <ul>
+    <li>用户手工改优先级时，覆盖是按 <code>rid = row.line_no</code> 应用的
+        —— 而<b>每把 Key 各占一行</b>。改一把，这一把就与同站其余的分层了。</li>
+    <li><code>priority_collisions</code> 只检测「<b>不同 host 拿到同一个值</b>」，
+        <b>不检测「同一 host 拿到不同值」</b>。于是不变式被破坏时，一条告警都没有。</li>
+  </ul>
+  <p>已补 <code>priority_split_within_host()</code>，列为<b>阻断级</b>告警，
+  并接进写回前的两处校验点。</p>
+
+  <h3>为什么本项目做批量反而更安全</h3>
+  <table>
+    <thead><tr><th>维度</th><th>CPAMP</th><th>本项目</th></tr></thead>
+    <tbody>
+      <tr><td>写入方式</td>
+          <td>分段 <code>PUT</code>，重新序列化</td>
+          <td>行级改写整份文本</td></tr>
+      <tr><td>注释</td>
+          <td><b>一律丢失</b></td>
+          <td><b>逐行保留</b>（实测 1744 行守恒）</td></tr>
+      <tr><td>未知字段</td><td>可能被序列化抹平</td><td>原样搬运</td></tr>
+      <tr><td>改 10 处的往返次数</td><td>10 轮（每轮全量 PUT）</td><td><b>1 轮</b></td></tr>
+      <tr><td>条目定位</td>
+          <td><code>api-key</code> + <code>base-url</code> 查询 ——
+              重复条目命中哪条<b>不确定</b></td>
+          <td>该段数组<b>下标</b>，精确</td></tr>
+      <tr><td>并发写</td><td>两个标签页会静默互相覆盖</td>
+          <td>基线比对，冲突直接 409</td></tr>
+    </tbody>
+  </table>
+
+  <h3>启用 / 停用是两套字段，写错就是静默失效</h3>
+  <p>这一点最容易踩坑：CPAMP 里两类段表达「停用」的方式<b>完全不同</b>。</p>
+  <ul>
+    <li><b>key 类段</b>（gemini / codex / claude / xai / vertex / interactions）：
+        往 <code>excluded-models</code> 里塞通配符 <code>"*"</code>；</li>
+    <li><b><code>openai-compatibility</code></b>：用真正的布尔字段
+        <code>disabled</code>。</li>
+  </ul>
+  <p>写错字段的后果是<b>界面显示已停用、CPA 照常轮询</b> —— 比不做还糟，
+  因为你以为它停了。</p>
+
+  <div class="note">
+    <b>这两个值不写死在本项目里。</b><code>disable_semantics()</code> 每次都从
+    CPAMP 源码实时解析（<code>DISABLE_ALL_MODELS_RULE</code> 与
+    <code>OpenAIProviderConfig.disabled</code>），带 6 小时缓存、失败也缓存。
+    实测：把上游的通配符改成 <code>ALL</code>、布尔字段改名 <code>isPaused</code>，
+    本项目<b>不改一行代码</b>就跟着写对了，且往返仍然逐字节可逆。
+  </div>
+
+  <h3>写回链路：一道闸都不少</h3>
+  <figure>
+  <svg viewBox="0 0 940 96" role="img"
+       aria-label="批量写回流程：选组、生成 ops、预览 diff、人工确认、基线比对、YAML 校验、备份落盘、推送重载、读回校验">
+    <defs>
+      <marker id="ar95" viewBox="0 0 10 10" refX="9" refY="5"
+              markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+      </marker>
+    </defs>
+    <g font-family="var(--f-body)" font-size="11.5" color="#6B7C8E">
+      <g fill="#F4F6F8" stroke="#D8DEE6">
+        <rect x="6"   y="30" width="96" height="34" rx="6"/>
+        <rect x="126" y="30" width="96" height="34" rx="6"/>
+        <rect x="246" y="30" width="96" height="34" rx="6"/>
+        <rect x="486" y="30" width="96" height="34" rx="6"/>
+        <rect x="606" y="30" width="96" height="34" rx="6"/>
+        <rect x="726" y="30" width="96" height="34" rx="6"/>
+        <rect x="846" y="30" width="88" height="34" rx="6"/>
+      </g>
+      <rect x="366" y="30" width="96" height="34" rx="6" fill="#FFF6E5" stroke="#E0B054" stroke-width="2"/>
+      <g fill="#3A4550" text-anchor="middle">
+        <text x="54"  y="51">① 选组</text>
+        <text x="174" y="51">② 生成 ops</text>
+        <text x="294" y="51">③ 预览 diff</text>
+        <text x="414" y="51" fill="#8A6516" font-weight="600">④ 人工确认</text>
+        <text x="534" y="51">⑤ 基线比对</text>
+        <text x="654" y="51">⑥ 备份落盘</text>
+        <text x="774" y="51">⑦ 推送重载</text>
+        <text x="890" y="51">⑧ 读回校验</text>
+      </g>
+      <g stroke="currentColor" fill="none" marker-end="url(#ar95)">
+        <path d="M102,47 H124"/><path d="M222,47 H244"/><path d="M342,47 H364"/>
+        <path d="M462,47 H484"/><path d="M582,47 H604"/><path d="M702,47 H724"/>
+        <path d="M822,47 H844"/>
+      </g>
+      <text x="414" y="82" text-anchor="middle" font-size="11" fill="#8A6516">
+        没有确认就没有第 ⑤ 步</text>
+    </g>
+  </svg>
+  <figcaption>与投喂流程的 <code>plan → apply</code> 是同一道门槛，
+  并且共用同一把写盘锁 —— 两条路径改的是同一个文件。</figcaption>
+  </figure>
+
+  <h3>不做什么</h3>
+  <p><b>批量删除没有做。</b>删除不可逆，而且条目下标会随删除移位 ——
+  一次批量里前一个删除会让后一个的下标失效。要做必须单独一条路径、
+  单独的二次确认、并且以内容指纹而不是下标定位。
+  当前只提供<b>批量启用 / 停用 / 统一优先级</b>三项，都是可逆的。</p>
+</div></section>
+
 <section id="s-fix-403"><div class="wrap">
   <div class="sech">
     <span class="no">FIX</span>
-    <h2>修复案例：zzzcoding codex 403 客户端限制</h2>
+    <h2>修复案例：zulu codex 403 客户端限制</h2>
   </div>
   <p class="sub">真实修复过程：从表象到根因，跨三个项目的联合排查</p>
 
   <h3>问题表象</h3>
-  <p>用户在 CPAMP 管理界面添加了 <code>api.zzzcoding.org</code> 的 codex 段配置，
+  <p>用户在 CPAMP 管理界面添加了 <code>zulu.example</code> 的 codex 段配置，
   手动填写了 <code>originator: codex-tui</code> 和完整的 User-Agent，
   但测试连通性时仍然返回 403：</p>
 
@@ -3157,7 +3334,7 @@ func applyCodexCloakingHeaders(headers http.Header, cfg *config.Config) {
   <h3>验证方法</h3>
   <div class="cmd">
     <div class="bar">测试修复效果</div>
-<pre>curl -X POST http://cpa.chiangma.com:15721/v1/responses?beta=true \
+<pre>curl -X POST http://cielo-cpa.example:15721/v1/responses?beta=true \
   -H "Authorization: Bearer cpachma-codex-fake-key" \
   -d '{"model":"gpt-6-astra","instructions":"test","input":[...]}'
 

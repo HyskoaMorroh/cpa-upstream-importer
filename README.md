@@ -221,9 +221,113 @@ docker compose pull cpa-upstream-importer && docker compose up -d
 
 ## 核心机制
 
+### 路由批量管理（2026-09-11）
+
+**问题**：CPAMP 的「AI 提供商」页只能逐条操作 —— 表格没有多选列，
+后端 provider 段只有 `GET/PUT/DELETE`、没有任何 bulk 路径，它自己的
+「按结果应用」是 `for` 循环逐条 read-modify-write（每条都 `GET /config`
++ `PUT` 整个 158 条数组）。更要紧的是它按条目扁平分页（158 条 / 10 条一页
+/ 16 页），**看不出「同一个网址下几把 Key 的档位一不一致」**。
+
+**为什么这件事重要**：CPA 按层级调度，只取 priority 最高那一桶
+（`selector.go` 的 `availableAuthsFromPriorityBuckets` 只收 `bestPriority`）。
+同址多 Key 一旦分裂档位，高档那几条会被优先抽中并先耗尽，低档的实质是冷备 ——
+本该并行轮询的多把 Key 变成了主备切换。
+
+**实测对账**：拿部署前后两份 `config.yaml` 逐组比对，**注入前 40 组 0 组分裂，
+注入后 3 组分裂**：
+
+| 段 | 网址 | 条目 | priority |
+|---|---|---|---|
+| codex | `romeo.example/v1` | 4 | **{350, 147}** |
+| codex | `golf.example/v1` | 7 | **{348, 149}** |
+| gemini | `romeo.example` | 3 | **{218, 215}** |
+
+`romeo` 那 4 条的 `models` / `headers` / `proxy-url` **逐字相同**，
+唯独 idx9 是 350 —— 纯漂移，不是有意配置。
+
+**根因**：`assign_priorities` 本身守住了「同 host 同档」，但它**之后**有两处破坏：
+用户手工改档是按 `rid = row.line_no`（每把 Key 一行）应用的，改一把就分层；
+而 `priority_collisions` 只检测「不同 host 同值」，**不检测「同 host 不同值」**，
+于是破坏了也零告警。已补 `priority_split_within_host()`，列为**阻断级**。
+
+**做法**：新增 `cpa_probe/bulk.py` + `GET /api/routes` +
+`POST /api/bulk-preview` / `/api/bulk-apply`，前端加「路由批量管理」面板
+（按 段 × 网址 分组，分裂的组红框顶出来）。与 CPAMP 的对比：
+
+| 维度 | CPAMP | 本项目 |
+|---|---|---|
+| 写入 | 分段 PUT，重新序列化 | 行级改写整份文本 |
+| 注释 | 一律丢失 | 逐行保留（实测 1744 行守恒） |
+| 改 10 处 | 10 轮全量 PUT | **1 轮** |
+| 条目定位 | `api-key`+`base-url` 查询，重复条目命中哪条不确定 | 该段数组**下标** |
+| 并发写 | 两个标签页静默互相覆盖 | 基线比对，冲突 409 |
+
+**启停是两套字段**：key 类段往 `excluded-models` 塞通配符 `"*"`，
+`openai-compatibility` 用布尔 `disabled`。写错的后果是「界面显示已停用、
+CPA 照常轮询」。**这两个值不写死** —— `disable_semantics()` 每次从 CPAMP 源码
+实时解析，带 6 小时缓存。实测把上游通配符改成 `ALL`、字段改名 `isPaused`，
+本项目不改一行代码就跟着写对，且往返逐字节可逆。
+
+**不做批量删除**：删除不可逆，且下标会随删除移位（前一个删除让后一个下标失效）。
+当前只提供批量启用 / 停用 / 统一优先级，三项都可逆。
+
+写回走与投喂流程**完全相同**的链路：预览 diff → 人工确认 → 基线比对 →
+YAML 校验 → 备份落盘 → 推送重载 → 读回校验，并共用同一把写盘锁。
+
+详见[图文教程 07.95 章](docs/tutorial.html#s7-95)。
+
+### 上游常量自动同步（2026-09-11）
+
+本项目对 CPA / CPAMP 的所有形态假设都**从上游源码实时解析**，不抄成常量：
+
+| 解析什么 | 来源文件 | 用途 |
+|---|---|---|
+| codex 强制/删除的请求体字段 | `codex_executor_execute.go` | 让探测形态跟着 CPA 升级自动对齐 |
+| 身份头常量（UA / originator / beta 族） | `claude_executor_request.go`、`codex_executor_request.go` | 画像梯的值 |
+| 停用语义（通配符 / 布尔字段名） | CPAMP `providers/utils.ts`、`types/provider.ts` | 批量启停写哪个字段 |
+| `disable-image-generation` 实际取值 | 运行时 `config.yaml` | 决定探测要不要发 `image_generation` 工具 |
+
+统一入口 `cpa_source_probe.cached_identity()`，三层回落：
+显式路径 → 环境变量 `CPA_SOURCE_ROOT` / `CPAMP_SOURCE_ROOT` → GitHub 远程，
+6 小时缓存且**失败也缓存**（国内直连 raw.githubusercontent 不通时不会每次干等）。
+任何一层拿不到都回落内置默认并在漂移报告里说明，不静默。
+
+实测提取结果：强制 `{stream: true, model: baseModel}`，
+删除 `[previous_response_id, generate, prompt_cache_retention, safety_identifier,
+stream_options]`；CPAMP 侧 `'*'` 与 `'disabled'`。
+
+### 探测形态必须与 CPA 实跑一致（2026-09-11）
+
+**问题**：一批上游在 cc-switch 里能用，填进 CPA/CPAMP 就报
+`400 invalid codex request`，本项目的探测也把它们判死。
+
+**逐字段实测**（alfa.example，模型 `gpt-6-astra`）：
+
+| 请求体 | 结果 |
+|---|---|
+| 缺 `prompt_cache_key` | `400 invalid codex request` |
+| 缺 `include` | `400 invalid codex request` |
+| 两者都有 | 500「负载已达上限」（**形态被接受**） |
+
+**身份头完全无关** —— 把 `Originator` / `User-Agent` 全部删掉，结果不变。
+
+**根因**：这类中转（new-api 系）按**真实 Codex CLI 的字段集**校验请求。
+而本项目原来发的是 `{"model", "stream": false, "input": "<字符串>"}` 三个字段，
+CPAMP 的「连通性测试」发的也是同一个瘦身 body —— 所以**那个测试失败并不代表
+网关坏了**，真实 Codex CLI 经 CPA 转发时是通的（CPA 在 codex 路径上不删
+`prompt_cache_key`）。
+
+**修法**：`request.py` 的 codex 基线补齐到真实客户端形态
+（数组 `input` + `include` + `prompt_cache_key` + `instructions` + `reasoning`
++ `tool_choice` + `store`），并新增判定类别「**形态**」（`usable=False` 但
+**不降权** —— 站没问题，问题在探测）。
+
+复验：改后同一站从 `400`（判死）变为 `520 → 判定「临时」`，假阴性链断开。
+
 ### codex 段 headers 转发修复（2026-09-06）
 
-**问题**：用户在 CPAMP 管理界面配置 `api.zzzcoding.org` 的 codex 段，
+**问题**：用户在 CPAMP 管理界面配置 `zulu.example` 的 codex 段，
 手动填写了正确的 `originator: codex-tui` 和 User-Agent，测试连通性时仍返回 403
 "This account only allows Codex official clients"。同一个 URL 和 Key 在
 cc-switch 直连时正常。
@@ -254,9 +358,9 @@ Originator，导致配置文件的自定义值被丢弃。
 **语义依据**（照现有 config.yaml 的规律，三段无一例外）：
 
 ```
-kktoken.cc      5 个 Key   priority 1000
-tabitoken.com  14 个 Key   priority  990
-gorouter.app   15 个 Key   priority  985
+kilo.example      5 个 Key   priority 1000
+tango.example  14 个 Key   priority  990
+gorou.example   15 个 Key   priority  985
 ```
 
 **同一个站的所有 Key 共用一档，站与站不同**。这与 CPA 的调度一致：`priority`
@@ -273,7 +377,7 @@ gorouter.app   15 个 Key   priority  985
 `score_verdict` 对 `usable=False` 一律返回 0，于是「四段全灭」与「探测通过但扣满分」
 排在同一档，之后只按主机名排 —— **字母序决定谁上去**。
 
-实测那次重探：`ai.hybgzs.com` 四段全灭（WAF ×12）却在 claude 段拿到该段第 2 名、
+实测那次重探：`hotel.example` 四段全灭（WAF ×12）却在 claude 段拿到该段第 2 名、
 gemini 段第 2 名，纯粹因为 `ai.` 开头。`claude-sonnet-5` 与 `gemini-3.1-pro` 的顶层
 承载因此换到一个**刚被判死的站**上 —— 层级隔离下顶层站不可用时那一层整个白撞一轮
 （`scheduler.go:402` 只取最高那一桶）。
@@ -291,7 +395,7 @@ diff 无法复核。修复后 claude 段 8 个 `probed` 站占 493-500，5 个 `
 170-175；两个热门模型的顶层回到实测通过的站上。
 
 **组内证据不一致时点出来**：同站多 Key 共用一档是对的（同一个上游、能力相同），
-但「这一档由谁的实测撑起来」得说清。实测 `agentrouter.org` 的 claude 段 7 把 Key 里
+但「这一档由谁的实测撑起来」得说清。实测 `golf.example` 的 claude 段 7 把 Key 里
 6 把实测通过、1 把余额耗尽走了种子猜测 —— 那一把因此拿到与实测同档的 494，并把 3 个
 它自己都没验过的模型顶上了顶层。档位不改，但 `priority_reason` 里会写「本 Key 的清单
 来自工具猜测，同档是同站其他 Key 的实测撑起来的」，那句话原样落进 config.yaml 的
@@ -329,7 +433,7 @@ diff 无法复核。修复后 claude 段 8 个 `probed` 站占 493-500，5 个 `
 #### 既有站沿用原档，重探不改站间次序（2026-09-04）
 
 **现场**：同一个上游地址、只是 token 不同的几条，`priority` 不一致 ——
-`kktoken.cc` 的 claude 段 5 条里 3 条 372、2 条 164；`tabitoken.com` 14 条里
+`kilo.example` 的 claude 段 5 条里 3 条 372、2 条 164；`tango.example` 14 条里
 9 条 371、5 条 167。
 
 两个独立成因，各自都足以造成拆档：
@@ -422,6 +526,46 @@ diff 无法复核。修复后 claude 段 8 个 `probed` 站占 493-500，5 个 `
   「目录里只有 o 系列」的站会被误判成落后从而一个都不预勾。改成**逐产品线**比：
   只对两侧都出现的线比较，全部落后才算落后，没有可比的线就不判。后端与前端
   （`market_top_gen_lines`）用同一套数据，否则界面预勾与落盘清单再次分叉。
+- **无版本号一律不收（2026-09-11 用户口径，所有类型一视同仁）** ——
+  「没有版本号就等于低等级模型」。原来「整条产品线都认不出版本就全留」的兜底
+  让每一个无版本号的名字（它们各自自成一条线、永远没有对手）永久保留，现场就是
+  `gpt-reserve` 与 `gpt-6` / `gpt-6-astra` 一起被勾上，而该型号并不存在。
+  与遗留的 `claude-fake-5` 是同一形态：名字合法（`name_is_safe` 只挡非法字符，
+  挡不住「合法但不存在」），却没有任何版本信息可比。现在无条件丢弃。
+
+  实测行为：
+
+  | 输入 | 输出 |
+  |---|---|
+  | `gpt-5.4-mini, gpt-5.5, gpt-5.6, -luna, -sol, -terra, gpt-6, gpt-6-astra, gpt-reserve` | `gpt-6, gpt-6-astra` |
+  | `claude-opus-5, claude-opus-4-8, claude-sonnet-5, claude-fable-5-1` | `claude-opus-5, claude-sonnet-5, claude-fable-5-1` |
+  | `gemini-3.1-pro, gemini-2.5-pro` | `gemini-3.1-pro` |
+  | `o1, o1-pro, o3, o3-mini, o3-pro, o4-mini, o4-mini-high` | `o3-pro, o4-mini, o4-mini-high` |
+
+  某站全部模型都无版本号时清单会被清空，此时退到目录 / 兜底清单，界面提示手填；
+  手填走 `manual` 来源，**不受本规则约束**（显式意图优先）。
+
+- **实测清单也过「就高」闸，但既有条目在用的低世代不删** —— 四条模型来源里
+  probed 原本是唯一不过闸的，于是 `_stage2` 按目录顺序补进来的旧款会与新款
+  一起落盘。现在接上同一个 `newest_generation_per_line`；为防数据丢失
+  （2026-09-06 第 2 号缺陷的现场：tango 的 claude 条目同时在用
+  `claude-opus-5` 与 `claude-opus-4-8`），**原条目已经在用的低世代保留**，
+  被丢弃的写进 `sp.warnings`，手填可恢复。
+
+- **候选顺序按世代降序，不用目录字母序** —— 目录来自
+  `parse_models_response` 的 `sorted(set(...))`（字母序），而 `_stage2` 收满
+  `max_models` 就停，于是目录大的站上同世代的新变体根本轮不到被验证 ——
+  这正是「勾了 `gpt-5.6` 却没勾 `gpt-5.6-sol`」的直接成因。现在用
+  `rank_models` 排（六级键第一顺位就是版本降序），与「就高」同一份判据。
+
+- **检测不到高级模型时按该系列最高级填充**（`topup_to_market_top`）——
+  用户 2026-09-11 明确要求，**推翻**了 2026-09-02 定的「站方目录整体落后时
+  列出但不预勾」。理由是探测本身会有 BUG，目录没报的模型实际上往往能用。
+  按类型分别填充：gemini 只填带 `pro` 的最高编号；codex 填最高世代**整个系列
+  的所有名字**；claude 填 `*-5` 那一级全部；`openai-compatibility`
+  **允许多族并存**，每族各填各自的最高级。判据是逐产品线比世代，
+  已经是最高世代的线原样不动。
+
 - **非对话模型一律不收** —— 图像（`gpt-image-2`、`gemini-3-pro-image`）、
   语音（`-tts`）、嵌入、开源小模型（`-oss-`）、批处理（`gemini-batch-inference`）。
   它们走的不是对话协议路径，写进去 CPA 路由必失配。
@@ -444,7 +588,7 @@ diff 无法复核。修复后 claude 段 8 个 `probed` 站占 493-500，5 个 `
 **为什么必须放行**（2026-09-03 拿生产 config.yaml 核实）：compat 段走
 `/chat/completions`（`openai_compat_executor.go:107`），CPA 侧对模型名零校验
 （`buildOpenAICompatibilityConfigModels` 照单注册，`service_models.go:713-739`）——
-能不能用只取决于上游认不认。而那份配置里 `runanytime` 的 compat 段**唯一通过
+能不能用只取决于上游认不认。而那份配置里 `romeo` 的 compat 段**唯一通过
 端到端验证的模型就是 `grok-4.6`**（注释原文：「整个 vip 分组当前只有 grok-4.6
 有渠道，已通过端到端验证的只有它」），`facai` 段还有 `grok-4.6` + `glm-5.2`。
 
@@ -765,7 +909,7 @@ bulk probe guard: ip 1.2.3.4 requested 4 distinct models in 60s
 ### proxy-url 搬运必须按段（2026-09-02）
 
 `existing_proxies` 原来按 `(host, api_key)` 索引，跨段共用一个值。实测
-`kktoken.cc` 的 5 把 Key 在 compat 段有 `proxy-url: http://mihomo:7890`，
+`kilo.example` 的 5 把 Key 在 compat 段有 `proxy-url: http://mihomo:7890`，
 在 claude 段**故意没有** —— 那个站的 claude 路径直连可用，走代理反而多一跳。
 
 按两元组搬运会把 compat 的代理灌进 claude 段，实测 claude 段 `proxy-url`
@@ -803,7 +947,7 @@ bulk probe guard: ip 1.2.3.4 requested 4 distinct models in 60s
 - `context-1m-2025-08-07` —— 只由 `betas.py` 在站方正文点名时才补
 
 整字段替换会把原条目里手工配的能力 beta 静默抹掉。实测 Desktop 版那份配置：
-含这两个 beta 的条目 **33** 个，其中 `anyrouter.top` 的 claude 条目 headers
+含这两个 beta 的条目 **33** 个，其中 `alfa.example` 的 claude 条目 headers
 **只有** `anthropic-beta: context-1m-2025-08-07`、没有 UA —— baseline 一通过
 `need_ua=False`，`sp.headers` 是空 dict，那个站的 1m 上下文直接被关掉。
 
@@ -2769,7 +2913,7 @@ headers 与 body 形态，不看模型名。假上游实测（全 403）：
 | 缺陷 | 实测影响 |
 |---|---|
 | **`headers` 整字段消失** | Desktop 版 24/24、fsdownload 版 66/66 条目；含 `anthropic-beta` 24 条 |
-| compat 段组内没进方案的 Key 会消失 | gorouter.app 15 把、tabitoken.com 14 把 |
+| compat 段组内没进方案的 Key 会消失 | gorou.example 15 把、tango.example 14 把 |
 | per-key `proxy-url` / `weight` 被统一成 head 那把的值 | 8 把带 per-key 代理 |
 | 同一个站两种 base-url 写法写出两个同名 provider | 同一把 Key 占两个轮询位 |
 | **`prefix` 被 `dominant_prefix` 猜的值覆盖** | 121/121 条目，`ANT/xxx` 别名全失效 |

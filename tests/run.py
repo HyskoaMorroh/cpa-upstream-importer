@@ -25,9 +25,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 #   test_edges     写回的边界形状（同站 100 Key、撞已有 provider、
 #                  已存在 Key 重导…… 全是「真跑一次才发现」型的坑）
 # test_pipeline 排后面：它起假上游、真发 HTTP，比纯逻辑慢。
+#
+# `*_compliance.py` 是另一类：按**契约面**切（源码对齐 / 传输 / 写回 /
+# HTTP API / 规划 / 探测），与上面按功能切的那批交叉覆盖。它们原来没进这张
+# 表 —— 于是 `python tests/run.py` 全绿并不代表它们也绿，实测过一次「主套件
+# 全通过而 compliance 里 6 项红着」。要么进表，要么删掉，留着不跑最坏：
+# 它给的是「已经测过了」的错觉。
 SUITES = ["test_probe.py", "test_server.py", "test_pipeline.py",
           "test_edges.py", "test_reload.py", "test_speed.py", "test_web.py",
-          "test_tiering.py", "test_full_redetect.py"]
+          "test_tiering.py", "test_full_redetect.py", "test_bulk.py",
+          "test_source_compliance.py", "test_transport_compliance.py",
+          "test_writeback_compliance.py", "test_planning_compliance.py",
+          "test_probe_compliance.py", "test_api_compliance.py"]
 
 
 def _force_utf8_stdout() -> None:

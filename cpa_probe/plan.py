@@ -38,13 +38,16 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import os
 import re
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit, urlunsplit
 
 from .parse import SECTIONS, ParsedRow, base_for_section, host_of
 from . import model_catalog
-# pipeline 不导入 plan，这个方向无环。只取白名单判定与每段模型上限，
+# pipeline 不导入 plan，这个方向无环。只取白名单判定，
 # 目录读回来的名字必须过同一道白名单 —— 不然中转站目录里的
 # embedding / whisper / tts 之类会被注册成对话模型。
 # SEED_MODELS 不在这里用（种子兜底走 model_catalog.latest_models 的三层，
@@ -182,6 +185,50 @@ def extract_existing_entries(cfg: dict) -> list[tuple[str, str, str, dict]]:
     return entries
 
 
+def _proxy_url_for_config() -> str:
+    """Only use an explicit runtime choice; never guess deployment addresses."""
+    cands = [u.strip() for u in os.environ.get("PROBE_PROXY", "").split(",")
+             if u.strip()]
+    # Multiple untested candidates do not establish which exit succeeded.
+    return cands[0] if len(cands) == 1 else ""
+
+
+def _source_url(url: str) -> str:
+    """Normalize authority only; paths and credentials remain separate evidence."""
+    p = urlsplit(url.strip().rstrip("/"))
+    return urlunsplit((p.scheme.lower(), p.netloc.lower(), p.path, p.query, p.fragment))
+
+
+def _cooling_override(v) -> bool | None:
+    """这个条目要不要覆盖全局冷却策略。返回 None = 跟随全局。
+
+    用户第 4 条要求「冷却策略根据实际需求检测填写到位」。而「到位」在这里
+    **不等于**「每条都写一个值」—— CPAMP 界面的默认就是「跟随全局」
+    （字段缺席），那是绝大多数条目的正确状态。无条件写值等于把一个全局
+    可调的策略钉死在每一条上，属于负向调整。
+
+    所以判据是：**只在实测证据表明默认会出问题时才覆盖**。
+
+    `disable-cooling` 的语义（config_types.go:406-408）：
+      · true  = 关掉这个凭据的冷却（即使全局启用）
+      · false = 强制启用冷却（即使全局禁用）
+      · 缺席  = 跟随全局
+
+    唯一有实测依据的覆盖方向是 **false（强制启用冷却）**：
+    探测判为「限流」或「限频」的站，说明它对请求频率敏感。若全局恰好
+    禁用了冷却，CPA 会在收到 429 之后立刻拿同一个凭据重试，把限流窗口
+    拉得更长 —— 对这类站强制开冷却是确定的正向调整。
+
+    反方向（true = 关冷却）**不做**：那需要「这个站被冷却误伤了」的证据，
+    而探测拿不到那个证据（冷却是 CPA 运行期行为，不在一次探测的观测范围内）。
+    猜着关掉冷却的风险是让一个真的该冷却的站反复打满，比不写更糟。
+    """
+    cat = str(getattr(v, "category", "") or "")
+    if cat in ("限流", "限频"):
+        return False
+    return None
+
+
 def existing_models_for(cfg: dict, section: str, base_url: str,
                         api_key: str) -> list[str]:
     """这个 (段, 站, Key) 在原 config.yaml 里注册着哪些模型。没有就空列表。
@@ -189,13 +236,9 @@ def existing_models_for(cfg: dict, section: str, base_url: str,
     给兜底分支用：判死 + 目录读不到时，原清单比「市面最新」的猜测硬 ——
     它是先前一轮实测沉淀的。见 build_plan 里 seed 分支的说明。
 
-    「站」这一维与 CarryTables 同口径（`entry_scope`）：前三段是 host，
-    compat 段是含路径的 provider 身份 —— 同一主机可按路径挂多个 provider，
-    用 host 查会串到另一个上游的清单上（这个键分叉在本项目发生过两次）。
+    按完整来源 URL 和 Key 匹配；主机规范化不能把不同路径的模型证据混在一起。
     """
-    from .batch import entry_scope
-
-    scope = entry_scope(section, base_url)
+    scope = _source_url(base_url)
 
     def names(models) -> list[str]:
         out = []
@@ -212,7 +255,7 @@ def existing_models_for(cfg: dict, section: str, base_url: str,
         for prov in cfg.get("openai-compatibility") or []:
             if not isinstance(prov, dict):
                 continue
-            if entry_scope(section, str(prov.get("base-url") or "")) != scope:
+            if _source_url(str(prov.get("base-url") or "")) != scope:
                 continue
             for ke in prov.get("api-key-entries") or []:
                 if isinstance(ke, dict) and str(ke.get("api-key") or "") == api_key:
@@ -224,7 +267,7 @@ def existing_models_for(cfg: dict, section: str, base_url: str,
             continue
         if str(e.get("api-key") or "") != api_key:
             continue
-        if entry_scope(section, str(e.get("base-url") or "")) != scope:
+        if _source_url(str(e.get("base-url") or "")) != scope:
             continue
         return names(e.get("models"))
     return []
@@ -328,7 +371,7 @@ class Band:
     #
     # 生产实测（fsdownload 版 codex 段）：425 档带 ws 且是最高档，所以此刻
     # 不越档；但 350/349/348 三档全无 ws，425 一冷却，WS 请求会直接跳到
-    # 154 档的 anyrouter.top（也带 ws），越过三个健康档。
+    # 154 档的 alfa.example（也带 ws），越过三个健康档。
     #
     # **只用于文案与影响面，不参与定档**：跨档只发生在下游用 WS 连接时
     # （Codex Desktop 那条路），HTTP 请求的档位谱仍然完全成立；而
@@ -416,8 +459,8 @@ _HOST_IN_NOTE = re.compile(
     r"#\s*([A-Za-z0-9][A-Za-z0-9.\-]{2,})\s*(?:[:：]|\s+(?=永久排除|站点级不可用))")
 
 # 第三种位置：站名后面**紧跟一对括号，括号里就是失败依据**。
-#   `# 同时压过 123nhh（分组无渠道，实测 503）与 100xlabs、hybgzs。`
-#   `# 990 仍高于 950 的 100xlabs（实测超时 90 秒），所以它仍轮不到。`
+#   `# 同时压过 nova（分组无渠道，实测 503）与 xray、hotel。`
+#   `# 990 仍高于 950 的 xray（实测超时 90 秒），所以它仍轮不到。`
 #
 # 为什么必须认（2026-09-03 拿生产 config.yaml 实测）：claude 与 compat 两段
 # 的死站结论**全部**是这个形态，`_HOST_IN_NOTE` 一个都抓不到 —— 于是那两段的
@@ -598,7 +641,7 @@ def unhealthy_from_comments(raw: str, section: str,
     （foxtrot 在 claude 段实测 200，在 gemini 段是 503）。
 
     known：本段真实出现过的主机名与它们的点分标签。给了才启用**括号路**
-    （`# … 123nhh（分组无渠道，实测 503）…`）—— 那一路的站名位置比冒号形态
+    （`# … nova（分组无渠道，实测 503）…`）—— 那一路的站名位置比冒号形态
     随意得多，必须拿真实主机名兜住，否则任何「词（…503…）」都会被当成站名。
     不给 known 时行为与从前完全一致，只走严格路。
 
@@ -958,7 +1001,7 @@ def build_band(cfg: dict, section: str, *, raw: str = "") -> Band:
         if not isinstance(e, dict):
             continue
         entry = e
-        pri = e.get("priority")
+        pri = e.get("priority", 0)
         if not isinstance(pri, int):
             continue
         host = host_of(str(e.get("base-url") or ""))
@@ -1533,8 +1576,8 @@ def _shadow_warning(band: Band, models: list[str], priority: int,
     """「挡住了谁」这条警告的正文。
 
     为什么要分开活站与死站（2026-09-02 演练发现）：原来只报总数，
-    实测输出是「priority 280 会把 2 个现有站挡在其后（ai.hybgzs.com、
-    muyuan.do）」—— 而那两个站在注释里都记着实测不可用，定档算法数出来的
+    实测输出是「priority 280 会把 2 个现有站挡在其后（hotel.example、
+    mike.example）」—— 而那两个站在注释里都记着实测不可用，定档算法数出来的
     在用站是 **0**。同一件事，警告说「挡 2 个」、算法说「挡 0 个、无代价」。
 
     用户看到的是前者，于是会去调低一个本来最优的档位。README 早就写着
@@ -1619,6 +1662,15 @@ class SectionPlan:
     # `websockets: true` 会静默消失 —— 与 headers / proxy-url 完全同构的空档。
     websockets: bool | None = None
     websockets_note: str = ""
+    # claude 段：实测需要请求体级 Claude Code 身份时，交给 CPA 自己补。
+    # 取值从 CPA 源码解析，不写死（见 build_plan 里的说明）。
+    cloak_mode: str = ""
+    fingerprint_profile: str = ""
+    # claude 段：对话中途的 system 消息要不要让 CPA 挪到顶层（实测得出）。
+    rebuild_mid_system: bool | None = None
+    # 冷却策略。None = 跟随全局（字段缺席，与 CPAMP 界面默认一致）；
+    # False = 强制启用冷却（即使全局禁用）。只在有实测证据时才覆盖。
+    disable_cooling: bool | None = None
     prompt_cache_key: bool | None = None
     prompt_cache_note: str = ""
     # 原条目里这两个开关的值，{字段名: 值}。只收显式写了 true 的
@@ -1630,7 +1682,7 @@ class SectionPlan:
     # 而 extract_carry_lines 有意跳过整个 models 块（清单由方案重新生成）。
     # 于是它落进空档 —— carry 不搬，方案只带本次实测的那**一个**
     # （max_context_length + context_model）。本次没探上下文时，历史实测值
-    # 全部消失。实测生产配置 8 处，kktoken.cc 的 987500 就在其中。
+    # 全部消失。实测生产配置 8 处，kilo.example 的 987500 就在其中。
     #
     # 优先级：本次实测（context_model 那一个）> 原值搬运 > 不写。
     # 见 render_entry 的 model_lines。
@@ -1691,7 +1743,7 @@ class SectionPlan:
     carry_lines: list[str] = field(default_factory=list)
     # 站方目录的最高世代已落后市面最新一个世代以上。
     #
-    # 2026-09-02 现场：runanytime.hxi.me 的 codex 段目录只有 gpt-4 /
+    # 2026-09-02 现场：romeo.example 的 codex 段目录只有 gpt-4 /
     # gpt-4-32k / gpt-4o / gpt-4o-mini，四个都是世代 (4,0)，于是「同产品线
     # 取最高世代」把四个全留下并默认全勾 —— 而用户要的是「最新是 gpt-5.6 时
     # gpt-4o 不该默认勾选」。
@@ -1724,7 +1776,7 @@ class SectionPlan:
     #     `provider_key`，而冷却（conductor_cooldown.go:73）、模型能力
     #     （api_key_model_capabilities.go:186）、执行路由三处都按它索引。
     #     render_entry 原来用 `host_of(base_url)` 现编一个，于是实测 12 个
-    #     provider 全部改名（`runanytime` → `runanytime.hxi.me`）——
+    #     provider 全部改名（`romeo` → `romeo.example`）——
     #     改名等于把它们的冷却状态与能力缓存全部作废，而且本项目自己的
     #     `name_alias_map`（注释里的人读短名 → 域名）也跟着失效，
     #     下一轮读注释拿健康度就大面积漏判。
@@ -1736,6 +1788,9 @@ class SectionPlan:
     #     命名空间别名（service_models.go:600-614），抹掉等于让所有按
     #     `ANT/claude-opus-5` 发的请求命中不到。
     provider_name: str = ""
+    # Additive API metadata; existing models and constructor positions stay intact.
+    highest_models: list[str] = field(default_factory=list)
+    model_provenance: dict[str, str] = field(default_factory=dict)
 
     @property
     def hijacked(self) -> list[Impact]:
@@ -1818,7 +1873,7 @@ class ImportPlan:
     # 候选的唯一身份 = 输入行号。
     #
     # 为什么不能用 host（2026-09-02 现场）：一个站有多把 Key 是常态
-    # （实测 gorouter 15 把、tabitoken 14 把）。前端把 (host, section) 当
+    # （实测 gorou 15 把、tango 14 把）。前端把 (host, section) 当
     # 勾选键，Set 去重后 15 个 Key 在同一段上只剩 1 个选择；表格行用
     # data-host 定位，querySelector 只找到第一行 —— 后 14 行的勾选状态与
     # priority 回填全落到第一行上。表现就是「全勾选只勾中 26 项」。
@@ -1979,6 +2034,7 @@ def build_plan(
 
     force = force or {}
     for section, v in result.sections.items():
+        model_warns: list[str] = []
         # 手填清单的过滤：**只挡协议层不可能成立的**，不挡族。
         #
         # 分两类，判据完全不同（2026-09-03 拿真实配置核实后区分开）：
@@ -1995,7 +2051,7 @@ def build_plan(
         #      对模型名零校验（buildOpenAICompatibilityConfigModels 照单注册，
         #      service_models.go:713-739），能不能用只取决于上游认不认。
         #
-        #      为什么必须放行（真实配置的反例）：runanytime 的 compat 段
+        #      为什么必须放行（真实配置的反例）：romeo 的 compat 段
         #      **唯一端到端验证过的模型就是 grok-4.6**（配置注释：「整个 vip
         #      分组当前只有 grok-4.6 有渠道，已通过端到端验证的只有它」），
         #      facai 段同样有 grok-4.6 + glm-5.2。按族挡掉手填，操作员就
@@ -2011,7 +2067,12 @@ def build_plan(
                       if str(m).strip()]
         forced_kept = [m for m in forced_raw
                        if model_catalog.section_protocol_ok(section, m)]
-        forced_models = model_catalog.newest_generation_per_line(forced_kept)
+        # `keep_low_tier=True`：手填的 mini / nano / lite 照写。
+        # 「带 mini 的一律不勾」是本工具的**选型偏好**（用户 2026-09-12），
+        # 与「不主动推荐四族之外」同一性质 —— 把它升级成「操作员显式指定
+        # 也不许」就越权了，理由见上面 forced_kept 那一段。
+        forced_models = model_catalog.newest_generation_per_line(
+            forced_kept, keep_low_tier=True)
         forced_dropped = [m for m in forced_raw if m not in forced_models]
         # 四族之外但被放行的手填项 —— 界面要说清「工具不推荐但已按你说的写」。
         forced_offfamily = [m for m in forced_models
@@ -2041,8 +2102,27 @@ def build_plan(
         # 但它是**确定的值**，不是「待定」—— 用户的硬要求是写进 config.yaml
         # 的参数不能有未定项，缺席比填错更难排查。
 
-        base = base_for_section(row.bare, section)
-        proxy = "http://mihomo:7890" if v.need_proxy else ""
+        base = getattr(v, "base_url", "") or base_for_section(row.bare, section)
+        proxy = ""
+        if v.need_proxy:
+            successful = str(getattr(v, "successful_proxy_url", "") or "")
+            mapped = str(getattr(v, "cpa_proxy_url", "") or
+                         getattr(result, "cpa_proxy_url", "") or "")
+            runtime = str(getattr(v, "proxy_url", "") or
+                          getattr(result, "proxy", "") or "")
+            proxy = mapped or successful or runtime or _proxy_url_for_config()
+            proxy_host = urlsplit(proxy).hostname or ""
+            try:
+                loopback = ipaddress.ip_address(proxy_host).is_loopback
+            except ValueError:
+                loopback = proxy_host.rstrip(".").lower() == "localhost"
+            if not proxy:
+                model_warns.append("需要代理，但没有已确认的 CPA 可达代理映射；请明确指定后写回")
+            elif loopback:
+                model_warns.append("探测使用本机代理；CPA 的 localhost 可能指向另一容器，"
+                                   "需要明确的可达代理映射")
+            elif not successful and not mapped:
+                model_warns.append("代理来自显式运行配置，但尚无成功出口证据；请确认 CPA 可达")
         headers = dict(v.min_headers) if v.need_ua else {}
         if not headers and not v.usable:
             # 判死的段：min_headers 是空的（探测没走到「确定最省可用档」那步），
@@ -2052,6 +2132,98 @@ def build_plan(
             # 取探测实际打到的最高档门票：那是实测走过的最完整形态，比猜一个
             # 档次可靠。不取全量档 —— 设备指纹那类头有站方会拒。
             headers = _fallback_headers(section, v, cfg, row.api_key)
+
+        # claude 段：body 级身份要落成 CPA 的 cloak / fingerprint-profile
+        # ----------------------------------------------------------------
+        # 这是探测结论**落不进配置**的一个缺口（2026-09-11 修）。
+        #
+        # 画像梯的 `cc-body-json` / `cc-body-plain` / `cc-body-system` 三档，
+        # 门票不在 headers 里而在**请求体**（`metadata.user_id`、
+        # Claude Code 的 system 块）。条目的 `headers:` 字段表达不了请求体，
+        # 于是这三档命中时，探测明明测出「这样发能通」，写回却只写了 headers ——
+        # CPA 实际发出去仍然缺身份。
+        #
+        # 实测（2026-09-11，papa.example，claude 段）：
+        #   baseline（仅 x-api-key）        -> 403 Cloudflare error 1010
+        #   cc-min（UA + anthropic-beta）   -> 503 only allows Claude Code clients
+        #   cc-std / cc-full（补齐所有头）  -> 503 同上
+        #   cc-body-system（+system 块）    -> **200**
+        # 也就是这个站根本不看头，只看请求体里那段 Claude Code system 块。
+        # 用户截图里那条 `测试失败: 503 No available accounts: this group only
+        # allows Claude Code clients` 就是这么来的，而截图底部「请求伪装」是关的。
+        #
+        # CPA 侧对应的能力正是 `cloak`（config_types.go:348-359）：
+        # mode=always 时对每个未确认的客户端补上 Claude Code 的身份与计费块。
+        # 合法取值从源码解析（见 cpa_source_probe.parse_claude_identity_opts），
+        # **不写死** —— CPA 的写入路径会用 ValidateClaudeFingerprintProfile
+        # 拒绝不认识的值，写错一个字这条配置就静默落不进去。
+        #
+        # 只在**实测确实需要 body 门票**时才写：不需要的站写上等于凭空改写
+        # 它们的请求体，属于负向调整。
+        cloak_mode = ""
+        fp_profile = ""
+        if section == "claude-api-key" and getattr(v, "min_body_kind", ""):
+            try:
+                from .cpa_source_probe import cached_identity
+                ident = cached_identity()
+                modes = ident.claude_cloak_modes or []
+                profs = ident.claude_fingerprint_profiles or []
+            except Exception:
+                modes, profs = [], []
+            # always：连「已确认的原生 Claude Code 客户端」之外的全部请求都补身份。
+            # 用 always 而不是 auto —— auto 会在「有强信号表明是原生入口」时放行，
+            # 而经 CPA 的请求恰恰常被判成原生，那就等于没开。
+            if "always" in modes:
+                cloak_mode = "always"
+            # system 块那一档还要 CLI 指纹：它带的是 OAuth betas + 稳定 CLI 身份，
+            # 与 system 块是同一套形态的两半。
+            if "+system" in v.min_body_kind and "claude-code-cli" in profs:
+                fp_profile = "claude-code-cli"
+            if cloak_mode or fp_profile:
+                model_warns.append(
+                    f"该段实测需要**请求体**级 Claude Code 身份"
+                    f"（{v.min_body_kind}），headers 表达不了 —— "
+                    f"已写入 "
+                    + "、".join(filter(None, [
+                        f"cloak.mode={cloak_mode}" if cloak_mode else "",
+                        f"fingerprint-profile={fp_profile}" if fp_profile else ""]))
+                    + " 让 CPA 自己补上")
+
+        # codex 段：originator 必须无条件写齐（2026-09-10）
+        # ---------------------------------------------------
+        # 上面那个 `if not headers and not v.usable` 只兜**判死**的段。
+        # 可用且 `need_ua=False` 的段（baseline 就通，min_headers 为空）会带着
+        # 空 headers 落到下面 :2255 那道门禁上，直接抛 ValueError 把整份方案打断
+        # —— 测试套件里 `端点通但模型空也要兜底` / `手填无条件优先` 两项就是
+        # 这么红的（本次改动前即已红，见基线）。
+        #
+        # 为什么不是「放宽那道门禁」而是「补齐 headers」：
+        # 生产 config.yaml 全局设了 `codex.disable-codex-cloaking: true`
+        # （fsdownload/config.yaml:476）。该开关一开，
+        # `applyCodexCloakingHeaders` 直接 return（codex_executor_request.go:373-374），
+        # 而 Originator 的另一条来源是
+        #     if ginHeaders.Get("Originator") != "" { set } else if !isAPIKey { set 默认 }
+        #     （codex_executor_request.go:351-355）
+        # —— **API key 认证时那个 else-if 不进**。于是「客户端没送 Originator
+        # + 全局关了伪装 + 条目没配 headers」= 一个 Originator 都不发。
+        # 也就是说这一段的 headers 不是「可选优化」，是**唯一来源**。
+        #
+        # **只补 originator，不补 user-agent**（2026-09-10 实测收窄）：
+        # `ensureHeaderWithConfigPrecedence(r.Header, ginHeaders, "User-Agent",
+        #  cfgUserAgent, codexUserAgent)`（codex_executor_request.go:356）
+        # 不受 cloaking 开关影响，客户端与 `codex-header-defaults` 都没给时
+        # 会回落到内置 `codexUserAgent` —— 所以 User-Agent 永远有值，不需要
+        # 条目兜。强加它会把「最省可用档」撑成非最省，`headers 写入` 那项测试
+        # 断言的正是最省档要保持最省。
+        #
+        # 用段标准档取值而不是全量档：设备指纹那类头有站方会拒（同 _fallback_headers）。
+        if section == "codex-api-key" and "originator" not in {
+                h.lower() for h in headers.keys()}:
+            std = _fallback_headers(section, v, cfg, row.api_key)
+            for sk, sv in std.items():
+                if sk.lower() == "originator" and sv:
+                    headers[sk] = sv
+                    break
         # 沿用该段主导 prefix。CPA 的五元组指纹**含 prefix**
         # （formatGeminiKeyDedupID），所以要在算 fp 之前定下来。
         prefix = dominant_prefix(cfg, section)
@@ -2097,10 +2269,47 @@ def build_plan(
         # 手填是操作员的显式意图，探测判定是工具的推测。推测盖掉显式意图
         # 在任何处境下都是错的 —— 这与 force 参数的设计意图一致（见
         # docstring：force 只绕过 usable 判定，去重/定档/影响面一道不少）。
+        # 「就高」筛掉低世代时攒的告警，等 sp 建好后挂上去（见下方 probed 分支）
         if forced_models:
             models, model_source = forced_models, "manual"
         elif v.usable and v.models:
-            models, model_source = list(v.models), "probed"
+            # 实测清单也要过「每条产品线只留最高世代」这一闸（2026-09-10）
+            # ----------------------------------------------------------
+            # 四条模型来源里，probed 原来是**唯一不过闸**的那条：manual 走
+            # :2014 的 `newest_generation_per_line`，catalog 走 :2143，
+            # seed 走 `model_catalog.latest_models` 内部，只有这里直接
+            # `list(v.models)` 落盘。
+            #
+            # 后果就是用户报的「部分高、低模型同时存在没有就高选择」：
+            # `_stage2` 按目录顺序补齐到 max_models，而目录是
+            # `request.parse_models_response` 的 `sorted(set(...))`——**字母序**，
+            # 于是 `gpt-4` / `gpt-4o` 这类旧款会和 `gpt-5.6-sol` 一起进 v.models，
+            # 再原样写进 config.yaml，让 CPA 的轮询把请求分给旧款。
+            #
+            # 用同一个函数而不是另写一份判据：这份规则在本项目里已经分叉过两次
+            # （README「模型库」一节记了三次修正），前端 `web/app.js:199` 是它的
+            # 逐条等价拷贝，`tests/test_web.py` 拿同一批名字喂两边比对。
+            #
+            # 保序：`newest_generation_per_line` 按输入首次出现的顺序输出，
+            # 所以 diff 仍然幂等（与 model_catalog.py:358 的承诺一致）。
+            #
+            # 2026-09-11：原配置的低代不再豁免默认最高代规则。
+            # 配置对象与显式别名不在这里改写，交给原有写回链保留。
+            from .model_catalog import newest_generation_per_line
+            probed = list(v.models)
+            top = newest_generation_per_line(probed)
+            if len(top) < len(probed):
+                models = top
+                dropped = [m for m in probed if m not in set(models)]
+                if dropped:
+                    model_warns.append(
+                        f"实测到 {len(dropped)} 个低世代模型未写入"
+                        f"（{'、'.join(dropped[:4])}"
+                        f"{'…' if len(dropped) > 4 else ''}）——"
+                        f"同族已有更高世代，按「就高」原则不注册")
+            else:
+                models = top
+            model_source = "probed"
         elif v.catalog:
             # 目录能读到 —— 取目录里通过段规则的名字。
             #
@@ -2111,7 +2320,7 @@ def build_plan(
             # `_accept` 把模型全拒了）时，这一支根本走不到 —— 直接掉进下面的
             # 种子兜底。
             #
-            # 后果在真实探测里看得很清楚：123nhh 的 compat 段实测就是这个状态，
+            # 后果在真实探测里看得很清楚：nova 的 compat 段实测就是这个状态，
             # 站方目录报了 16 个名字，而方案里写的是 6 个种子猜测 ——
             # 界面列出目录那 16 个（一个没勾），落盘写种子那 6 个，两个集合
             # 不相交。而目录里的名字是**这个站自己报的**，种子是本工具猜的、
@@ -2127,7 +2336,7 @@ def build_plan(
             # 选择变成了：
             #   (a) 写工具猜的名字 —— 这个站**从没报过**它们，CPA 路由过去 404
             #   (b) 写站方自己报的名字 —— 未验证，但至少是这个站说它有的
-            # (b) 严格更好。实测 runanytime 与 facai 的 compat 段目录里
+            # (b) 严格更好。实测 romeo 与 facai 的 compat 段目录里
             # grok-4.6 就是这种处境（配置注释：那是唯一端到端验证过的模型）。
             #
             # 判据仍是 protocol_ok 而不是无条件收：前三段仍按族拒
@@ -2140,24 +2349,11 @@ def build_plan(
                 models = list(catalog_offfamily)
             # 同产品线取最高世代：目录里常同时报 gpt-5.5 与 gpt-5.6，
             # 两个都写进去等于让 CPA 把请求分给旧版。
-            models = model_catalog.newest_generation_per_line(
-                models)[:MAX_MODELS_PER_SECTION]
+            models = model_catalog.newest_generation_per_line(models)
             if models:
                 model_source = "catalog"
-                # 目录整体落后市面最新一个世代以上 —— 列出来但**不建议勾**。
-                #
-                # 2026-09-02 现场：runanytime.hxi.me 的 codex 段目录只有
-                # gpt-4 / gpt-4-32k / gpt-4o / gpt-4o-mini，四个都是世代
-                # (4,0)，于是「取最高世代」四个全留并默认全勾 —— 违反用户
-                # 「gpt-4o 不该默认勾选」的意图。
-                #
-                # 为什么不改用市面最新清单：那个站的目录里没有 gpt-5.6-sol
-                # 这些名字，写进去 CPA 路由过去大概率 404，把一个「有老模型
-                # 可用」的站变成死条目，比默认勾错更糟。
-                # 所以只降级默认勾选，清单本身照旧 —— 确知可用的人仍可手工勾。
-                catalog_stale, stale_why = model_catalog.catalog_is_stale(
-                    section, list(v.catalog), cfg=cfg,
-                    remote=model_catalog.remote_names()[0])
+                # 旧的「目录落后就不补」策略由下方最高代补齐替代；
+                # catalog_stale 字段保留兼容，逐模型来源说明未验证风险。
 
         # 兜底放在**所有分支之外** —— 只要最终清单为空就填「当前市面最新」。
         #
@@ -2186,25 +2382,22 @@ def build_plan(
             # remote_names 走 model_catalog 自己的缓存（成功 6 小时 /
             # 失败 10 分钟），所以 79 个凭据串行调用只有第一次走网络。
             remote, _why = model_catalog.remote_names()
-            # limit 用 6 而不是 MAX_MODELS_PER_SECTION（4）：那个常数管的是
-            # 「每段最多**验**几个模型」（每个都要发一次推理请求，贵）。
-            # 这里是「写进 config.yaml 几个」—— 不发请求，多写几个只是让
-            # CPA 的模型注册表多几行，而覆盖面更全。
-            # 6 恰好放得下用户指定的 gemini 六个 pro 变体。
+            # limit=0 不截断注册清单；HTTP 探测预算由探测阶段单独管理。
             models, model_src = model_catalog.latest_models(
-                section, cfg=cfg, remote=remote, limit=6)
+                section, cfg=cfg, remote=remote, limit=0)
             # usable 段落到这里 = 端点通但模型全被拒收（换模/错误体）。
             # 那和「判死且目录读不到」是同一种处境：清单没有实测依据。
             # 记成 seed 让界面照实说，别让它顶着「实测」的徽标。
             model_source = "seed"
 
-            # 重探既有条目时，**原清单优先于猜测**（2026-09-06）。
+            # 重探既有条目时，先收原清单作为该来源的候选（2026-09-06）。
+            # 2026-09-11：下方仍统一做最高代筛选；历史低代不再享有豁免。
             #
             # 为什么必须加这一条：兜底清单是「当前市面最新」，它与「这个站
             # 实际卖什么」无关。而重探一个既有条目时，原条目里的清单是先前
             # 一轮实测沉淀下来的 —— 它比工具的猜测硬。原来这里无条件用猜测
             # 清单，于是判死段（中转站关 /models 是常态）的既有条目在写回时
-            # 清单被整份换掉。实测这份生产配置：tabitoken claude 条目的
+            # 清单被整份换掉。实测这份生产配置：tango claude 条目的
             # claude-opus-4-8 / claude-opus-4-8-thinking 两个模型消失，
             # 换进 claude-fable-5-1 等四个这个站从没验过的名字 ——
             # 那让 CPA 每次轮到它都对着不存在的模型发请求。
@@ -2217,11 +2410,96 @@ def build_plan(
             if prior:
                 models, model_source = prior, "prior"
 
+        # The approved highest-family policy also applies to existing entries.
+        # Catalog and market names are suggestions, never probe successes.
+        if not forced_models:
+            prior = existing_models_for(cfg, section, base, row.api_key)
+            candidates = list(dict.fromkeys(
+                list(models) + list(v.models) + list(v.catalog) + prior))
+            # 两级过滤，与上面 catalog 分支同一套判据（2026-09-12 接齐）
+            # ----------------------------------------------------------
+            # `section_protocol_ok` 只问「这个段的协议接不接得住」，compat 段
+            # 因此放行四族之外的一切。而**选型偏好**（只挑 gemini / gpt /
+            # claude / kimi）是另一层：目录里同时有 claude-opus-5 与 grok-4.6
+            # 时该挑前者。
+            #
+            # 这里原来只用 protocol_ok，于是 catalog 分支刚按偏好挑出
+            # `claude-opus-5`，这一步又把 `v.catalog` 整个倒回来，grok-4.6
+            # 重新混进清单 —— 偏好被绕过，与 catalog 分支自相矛盾。
+            #
+            # 一个四族的都没有时才退到 protocol_ok：那时的选择是「写工具猜的
+            # 名字（这个站从没报过）」还是「写站方自己报的名字」，后者严格
+            # 更好。判据与 catalog 分支的 `catalog_offfamily` 完全一致。
+            preferred = [m for m in candidates
+                         if model_catalog.section_allows(section, m)]
+            candidates = preferred or [
+                m for m in candidates
+                if model_catalog.section_protocol_ok(section, m)]
+            merged = model_catalog.newest_generation_per_line(candidates)
+            # 过滤把清单清空时，退回站方自己报的名字（2026-09-12）
+            # ------------------------------------------------------
+            # `section_protocol_ok` 按族判，而站方特供的简写（实测夹具里的
+            # `opus-5`、生产配置里的若干别名）族认不出来 → 被整批滤掉。
+            # 原来滤空之后直接进 `topup_to_market_top`，而那时 `models` 已经
+            # 是空的，补齐函数的「只补已出现过的产品线」约束失效，于是它填进
+            # 整份「市面最新」：一个只报了 opus-5 的站被写成
+            # claude-opus-5 + claude-sonnet-5 + claude-fable-5-1 +
+            # claude-haiku-4-5-20251001 —— 后三个这个站从没报过，
+            # 还把 priority 定档的影响面算错（挡站数变了，试用期档位从 270
+            # 抬到 750）。
+            #
+            # 站方报过的名字是**实测事实**，工具猜的不是。滤空时宁可留下
+            # 认不出族的原名，也不要换成一批没有依据的名字。
+            if not merged and v.models:
+                merged = list(dict.fromkeys(v.models))
+            models = merged
+            # Keep the supported custom-only compat path without inventing peers.
+            custom_only = bool(models) and all(
+                not model_catalog.family(m) for m in models)
+            if not custom_only:
+                remote, _why = model_catalog.remote_names()
+                models, added, fill_src = model_catalog.topup_to_market_top(
+                    section, models, cfg=cfg, remote=remote)
+                if added:
+                    model_src = fill_src
+            catalog_stale, stale_why = False, ""
+        provenance = {
+            m: ("verified" if v.usable and m in v.models else "inferred")
+            for m in models
+        }
+        inferred = [m for m, source in provenance.items() if source == "inferred"]
+        if inferred:
+            model_warns.append(
+                f"最高代选择中有 {len(inferred)} 个模型未经本次推理验证"
+                f"（{'、'.join(inferred[:4])}"
+                f"{'…' if len(inferred) > 4 else ''}）；"
+                "目录、原配置及补齐项均为 inferred，不代表探测成功")
+            # 这里**不**下调 model_source（2026-09-12 修）
+            # ------------------------------------------------
+            # 原来只要有 inferred 就把 probed 改成 catalog/seed。而上面的
+            # 补齐逻辑对任何非空清单都会加同档变体 —— inferred 几乎必然非空，
+            # 于是**每一个实测成功的段**都被降级。降级后
+            # `SectionPlan.recommended` 第二条判据 `model_source != "probed"`
+            # 直接 False，界面默认一个都不勾、`for_write` 为 0、写回没有 diff：
+            # 探测跑完却什么都写不进去。
+            #
+            # 而用户对补齐的要求原文是「如果检测出来没有高级模型按该系列该
+            # 类型模型的最高级进行**填充勾选**」—— 补齐项就是要勾上的。
+            #
+            # 依据强度并没有丢：逐模型的 verified / inferred 记在
+            # `model_provenance` 里，经 server.py 带到界面；上面那条警告把
+            # 名字也列出来。model_source 说的是「这一段这次有没有实测依据」，
+            # 段真的探通了就是 probed，补齐几个同族同档变体不改变这件事。
+
         score = score_verdict(v)
         pri, reason = suggest_priority(band, score, models=models,
                                        probation=probation)
 
         sp = SectionPlan(
+            cloak_mode=cloak_mode,
+            fingerprint_profile=fp_profile,
+            rebuild_mid_system=getattr(v, "rebuild_mid_system", None),
+            disable_cooling=_cooling_override(v),
             section=section,
             base_url=base,
             api_key=row.api_key,
@@ -2243,16 +2521,27 @@ def build_plan(
             model_source=model_source,
             catalog_stale=catalog_stale,
             catalog_stale_why=stale_why,
+            highest_models=list(models),
+            model_provenance=provenance,
         )
+        if model_warns:
+            sp.warnings.extend(model_warns)
 
         # codex 段必须包含 originator（2026-09-06）
         # --------------------------------------------
-        # zzzcoding 等站方限制「仅 Codex 官方客户端可调用」。CPA 转发 codex
+        # zulu 等站方限制「仅 Codex 官方客户端可调用」。CPA 转发 codex
         # 请求时，条目 headers 里的 originator 必须原样传到上游，否则 403。
         # 判死的 codex 段会回落标准档（codex-tui），_fallback_headers 逻辑
         # 已保证回落后的 headers 包含 originator。但若后续写回路径（CPAMP
         # 前端保存、或 CPA executor 转发）有 bug，这条门禁能提前抓到。
-        if section == "codex-api-key" and "originator" not in headers:
+        # 判据必须**大小写不敏感**（2026-09-10 修）：原来是
+        # `"originator" not in headers` 的精确匹配，而 headers 的键保留的是
+        # 实测原写法 —— `v.min_headers` 里是 `Originator`（大写 O，抄的是
+        # 真实客户端形态），于是一个**明明带了** originator 的条目被判成缺失。
+        # HTTP 头名本身大小写不敏感，`merge_entry_headers` 也是「大小写不敏感
+        # 但保留原写法」，这里跟它同口径。
+        if section == "codex-api-key" and "originator" not in {
+                h.lower() for h in headers.keys()}:
             raise ValueError(
                 f"codex 段条目缺少 originator 头。base={base}, "
                 f"headers={list(headers.keys())}")
@@ -2546,9 +2835,9 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
     -------------------------------------------
     原始 config.yaml 就是这个规律，三段无一例外：
 
-        kktoken     5 个 Key   priority 1000
-        tabitoken  14 个 Key   priority  990
-        gorouter   15 个 Key   priority  985
+        kilo     5 个 Key   priority 1000
+        tango  14 个 Key   priority  990
+        gorou   15 个 Key   priority  985
 
     这与 CPA 的调度语义一致：`priority` 决定「哪一层先被尝试」，同层内部按
     `weight` 轮询（selector.go:539-549 只取最高那一桶）。同站多 Key 指向同一个
@@ -2606,8 +2895,8 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
         #
         #   · 落盘后同站被拆成两层。留守条目（没勾 / 判不可写 / 探测异常）
         #     由 _orphan_entry_lines 原样搬回旧值，被重探的那几把拿新值。
-        #     实测那次：kktoken claude 3 把→164 + 2 把留在 372；
-        #     tabitoken claude 9 把→167 + 5 把留在 371。
+        #     实测那次：kilo claude 3 把→164 + 2 把留在 372；
+        #     tango claude 9 把→167 + 5 把留在 371。
         #   · 即使全勾，整份配置的站间次序也被推平重排：`taken` 里塞着这些站
         #     自己的旧档，于是每个站都躲开自己原来的值往下掉。实测 claude 段
         #     12 个站从 1000/995/990/985/700/650/630/600/400/350/300/50
@@ -2704,7 +2993,7 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
         # `usable=False` 一律返回 0，于是**探测全灭的站与探测通过但扣满分的站
         # 排在同一档**，之后只按主机名排 —— 字母序在前的就上去了。
         #
-        # 实测那次重探：hybgzs 四段全灭（WAF ×12）却在 claude 段拿到 160、
+        # 实测那次重探：hotel 四段全灭（WAF ×12）却在 claude 段拿到 160、
         # gemini 段拿到 217，都是该段第 2 名；而 `ai.` 开头纯粹是因为字母序。
         # claude-sonnet-5 与 gemini-3.1-pro 的顶层承载因此换到一个刚被判死的
         # 站上 —— 顶层站不可用时那一层整个白撞一轮（层级隔离，
@@ -2833,7 +3122,7 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
                     note += f"；算法上限 {cap}，为与前一站分开降到 {v}"
                 # 组内证据不一致时点出来（2026-09-03 真实探测发现）：
                 # 同站多 Key 共用一个档是对的（同一个上游、能力相同），但
-                # 「这一档由谁的实测撑起来」得说清 —— agentrouter 的 claude 段
+                # 「这一档由谁的实测撑起来」得说清 —— golf 的 claude 段
                 # 7 把 Key 里 6 把实测通过、1 把余额耗尽走了种子猜测，那一把
                 # 因此拿到与实测同档的 494，并把 3 个它自己都没验过的模型
                 # （claude-fable-5-1 / mythos-preview / 4.5-haiku）顶上了顶层。
@@ -2907,4 +3196,57 @@ def priority_collisions(plans: list[ImportPlan]) -> list[str]:
                     f"段 {section}：{len(hosts)} 个站共用 priority {pri}"
                     f"（{'、'.join(sorted(hosts))}）—— 它们会在同一层按 weight "
                     f"轮询，而不是分先后。手工改过 priority 的话这是预期结果")
+    return out
+
+
+def priority_split_within_host(plans: list[ImportPlan]) -> list[str]:
+    """同一网址跨协议、跨 Key 的条目拿到不同 priority：阻断级警告。
+
+    与 `priority_collisions` 正好相反的方向，而这个方向是**硬错误**，不是
+    「可能是预期结果」（2026-09-10 加）。
+
+    用户的硬要求：同一网址的上游，即使 Key 不同，priority 也必须相同。
+    `assign_priorities` 本身守住了这条（按 `host_of(sp.base_url)` 分组，
+    同 host 的所有 SectionPlan 复制同一个值，见 :2658-2668 / :2825-2826），
+    但它之后还有两道会破坏它：
+      · 用户覆盖按 `rid = row.line_no`（**每把 Key 一行**）应用
+        （server.py:2401-2403 / 2246-2248 / web/app.js:1592），
+        同站第 2 把 Key 一改就与第 1 把分层；
+      · 全量重探沿用既有档位时，若原文件本来就分裂，会照样沿用。
+
+    实测证据（2026-09-10 逐条对账两份生产配置）：
+    桌面份（**本项目注入前**）40 组里 0 组分裂；fsdownload 份（**注入后**）
+    3 组分裂 —— 也就是这些分裂是本项目自己写进去的：
+      · codex  @romeo.example/v1  4 条 {350, 147}
+        —— models / headers / proxy-url 三项**逐字相同**，唯 idx9 是 350。
+           后果：350 那条被永远优先抽中并先烧完，另 3 把 Key 沦为冷备
+           （147 档要等 155/154/153/150/149/148 全部冷却后才轮到）。
+      · codex  @golf.example/v1    7 条 {348, 149}
+      · gemini @romeo.example     3 条 {218, 215}
+
+    2026-09-11：批准的同站规则覆盖所有协议段。这里只检查并报告，
+    不合并路径、凭据、模型或请求参数；档位修改仍须调用方确认。
+    """
+    out: list[str] = []
+    by_host: dict[str, dict[int, list[str]]] = {}
+    for plan in plans:
+        for section, sp in plan.sections.items():
+            if sp is None or not sp.writable:
+                continue
+            host = host_of(sp.base_url)
+            if not host:
+                continue
+            by_host.setdefault(host, {}).setdefault(
+                sp.priority, []).append(section)
+    for host, at in sorted(by_host.items()):
+        if len(at) <= 1:
+            continue
+        detail = "；".join(
+            f"priority {pri} × {len(sections)} 条"
+            for pri, sections in sorted(at.items(), reverse=True))
+        out.append(
+            f"跨协议检查：同一网址 {host} 的条目拿到了不同 priority"
+            f"（{detail}）—— 违反「同网址同优先级」。"
+            f"同协议内高档优先、低档作冷备；跨协议仍须满足同站约束。"
+            f"请统一到同一档再写回")
     return out

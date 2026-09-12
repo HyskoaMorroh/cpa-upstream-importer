@@ -46,6 +46,13 @@ DISPOSITION = {
                               "记下窗口，窗口内复测；不要降权也不要弃用"),
     "边缘":    (True,  False, "Cloudflare 概率性拦截，重试即可。不代表不可用"),
     "反测活":  (True,  False, "探测文本触发站方测活拦截。换探测文本重测，非站点问题"),
+    # 与「客户端」分开：那一类补**头**可能过，这一类补头一点用没有，要补的是
+    # **请求体字段**（实测 `prompt_cache_key`）。usable=False 是因为确实没拿到
+    # 200，不能凭空判活；但 downrank=False —— 站没问题，问题在探测形态。
+    # 2026-09-10 alfa 实测：补 prompt_cache_key 后 400 立刻消失。
+    "形态":    (False, False, "探测请求体缺真实客户端才有的字段（如 codex 的 "
+                              "prompt_cache_key），站方按字段集校验后拒收。"
+                              "补齐请求体形态后重测，非站点问题；补头无效"),
     "注入":    (False, False, "CPA 自身注入的工具被站方拒绝。关 disable-image-generation"),
     "限频":    (True,  False, "站方 bulk probe 保护。加大探测间隔重试"),
     "临时":    (True,  False, "站方负载上限，稍后可用"),
@@ -99,13 +106,38 @@ _RULES: list[tuple[str, str, str, set[str] | None]] = [
      r"|client[\s_-]?not[\s_-]?allowed"
      r"|仅(?:支持|允许)[^，。]{0,20}客户端", None),
 
+    # ---- 探测请求形态不合规：站是好的，错在探测没照着真实客户端发 ----
+    #
+    # 2026-09-10 实测 alfa.example（new-api 系）codex 段，模型 gpt-6-astra，
+    # 逐字段逼近真实 Codex CLI 形态：
+    #   model+input(数组)+stream+store+tool_choice+parallel_tool_calls
+    #   +reasoning+include+instructions          -> 400 invalid codex request
+    #   以上再 + prompt_cache_key                 -> 500 负载已达上限（形态被接受了）
+    #   以上再 + text{verbosity}（不加 cache_key） -> 400（无效，不是这个字段）
+    # 即：站方按真实 Codex CLI 的**字段集**校验，`prompt_cache_key` 是本项目
+    # 原来缺的那一个。身份头无关 —— 把 Originator/User-Agent 全删掉结果不变。
+    #
+    # 为什么单独一类而不是并进「客户端」：
+    #   · 「客户端」的处置是「补客户端标识（头）」，而这里补头没有任何用；
+    #   · usable 必须是 False（没拿到 200，不能凭空判活），但**不该降权**
+    #     —— 降权的前提是「站有问题」，这里站没问题；
+    #   · 处置要明确指向「补请求体字段后重测」，否则下一个人会去查头。
+    #
+    # CPA 侧不删这个字段（`codex_executor_execute.go:61` 只删
+    # prompt_cache_retention；翻译层 `:34` 只删 prompt_cache_options /
+    # prompt_cache_retention；唯一删它的 `server_routes.go:245`
+    # sanitizeCodexAlphaSearchBody 只作用于 alpha-search 开关），
+    # 所以真实 Codex CLI 经 CPA 转发时该字段原样透传，网关本身是通的。
+    # 出现这条 = 探测形态落后于 CPA 真实形态，属本项目的缺陷，不是站点缺陷。
+    ("形态", "codex 请求体字段不全", r"invalid codex request", {"400"}),
+
     # ---- 站方硬拒 ----
     ("死路", "敏感词拦截", r"sensitive_words", None),
     ("鉴权", "需特定客户端标识", r"unauthorized client", None),
 
     # ---- 405 Method Not Allowed：站方维护或协议不支持 ----
     #
-    # 实测 zzzcoding 维护期间对所有 POST 一律回 405 + nginx HTML，GET 回 200 HTML
+    # 实测 zulu 维护期间对所有 POST 一律回 405 + nginx HTML，GET 回 200 HTML
     # 维护页。405 在 CPA 里既不自动重试也不在用户 config 的 request-scoped-errors
     # 里，导致 CPA 直接把 405 返给客户端而不轮换下一凭据，明明有 29 个健康 codex
     # 凭据却因为优先级最高的这个站返回 405 而全失败（2026-09-06 实测）。
@@ -175,6 +207,13 @@ def classify(status: str, body: str) -> tuple[str, str]:
 
     # ---- 关键词全不命中，退到状态码 ----
     if s == "200":
+        # 200 但正文是**整页 HTML** —— 不是 API 响应，是维护页/拦截页。
+        # 判「临时」而不是「可用」：站方维护会结束，凭据本身没问题，
+        # 不该降权也不该弃用（2026-09-11 实测 zulu.example 维护期形态：
+        # GET /v1/models 回 200 + 「系统升级中」HTML，POST 一律 405）。
+        # 与「200 但正文是 JSON 错误体」是同一类假阳性，载体不同而已。
+        if looks_like_html(b):
+            return "临时", "200 但正文是 HTML 页面（维护页/拦截页），不是 API 响应"
         return "可用", "200 且无异常关键词"
     if s == "401":
         return "鉴权", "401 未授权"
@@ -246,6 +285,207 @@ def has_error_envelope(text: str) -> bool:
 
     # Anthropic 的错误形态：{"type":"error","error":{...}}
     if str(obj.get("type") or "").strip().lower() == "error":
+        return True
+    return False
+
+
+def validate_success(section: str, status: str, body: str, *,
+                     error: str = "", require_stream: bool = False) -> tuple[bool, str]:
+    """Pure protocol evidence gate; does not assert model identity.
+
+    Returns (valid, reason). Transport errors always win. Stream responses must
+    contain functional output and the protocol's terminal event, not a handshake.
+    User-generated text is never scanned for error keywords.
+    """
+    if error or str(status) != "200":
+        return False, "transport-error" if error else "http-error"
+    text = (body or "").strip()
+    if not text or looks_like_html(text):
+        return False, "empty-or-html"
+
+    def bad(obj):
+        return (not isinstance(obj, dict) or bool(obj.get("error"))
+                or obj.get("type") in ("error", "response.failed", "response.incomplete")
+                or obj.get("status") in ("failed", "incomplete", "cancelled"))
+
+    def blocks(items):
+        if not isinstance(items, list):
+            return False
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("text"), str) and item["text"].strip():
+                return True
+            if item.get("type") == "tool_use" and item.get("name") and isinstance(item.get("input"), dict):
+                return True
+            if item.get("functionCall", {}).get("name"):
+                return True
+        return False
+
+    def output(obj):
+        if not isinstance(obj, dict):
+            return False
+        if section == "codex-api-key":
+            return any(isinstance(it, dict) and (
+                blocks(it.get("content")) or
+                (it.get("type") == "function_call" and it.get("name")
+                 and isinstance(it.get("arguments"), str)) or
+                (it.get("type") == "image_generation_call" and bool(it.get("result"))))
+                for it in (obj.get("output") or []) if isinstance(obj.get("output"), list))
+        if section == "claude-api-key":
+            return blocks(obj.get("content"))
+        if section == "gemini-api-key":
+            return any(isinstance(c, dict) and blocks((c.get("content") or {}).get("parts"))
+                       for c in (obj.get("candidates") or []))
+        if section == "openai-compatibility":
+            for choice in obj.get("choices") or []:
+                msg = choice.get("message") or choice.get("delta") or {}
+                if isinstance(msg.get("content"), str) and msg["content"].strip():
+                    return True
+                if blocks(msg.get("content")):
+                    return True
+                for tool in msg.get("tool_calls") or []:
+                    fn = tool.get("function") or {}
+                    if fn.get("name") and isinstance(fn.get("arguments"), str):
+                        return True
+                if (msg.get("function_call") or {}).get("name"):
+                    return True
+        return False
+
+    is_stream = any(line.startswith(("data:", "event:")) for line in text.splitlines())
+    if not is_stream:
+        # 错误体优先于「形态不对」（2026-09-12）
+        # --------------------------------------
+        # 原来先判 require_stream 直接返回 stream-required，于是 codex 段
+        # 收到「200 + {"error": ...}」时报的是「该发流却发了整份 JSON」——
+        # 把**站方明说的失败原因**盖成了探测形态问题，排查会走到完全错的
+        # 方向（去查 stream 参数，而真正的原因是分组里没有可用渠道）。
+        # okerror 画像正是这个形态：四段全回 200 错误体，codex 那段被
+        # 报成 stream-required，`model-rejected` 事件里也拿不到原因。
+        #
+        # 判错误体不需要流：它是整份 JSON，解析得出来就算数。解析不出来
+        # 再按原逻辑落到 stream-required / invalid-json。
+        try:
+            obj = json.loads(text)
+        except (ValueError, TypeError, AttributeError):
+            obj = None
+        if isinstance(obj, dict) and bad(obj):
+            return False, "error-envelope"
+        if require_stream:
+            return False, "stream-required"
+        if obj is None:
+            return False, "invalid-json"
+        try:
+            if section == "codex-api-key" and obj.get("status") != "completed":
+                return False, "missing-terminal"
+            return (True, "json-output") if output(obj) else (False, "missing-output")
+        except (ValueError, TypeError, AttributeError):
+            return False, "invalid-json"
+
+    terminal = False
+    produced = False
+    done = False
+    choice_seen, choice_done = set(), set()
+    started_blocks, stopped_blocks = set(), set()
+    # Blank lines delimit SSE records; multiline data is one JSON value.
+    for record in re.split(r"\r?\n\r?\n", text):
+        lines = record.splitlines()
+        event = next((line[6:].strip() for line in lines if line.startswith("event:")), "")
+        if event in ("error", "response.failed", "response.incomplete"):
+            return False, "stream-error"
+        data = "\n".join(line[5:].lstrip() for line in lines if line.startswith("data:"))
+        if not data:
+            continue
+        if data == "[DONE]":
+            done = True
+            continue
+        try:
+            obj = json.loads(data)
+            if bad(obj):
+                return False, "stream-error"
+            kind = obj.get("type") or event
+            if section == "codex-api-key":
+                resp = obj.get("response") or {}
+                if bad(resp):
+                    return False, "stream-error"
+                produced |= output(resp)
+                if kind == "response.output_text.delta":
+                    produced |= bool(obj.get("delta"))
+                if kind == "response.output_item.done":
+                    produced |= output({"output": [obj.get("item")]})
+                if kind == "response.completed":
+                    terminal = resp.get("status", "completed") == "completed"
+            elif section == "claude-api-key":
+                if kind == "message_start" and bad(obj.get("message") or {}):
+                    return False, "stream-error"
+                if kind == "content_block_start":
+                    started_blocks.add(obj.get("index", 0))
+                    produced |= blocks([obj.get("content_block")])
+                if kind == "content_block_delta":
+                    produced |= bool((obj.get("delta") or {}).get("text"))
+                if kind == "content_block_stop":
+                    stopped_blocks.add(obj.get("index", 0))
+                terminal |= kind == "message_stop"
+            elif section == "openai-compatibility":
+                produced |= output(obj)
+                for choice in obj.get("choices") or []:
+                    idx = choice.get("index", 0)
+                    choice_seen.add(idx)
+                    if choice.get("finish_reason"):
+                        choice_done.add(idx)
+            elif section == "gemini-api-key":
+                produced |= output(obj)
+                for choice in obj.get("candidates") or []:
+                    idx = choice.get("index", 0)
+                    choice_seen.add(idx)
+                    if choice.get("finishReason"):
+                        choice_done.add(idx)
+            else:
+                return False, "unknown-protocol"
+        except (ValueError, TypeError, AttributeError):
+            return False, "invalid-stream-json"
+    if section in ("openai-compatibility", "gemini-api-key"):
+        terminal = bool(choice_seen) and choice_seen <= choice_done
+        if section == "openai-compatibility":
+            terminal &= done
+    if section == "claude-api-key":
+        terminal &= bool(started_blocks) and started_blocks <= stopped_blocks
+    if not terminal:
+        return False, "missing-terminal"
+    return (True, "stream-output") if produced else (False, "missing-output")
+
+
+def looks_like_html(text: str) -> bool:
+    """正文是不是一个 HTML 页面而不是 API 响应。
+
+    为什么需要（2026-09-11 实测 zulu.example）
+    --------------------------------------------
+    该站维护期间：`GET /v1/models` 返回 **HTTP 200 + text/html** 的
+    「系统升级中」页面，所有 POST 返回 405 + nginx 错误页。
+
+    200 + HTML 是个危险组合：
+      · `classify` 的状态码兜底把 200 判成「可用（200 且无异常关键词）」；
+      · `has_error_envelope` 只认 JSON 错误信封 —— HTML 解析不出 JSON，
+        它返回 False，等于放行。
+    两者叠加：一个正在维护的站会被判成**可用**，写进 config.yaml 就是死条目，
+    而 CPA 每次真实请求都会失败。这与「200 但正文是错误体」是同一类假阳性，
+    只是载体从 JSON 换成了 HTML，原来的那道闸拦不住。
+
+    判据要窄，否则会误伤合法响应：
+      · 只认**开头**就是 HTML 的（doctype / `<html` / `<!--`），
+        以及开头是 `<` 且出现 `<title`/`<body`/`<head` 的；
+      · 模型的正常输出里完全可能**包含** HTML 片段（用户让它写网页），
+        所以绝不按「正文里有没有 `<div>`」来判 —— 只看正文整体形态。
+      · 空正文不算 HTML（那是另一类，由状态码分支处理）。
+    """
+    t = (text or "").lstrip()
+    if not t:
+        return False
+    low = t[:400].lower()
+    if low.startswith("<!doctype html") or low.startswith("<html"):
+        return True
+    if low.startswith("<") and any(
+            tag in low for tag in ("<title", "<body", "<head", "<h1")):
         return True
     return False
 

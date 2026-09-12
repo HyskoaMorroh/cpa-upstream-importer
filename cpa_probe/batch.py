@@ -115,6 +115,19 @@ class BatchProber:
                             current, total, row.bare, dict(self._stats)
                         )
 
+                except concurrent.futures.CancelledError:
+                    # 取消**不是**单站失败，不能被下面那一支吞掉（2026-09-12）
+                    # ------------------------------------------------------
+                    # 用户按了停止 / 任务被撤销时，每个还没跑完的站都会从
+                    # `future.result()` 抛出 CancelledError。原来它落进下面的
+                    # `except Exception`，于是：
+                    #   · 每个站各记一条 failure，175 个站的批次报「175 个失败」
+                    #   · `probe_batch` 正常返回一个残缺的 results
+                    #   · 调用方（server 的 Job）看到的是「跑完了，成功 0 个」，
+                    #     而不是「被取消了」—— 界面上分不出这两种，日志里也
+                    #     只留下一片假失败
+                    # 取消是**整批**的状态，原样往上抛，让调用方自己决定怎么记。
+                    raise
                 except Exception as e:                     # noqa: BLE001
                     # 单站抛异常不能让整批停下 —— 175 个站里有一个超时就全废
                     # 不可接受。但**异常本身不能吞掉**：原来这里连 e 都没用，
@@ -327,7 +340,7 @@ def existing_weights(cfg: dict) -> dict[tuple[str, str, str], int]:
     ------------------------------------------------------------------
     原来按 (host, api_key) 索引、跨段共用一个值。实测生产 config.yaml：
     facai 的 3 把 Key 在 codex 与 claude 段是 `weight: 0`（那两条路径实测
-    静默换模，已封），在 compat 段**故意没写**（那条路径可用）；100xlabs 的
+    静默换模，已封），在 compat 段**故意没写**（那条路径可用）；xray 的
     3 把 Key 同样只在 claude 段封。按两元组搬运会把 0 灌进 compat 段 ——
     6 个 (凭据, 段) 组合被无声封禁。
 
@@ -385,7 +398,7 @@ def existing_proxies(cfg: dict) -> dict[tuple[str, str, str], str]:
 
     为什么键里必须有段（2026-09-02 二次对账发现）
     ------------------------------------------
-    原来按 (host, api_key) 索引，跨段共用一个值。实测 kktoken.cc 的 5 把 Key
+    原来按 (host, api_key) 索引，跨段共用一个值。实测 kilo.example 的 5 把 Key
     在 compat 段有 `proxy-url: http://mihomo:7890`，在 claude 段**故意没有** ——
     那个站的 claude 路径直连可用，走代理反而多一跳。按两元组搬运会把 compat
     的代理灌进 claude 段，实测 claude 段 proxy-url 从 3 条涨到 8 条。
@@ -545,7 +558,7 @@ def existing_provider_names(cfg: dict) -> dict[str, str]:
     （api_key_model_capabilities.go:186）、执行路由（conductor_execution.go:1605-1609）
     三处都按它索引。
 
-    实测生产配置里 12/13 个 provider 的 name 是人读短名（`runanytime`、
+    实测生产配置里 12/13 个 provider 的 name 是人读短名（`romeo`、
     `chma`、`facai`），与 host 不同。用 host 现编会把它们全部改名：冷却状态
     与能力缓存作废，而且本项目自己的 `name_alias_map`（注释里的短名 → 域名）
     也跟着失效 —— 下一轮读注释拿健康度就大面积漏判。
@@ -771,7 +784,7 @@ def existing_model_context(cfg: dict) -> dict[tuple[str, str, str, str], int]:
       · 方案只带**一个**值（`sp.max_context_length` + `sp.context_model`），
         那是本次探测实测的那一个模型
     结果：本次没探上下文（`--no-context`、或那个模型没被验）时，历史实测值
-    全部消失。实测生产配置有 8 处，kktoken.cc 的 987500 与 zzzcoding 的 15515
+    全部消失。实测生产配置有 8 处，kilo.example 的 987500 与 zulu 的 15515
     都在其中。
 
     丢了的后果不是不可用，而是**客户端按错的窗口定压缩点**：CPA 把它写进
