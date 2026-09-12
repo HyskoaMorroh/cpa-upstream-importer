@@ -2939,6 +2939,9 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
 
     返回 warnings（哪些段挤到了现有档位之下、哪些段排不下）。
     """
+    import logging
+    logger = logging.getLogger(__name__)
+
     warns: list[str] = []
 
     # 1. 按段 → 站 归集。站的身份用 host —— 同站不同段的 base-url 形态不同。
