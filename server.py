@@ -9,7 +9,7 @@
   1. 默认只绑 127.0.0.1。要外网访问请用 nginx 反代并在那一层加 TLS + 认证，
      不要把 --host 改成 0.0.0.0 直接暴露。
   2. **强制 Bearer token**，没有免鉴权模式。token 从 --token 或环境变量
-     IMPORTER_TOKEN 读；都没给则启动时随机生成并打印到 stdout。
+     IMPORTER_TOKEN 读；都没给则随机生成，但绝不打印到日志。
   3. 写回必须两步：先 /api/plan 拿到 plan_id，再 /api/apply 带同一个
      plan_id + confirm=true。单次请求改不了文件。
   4. 完整 key 只在内存里，不落日志、不进 JSON 响应（一律 masked）。
@@ -29,11 +29,15 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import copy
+import difflib
 import hmac
+import hashlib
+import ipaddress
 import io
 import json
 import mimetypes
 import os
+import re
 import secrets
 import sys
 import threading
@@ -58,6 +62,8 @@ from cpa_probe.writeback import (  # noqa: E402
     validate,
     verify_upstream,
     write_local,
+    config_version,
+    WritebackError,
 )
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -77,6 +83,7 @@ class Job:
         self.rows = rows
         self.opts = opts
         self.events: list[dict] = []
+        self.event_cursor = 0
         self.results: list = []
         self.state = "pending"      # pending | running | done | error
         self.error = ""
@@ -110,12 +117,22 @@ class Job:
 
     def emit(self, kind: str, data: dict) -> None:
         with self.lock:
+            self.event_cursor += 1
             self.events.append({"t": round(time.time() - self.started, 1),
-                                "kind": kind, **data})
+                                "kind": kind, **data, "seq": self.event_cursor})
             if kind == "attempt":
                 self.calls += 1
             if len(self.events) > self.MAX_EVENTS:
                 drop = len(self.events) - self.MAX_EVENTS
+                # 保头 + 留痕（2026-09-12 恢复）
+                # --------------------------------
+                # 中途被改成 `del self.events[:drop]`，那是两处降级：
+                #   ① 最早的事件被丢掉 —— 开头那批正是这次跑的前置信息
+                #     （目录、代理预检、画像选档），排查时最需要它们；
+                #   ② 界面上看不出「中间有事件被省略」，读日志的人会把
+                #     残缺的事件流当成完整的。
+                # 用户第 8 条：改动只能正向。这里按 HEAD 的形状复原，
+                # 同时保留新增的 seq 字段（游标分页靠它）。
                 head = self.events[:self.KEEP_HEAD]
                 cut = self.events[self.KEEP_HEAD:self.KEEP_HEAD + drop + 1]
                 tail = self.events[self.KEEP_HEAD + drop + 1:]
@@ -131,6 +148,7 @@ class Job:
                     "t": head[-1]["t"] if head else 0.0,
                     "kind": "info",
                     "_trunc": True,
+                    "seq": self.event_cursor,
                     "msg": f"（省略 {self.dropped} 条中间事件 —— 事件表上限 "
                            f"{self.MAX_EVENTS} 条。完整记录在服务端 stderr）",
                 }] + tail
@@ -252,20 +270,36 @@ class Job:
                 "error": self.error,
                 "calls": self.calls,
                 "elapsed": round((self.finished or time.time()) - self.started, 1),
-                "total_rows": len(self.rows),
+                "total_rows": self.unit_total,
                 "done_rows": len(self.results),
-                "events": self.events[since:],
-                "event_cursor": len(self.events),
+                "events": [e for e in self.events if e["seq"] > since],
+                "event_cursor": self.event_cursor,
+                "next_cursor": self.event_cursor,
+                "oldest_cursor": self.events[0]["seq"] if self.events else self.event_cursor + 1,
+                # 「有事件看不到了」有**两种**成因，都要报（2026-09-12 补第二种）
+                # ------------------------------------------------------------
+                #   ① 轮询者落后太多，队头之前的事件已经不在表里
+                #      —— 原判据 `since < events[0].seq - 1`
+                #   ② 表满后**中间段**被截掉（emit 保留 KEEP_HEAD 条队头 +
+                #      一条 `_trunc` 面包屑 + 队尾）。这一种下 `events[0].seq`
+                #      恒为 1，①那个判据永远不成立 —— 于是事件确实丢了，
+                #      而 `history_lost` 一直是 False，轮询者拿不到任何提示，
+                #      还以为自己看到了完整事件流。
+                #
+                # `self.dropped` 就是 emit 累计丢弃的条数（面包屑自己不计入），
+                # 用它兜住第二种。
+                "history_lost": bool(
+                    self.dropped
+                    or (self.events and since < self.events[0]["seq"] - 1)),
+                "lost_events": max(
+                    0,
+                    (self.events[0]["seq"] - 1 if self.events else 0) - since,
+                ) + self.dropped,
             }
 
 
 class ApplyTask:
-    """一次写回的后台收尾。落盘已完成，这里只跟踪重载与验证。
-
-    为什么需要它（2026-09-02 解 Cloudflare 524）：重载 1-3 秒、验证单个最长
-    45 秒，79 凭据那种规模累计破 100 秒，CF 直接切断连接返回 524 —— 而任务
-    其实成功了。落盘同步做完给确定回执，剩下的丢后台，前端轮询进度。
-    """
+    """后台事务状态：排队、基线复查、写盘、CPA 重载与验证。"""
 
     def __init__(self, task_id: str, base_result: dict):
         self.id = task_id
@@ -276,7 +310,7 @@ class ApplyTask:
         self.finished = 0.0
         # 阶段进度。写回没有「79 个单元」那种自然分片，能给准的是**阶段**
         # 与验证的 已完成/总数 —— 那两个都是实测量。
-        self.stage = "写盘完成"
+        self.stage = "queued"
         self.verify_total = 0
         self.verify_done = 0
         self.lock = threading.Lock()
@@ -307,6 +341,10 @@ class ApplyTask:
             }
 
 
+class CapacityError(ValueError):
+    pass
+
+
 class Store:
     """任务 / 方案 / 写回任务三张表。**都有容量上限与 TTL**。
 
@@ -332,17 +370,23 @@ class Store:
 
     # 上限按「一条占多少」定：plan 约 1.7MB × 8 ≈ 14MB，够一轮交互
     MAX_PLANS = 8
+    # 批量方案比 plan 轻（只存两份文本 + 说明），但同样一份约 450KB。
+    MAX_BULKS = 4
     MAX_JOBS = 32
     MAX_APPLIES = 32
     TTL = 2 * 3600          # 2 小时没人碰就清
 
     def __init__(self) -> None:
+        self.apply_generation = 0
         self.jobs: dict[str, Job] = {}
         self.plans: dict[str, dict] = {}
         self.applies: dict[str, ApplyTask] = {}
+        # 批量管理的预览结果（每份两段整份配置文本）
+        self.bulks: dict[str, dict] = {}
         # {表名: {id: 最后访问时间}} —— 与数据分开存，避免污染 payload
+        # 新增表**必须同时在这里登记**，否则 `_touch` 会 KeyError。
         self._touched: dict[str, dict[str, float]] = {
-            "jobs": {}, "plans": {}, "applies": {}}
+            "jobs": {}, "plans": {}, "applies": {}, "bulks": {}}
         self.lock = threading.Lock()
 
     def _touch(self, table: str, key: str) -> None:
@@ -378,7 +422,7 @@ class Store:
 
     @staticmethod
     def _job_busy(job) -> bool:
-        return bool(job is not None and getattr(job, "state", "") == "running")
+        return bool(job is not None and getattr(job, "state", "") in ("pending", "running"))
 
     @staticmethod
     def _apply_busy(task) -> bool:
@@ -387,7 +431,9 @@ class Store:
 
     def add_job(self, job: Job) -> None:
         with self.lock:
-            self._evict("jobs", self.jobs, self.MAX_JOBS, self._job_busy)
+            self._evict("jobs", self.jobs, self.MAX_JOBS - 1, self._job_busy)
+            if len(self.jobs) >= self.MAX_JOBS:
+                raise CapacityError("探测任务容量已满，请等待已有任务结束")
             self.jobs[job.id] = job
             self._touch("jobs", job.id)
 
@@ -396,6 +442,28 @@ class Store:
             got = self.jobs.get(jid)
             if got is not None:
                 self._touch("jobs", jid)
+            return got
+
+    def put_bulk(self, base_raw: str, text: str, notes: list) -> str:
+        """存一份批量预览结果，返回 bulk_id。
+
+        新文本存在服务端而不是让前端回传 —— 回传等于让客户端决定写什么，
+        而这个服务持有明文上游 key 与 config.yaml 的写权限。
+        `base_raw` 用于 apply 时的基线比对，挡并发覆盖。
+        """
+        bid = secrets.token_urlsafe(12)
+        with self.lock:
+            self._evict("bulks", self.bulks, self.MAX_BULKS)
+            self.bulks[bid] = {"base_raw": base_raw, "text": text,
+                               "notes": list(notes)}
+            self._touch("bulks", bid)
+        return bid
+
+    def get_bulk(self, bid: str) -> dict | None:
+        with self.lock:
+            got = self.bulks.get(bid)
+            if got is not None:
+                self._touch("bulks", bid)
             return got
 
     def add_plan(self, pid: str, payload: dict) -> None:
@@ -422,8 +490,10 @@ class Store:
 
     def add_apply(self, task: "ApplyTask") -> None:
         with self.lock:
-            self._evict("applies", self.applies, self.MAX_APPLIES,
+            self._evict("applies", self.applies, self.MAX_APPLIES - 1,
                         self._apply_busy)
+            if len(self.applies) >= self.MAX_APPLIES:
+                raise CapacityError("写回任务容量已满，请稍后重试")
             self.applies[task.id] = task
             self._touch("applies", task.id)
 
@@ -433,6 +503,26 @@ class Store:
             if got is not None:
                 self._touch("applies", tid)
             return got
+
+    def claim_apply(self, entry: dict) -> tuple[ApplyTask, bool]:
+        with self.lock:
+            tid = entry.get("task_id")
+            if tid:
+                task = self.applies.get(tid)
+                if task is None:
+                    raise ValueError("方案已消费，任务已过期；请重新预览")
+                return task, False
+            self._evict("applies", self.applies, self.MAX_APPLIES - 1, self._apply_busy)
+            if len(self.applies) >= self.MAX_APPLIES:
+                raise CapacityError("写回任务容量已满，请稍后重试")
+            task = ApplyTask(secrets.token_hex(8), {"local_written": False})
+            self.apply_generation = getattr(self, "apply_generation", 0) + 1
+            task.generation = self.apply_generation
+            task.stage = "queued"
+            self.applies[task.id] = task
+            self._touch("applies", task.id)
+            entry["task_id"] = task.id
+            return task, True
 
     def sizes(self) -> dict[str, int]:
         """三张表的条数。给 /api/context 用，便于运维看有没有堆积。"""
@@ -444,19 +534,312 @@ class Store:
 STORE = Store()
 
 
+def _validate_body(body: dict) -> None:
+    if not isinstance(body, dict):
+        raise ValueError("JSON 顶层必须是对象")
+    bools = {"confirm", "full_redetect", "by_score", "probe_context",
+             "probe_capabilities", "reuse_profile_verdict", "run_full", "full", "probation",
+             "rebuild_mid_system", "disable_cooling", "websockets",
+             "prompt_cache_key"}
+    def check(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in bools and type(value) is not bool:
+                    # Nullable three-state configuration overrides are supported.
+                    if not (key in {"rebuild_mid_system", "disable_cooling",
+                                    "websockets", "prompt_cache_key"} and value is None):
+                        raise ValueError(f"{key} 必须是布尔值")
+                if key in {"priority", "max_context_length"} and value is not None:
+                    try:
+                        if isinstance(value, bool) or isinstance(value, (dict, list)):
+                            raise ValueError
+                        int(value)
+                    except (ValueError, TypeError, OverflowError):
+                        raise ValueError(f"{key} 必须是整数") from None
+                check(value)
+        elif isinstance(node, list):
+            for item in node:
+                check(item)
+    check(body)
+    for key in ("opts", "push", "overrides", "forced"):
+        if key in body and not isinstance(body[key], dict):
+            raise ValueError(f"{key} 必须是对象")
+    if "text" in body and not isinstance(body["text"], str):
+        raise ValueError("text 必须是字符串")
+    for key in ("job_id", "plan_id", "bulk_id", "revision", "_cred"):
+        if key in body and not isinstance(body[key], str):
+            raise ValueError(f"{key} 必须是字符串")
+    if "selected" in body and body["selected"] is not None:
+        if not isinstance(body["selected"], list) or any(
+                not isinstance(item, list) or len(item) != 2
+                or not isinstance(item[0], (str, int)) or not isinstance(item[1], str)
+                for item in body["selected"]):
+            raise ValueError("selected 必须是 [行号, 段名] 列表")
+    for group in ("overrides", "forced"):
+        for rows in body.get(group, {}).values():
+            if not isinstance(rows, dict):
+                raise ValueError(f"{group} 的每行必须是对象")
+            for section, value in rows.items():
+                if section not in cp.SECTIONS:
+                    raise ValueError("未知协议段")
+                if group == "overrides" and not isinstance(value, dict):
+                    raise ValueError("每段覆盖值必须是对象")
+                if group == "forced":
+                    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+                        raise ValueError("forced 模型必须是字符串列表")
+                    _clean_override_models(section, value)
+    for key, value in body.get("push", {}).items():
+        if key in {"base", "mgmt_key", "client_key"} and not isinstance(value, str):
+            raise ValueError(f"push.{key} 必须是字符串")
+
+
+_PUBLIC_SALT = secrets.token_bytes(32)
+_DOMAIN = re.compile(r"(?<![\w-])(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,63}(?![\w-])")
+_SECRET_NAME = re.compile(r"secret|password|authorization|cookie|credential|token|(?:^|_)cred$|^key$|api[-_]?key|mgmt[-_]?key|client[-_]?key", re.I)
+
+# `_SECRET_NAME` 会误伤的字段名（2026-09-12）
+# ------------------------------------------
+# CPA 的**段名**本身就叫 `codex-api-key` / `claude-api-key` /
+# `gemini-api-key` —— 它们匹配上面的 `api[-_]?key`，于是 `_public` 把这些
+# 键的**值**（base-url、模型清单这类）整体换成 `***`：
+# `/api/parse` 回的 bases 三段全是 `***`，界面上什么都看不到。
+# 段名不是凭据，凭据是段里那个 `api-key` 字段 —— 后者仍然被抹。
+_NOT_SECRET_FIELDS = frozenset({
+    "verify_key_src",
+    "codex-api-key", "claude-api-key", "gemini-api-key",
+})
+
+
+def _safe_text(text: str) -> str:
+    """Public prose: remove URL credentials. Host names stay readable.
+
+    2026-09-12：去掉「把域名替换成 site-<hash>.invalid」那一步。
+    ------------------------------------------------------------
+    这个函数在 `_json` 里作用于**每一个** API 响应，而本工具的界面就跑在
+    操作员自己机器上，全部工作都要靠站名来做：`/api/parse` 回的 base-url、
+    方案里的 base_url、diff 里的 config.yaml 行。域名一律改写之后：
+
+      · `/api/parse` 回 `site-393c5c20b011.invalid/v1`，界面上认不出是哪个站；
+      · 方案与 diff 里的 base-url 全变假名，操作员无法复核要写什么进配置；
+      · 每次进程重启 `_PUBLIC_SALT` 都换，同一个站两次假名不同，
+        连「前后两次是不是同一个站」都判断不了。
+
+    用户第 9 条要的是**提交到 GitHub 之前**把私有域名排除掉 —— 那是
+    `tools/scrub.py` 与 `.gitignore` 的职责，不是本地界面响应的职责。
+    tests/test_server.py 里写明的契约也是「主机与端口要留着 —— 排障最需要
+    看那部分」。所以这里只抹凭据：URL userinfo、query 里的 token/key、
+    Authorization 头值。
+    """
+    text = re.sub(r"(https?://)[^\s/@]+:[^\s/@]+@", r"\1***@", str(text))
+    text = re.sub(r"(?i)([?&](?:token|key|api_key|secret|password)=)[^&\s\"']+", r"\1***", text)
+    text = re.sub(r"(?i)(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+", r"\1 ***", text)
+    return text
+
+
+def _public(value, field: str = ""):
+    """Redact only output copies; never mutate plans or config snapshots."""
+    if isinstance(value, dict):
+        if field.endswith("headers"):
+            import yaml
+            redacted = yaml.safe_load(redact_yaml_secrets(
+                yaml.safe_dump({"headers": value}, allow_unicode=True)))
+            value = redacted["headers"]
+        return {key: _public(item, key) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_public(item, field) for item in value]
+    if not isinstance(value, str):
+        return value
+    if (_SECRET_NAME.search(field) and field not in _NOT_SECRET_FIELDS
+            and not field.endswith("_masked")):
+        return "***" if value else ""
+    # Reuse writeback's structural redactor for URL userinfo/query credentials.
+    import yaml
+    wrapped = yaml.safe_dump({"value": value}, allow_unicode=True)
+    scrubbed = yaml.safe_load(redact_yaml_secrets(wrapped))
+    return _safe_text(scrubbed["value"])
+
+
+def _public_with_context(value, context):
+    """Let writeback remove known credentials even inside free-form messages."""
+    import yaml
+    def strings_only(node):
+        if isinstance(node, dict):
+            return {key: strings_only(item) for key, item in node.items()
+                    if isinstance(item, (str, dict, list))}
+        if isinstance(node, list):
+            return [strings_only(item) for item in node
+                    if isinstance(item, (str, dict, list))]
+        return node
+    strings = []
+    def flatten(node):
+        if isinstance(node, dict):
+            for item in node.values():
+                flatten(item)
+        elif isinstance(node, list):
+            for item in node:
+                flatten(item)
+        elif isinstance(node, str):
+            strings.append(node)
+    flatten(value)
+    # JSON is also YAML, and quotes every string. Non-string fields never
+    # enter a credential redactor (e.g. nullable prompt_cache_key is not a key).
+    text = json.dumps({"context": strings_only(context), "payload_items": strings},
+                      ensure_ascii=False)
+    redacted = yaml.safe_load(redact_yaml_secrets(text))
+    if (not isinstance(redacted, dict) or not isinstance(redacted.get("payload_items"), list)
+            or len(redacted["payload_items"]) != len(strings)):
+        raise ValueError("公开输出无法安全脱敏")
+    cleaned = iter(redacted["payload_items"])
+    def typed(original):
+        if isinstance(original, dict):
+            return {key: typed(item) for key, item in original.items()}
+        if isinstance(original, list):
+            return [typed(item) for item in original]
+        return next(cleaned) if isinstance(original, str) else original
+    return _public(typed(value))
+
+def _validate_final(preview: str, plans=()) -> tuple[bool, str]:
+    ok, msg = validate(preview)
+    if not ok:
+        return ok, msg
+    issues = cp.priority_split_within_host(list(plans))
+    import yaml
+    cfg = yaml.safe_load(preview) or {}
+    groups = {}
+    for section in cp.SECTIONS:
+        for entry in cfg.get(section) or []:
+            if not isinstance(entry, dict):
+                continue
+            host = cp.host_of(str(entry.get("base-url") or ""))
+            if not host:
+                continue
+            pri = entry.get("priority", 0)
+            if type(pri) is not int:
+                return False, "priority 必须是整数"
+            values = [pri]
+            if section == "openai-compatibility":
+                values += [k.get("priority", pri) for k in entry.get("api-key-entries") or []
+                           if isinstance(k, dict)]
+            if any(type(value) is not int for value in values):
+                return False, "priority 必须是整数"
+            groups.setdefault(host, set()).update(values)
+    if issues or any(len(values) > 1 for values in groups.values()):
+        return False, "同站优先级不一致：请将该站所有 Key（包括未勾选项与默认 0）统一后重新预览"
+    return True, msg
+
+
+def _preview_diff(before: str, after: str) -> dict:
+    diff = "\n".join(difflib.unified_diff(
+        _safe_text(redact_yaml_secrets(before)).splitlines(),
+        _safe_text(redact_yaml_secrets(after)).splitlines(),
+        fromfile="config.yaml (before)", tofile="config.yaml (after)",
+        lineterm="", n=2))
+    return {"unified_diff": diff[:200000],
+            "unified_diff_truncated": len(diff) > 200000}
+
+
+def _apply_identity_override(sp, ov: dict) -> None:
+    _validate_body(ov)
+    for name in ("rebuild_mid_system", "disable_cooling"):
+        if name in ov:
+            setattr(sp, name, ov[name])
+    for name in ("cloak_mode", "fingerprint_profile"):
+        if name not in ov:
+            continue
+        value = ov[name]
+        if not isinstance(value, str):
+            raise ValueError(f"{name} 必须是字符串")
+        from cpa_probe import cpa_source_probe
+        ident = cpa_source_probe.cached_identity()
+        choices = (getattr(ident, "claude_cloak_modes", []) if name == "cloak_mode"
+                   else getattr(ident, "claude_fingerprint_profiles", [])) or []
+        if value and value not in choices:
+            raise ValueError(f"{name} 未被当前来源元数据支持，请刷新来源或留空")
+        setattr(sp, name, value)
+
+
+def _restore_public_scalar(value, original: str, field: str) -> str:
+    value = str(value or "")
+    if original and value == _public(original, field):
+        return original
+    if "***" in value or re.search(r"site-[0-9a-f]+\.invalid", value):
+        raise ValueError(f"{field} 的脱敏占位符不能用于新值，请提供真实值或保留原值")
+    return value
+
+
+def _restore_public_headers(values: dict, original: dict) -> dict:
+    public = _public(original, "headers")
+    out = {}
+    for key, value in values.items():
+        key, value = str(key), str(value)
+        if key in original and value == public.get(key):
+            out[key] = original[key]
+        elif "***" in value:
+            raise ValueError("新的请求头不能使用脱敏占位符")
+        else:
+            out[key] = value
+    return out
+
+
+def _verification_target(cfg: dict, sp) -> tuple[str, str]:
+    model = sp.models[0]
+    prefix = getattr(sp, "prefix", "")
+    # Gemini embeds the model in the URL; do not invent prefix path handling.
+    if (getattr(sp, "section", "") == "gemini-api-key" or not prefix
+            or not re.fullmatch(r"[A-Za-z0-9_-]+", prefix)):
+        return model, "gateway_only"
+    owners = []
+    for sec in cp.SECTIONS:
+        for entry in cfg.get(sec) or []:
+            if not isinstance(entry, dict) or entry.get("prefix") != prefix:
+                continue
+            keys = (entry.get("api-key-entries") or []) if sec == "openai-compatibility" else [entry]
+            for key in keys:
+                if isinstance(key, dict):
+                    owners.append((sec, entry, key.get("api-key", "")))
+    if len(owners) != 1:
+        return model, "gateway_only"
+    sec, entry, key = owners[0]
+    if (sec != sp.section or key != sp.api_key
+            or entry.get("base-url", "").rstrip("/") != sp.base_url.rstrip("/")):
+        return model, "gateway_only"
+    aliases = [m.get("alias") or m.get("name")
+               for m in entry.get("models") or []
+               if isinstance(m, dict) and model in (m.get("name"), m.get("alias"))]
+    if len(aliases) != 1 or not aliases[0] or "/" in aliases[0]:
+        return model, "gateway_only"
+    route = f"{prefix}/{aliases[0]}"
+    if cfg.get("auth-dir") or cfg.get("oauth-model-alias"):
+        return model, "gateway_only"
+    for section in cp.SECTIONS:
+        for other in cfg.get(section) or []:
+            if not isinstance(other, dict) or other is entry:
+                continue
+            if any(isinstance(m, dict) and route in (m.get("name"), m.get("alias"))
+                   for m in other.get("models") or []):
+                return model, "gateway_only"
+    return route, "unique_prefix"
+
+
 # --------------------------------------------------------------------------
 # 序列化：完整 key 绝不出现在响应里
 # --------------------------------------------------------------------------
 
 
 def row_json(row) -> dict:
+    bases = {}
+    for section in cp.SECTIONS:
+        try:
+            bases[section] = row.base_for(section) if row.ok else ""
+        except ValueError:
+            bases[section] = ""
     return {
         "line_no": row.line_no,
         "host": row.host,
         "bare": row.bare,
         "key_masked": row.masked(),
-        "error": row.error,
-        "bases": {s: row.base_for(s) for s in cp.SECTIONS},
+        "error": "输入格式无效，请检查网址和凭据" if row.error else "",
+        "bases": bases,
     }
 
 
@@ -517,7 +900,7 @@ def verdict_json(v) -> dict:
 
 
 def plan_json(p) -> dict:
-    return {
+    return _public_with_context({
         "host": p.host,
         # 候选身份。前端拿它当勾选键与 DOM 定位键 —— host 不唯一
         # （一个站常有 15 把 Key），用 host 会让同站多 Key 互相覆盖。
@@ -533,6 +916,12 @@ def plan_json(p) -> dict:
                 # probed / catalog / manual —— 界面要标清模型是实测跑通的、
                 # 站方目录报的，还是操作员手填的，三者可信度差一截
                 "model_source": sp.model_source,
+                "highest_models": list(getattr(sp, "highest_models", None) or []),
+                "model_provenance": dict(getattr(sp, "model_provenance", None) or {}),
+                "cloak_mode": getattr(sp, "cloak_mode", ""),
+                "fingerprint_profile": getattr(sp, "fingerprint_profile", ""),
+                "rebuild_mid_system": getattr(sp, "rebuild_mid_system", None),
+                "disable_cooling": getattr(sp, "disable_cooling", None),
                 # 站方目录整体落后市面最新一个世代以上（如目录只有 gpt-4 系
                 # 而市面已到 5.6）。清单照旧列出，但默认不勾 —— 界面要说清
                 # 为什么，否则「有模型却不建议勾」看着像 bug。
@@ -588,7 +977,9 @@ def plan_json(p) -> dict:
             }
             for s, sp in p.sections.items()
         },
-    }
+    }, {"api-keys": [sp.api_key for sp in p.sections.values()],
+        "entries": [{"headers": sp.headers, "proxy_url": sp.proxy_url}
+                    for sp in p.sections.values()]})
 
 
 # --------------------------------------------------------------------------
@@ -596,12 +987,89 @@ def plan_json(p) -> dict:
 # --------------------------------------------------------------------------
 
 
+def proxy_candidates() -> list[str]:
+    """本项目**自己要用**的代理地址候选，按优先级。
+
+    为什么要可配置（第 6 条：严禁硬编码 / 死编码）
+    ------------------------------------------
+    原来 `mihomo:7890` / `127.0.0.1:7890` 写死在两处代码里（这里的候选表、
+    以及 `plan.py` 写 `proxy-url` 时的字面量）。那两个值来自**当前这套部署**
+    的 compose 服务名与端口映射 —— 换个部署（改服务名、改端口、用别的代理
+    实现）就全部失效，而失效的表现是「所有需要代理的站探测失败」，不报错。
+
+    取值顺序（先到先用，都不通则跳过代理）：
+      1. `PROBE_PROXY` 环境变量 —— 逗号分隔可给多个，部署里显式指定
+      2. `docker-compose.yml` 里解析出的代理服务名与端口（自动跟随部署）
+      3. 内置回落 `http://mihomo:7890` / `http://127.0.0.1:7890`
+
+    第 2 条是关键：它让「改了 compose 的服务名或端口」这件事自动被跟上，
+    与 CPA / CPAMP 源码解析同一个思路 —— 配置的真相在部署文件里，不在我们
+    的代码里。解析失败就静默跳到第 3 条，这是可选增强不是运行前提。
+    """
+    out: list[str] = []
+
+    def add(u: str) -> None:
+        u = (u or "").strip()
+        if u and u not in out:
+            out.append(u)
+
+    for u in os.environ.get("PROBE_PROXY", "").split(","):
+        add(u)
+
+    # compose 里找暴露 7890/9090 这类端口的代理服务。只读不改。
+    # 找不到 compose、或格式不认识，都只是少一个候选，不影响其余两条。
+    try:
+        import yaml as _yaml
+        for cand_path in (os.environ.get("COMPOSE_FILE", ""),
+                          "docker-compose.yml", "/deploy/docker-compose.yml"):
+            if not cand_path or not os.path.isfile(cand_path):
+                continue
+            doc = _yaml.safe_load(io.open(cand_path, encoding="utf-8").read())
+            for name, svc in (doc.get("services") or {}).items():
+                if not isinstance(svc, dict):
+                    continue
+                img = str(svc.get("image") or "")
+                hay = (name + " " + img).lower()
+                # 认代理**实现**的名字，不认泛化的 "proxy" 字样（2026-09-11 收紧）。
+                # 实测生产 compose 上放开 "proxy" 会把 `cli-proxy-api`（CPA 自己）
+                # 收进来 —— 把 CPA 当成本工具的出网代理会造成转发环路，
+                # 而且它那 4 个端口没一个是代理端口。
+                if not any(k in hay for k in ("mihomo", "clash", "xray",
+                                              "v2ray", "sing-box",
+                                              "shadowsocks", "tinyproxy",
+                                              "privoxy", "squid")):
+                    continue
+                for p in (svc.get("ports") or []):
+                    # "127.0.0.1:7890:7890" / "7890:7890" / 7890
+                    parts = str(p).split(":")
+                    inner = parts[-1].split("/")[0]
+                    if not inner.isdigit():
+                        continue
+                    # 只收**混合/HTTP 代理**常用端口。mihomo 之类同时还暴露
+                    # 控制台端口（9090）—— 那是 REST API，拿它当代理必然不通，
+                    # 收进来只会让 `_resolve_proxy` 多做几次无谓的 TCP 探测。
+                    if int(inner) not in (7890, 7891, 1080, 8080, 8118, 3128):
+                        continue
+                    add(f"http://{name}:{inner}")          # 容器内走服务名
+                    if len(parts) >= 2 and parts[-2].isdigit():
+                        add(f"http://127.0.0.1:{parts[-2]}")   # 宿主机走映射端口
+            break
+    except Exception:
+        pass
+
+    # 内置回落：当前这套部署的形态。放最后，只在前两条都没给出候选时生效。
+    add("http://mihomo:7890")
+    add("http://127.0.0.1:7890")
+    return out
+
+
 def _resolve_proxy(requested: str) -> str | None:
     """把前端传来的代理意愿解析成一个真能连的地址。
 
     前端只表达「要不要试代理」（勾选框），不该让用户操心地址形态 ——
-    容器内是服务名 `mihomo:7890`（同 default 网络），宿主机上得用映射端口
-    `127.0.0.1:7890`。同一份前端两种部署都要能用，所以这里依次探测。
+    容器内是服务名、宿主机上是映射端口，同一份前端两种部署都要能用。
+    候选清单由 `proxy_candidates()` 给（环境变量 > compose 解析 > 内置回落），
+    不再写死在这里。
 
     返回 None 表示都不通，整轮跳过 via-proxy（Prober.live_proxy 也会再挡一次）。
     """
@@ -609,6 +1077,7 @@ def _resolve_proxy(requested: str) -> str | None:
         return None
     from cpa_probe.client import probe_proxy
     from cpa_probe.parse import host_of, is_private_target
+    cands = proxy_candidates()
     # 显式给了别的地址就只试那个，不擅自改成别的 —— 但要挡内网去向。
     #
     # 为什么这里也要挡（2026-09-05，与探测目标同一批）：`probe_proxy` 做的是
@@ -617,15 +1086,14 @@ def _resolve_proxy(requested: str) -> str | None:
     # 的端口扫描 oracle —— `{"opts":{"proxy":"http://10.0.0.5:22"}}` 就能问
     # 「那台机器的 22 端口开着吗」。
     #
-    # 两个白名单地址是例外：`mihomo:7890` 是 compose 里的服务名，
-    # `127.0.0.1:7890` 是宿主机上的映射端口 —— 那正是本工具**要用**的代理，
-    # 由服务端自己写死，不来自请求体。
-    if requested not in ("http://mihomo:7890", "auto"):
+    # 候选清单里的地址是例外：它们是本工具**要用**的代理，由服务端自己算出
+    # （环境变量 / compose / 内置回落），不来自请求体。
+    if requested != "auto" and requested not in cands:
         why = is_private_target(host_of(requested) or requested)
         if why:
             return None
         return requested
-    for cand in ("http://mihomo:7890", "http://127.0.0.1:7890"):
+    for cand in cands:
         ok, _detail = probe_proxy(cand, timeout=3)
         if ok:
             return cand
@@ -650,6 +1118,7 @@ def _resolve_proxy(requested: str) -> str | None:
 # max_workers 的 128 对应「cgroup 推荐值（4 核算出 48）的 2.6 倍」，
 # 而 resources.detect 自己的 cap 是 64。
 _LIMITS: dict[str, tuple[float, float]] = {
+    "candidate_workers": (1, 32),
     "max_workers": (1, 128),
     "workers": (1, 16),            # 段级并行，四段最多 4，给 16 的余量
     "timeout": (1, 300),           # 秒。单次请求，nginx 侧 600 秒断连
@@ -721,9 +1190,18 @@ def _error_ref(where: str) -> str:
     定位到完整栈，而客户端只看到「服务内部错误（err-3f2a1b）」。
     """
     ref = secrets.token_hex(3)
+    # stderr 那一份要**完整**（2026-09-12）
+    # ------------------------------------
+    # 中途改成 `format_tb(...) + type(exc).__name__`，那丢掉了异常的
+    # **消息文本**：日志里只有栈帧和一个 `RuntimeError`，看不到
+    # 「probe-for-test」这种真正说明问题的内容。而本函数的整个设计前提就是
+    # 「客户端只拿 id，运维 `docker compose logs | grep <id>` 拿全量」——
+    # 全量那一份被削薄，排障链路就断了。
+    # 对外仍然只返回 id，泄露面没有变化。
+    exc = sys.exc_info()[1]
     sys.stderr.write(
         f"[{time.strftime('%H:%M:%S')}] ERROR err-{ref} at {where}\n"
-        + traceback.format_exc() + "\n")
+        + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
     sys.stderr.flush()
     return f"err-{ref}"
 
@@ -767,7 +1245,11 @@ def run_job(job: Job, cfg_path: str) -> None:
     job.state = "running"
     try:
         _emit_opt_notices(job)
+        import yaml
+        with open(cfg_path, encoding="utf-8") as stream:
+            cfg = yaml.safe_load(stream) or {}
         prober = Prober(
+            cfg_snapshot=cfg,
             proxy=_resolve_proxy(str(job.opts.get("proxy") or "")),
             gap=_clamp(job.opts, "gap", 3.0),
             timeout=_clamp(job.opts, "timeout", 120),
@@ -795,9 +1277,23 @@ def run_job(job: Job, cfg_path: str) -> None:
         #     真正的并行度上限是**不同主机数**，再高只是空转线程
         #   · 每个候选内部还会开最多 4 个段线程，总线程数是乘出来的
         # 所以取「不同主机数」与配置上限的较小值。
+        #
+        # 默认值 4 -> 16（2026-09-11 提速）
+        # -------------------------------
+        # 4 是个过于保守的默认：它让「增加账号」这条路在 20 个新站时要排 5 轮，
+        # 而每一轮的墙钟时间由**最慢的那个站**决定（实测单站最慢 121 秒）。
+        # 放开到 16 不会加重任何单站的负担 —— 节流桶是按 `(host, section)` 分的
+        # （`Prober._throttle`），跨站并发对单站的请求频率**没有任何影响**，
+        # 上面那句注释「不同站之间没有任何理由互相等」说的就是这件事。
+        #
+        # 上限仍由三重闸兜住，不会失控：
+        #   · `min(len(hosts), …)` —— 站数少于配置时实际并发就是站数
+        #   · 每个候选内部最多 4 个段线程，总线程 = 16 × 4 = 64（可接受）
+        #   · `_LIMITS["max_workers"]` 的 128 是硬上限
+        # 全量重探那条路本来就是 30，这里对齐到同一量级。
         hosts = {r.host for r in job.rows}
         cand_workers = max(1, min(len(hosts),
-                                  int(job.opts.get("candidate_workers", 4))))
+                                  _clamp(job.opts, "candidate_workers", 16)))
         # ETA 的并发闸要知道真实并发度，不是配置值 —— 站数少于配置时
         # 实际并发就是站数。
         with job.lock:
@@ -830,6 +1326,17 @@ def run_job(job: Job, cfg_path: str) -> None:
         with job.lock:
             job.results = [x for x in slots if x is not None]
         job.state = "done"
+    except concurrent.futures.CancelledError:
+        # 用户按了停止 —— 这不是错误（2026-09-12）
+        # ------------------------------------------
+        # BatchProber 现在把取消原样往上抛（原来它落进逐站的
+        # `except Exception`，于是 175 个站各记一条 failure，任务还报 done）。
+        # 这里也必须与真正的失败分开：记成 error 会给用户一个查不出所以然的
+        # 错误号（_error_ref 只回引用，细节在 stderr），而他自己按的停止
+        # 根本不该去查日志。
+        job.state = "cancelled"
+        job.emit("info", {"msg": "已按请求停止 —— 未完成的站没有结论，"
+                                 "已完成的结果保留"})
     except Exception:
         job.state = "error"
         job.error = _error_ref(f"job {job.id}")
@@ -860,13 +1367,13 @@ _DRIFT_TTL_OK = 6 * 3600
 _DRIFT_TTL_BAD = 600
 
 
-def _drift_snapshot(*, runtime_commit_url: str = "", **kw) -> dict:
+def _drift_snapshot(*, runtime_commit_url: str = "", runtime_mgmt: str = "", **kw) -> dict:
     """漂移检测结果：只读缓存，过期则后台刷新。绝不阻塞调用方。
 
     kw 原样转交 cp.check_profile_drift。
 
-    runtime_commit_url 是 CPA 管理端点，在**后台线程里**才去打它的 /healthz
-    取 X-CPA-COMMIT —— 那一步也是网络请求（超时 3 秒），在请求路径里算等于
+    runtime_commit_url 是 CPA 管理端点，在**后台线程里**带认证取
+    X-CPA-COMMIT —— 那一步也是网络请求（超时 3 秒），在请求路径里算等于
     把这个接口的下限抬到 3 秒。它只是个增强信号（发现「源码更新了但 CPA 没
     重启」），不该决定页面能不能显示。
     """
@@ -882,9 +1389,26 @@ def _drift_snapshot(*, runtime_commit_url: str = "", **kw) -> dict:
     if need:
         def work() -> None:
             try:
-                got = cp.check_profile_drift(
-                    runtime_commit=_cpa_runtime_commit(runtime_commit_url),
-                    **kw)
+                commit = _cpa_runtime_commit(runtime_commit_url, runtime_mgmt)
+                source_args = dict(kw)
+                # A moving main branch is never evidence for a deployed build.
+                if commit and source_args.get("remote_ref") == "main":
+                    source_args["remote_ref"] = commit
+                got = cp.check_profile_drift(runtime_commit=commit, **source_args)
+                got["runtime_commit"] = commit
+                version = (_CPA_COMMIT_CACHE.get("version", "")
+                           if runtime_mgmt and _CPA_COMMIT_CACHE.get("key", ("",))[0]
+                           == runtime_commit_url.rstrip("/") else "")
+                got["runtime_version"] = version
+                got["runtime_version_known"] = bool(commit or version)
+                got["runtime_version_source"] = "authenticated_management" if commit or version else "unavailable"
+                got["deployed_version_verified"] = bool(
+                    commit and got.get("checked") and not got.get("drifts")
+                    and str(got.get("source_commit") or "") == commit)
+                if not commit:
+                    got["version_note"] = "管理响应未提供运行版本；源码快照不能证明部署版本"
+                    if version:
+                        got["version_note"] = "已知运行版本标签，但缺少 commit；尚未绑定源码快照"
             except Exception as e:                       # noqa: BLE001
                 # 后台线程里抛出去没人接，会静默丢失整个检查。转成一条
                 # 「没能核对」的结论 —— 与三条路径都不成立时同一个形状。
@@ -926,12 +1450,14 @@ def _clean_override_models(section: str, raw_models: list) -> list[str]:
     # 判据与 build_plan 的 forced 路径**必须同一个**（2026-09-03）：
     # `section_protocol_ok` 只挡协议层不可能成立的（段协议不匹配、非对话模型），
     # 不挡四族之外 —— 那是操作员的显式指定，而 compat 段确实能跑 grok / glm
-    # （实测 runanytime 唯一验证过的模型就是 grok-4.6）。
+    # （实测 romeo 唯一验证过的模型就是 grok-4.6）。
     # 这里用 section_allows 会让「界面手填能写、curl 覆盖写不进」，两条入口
     # 对同一个名字给出不同结果。
     kept = cp.model_catalog.newest_generation_per_line(
         [m for m in got if cp.model_catalog.section_protocol_ok(section, m)])
-    return kept or got
+    if got and not kept:
+        raise ValueError("模型覆盖与目标协议不兼容，请选择该协议支持的模型")
+    return kept
 
 
 def _market_top_gen(cfg: dict) -> tuple[dict, dict]:
@@ -976,31 +1502,36 @@ def _market_top_gen(cfg: dict) -> tuple[dict, dict]:
     return out, by_line
 
 
-def _cpa_runtime_commit(base: str) -> str:
+def _cpa_runtime_commit(base: str, mgmt: str = "") -> str:
     """读运行中 CPA 的 commit（管理响应头 X-CPA-COMMIT，handler.go:267-269）。
 
     用来发现「源码已更新但 CPA 没重启」—— 挂进来的是源码，跑着的是编译产物。
 
-    打的是 /healthz：它不需要管理密钥，而 X-CPA-COMMIT 由管理路由的中间件写
-    在响应头上。拿不到就返回空串，调用方降级为「不比对版本」，不报错 ——
-    这只是个增强信号，不能让它影响 /api/context 的可用性。
+    只读取认证管理响应头；没有管理凭据或响应头就返回空串，
+    不能将未绑定的源码 main 快照当成部署版本。
 
     缓存 5 分钟：每次打开网页都发一次外网请求不值得，而 CPA 版本不会秒级变。
     """
-    if not base:
+    if not base or not mgmt:
         return ""
+    cache_key = (base.rstrip("/"), hashlib.sha256(mgmt.encode()).hexdigest())
     now = time.time()
-    if now - _CPA_COMMIT_CACHE["at"] < _CPA_COMMIT_TTL:
+    if (_CPA_COMMIT_CACHE.get("key") == cache_key
+            and now - _CPA_COMMIT_CACHE["at"] < _CPA_COMMIT_TTL):
         return _CPA_COMMIT_CACHE["commit"]
     commit = ""
+    version = ""
     try:
-        req = urllib.request.Request(base.rstrip("/") + "/healthz",
-                                     method="GET")
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        req = urllib.request.Request(base.rstrip("/") + "/v0/management/config.yaml",
+                                     method="GET", headers={"Authorization": f"Bearer {mgmt}"})
+        # Reuse the transport's same-origin redirect guard; never send
+        # management credentials to a redirect destination on another origin.
+        with cp.client._opener(None).open(req, timeout=3) as resp:
             commit = (resp.headers.get("X-CPA-COMMIT") or "").strip()
+            version = (resp.headers.get("X-CPA-VERSION") or "").strip()
     except Exception:                                   # noqa: BLE001
         commit = ""
-    _CPA_COMMIT_CACHE.update(at=now, commit=commit)
+    _CPA_COMMIT_CACHE.update(at=now, commit=commit, version=version, key=cache_key)
     return commit
 
 
@@ -1043,7 +1574,7 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
         lines: list[str] = []
         dup = 0
         for _sec, base_url, api_key, _orig in existing_entries:
-            ck = (cp.host_of(base_url), api_key)
+            ck = (base_url.rstrip("/"), api_key)
             if ck in seen_cred:
                 dup += 1
                 continue
@@ -1052,7 +1583,7 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
 
         # 新站：原始文本，同样参与去重（用户可能粘贴了已在配置里的站）
         for row in job.rows:
-            ck = (cp.host_of(row.bare), row.api_key)
+            ck = (row.bare.rstrip("/"), row.api_key)
             if ck in seen_cred:
                 dup += 1
                 continue
@@ -1078,6 +1609,7 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
 
         # 创建 Prober
         prober = Prober(
+            cfg_snapshot=cfg,
             proxy=_resolve_proxy(str(job.opts.get("proxy") or "")),
             gap=_clamp(job.opts, "gap", 3.0),
             timeout=_clamp(job.opts, "timeout", 120),
@@ -1167,6 +1699,17 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
             f"{_st['failure']} 个全灭")})
 
         job.state = "done"
+    except concurrent.futures.CancelledError:
+        # 用户按了停止 —— 这不是错误（2026-09-12）
+        # ------------------------------------------
+        # BatchProber 现在把取消原样往上抛（原来它落进逐站的
+        # `except Exception`，于是 175 个站各记一条 failure，任务还报 done）。
+        # 这里也必须与真正的失败分开：记成 error 会给用户一个查不出所以然的
+        # 错误号（_error_ref 只回引用，细节在 stderr），而他自己按的停止
+        # 根本不该去查日志。
+        job.state = "cancelled"
+        job.emit("info", {"msg": "已按请求停止 —— 未完成的站没有结论，"
+                                 "已完成的结果保留"})
     except Exception:
         job.state = "error"
         job.error = _error_ref(f"job {job.id}")
@@ -1242,14 +1785,17 @@ class Handler(BaseHTTPRequestHandler):
     # 绑到 0.0.0.0 直接暴露时对端是真实客户端，那时**不能**信这两个头 ——
     # 否则任何人都能伪造来源 IP 绕过封锁。
     _LOOPBACK = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"})
+    trusted_proxy_peers: tuple[str, ...] = ()
 
     # ---- 基础设施 ----
 
     def log_message(self, fmt: str, *args) -> None:
         # 不记 query string —— token 可能在里面
-        path = self.path.split("?")[0]
-        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {self.command} {path} "
-                         f"{fmt % args if args else ''}\n")
+        # requestline and formatter arguments can both contain credentials.
+        path = urllib.parse.urlsplit(self.path).path
+        status = str(args[1]) if len(args) > 1 and re.fullmatch(r"\d{3}", str(args[1])) else ""
+        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] "
+                         f"{self.command} {_safe_text(path)} {status}\n")
 
     @classmethod
     def _cpa_mgmt_hash(cls) -> str:
@@ -1358,15 +1904,36 @@ class Handler(BaseHTTPRequestHandler):
         那时任何人都能自带 XFF 伪造来源。
         """
         peer = (self.client_address or ("?",))[0]
-        if peer not in self._LOOPBACK:
-            return peer                       # 直连：对端就是真实来源
+        def trusted(address):
+            if address in self._LOOPBACK:
+                return True
+            try:
+                ip = ipaddress.ip_address(address)
+                return any(ip in ipaddress.ip_network(net, strict=False)
+                           for net in type(self).trusted_proxy_peers)
+            except ValueError:
+                return False
+
+        if not trusted(peer):
+            return peer
         xff = self.headers.get("X-Forwarded-For", "")
         if xff:
-            hops = [h.strip() for h in xff.split(",") if h.strip()]
-            if hops:
-                return hops[-1]               # nginx 追加的那一跳
+            hops = [h.strip() for h in xff.split(",")]
+            try:
+                hops = [str(ipaddress.ip_address(h)) for h in hops]
+            except ValueError:
+                return peer
+            current = peer
+            for hop in reversed(hops):
+                if not trusted(current):
+                    break
+                current = hop
+            return current
         real = (self.headers.get("X-Real-IP") or "").strip()
-        return real or peer
+        try:
+            return str(ipaddress.ip_address(real)) if real else peer
+        except ValueError:
+            return peer
 
     @classmethod
     def _locked_out(cls, ip: str) -> float:
@@ -1484,13 +2051,22 @@ class Handler(BaseHTTPRequestHandler):
             ok = self._check_cpa_password(got)
 
         if ok:
+            self._validated_credential = got
+            self._validated_management = not _same_secret(got, own)
             self._note_success(ip)
         else:
             self._note_failure(ip)
         return ok
 
     def _json(self, code: int, payload: dict) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if code >= 400 and "error_code" not in payload:
+            payload = {**payload, "error_code": {
+                400: "invalid_request", 401: "unauthorized", 404: "not_found",
+                409: "conflict", 428: "revision_required", 429: "capacity_exhausted",
+                503: "unavailable"}.get(code, "internal_error")}
+        context = {"request": getattr(self, "_output_context", {}),
+                   "credential": getattr(self, "_validated_credential", "")}
+        body = json.dumps(_public_with_context(payload, context), ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -1507,9 +2083,12 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("请求体过大（上限 8MB）")
         raw = self.rfile.read(n)
         try:
-            return json.loads(raw.decode("utf-8"))
+            body = json.loads(raw.decode("utf-8"))
         except Exception as e:
-            raise ValueError(f"JSON 解析失败：{e}") from e
+            raise ValueError("JSON 解析失败") from e
+        _validate_body(body)
+        self._output_context = body
+        return body
 
     def _static(self, rel: str) -> None:
         # 防目录穿越。
@@ -1562,6 +2141,8 @@ class Handler(BaseHTTPRequestHandler):
         """
         try:
             self._do_get()
+        except ValueError as e:
+            self._json(400, {"error": str(e), "error_code": "invalid_request"})
         except Exception:
             ref = _error_ref(f"GET {self.path.split('?')[0]}")
             self._json(500, {"error": f"服务内部错误（{ref}）",
@@ -1587,6 +2168,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "/api/context":
             self._api_context()
+        elif route == "/api/tuning":
+            # 全局调优体检（只读）：重试预算与顶层池的耦合结论
+            self._api_tuning()
+        elif route == "/api/routes":
+            # 既有上游路由清单（只读），批量管理面板的数据源
+            self._api_routes()
         elif route.startswith("/api/apply-status/"):
             self._api_apply_status(route[len("/api/apply-status/"):])
         elif route.startswith("/api/export/"):
@@ -1629,8 +2216,22 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_plan(body)
             elif route == "/api/apply":
                 self._api_apply(body)
+            elif route == "/api/tuning-apply":
+                # 全局调优：落盘 + 推送，必须 confirm
+                self._api_tuning_apply(body)
+            elif route == "/api/bulk-preview":
+                # 批量管理：只算 diff，不落盘
+                self._api_bulk_preview(body)
+            elif route == "/api/bulk-apply":
+                # 批量管理：落盘 + 推送，必须 confirm
+                self._api_bulk_apply(body)
             else:
                 self._json(404, {"error": f"未知路由 {route}"})
+        except CapacityError as e:
+            self._json(429, {"error": str(e), "error_code": "capacity_exhausted",
+                             "retryable": True})
+        except ValueError as e:
+            self._json(400, {"error": str(e), "error_code": "invalid_request"})
         except Exception:
             # 完整 traceback 只进 stderr；响应只带引用 id。
             # 见 _error_ref —— 那段栈会泄露容器内文件布局与行号。
@@ -1694,12 +2295,15 @@ class Handler(BaseHTTPRequestHandler):
 
         # 先看元数据能不能快速否掉缓存 —— 变了就一定要重读，
         # 没变也仍要读一次内容确认（成本是一次 read，比 yaml 解析便宜两个数量级）。
-        raw = io.open(path, encoding="utf-8").read()
+        with io.open(path, encoding="utf-8") as stream:
+            raw = stream.read()
         sig = hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
         with Handler._cfg_cache_lock:
             c = Handler._cfg_cache
             if c is not None and c["sig"] == sig:
+                self._output_context = {"request": getattr(self, "_output_context", {}),
+                                        "config": c["cfg"]}
                 return c["raw"], c["cfg"]
 
         cfg = yaml.safe_load(raw)
@@ -1711,7 +2315,148 @@ class Handler(BaseHTTPRequestHandler):
 
         with Handler._cfg_cache_lock:
             Handler._cfg_cache = {"sig": sig, "raw": raw, "cfg": cfg}
+        self._output_context = {"request": getattr(self, "_output_context", {}),
+                                "config": cfg}
         return raw, cfg
+
+    def _api_routes(self) -> None:
+        """既有上游路由清单，按 (段, 网址) 分组 —— 批量管理面板的数据源。
+
+        为什么本项目要自己做这件事（2026-09-11）
+        ----------------------------------------
+        CPAMP 的「AI 提供商」页只有逐行操作：表格无多选列，`ProviderTable`
+        的 props 全是单行回调；后端 `router.go` 的 provider 段只有
+        `GET/PUT/DELETE` 三个动词，**没有任何 bulk 路径**。它自己的
+        「按结果应用」是 `for` 循环逐条 read-modify-write，每条都要
+        `GET /config` + `PUT` 整个 158 条数组。
+        158 条规模下批量启停一次就是 158 轮往返，且两个标签页同时操作会
+        静默互相覆盖（它的串行队列只在同一 JS 进程内有效）。
+
+        本项目走的是另一条路：`writeback.push_to_cpa` →
+        `PUT /v0/management/config.yaml`，整份文本、行级改、**保注释与未知
+        字段**。一次往返完成全部改动，且天然规避 CPAMP 那条
+        「DELETE 只按 api-key + base-url 匹配、重复条目删哪条不确定」的坑。
+
+        这个接口只读，不改任何东西 —— 真正的写入仍走既有的
+        plan → diff → 确认 → apply 链路，一道闸都不少。
+
+        返回结构：
+            {"groups": [{
+                "section": "codex-api-key",
+                "host": "api.example.com",
+                "base_urls": ["https://api.example.com/v1"],
+                "priorities": [349],            # 该组出现过的档位，降序
+                "split": false,                 # 同组是否档位分裂（阻断级）
+                "entries": [{
+                    "index": 3,                 # 在该段数组里的下标，删改的定位键
+                    "base_url": "...",
+                    "api_key_masked": "sk-xxx***ab",
+                    "priority": 349, "weight": null, "prefix": "",
+                    "models": 6, "enabled": true,
+                    "proxy_url": "", "has_headers": true,
+                    "websockets": null,
+                }, ...]}, ...],
+             "totals": {...}}
+        """
+        _raw, cfg = self._load_cfg()
+        rule, disabled_field, _ = cp.bulk.disable_semantics()
+
+        def _enabled(entry: dict, section: str) -> bool:
+            """条目当前是启用还是停用。
+
+            CPAMP 的两套语义（`components/providers/utils.ts:17`
+            与 `AiProvidersPage.tsx:450`）必须分开认，否则批量启停会写错字段：
+              · key 类段：靠 `excluded-models` 里塞通配符 `"*"` 表示停用
+              · openai-compatibility：用真正的布尔字段 `disabled`
+            """
+            if section == "openai-compatibility":
+                return not bool(entry.get(disabled_field))
+            ex = entry.get("excluded-models") or []
+            if isinstance(ex, str):
+                ex = [ex]
+            return rule not in [str(x).strip() for x in ex]
+
+        groups: dict[tuple[str, str], dict] = {}
+        for section in cp.SECTIONS:
+            arr = cfg.get(section) or []
+            if not isinstance(arr, list):
+                continue
+            for idx, e in enumerate(arr):
+                if not isinstance(e, dict):
+                    continue
+                base_url = str(e.get("base-url") or "")
+                if not base_url:
+                    continue
+                host = cp.host_of(base_url)
+                if not host:
+                    continue
+                # compat 段是 provider 级条目，一个 provider 下挂多把 Key；
+                # 前三段一条目一把 Key。两者都以「该段数组下标」为定位键。
+                if section == "openai-compatibility":
+                    keys = [str(k.get("api-key") or "")
+                            for k in (e.get("api-key-entries") or [])
+                            if isinstance(k, dict)]
+                else:
+                    keys = [str(e.get("api-key") or "")]
+                pri = e.get("priority", 0)
+                pri = int(pri) if isinstance(pri, int) else None
+                g = groups.setdefault((section, host), {
+                    "section": section, "host": host,
+                    "base_urls": [], "entries": [],
+                })
+                if base_url not in g["base_urls"]:
+                    g["base_urls"].append(base_url)
+                g["entries"].append({
+                    "index": idx,
+                    "fingerprint": cp.bulk.entry_fingerprint(e),
+                    "base_url": base_url,
+                    "api_key_masked": "、".join(
+                        cp.mask_key(k) for k in keys if k) or "(无)",
+                    "key_count": len([k for k in keys if k]),
+                    "priority": pri,
+                    "key_priorities": [key.get("priority", pri) for key in
+                                       (e.get("api-key-entries") or [])
+                                       if isinstance(key, dict)],
+                    "weight": e.get("weight"),
+                    "prefix": str(e.get("prefix") or ""),
+                    "models": len(e.get("models") or []),
+                    "enabled": _enabled(e, section),
+                    "proxy_url": str(e.get("proxy-url") or ""),
+                    "has_headers": bool(e.get("headers")),
+                    "websockets": e.get("websockets"),
+                })
+
+        site_priorities = {}
+        for g in groups.values():
+            for entry in g["entries"]:
+                values = [entry["priority"]] + entry["key_priorities"]
+                site_priorities.setdefault(g["host"], set()).update(
+                    value for value in values if type(value) is int)
+        out = []
+        for g in groups.values():
+            pris = sorted({x["priority"] for x in g["entries"]
+                           if x["priority"] is not None}, reverse=True)
+            g["priorities"] = pris
+            # 同一段同一网址出现多个档位 = 违反「同网址同优先级」，阻断级。
+            # 实测两份生产配置：本项目注入前 0 组、注入后 3 组。
+            g["split"] = len(pris) > 1
+            g["site_priorities"] = sorted(site_priorities[g["host"]], reverse=True)
+            g["site_split"] = len(g["site_priorities"]) > 1
+            g["entries"].sort(key=lambda x: x["index"])
+            out.append(g)
+        out.sort(key=lambda g: (g["section"], g["host"]))
+
+        self._json(200, {
+            "revision": cp.bulk.config_revision(_raw),
+            "groups": out,
+            "totals": {
+                "groups": len(out),
+                "entries": sum(len(g["entries"]) for g in out),
+                "split_groups": sum(1 for g in out if g["split"]),
+                "disabled_entries": sum(
+                    1 for g in out for x in g["entries"] if not x["enabled"]),
+            },
+        })
 
     def _api_context(self) -> None:
         """当前 config.yaml 的档位谱与规模 —— 前端据此显示插档基准。"""
@@ -1766,6 +2511,7 @@ class Handler(BaseHTTPRequestHandler):
         drift = _drift_snapshot(
             source_root=type(self).cpa_source_root, cfg=cfg,
             runtime_commit_url=type(self).cpa_url,
+            runtime_mgmt=self._cpa_password_for({}),
             allow_remote=type(self).cpa_source_remote,
             remote_ref=type(self).cpa_source_ref,
             proxy=type(self).drift_proxy or None)
@@ -1856,8 +2602,22 @@ class Handler(BaseHTTPRequestHandler):
             cfg_snapshot=cfg,
         )
 
+        # 四段并行跑（2026-09-11 提速）
+        # ---------------------------
+        # 原来是 `for section in secs:` 串行 —— 虽然给 Prober 传了
+        # `workers=len(secs)`，但那个参数管的是 `probe()` 内部的并行度，
+        # 这个自己写的梯子循环根本没用上它。四段各打一遍画像梯，
+        # 最坏 4 × 8 档 = 32 次串行请求，单次 60 秒超时 ——
+        # 一个慢站能让「单站诊断」跑到几分钟。
+        #
+        # 并行是安全的：四段各写各的 `out[section]`，段之间零共享状态；
+        # 节流桶按 `(host, section)` 分，四段并发不会加重同一个桶的频率。
+        # 段**内部**的梯子仍然串行 —— 那是「最省可用档」的语义要求
+        # （找到第一个通的就停），不能并行。
         out: dict[str, dict] = {}
-        for section in secs:
+        out_lock = threading.Lock()
+
+        def _diag_one(section: str) -> None:
             base = cp.base_for_section(row.bare, section)
             model = SEED_MODELS[section][0]
             rungs: list[dict] = []
@@ -1884,7 +2644,7 @@ class Handler(BaseHTTPRequestHandler):
                     hit = rungs[-1]
                     break
 
-            out[section] = {
+            got = {
                 "base_url": base,
                 "model": model,
                 "rungs": rungs,
@@ -1895,6 +2655,17 @@ class Handler(BaseHTTPRequestHandler):
                 "needs_body": bool(hit and hit["body_patch"]),
                 "calls": len(rungs),
             }
+            with out_lock:
+                out[section] = got
+
+        # 线程数取段数：再多也没有第五个段可跑。
+        # 异常必须收上来 —— 后台线程里抛异常没人看得到，会让某个段静默缺席。
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, len(secs)),
+                thread_name_prefix="diag") as ex:
+            for fut in concurrent.futures.as_completed(
+                    [ex.submit(_diag_one, s) for s in secs]):
+                fut.result()
 
         # ── 完整参数：走与全量检测**同一条链路** ──────────────────────
         #
@@ -1954,6 +2725,7 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _api_probe(self, body: dict) -> None:
+        _validate_body(body)
         full_redetect = body.get("full_redetect", False)
         max_workers = body.get("max_workers")
 
@@ -1978,12 +2750,24 @@ class Handler(BaseHTTPRequestHandler):
 
         jid = secrets.token_hex(8)
         job = Job(jid, res.valid, opts)
-        STORE.add_job(job)
+        try:
+            STORE.add_job(job)
+        except CapacityError as e:
+            self._json(429, {"error": str(e), "error_code": "capacity_exhausted",
+                             "retryable": True})
+            return
 
         # 选择执行函数
         target_fn = run_job_full_redetect if full_redetect else run_job
-        threading.Thread(target=target_fn, args=(job, type(self).cfg_path),
-                         daemon=True).start()
+        try:
+            threading.Thread(target=target_fn, args=(job, type(self).cfg_path),
+                             daemon=True).start()
+        except Exception:
+            job.state = "error"
+            job.error = "探测工作线程无法启动"
+            job.finished = time.time()
+            self._json(503, {"error": job.error, "job_id": jid, "state": job.state})
+            return
 
         self._json(202, {"job_id": jid, "rows": len(res.valid),
                          "invalid": [row_json(r) for r in res.invalid],
@@ -1995,6 +2779,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": f"没有这个任务：{jid}"})
             return
         snap = job.snapshot(since)
+        self._output_context = {
+            "api-keys": [row.api_key for row in job.rows]
+                        + [r.row.api_key for r in job.results],
+            "opts": job.opts,
+            "entries": [{"headers": verdict.min_headers} for r in job.results
+                        for verdict in r.sections.values()]}
         if job.state in ("done", "error"):
             snap["results"] = [
                 {"row": row_json(r.row),
@@ -2034,7 +2824,7 @@ class Handler(BaseHTTPRequestHandler):
         w("注：api-key 一律只出末四位。上游 URL 与模型名原样保留。")
         w("")
 
-        opts = job.opts or {}
+        opts = _public(job.opts or {})
         if opts:
             w("── 探测参数 " + "─" * 52)
             for k in sorted(opts):
@@ -2060,7 +2850,8 @@ class Handler(BaseHTTPRequestHandler):
                     w(f"    请求指纹        {v.profile_name}")
                 if v.min_headers:
                     w("    最小门票头      "
-                      + ", ".join(f"{k}: {x}" for k, x in v.min_headers.items()))
+                      + ", ".join(f"{k}: {x}" for k, x in
+                                  _public(v.min_headers, "headers").items()))
                 if v.min_body_kind:
                     w(f"    需 body 补丁    {v.min_body_kind}")
                 w(f"    需代理          {'是' if v.need_proxy else '否'}")
@@ -2101,7 +2892,12 @@ class Handler(BaseHTTPRequestHandler):
               + " ".join(f"{k}={v}" for k, v in e.items()
                          if k not in ("t", "kind")))
 
-        raw = ("\n".join(L) + "\n").encode("utf-8")
+        context = {"api-keys": [row.api_key for row in job.rows]
+                              + [r.row.api_key for r in job.results],
+                   "opts": job.opts,
+                   "entries": [{"headers": verdict.min_headers} for r in job.results
+                               for verdict in r.sections.values()]}
+        raw = (_public_with_context("\n".join(L), context) + "\n").encode("utf-8")
         name = time.strftime("cpa-probe-%Y%m%d-%H%M%S.txt", time.localtime())
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -2113,6 +2909,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _api_plan(self, body: dict) -> None:
         """把探测结果变成写入方案 + diff 预览。不落盘。"""
+        _validate_body(body)
         job = STORE.get_job(body.get("job_id") or "")
         if not job:
             self._json(404, {"error": "任务不存在"})
@@ -2123,7 +2920,7 @@ class Handler(BaseHTTPRequestHandler):
 
         raw, cfg = self._load_cfg()
         # 三个按候选索引的入参。键是**行号字符串**而不是 host ——
-        # 一个站常有 15 把 Key（实测 gorouter 15、tabitoken 14），用 host
+        # 一个站常有 15 把 Key（实测 gorou 15、tango 14），用 host
         # 做键会让同站多 Key 互相覆盖：勾选 Set 去重成一个、DOM 定位只命中
         # 第一行、priority 覆盖落到错误的条目上。2026-09-02 现场表现为
         # 「全勾选只勾中 26 项」。
@@ -2201,11 +2998,11 @@ class Handler(BaseHTTPRequestHandler):
                 ov_host = _by_row(overrides, p)
                 for sec, sp in list(p.sections.items()):
                     ov = ov_host.get(sec) or {}
+                    _apply_identity_override(sp, ov)
                     if "proxy_url" in ov:
-                        sp.proxy_url = str(ov["proxy_url"] or "")
+                        sp.proxy_url = _restore_public_scalar(ov["proxy_url"], sp.proxy_url, "proxy_url")
                     if "headers" in ov and isinstance(ov["headers"], dict):
-                        sp.headers = {str(k): str(v)
-                                      for k, v in ov["headers"].items()}
+                        sp.headers = _restore_public_headers(ov["headers"], sp.headers)
                     if "models" in ov and isinstance(ov["models"], list):
                         sp.models = _clean_override_models(sec, ov["models"])
                         # 显式给了清单 = 操作员的手填意图，与 forced 同权。
@@ -2304,22 +3101,31 @@ class Handler(BaseHTTPRequestHandler):
             # 同层是无中生有的警告。
             prio_warns = list(prio_warns) + cp.priority_collisions(
                 list(write_plans.values()))
+            # 同一网址的条目拿到不同 priority 是**阻断级**错误（与上面那条
+            # 「不同站同值」方向相反）。用户的硬要求是同网址同优先级，而
+            # `assign_priorities` 之后的用户覆盖按每把 Key 应用，改一把就分层。
+            # 实测两份生产配置：注入前 0 组分裂，注入后 3 组 —— 是本项目写进去的。
+            prio_warns = prio_warns + cp.priority_split_within_host(
+                list(write_plans.values()))
             warnings = list(prio_warns) + list(warnings)
 
             # 生成完整 diff（整个文件）
             diffs = []
-            ok, msg = validate(preview)
+            ok, msg = _validate_final(preview, list(write_plans.values()))
 
             pid = secrets.token_hex(8)
             # 存 write_plans 而不是 all_plans：写后验证按 entry["plans"] 挑目标，
             # 存全量会去验根本没写进去的段（与增量路径同一条规则）。
             STORE.add_plan(pid, {"plans": list(write_plans.values()), "diffs": diffs,
                                  "preview": preview, "base_raw": raw,
+                                 "valid": ok, "validate_msg": msg,
                                  "created": time.time(),
                                  "full_redetect": True})
 
             self._json(200, {
                 "plan_id": pid,
+                "preview_kind": "full_snapshot",
+                **_preview_diff(raw, preview),
                 "plans": [plan_json(p) for p in all_plans.values()],
                 "diffs": [{
                     "section": "全量重建",
@@ -2370,6 +3176,7 @@ class Handler(BaseHTTPRequestHandler):
             ov_host = _by_row(overrides, p)
             for sec, sp in list(p.sections.items()):
                 ov = ov_host.get(sec) or {}
+                _apply_identity_override(sp, ov)
                 if "models" in ov and isinstance(ov["models"], list):
                     # 过段规则（全量重探那条路早就过了，这条原来直接
                     # `str(m)` 塞进去，绕开全部规则），并把来源记成 manual。
@@ -2409,9 +3216,9 @@ class Handler(BaseHTTPRequestHandler):
                         sp.warnings.append(
                             f"会抢走 {len(sp.hijacked)} 个模型的顶层（{names}）—— 你已手工确认")
                 if "proxy_url" in ov:
-                    sp.proxy_url = str(ov["proxy_url"] or "")
+                    sp.proxy_url = _restore_public_scalar(ov["proxy_url"], sp.proxy_url, "proxy_url")
                 if "headers" in ov and isinstance(ov["headers"], dict):
-                    sp.headers = {str(k): str(v) for k, v in ov["headers"].items()}
+                    sp.headers = _restore_public_headers(ov["headers"], sp.headers)
                 if "max_context_length" in ov:
                     v = ov["max_context_length"]
                     sp.max_context_length = int(v) if v else None
@@ -2450,21 +3257,25 @@ class Handler(BaseHTTPRequestHandler):
 
         diffs = build_diffs(raw, for_write)
         preview = apply_diffs(raw, diffs)
-        ok, msg = validate(preview)
+        ok, msg = _validate_final(preview, for_write)
 
         pid = secrets.token_hex(8)
         # 存 for_write 而不是 plans：apply 后的写后验证按 entry["plans"]
         # 挑目标，存全量就会去验根本没写进去的段（判死段现在也 writable）。
         STORE.add_plan(pid, {"plans": for_write, "diffs": diffs,
                              "preview": preview, "base_raw": raw,
+                             "valid": ok, "validate_msg": msg,
                              "created": time.time()})
 
         self._json(200, {
             "plan_id": pid,
+            "preview_kind": "incremental",
+            **_preview_diff(raw, preview),
             "plans": [plan_json(p) for p in plans],
             "diffs": [{"section": d.section, "host": d.host,
-                       "insert_at": d.insert_at, "lines": d.lines,
-                       "text": d.render()} for d in diffs],
+                       "insert_at": d.insert_at,
+                       "lines": _safe_text(redact_yaml_secrets("\n".join(d.lines))).splitlines(),
+                       "text": _safe_text(redact_yaml_secrets("\n".join(d.lines)))} for d in diffs],
             "valid": ok,
             "validate_msg": msg,
             "lines_before": raw.count("\n") + 1,
@@ -2473,7 +3284,10 @@ class Handler(BaseHTTPRequestHandler):
             # 造成的同层。全都会影响站与站的先后，必须让人看到。
             # 只查真正写进去的那些段（for_write）—— 未勾选的段不落盘，
             # 报它们同值只是噪声。
-            "warnings": list(prio_warns) + cp.priority_collisions(for_write)
+            "warnings": (list(prio_warns)
+                         + cp.priority_collisions(for_write)
+                         # 同网址不同 priority 是阻断级错误，不是「可能是预期结果」
+                         + cp.priority_split_within_host(for_write))
             + ([f"{blocked_new} 个 (凭据, 段) 组合的模型清单只是工具猜测，"
                 f"而这个凭据原本没配那一段 —— 界面已标成「不写入」并说明原因。"
                 f"确知可用的话手填模型清单即可放行"] if blocked_new else []),
@@ -2490,97 +3304,246 @@ class Handler(BaseHTTPRequestHandler):
         mgmt = (push.get("mgmt_key") or "").strip()
         if mgmt:
             return mgmt
+        if getattr(self, "_validated_management", False):
+            return self._validated_credential
         cred = (body.get("_cred") or "").strip()
         if cred and not _same_secret(cred, type(self).token)                 and self._check_cpa_password(cred):
             return cred
         return ""
 
     def _api_apply_status(self, tid: str) -> None:
-        """写回收尾的进度。前端轮询它，直到 state 不再是 running。
-
-        落盘已经完成了 —— 这个端点只报「重载与验证进行到哪」。
-        """
+        """查询整个后台事务；仅 local_written=true 才表示已经写盘。"""
         task = STORE.get_apply(tid)
         if not task:
             self._json(404, {"error": f"没有这个写回任务：{tid}"})
             return
         self._json(200, task.snapshot())
 
+    def _api_tuning(self) -> None:
+        """全局调优体检：算出「重试预算 vs 顶层池」的耦合结论，只读不改。
+
+        为什么放在服务端而不是让前端算（与 /api/routes 同一条原则）：
+        判据要读 CPA 源码行号、顶层池实况与探测实测耗时，那些数据只有
+        服务端有。前端只负责显示结论与「要不要应用」。
+
+        返回的 advices 里每条都带 `why` —— 那句话就是给操作员复核用的，
+        不许只给一个数字让人凭信任点确认。
+        """
+        raw, cfg = self._load_cfg()
+        # 实测单次失败耗时：优先用最近一次探测的样本，拿不到就用估值。
+        # 两种情况都要在 attempt_why 里说清，别让估值看起来像实测。
+        attempt_sec, attempt_why = cp.tuning.FALLBACK_ATTEMPT_SEC, ""
+        with STORE.lock:
+            jobs = list(STORE.jobs.values())
+        for job in reversed(jobs):
+            results = {(r.row.bare, r.row.api_key): r
+                       for r in (job.results or []) if getattr(r, "row", None)}
+            if results:
+                attempt_sec, attempt_why = cp.tuning.attempt_seconds_from_results(
+                    results)
+                break
+        if not attempt_why:
+            attempt_sec, attempt_why = cp.tuning.attempt_seconds_from_results({})
+
+        advices, notes, facts = cp.tuning.advise(
+            cfg, attempt_sec=attempt_sec, attempt_why=attempt_why)
+        pending = [a for a in advices if a.changed]
+        tuning_id = ""
+        diff = ""
+        problems: list[str] = []
+        if pending:
+            diffs, problems = cp.writeback.global_tuning_diffs(raw, pending)
+            if diffs:
+                new_text = "\n".join(diffs[0].lines)
+                diff = "\n".join(difflib.unified_diff(
+                    _safe_text(redact_yaml_secrets(raw)).splitlines(),
+                    _safe_text(redact_yaml_secrets(new_text)).splitlines(),
+                    fromfile="config.yaml（当前）", tofile="config.yaml（调优后）",
+                    lineterm="", n=2))
+                tuning_id = STORE.put_bulk(
+                    raw, new_text,
+                    [f"{a.label}: {a.current} → {a.want}" for a in pending])
+        self._json(200, {
+            "tuning_id": tuning_id,
+            "attempt_sec": round(attempt_sec, 2),
+            "attempt_why": attempt_why,
+            "edge_window_sec": cp.tuning.DEFAULT_EDGE_WINDOW_SEC,
+            "advices": [{"item": a.label, "current": a.current, "want": a.want,
+                         "why": a.why, "severity": a.severity,
+                         "changed": a.changed} for a in advices],
+            "notes": notes,
+            "problems": problems,
+            "tiers": [{"section": f.section, "top_priority": f.top_priority,
+                       "credentials": f.credentials, "hosts": f.hosts,
+                       "longest_same_host_run": f.longest_same_host_run,
+                       "run_host": f.run_host} for f in facts.values()],
+            "diff": diff[:200000],
+            "diff_truncated": len(diff) > 200000,
+        })
+
+    def _api_tuning_apply(self, body: dict) -> None:
+        """全局调优落盘 + 推送。必须带 tuning_id + confirm=true。
+
+        复用 `_submit_apply` —— 基线比对、备份、落盘、PUT 重载、读回校验
+        与投喂流程完全同一条链路。不新增写盘路径。
+        """
+        tid = body.get("tuning_id") or ""
+        entry = STORE.get_bulk(tid)
+        if not entry:
+            self._json(404, {"error": "调优方案不存在或已过期，请重新体检"})
+            return
+        if body.get("confirm") is not True:
+            self._json(400, {"error": "未确认。调优写回需要 confirm=true"})
+            return
+        self._submit_apply(entry, body)
+
+    def _api_bulk_preview(self, body: dict) -> None:
+        """批量操作的**预览**：只算新文本与 diff，不落盘、不推送。
+
+        与投喂流程的 plan → apply 是同一道门槛：先看 diff、再显式确认。
+        差别只在于批量操作改的是**既有条目的字段**，不新增条目，所以不需要
+        定档、去重、影响面那一整套 —— 它们是给「插入新条目」用的。
+
+        返回 diff 与一个 `bulk_id`，确认后拿它调 /api/bulk-apply。
+        新文本存在服务端，不让前端回传 —— 回传等于让客户端决定写什么。
+        """
+        _validate_body(body)
+        ops = body.get("ops") or []
+        if not isinstance(ops, list) or not ops:
+            self._json(400, {"error": "ops 为空"})
+            return
+        if len(ops) > 2000:
+            self._json(400, {"error": f"一次最多 2000 条操作，收到 {len(ops)}"})
+            return
+        raw, _cfg = self._load_cfg()
+        revision = body.get("revision")
+        if not revision:
+            self._json(428, {"error": "请刷新路由并提交 revision",
+                             "error_code": "revision_required"})
+            return
+        if revision != cp.bulk.config_revision(raw):
+            self._json(409, {"error": "选择基于旧配置，请刷新路由并重新选择",
+                             "error_code": "stale_selection"})
+            return
+        checked_ops = []
+        for op in ops:
+            if (not isinstance(op, dict) or type(op.get("index")) is not int
+                    or not isinstance(op.get("section"), str)
+                    or op.get("section") not in cp.SECTIONS):
+                self._json(400, {"error": "ops 每项必须有整数 index",
+                                 "error_code": "invalid_operation"})
+                return
+            arr = _cfg.get(op.get("section")) or []
+            idx = op["index"]
+            if idx < 0 or idx >= len(arr) or not isinstance(arr[idx], dict):
+                self._json(409, {"error": "条目已变化，请重新选择",
+                                 "error_code": "stale_selection"})
+                return
+            if op.get("fingerprint") and op["fingerprint"] != cp.bulk.entry_fingerprint(arr[idx]):
+                self._json(409, {"error": "条目指纹不符，请重新选择",
+                                 "error_code": "stale_selection"})
+                return
+            # The revision binds the original indices. Public URLs are masked.
+            checked = dict(op)
+            if checked.get("action") == "delete":
+                checked["expect"] = str(arr[idx].get("base-url") or "")
+            checked_ops.append(checked)
+        stamp = time.strftime("%Y-%m-%d %H:%M")
+        try:
+            new_text, notes, problems = cp.bulk.apply_bulk(
+                raw, checked_ops, stamp=stamp)
+        except cp.bulk.BulkError as e:
+            self._json(400, {"error": str(e)})
+            return
+        if problems:
+            self._json(400, {"error": "批量操作未通过校验", "problems": problems,
+                             "error_code": "invalid_operation", "bulk_id": ""})
+            return
+        ok, msg = _validate_final(new_text)
+        if not ok:
+            self._json(400, {"error": msg, "error_code": "priority_invariant",
+                             "bulk_id": ""})
+            return
+        if not notes:
+            self._json(200, {"changed": 0, "notes": [], "problems": problems,
+                             "diff": "", "bulk_id": ""})
+            return
+
+        import difflib
+        diff = "\n".join(difflib.unified_diff(
+            _safe_text(redact_yaml_secrets(raw)).splitlines(),
+            _safe_text(redact_yaml_secrets(new_text)).splitlines(),
+            fromfile="config.yaml（当前）", tofile="config.yaml（批量后）",
+            lineterm="", n=2))
+        bid = STORE.put_bulk(raw, new_text, notes)
+        self._json(200, {
+            "bulk_id": bid, "changed": len(notes), "notes": notes,
+            "problems": problems,
+            # diff 可能很长（158 条全改时）。截断并说明，不把整份塞给浏览器。
+            "diff": diff[:200000],
+            "diff_truncated": len(diff) > 200000,
+            "semantics": cp.bulk.disable_semantics()[2],
+        })
+
+    def _api_bulk_apply(self, body: dict) -> None:
+        """批量操作落盘 + 推送。必须带 bulk_id + confirm=true。
+
+        走的是与 `_api_apply` **完全相同**的收尾链路：
+        基线比对（防并发覆盖）→ YAML 校验 → 本地备份 + 落盘 →
+        后台 PUT 重载 → 读回校验。一道闸都不少。
+        """
+        bid = body.get("bulk_id") or ""
+        entry = STORE.get_bulk(bid)
+        if not entry:
+            self._json(404, {"error": "批量方案不存在或已过期，请重新预览"})
+            return
+        if body.get("confirm") is not True:
+            self._json(400, {"error": "未确认。批量写回需要 confirm=true"})
+            return
+
+        self._submit_apply(entry, body)
+
     def _api_apply(self, body: dict) -> None:
-        """真正落盘。必须带 plan_id + confirm=true。
+        """原子认领方案并立即返回 task_id；confirm 必须严格等于 true。
 
-        两段式（2026-09-02 改，为解 Cloudflare 524）
-        ------------------------------------------
-        落盘本身很快（一次 O_TRUNC 写），慢的是后面两步：
-          · PUT 触发 CPA 重载        1-3 秒
-          · 端到端验证 N 个段        单个最长 45 秒，并行但受上限 24 约束
-
-        原来这三步在**同一个 HTTP 请求里同步做完**，于是 79 凭据那种规模会
-        跑到 100 秒以上 —— Cloudflare 在 100 秒切断连接，返回 524，前端拿到
-        的是 CF 的 HTML 拦截页而不是 JSON（现场截图里一堆 <!DOCTYPE html>）。
-        任务其实已经写盘成功，但用户看到的是「写回失败」。
-
-        并发度不是瓶颈：验证早就是并行的。瓶颈在「客户端必须一直等着」。
-        所以改成：落盘同步做完（它是关键路径，必须给确定回执），重载与验证
-        丢到后台线程，立刻返回 task_id，前端轮询 /api/apply-status/{id}。
-
-        这样每个 HTTP 请求都在 1 秒内结束，CF 的 100 秒上限再也碰不到，
-        而进度可见 —— 与步骤②的探测进度同一套显示。
+        重复确认返回同一任务。后台串行执行基线复查、写盘、PUT 和验证，
+        HTTP 请求不等待事务锁，也不会把接收入队误报为最终成功。
         """
         pid = body.get("plan_id") or ""
         entry = STORE.get_plan(pid)
         if not entry:
             self._json(404, {"error": "方案不存在或已过期，请重新生成"})
             return
-        if not body.get("confirm"):
+        if body.get("confirm") is not True:
             self._json(400, {"error": "未确认。写回需要 confirm=true"})
             return
 
-        # 并发保护：文件在生成方案后被改过就拒绝。
-        # 读→比基线→校验→写盘必须在**同一把锁内**完成，否则两个并发 apply
-        # 会各自比对到同一份未改动的基线、双双通过，然后后写的覆盖先写的
-        # （见 _apply_lock 处的说明）。锁只圈到写盘为止 —— 之后的 CPA 重载与
-        # 端到端验证要发外网请求、可能几十秒，圈进来会让第二个请求干等。
-        with Handler._apply_lock:
-            raw_now = io.open(type(self).cfg_path, encoding="utf-8").read()
-            if raw_now != entry["base_raw"]:
-                self._json(409, {"error": "config.yaml 在此期间已被修改，"
-                                          "方案基线失效。请重新生成方案"})
-                return
+        self._submit_apply(entry, body)
 
-            ok, msg = validate(entry["preview"])
-            if not ok:
-                self._json(400, {"error": f"预览内容校验不通过，拒绝写入：{msg}"})
-                return
-
-            # write_local 内部已备份，别再单独调 backup —— 否则每次写回两个 .bak
-            bak = write_local(type(self).cfg_path, entry["preview"],
-                              backup_dir=type(self).backup_dir or None)
-            # 同一个 plan_id 不能被重放写第二次：基线已经不匹配了，但把它显式
-            # 作废更直接 —— 重放会拿旧 base_raw 去比新文件，只是恰好也被 409 挡住。
-            entry["base_raw"] = entry["preview"]
-            # 显式清缓存。write_local 会改 mtime，(mtime_ns, size) 已经能自动
-            # 失效 —— 但依赖那个隐式行为不值得：若将来有人写入同样长度的内容
-            # 且文件系统 mtime 精度不够，就会读到旧基线去生成下一个方案。
-            with Handler._cfg_cache_lock:
-                Handler._cfg_cache = None
-
-        result = {"backup": bak, "written": type(self).cfg_path,
-                  "validate_msg": msg,
-                  "diffs": len(entry["diffs"])}
-
-        # 落盘已完成，是不可逆的关键路径 —— 上面那段同步做完并给出确定回执。
-        # 剩下的重载与验证丢到后台，立刻返回 task_id。见本方法 docstring。
-        task = ApplyTask(secrets.token_hex(8), result)
-        STORE.add_apply(task)
+    def _submit_apply(self, entry: dict, body: dict) -> None:
+        # Claiming is short and atomic. Slow I/O never holds an HTTP request.
+        if entry.get("valid") is False:
+            self._json(400, {"error": entry.get("validate_msg", "方案校验不通过"),
+                             "error_code": "invalid_plan"})
+            return
+        try:
+            task, created = STORE.claim_apply(entry)
+        except CapacityError as e:
+            self._json(429, {"error": str(e), "error_code": "capacity_exhausted",
+                             "retryable": True})
+            return
         cls = type(self)
-        threading.Thread(
-            target=_run_apply_tail,
-            args=(task, entry, body, cls.cfg_path, cls.cpa_url,
-                  self._cpa_password_for(body), self._cpa_client_key()),
-            name=f"apply-tail-{task.id}", daemon=True).start()
-        self._json(200, {**result, "task_id": task.id, "state": "running"})
-        return
+        if created:
+            try:
+                _start_apply_task(task, entry, body, cls.cfg_path, cls.cpa_url,
+                                  self._cpa_password_for(body), self._cpa_client_key(),
+                                  cls.backup_dir)
+            except Exception:
+                task.state = "error"
+                task.error = "后台任务无法启动，请重新预览"
+                task.result["error_code"] = "worker_start_failed"
+                task.finished = time.time()
+        self._json(202 if created else 200, task.snapshot())
 
 
 
@@ -2614,34 +3577,42 @@ def _push_target_ok(base: str, configured: str) -> str:
         这边只放私网（防把凭据发出公网）。两者不矛盾 —— 判据都是「这个地址
         该不该是这条路的目标」，只是两条路的正常目标恰好互补。
     """
-    from cpa_probe.parse import host_of, is_private_target
-
-    import re as _re
-
     b = (base or "").strip()
     if not b:
         return ""                       # 空地址由调用方另行处理（跳过重载）
-    if not _re.match(r"^https?://", b, _re.I):
-        return f"地址必须以 http:// 或 https:// 开头：{b[:60]}"
-    h = host_of(b)
-    if not h:
-        return f"取不到主机名：{b[:60]}"
-
-    # 运维在启动参数里写死的那个 —— 比请求体可信
-    ch = host_of((configured or "").strip())
-    if ch and h == ch:
-        return ""
-
-    # 回环 / 私网 / compose 服务名（无点号的单段主机名，如 cli-proxy-api:8317）
-    if is_private_target(h):
-        return ""
-    bare = h.split(":")[0]
-    if "." not in bare and ":" not in bare:
-        return ""                       # docker 网络内的服务名
-
-    return (f"拒绝把整份配置与管理密码发往 {h} —— 只允许回环、私网、"
-            f"docker 服务名，或服务端 --cpa-url 配置的那个地址"
-            f"（当前配置：{ch or '未配置'}）")
+    try:
+        url = urllib.parse.urlsplit(b)
+        configured_url = urllib.parse.urlsplit(configured or "")
+        if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password:
+            raise ValueError
+        if url.query or url.fragment:
+            raise ValueError
+        origin = (url.scheme, url.hostname, url.port or (443 if url.scheme == "https" else 80))
+        if configured_url.hostname:
+            allowed = (configured_url.scheme, configured_url.hostname,
+                       configured_url.port or (443 if configured_url.scheme == "https" else 80))
+            if origin == allowed:
+                return ""
+        try:
+            ip = ipaddress.ip_address(url.hostname)
+        except ValueError:
+            if re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_-]*", url.hostname):
+                return ""
+        else:
+            if ip.is_loopback or (ip.is_private and not ip.is_unspecified
+                                  and not ip.is_multicast and not ip.is_reserved):
+                return ""
+    except ValueError:
+        return "配置推送地址格式无效"
+    # 理由要说清**后果**，不能只说「被拒了」（2026-09-12 退回原措辞）
+    # ----------------------------------------------------------------
+    # 推送走的是 `PUT /v0/management/config.yaml` —— 发出去的是**整份配置**，
+    # 里面含 `remote-management.secret-key`（管理密码）与全部上游 Key。
+    # 发错目标就是一次全量凭据泄露，所以这句话必须让人看懂代价，
+    # 而不是只留一句「请使用明确配置的管理地址」。
+    return ("拒绝向未配置的公网目标发送配置：推送会把**整份配置**"
+            "（含管理密码与全部上游 Key）发给该地址。"
+            "请改用回环、私网、docker 服务名，或服务端 --cpa-url 明确配置过的地址")
 
 
 def _push_result(base: str, configured: str) -> dict | None:
@@ -2662,14 +3633,72 @@ def _push_result(base: str, configured: str) -> dict | None:
             "push_ok": False, "push_msg": why}
 
 
+def _start_apply_task(task, entry, body, cfg_path, cpa_url, mgmt, client_key,
+                      backup_dir=""):
+    threading.Thread(
+        target=_commit_apply,
+        args=(task, entry, copy.deepcopy(body), cfg_path, cpa_url, mgmt,
+              client_key, backup_dir),
+        name=f"apply-{task.id}", daemon=True).start()
+
+
+def _commit_apply(task, entry, body, cfg_path, cpa_url, mgmt, client_key,
+                  backup_dir=""):
+    # One transaction lock covers local write AND management PUT. HTTP merely
+    # claims work; a queued task must recheck its original snapshot under lock.
+    try:
+        with Handler._apply_lock:
+            if getattr(task, "generation", 0) < STORE.apply_generation:
+                task.result["error_code"] = "stale_queued_work"
+                raise ValueError("已有更新的确认任务，请重新预览")
+            version = config_version(cfg_path)
+            with open(cfg_path, encoding="utf-8") as stream:
+                raw = stream.read()
+            if raw != entry["base_raw"] or config_version(cfg_path) != version:
+                task.result["error_code"] = "stale_config"
+                raise ValueError("配置已变化，队列中的旧方案已拒绝；请重新预览")
+            preview = entry.get("preview", entry.get("text", ""))
+            ok, msg = _validate_final(preview, entry.get("plans", []))
+            if not ok:
+                task.result["error_code"] = "invalid_plan"
+                raise ValueError(msg)
+            push = body.get("push") or {}
+            refused = _push_result(push.get("base") or cpa_url, cpa_url)
+            if refused:
+                task.result.update(refused, error_code="push_target_refused")
+                raise ValueError("管理目标被拒，未写盘")
+            task.set_stage("local_write")
+            bak = write_local(cfg_path, preview, backup_dir=backup_dir or None,
+                              expected_version=version)
+            task.result.update(backup=bak, written=cfg_path, local_written=True,
+                               validate_msg=msg, diffs=len(entry.get("diffs", [])),
+                               notes=entry.get("notes", []))
+            with Handler._cfg_cache_lock:
+                Handler._cfg_cache = None
+            tail_entry = {**entry, "preview": preview,
+                          "plans": entry.get("plans", [])}
+            _run_apply_tail(task, tail_entry, body, cfg_path, cpa_url, mgmt, client_key)
+    except (ValueError, WritebackError) as e:
+        task.state = "error"
+        task.error = _safe_text(str(e))
+        task.result.setdefault("error_code", "write_conflict")
+        task.set_stage("refused")
+    except Exception:
+        task.state = "error"
+        task.error = _error_ref(f"apply {task.id}")
+        task.result["error_code"] = "write_failed"
+        task.set_stage("error")
+    finally:
+        task.finished = time.time()
+
+
 def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
                     cfg_path: str, cfg_cpa_url: str,
                     mgmt: str, auto_client_key: str) -> None:
     """写回的后台收尾：触发 CPA 重载 + 端到端验证。
 
-    落盘已在 HTTP 请求里同步完成 —— 这里只做「慢且非关键路径」的两步，
-    进度写进 task 供 /api/apply-status 轮询。见 _api_apply 的 docstring：
-    这两步同步做会让 79 凭据那种规模跑破 Cloudflare 的 100 秒上限。
+    由 _commit_apply 持事务锁并完成写盘后调用。进度写进 task，
+    供 /api/apply-status 轮询；不占用确认请求的响应时间。
 
     所有分支都必须落到 task.state —— 后台线程抛异常没人看得到，
     前端会永远停在「运行中」。
@@ -2713,7 +3742,7 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
         # 管理密码由调用方算好传入（见 _cpa_password_for）
 
         if cpa_base and mgmt:
-            task.set_stage("触发 CPA 重载")
+            task.set_stage("reload")
             rok, rmsg = reload_cpa(cpa_base, mgmt, entry["preview"])
             result["reload_ok"] = rok
             result["reload_msg"] = rmsg
@@ -2774,17 +3803,24 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
                 #   · 条数上限 24 —— 超出的部分明确报「未验证」，
                 #     而不是悄悄少验或把请求拖死
                 todo = []
+                import yaml
+                final_cfg = yaml.safe_load(entry["preview"]) or {}
+                scopes = {}
                 for plan in entry["plans"]:
                     for sec, sp in plan.sections.items():
                         if not sp.writable or not sp.models:
                             continue
-                        todo.append((plan.host, sec, sp.models[0]))
+                        # A shared model request proves only gateway behavior.
+                        # Do not label it as evidence for this upstream/key.
+                        model, scope = _verification_target(final_cfg, sp)
+                        scopes[(plan.host, sec, model)] = scope
+                        todo.append((plan.host, sec, model))
 
                 MAX_VERIFY = 24
                 skipped_over = todo[MAX_VERIFY:]
                 todo = todo[:MAX_VERIFY]
 
-                task.set_stage("端到端验证")
+                task.set_stage("verify")
                 task.set_verify_total(len(todo))
                 verified = [None] * len(todo)
 
@@ -2794,7 +3830,9 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
                     )
                     task.bump_verify()
                     verified[i] = {"host": host, "section": sec,
-                                   "model": model, "ok": vok, "msg": vmsg}
+                                   "model": model, "ok": vok, "msg": vmsg,
+                                   "verification_scope": scopes[(host, sec, model)],
+                                   "target_verified": bool(vok and scopes[(host, sec, model)] == "unique_prefix")}
 
                 if len(todo) > 1:
                     with concurrent.futures.ThreadPoolExecutor(
@@ -2817,7 +3855,9 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
                 for i, (h, sc, mo) in enumerate(todo):
                     if verified[i] is None:
                         verified[i] = {"host": h, "section": sc, "model": mo,
-                                       "ok": False, "msg": "验证请求本身失败（超时或连接错误）"}
+                                       "ok": False, "msg": "验证请求本身失败（超时或连接错误）",
+                                       "verification_scope": "gateway_only",
+                                       "target_verified": False}
                 if skipped_over:
                     result["verify_over_limit"] = (
                         f"另有 {len(skipped_over)} 个条目未验证 —— "
@@ -2838,8 +3878,12 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
                     "不知道客户端打过来时新上游会不会被换模或拒绝。"
                 )
 
-        task.state = "done"
-        task.set_stage("全部完成")
+        failed = not result.get("reload_ok") or bool(result.get("verify_failed"))
+        task.state = "error" if failed else "done"
+        if failed:
+            task.error = result.get("reload_msg") if not result.get("reload_ok") else "网关验证失败"
+            result["error_code"] = "reload_failed" if not result.get("reload_ok") else "verification_failed"
+        task.set_stage("error" if failed else "done")
     except Exception:
         task.state = "error"
         task.error = _error_ref(f"apply {task.id}")
@@ -2849,9 +3893,8 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
         # 那份 plan 已经作废（上面把 base_raw 置成 preview，重放会被 409 挡）。
         # 主动释放它 —— 每份持有两份**整份配置**（生产文件约 857KB，即约
         # 1.7MB），是三张表里最重的，而前端每次勾选变化都会新生成一份。
-        pid = str(body.get("plan_id") or "")
-        if pid:
-            STORE.drop_plan(pid)
+        # Keep the bounded, TTL-managed claim so retries return the same task.
+        pass
 
 
 def main() -> None:
@@ -2861,7 +3904,10 @@ def main() -> None:
                     help="监听地址。默认只本机；改 0.0.0.0 前请先加 nginx + TLS + 认证")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--token", default=os.environ.get("IMPORTER_TOKEN", ""),
-                    help="Bearer token。不给则随机生成并打印")
+                    help="Bearer token。日志不显示；也可使用 CPA 管理密码登录")
+    ap.add_argument("--trusted-proxy-peer", action="append",
+                    default=[x.strip() for x in os.environ.get("IMPORTER_TRUSTED_PROXY_PEERS", "").split(",") if x.strip()],
+                    help="明确可信的反代 IP/CIDR，可重复；默认仅回环")
     ap.add_argument("--backup-dir", default=os.environ.get("IMPORTER_BACKUP_DIR", ""),
                     help="备份目录。容器里 config.yaml 是单文件挂载、同目录不可写，"
                          "必须指到另一个卷（compose 里已设 /backups）")
@@ -2888,6 +3934,11 @@ def main() -> None:
     ap.add_argument("--no-cpa-key", action="store_true",
                     help="不接受 CPA 管理密钥登录，只认本服务的 token")
     args = ap.parse_args()
+    try:
+        Handler.trusted_proxy_peers = tuple(str(ipaddress.ip_network(x, strict=False))
+                                            for x in args.trusted_proxy_peer)
+    except ValueError:
+        ap.error("trusted-proxy-peer 必须是合法 IP 或 CIDR")
 
     cfg = os.path.abspath(args.config)
     if not os.path.isfile(cfg):
@@ -2919,8 +3970,8 @@ def main() -> None:
     print("=" * 68)
     print(f"  config.yaml : {cfg}")
     print(f"  监听        : http://{args.host}:{args.port}")
-    print(f"  token       : {token}")
-    print(f"  打开        : http://{args.host}:{args.port}/?token={token}")
+    print("  token       : [不在日志中显示；请使用配置的凭据]")
+    print(f"  打开        : http://{args.host}:{args.port}/")
     if args.backup_dir:
         print(f"  备份目录    : {args.backup_dir}")
     if Handler.accept_cpa_key:

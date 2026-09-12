@@ -52,6 +52,18 @@ function famOf(m) {
 // 不报错，但 CPA 路由过去必然失配 —— 它们走的不是对话协议路径。
 const NON_CHAT = /-image(?:$|[-.])|-tts(?:$|[-.])|^imagen|-oss-|-embedding|-whisper|-moderation|-batch-inference/;
 
+// 降级档：名字里带 mini / nano / lite 的一律不选（用户 2026-09-12 定，
+// **不分类型、不看版本号**）。与后端 model_catalog.is_low_tier 逐条等价。
+//
+// 必须按 **token 边界** 匹配：`gemini` 与 `kimi` 的字面里就含 `mini`。
+// 裸 includes('mini') 会把整个 gemini 族和 kimi 族全挡掉 —— 静默的灾难
+// （gemini 段界面上一个模型都挑不出来）。
+const LOW_TIER = /(?:^|[^a-z0-9])(?:mini|nano|lite)(?![a-z0-9])/;
+
+function isLowTier(m) {
+  return LOW_TIER.test(bareName(m));
+}
+
 // gemini 段：只要 gemini-<版本>-pro*，版本 >= 2.5。`-pro` 后可带
 // -high / -low / -preview / -preview-search / -preview-customtools。
 const GEMINI_PRO = /^gemini-(\d+(?:\.\d+)?)-pro(?:$|[-.])/;
@@ -71,9 +83,19 @@ function famOk(sec, m) {
   const f = famOf(n);
   if (!f) return false;                     // 四族之外（deepseek / grok / glm…）
   if (NON_CHAT.test(n)) return false;
-  if (sec === 'gemini-api-key') {
+  // mini / nano / lite 一律不挑（用户 2026-09-12，不分类型、不看版本）。
+  // 放在族判之后：LOW_TIER 按 token 边界匹配，gemini / kimi 不受影响。
+  if (isLowTier(n)) return false;
+  // gemini 族的 pro / >=2.5 闸在**族**上，不在段上（2026-09-12 对齐后端）
+  // ------------------------------------------------------------------
+  // 后端 section_allows 先判 `fam == "gemini" and not gemini_pro_ok(n)`，
+  // 再判段；原来这里只在 `sec === 'gemini-api-key'` 时判，于是 compat 段
+  // 放行了 gemini-2.0-pro / gemini-3.5-flash / gemini-pro-agent ——
+  // 界面列出来还预勾，后端一个都不收。flash 是降级档、2.0 已停服，
+  // compat 段走万能口不代表这三个该挑。
+  if (f === 'gemini') {
     const mm = GEMINI_PRO.exec(n);
-    return !!mm && parseFloat(mm[1]) >= GEMINI_MIN;
+    if (!mm || parseFloat(mm[1]) < GEMINI_MIN) return false;
   }
   const want = SECTION_FAMILY[sec];
   return want ? f === want : true;          // compat：四族都行
@@ -83,7 +105,7 @@ function famOk(sec, m) {
 // 用于：手填框的校验提示 —— 那是操作员的显式指定，只挡协议层不可能成立的。
 //
 // 与 famOk 的唯一差别是四族之外：compat 段走 /chat/completions、CPA 对模型名
-// 零校验，实测 runanytime 唯一验证过的模型就是 grok-4.6。按族拒掉手填等于让
+// 零校验，实测 romeo 唯一验证过的模型就是 grok-4.6。按族拒掉手填等于让
 // 操作员没法把已知可用的模型写回去（2026-09-03）。
 function protoOk(sec, m) {
   const n = bareName(m);
@@ -150,6 +172,21 @@ function generationOf(m) {
   return [ver[0], ver.length > 1 ? ver[1] : 0];
 }
 
+// 比较世代时的分组维度。比 famOf 多分出一个 `o` 族。
+// 与后端 model_catalog.generation_family 逐条等价。
+//
+// famOf('o3') 是 'gpt' —— 那对「这个段收不收它」是对的（o 系列走 codex
+// 段），但对「谁比谁新」是错的：o 系列与 gpt 系列是互不相干的编号体系，
+// o3 的 3 不代表它比 gpt-5.6 老一代（用户 2026-09-12 判例一）。
+// 四族之外的名字按自己的词根分组，不能一起丢进 '' 桶：famOf('grok-4.6')
+// 与 famOf('glm-5.2') 都是 ''，同桶就变成「glm 的 5 比 grok 的 4 新」，
+// 而 grok-4.6 是 compat 段唯一端到端验证过的模型。
+function generationFamily(m) {
+  const n = bareName(m);
+  if (O_SERIES_RE.test(n)) return 'o';
+  return famOf(n) || n.split('-')[0];
+}
+
 function genGreater(a, b) {
   if (!a) return false;
   if (!b) return true;
@@ -162,57 +199,89 @@ function genEqual(a, b) {
   return a[0] === b[0] && a[1] === b[1];
 }
 
-// 产品线：把版本与常见变体后缀剥掉之后剩下的名字。
-// 与 Python 侧 _LINE_STRIP / _product_line 同一套。
-const LINE_STRIP = new RegExp(
-  '(?:^|[^A-Za-z0-9.])k?\\d+(?:[.\\-]\\d+)*o?(?![A-Za-z0-9])'
-  + '|-(?:thinking|m-aws|agent|latest|fast|high|low|extra-low'
-  + '|sol|luna|terra|preview|search|customtools|spark'
-  + '|mini|nano|lite|chat|audio-preview'
-  + '|32k|64k|128k|256k|512k|1m)(?=$|[-.])', 'g');
-
+// 产品线 = 版本号**之前**那一截。结构判据，不含任何后缀清单。
+// 与 Python 侧 _product_line 同一套（2026-09-12 一起改的）。
+//
+// 原来这里有一张手写的后缀白名单（LINE_STRIP：sol / luna / terra /
+// preview / 32k …）。它漏一个就错一次，而漏是常态 —— 实测 `gpt-6-astra`
+// 因为 astra 不在表里就自成一条线、躲过「同线取最高世代」被与 gpt-5.6
+// 一起勾上。那也正是 docx 第 6 条禁止的硬编码：模型名录跟着 CPA / CPAMP
+// 更新，判据不能每次都要改本项目的代码。
+//
+// seriesAndVersion 已经把名字拆成「模板 + 版本」，模板里 `*` 之前那一截
+// 就是版本号之前的固定前缀 —— 天然的产品线，不必知道后面是什么后缀：
+//   gpt-6-astra      → 模板 gpt-*-astra      → 线 gpt
+//   claude-fable-5-1 → 模板 claude-fable-*   → 线 claude-fable
+//   o3-pro           → 模板 o*-pro           → 线 o
 function productLine(m) {
-  let n = bareName(m);
-  // 推理系列的世代数字紧贴开头的 o，LINE_STRIP 的版本支路读不到它。
-  // 不先剥掉的话 o1 / o3 / o4-mini 各成一条线，「每条线取最高世代」无从
-  // 比较，七个名字全留。剥完统一叫 `o`，于是同线不同代。与 Python 侧一致。
-  n = n.replace(O_SERIES_RE, 'o');
-  let prev = null;
-  // 反复剥到不动为止 —— gemini-3.1-pro-preview-customtools 要剥三次。
-  // 版本 token 那一支会吃掉前置分隔符，所以剥完要补回一个 `-`，
-  // 否则 `gpt-5.6-luna` 会变成 `gptluna` 而不是 `gpt-luna`。
-  while (n !== prev) {
-    prev = n;
-    n = n.replace(LINE_STRIP, (s) => (/^[^A-Za-z0-9.]/.test(s) ? '-' : ''));
-  }
-  return n.replace(/[-.]{2,}/g, '-').replace(/^[-.]+|[-.]+$/g, '') || bareName(m);
+  const n = bareName(m);
+  const [series, ver] = seriesAndVersion(n);
+  if (!ver || series.indexOf('*') < 0) return n;
+  return series.split('*')[0].replace(/[-.]+$/, '') || n;
 }
 
-// 每条产品线只留**最高世代**，该世代的所有变体全部保留。
-// 与 Python 侧 newest_generation_per_line 同一套判据。
+// 每条产品线只留**最高世代**，且低主版本的产品线整条出局。
+// 与 Python 侧 newest_generation_per_line 同一套判据（2026-09-12 起两阶段）。
 //
 // 为什么不是「同系列取最新」（2026-09-02 现场截图）：按系列分组时
 // gpt-5.5 的系列是 `gpt-*`，而 luna / terra 各自是 `gpt-*-luna` /
 // `gpt-*-terra` —— 三个独立系列，5.5 没有对手所以留下；gpt-4o 则因为
 // 旧正则不认 `4o` 是版本而自成一系。两件事叠加就是截图里 codex 段
 // 勾着 gpt-4o 与 gpt-5.5 的原因。
-function newestGenerationPerLine(names) {
-  const groups = new Map();
+function newestGenerationPerLine(names, keepLowTier) {
+  // 两阶段，与后端 model_catalog.newest_generation_per_line 逐条等价
+  // （tests/test_web.py 拿同一批名字喂两边比对，单边改会被立刻抓到）：
+  //
+  //   阶段 A 按**族**（generationFamily）比**主版本** —— docx 第 4 条的
+  //     「codex 当前最高为 gpt-6 系列所有模型名称」：gpt-6 出现时
+  //     gpt-5.6 那一代全走，不管挂在哪条产品线上。
+  //   阶段 B 同族内再按**产品线**比**完整世代**，该世代的变体全保留 ——
+  //     「所有相同等级系列的模型全部都要勾选上」，也就是用户点名的
+  //     「勾了 gpt-5.6 却没勾 gpt-5.6-sol」的反面。
+  //
+  // 单独任何一阶段都不行：只按族比完整世代会让 claude-fable-5-1 的 (5,1)
+  // 挤掉同档的 opus/sonnet (5,0)；只按产品线比则 gpt-5.6-codex 与 gpt-6
+  // 是两条线，5.6-codex 会留下。
+  //
+  // 阶段 A 用 generationFamily 而不是 famOf：o 系列自成一族，于是
+  // gpt-5.6 不会挤掉 o3（用户 2026-09-12 判例一）。
+  //
+  // 无版本号的名字在进入比较前就剔除（用户口径：没有版本号 = 低等级）。
+  // 现场是 `gpt-reserve` 和 `gpt-6` / `gpt-6-astra` 一起被勾上，而该型号
+  // 并不存在。
+  const cand = [];
   (names || []).forEach((n) => {
     if (!n) return;
-    const line = productLine(n);
-    if (!groups.has(line)) groups.set(line, []);
-    groups.get(line).push(n);
+    // gemini 族只比 pro 型号，与后端同一道前置闸
+    if (famOf(bareName(n)) === 'gemini') {
+      const mm = GEMINI_PRO.exec(bareName(n));
+      if (!mm || parseFloat(mm[1]) < GEMINI_MIN) return;
+    }
+    // 降级档不参与（也就不会被选中）。keepLowTier 只给手填路径用。
+    if (!keepLowTier && isLowTier(n)) return;
+    const g = generationOf(n);
+    if (!g) return;
+    cand.push([n, g]);
   });
-  const keep = new Set();
-  groups.forEach((items) => {
-    const gens = items.map(generationOf);
-    const known = gens.filter((g) => g);
-    if (!known.length) { items.forEach((x) => keep.add(x)); return; }
-    let top = known[0];
-    known.forEach((g) => { if (genGreater(g, top)) top = g; });
-    items.forEach((x, i) => { if (genEqual(gens[i], top)) keep.add(x); });
+
+  // 阶段 A：族内比主版本
+  const topMajor = new Map();
+  cand.forEach(([n, g]) => {
+    const f = generationFamily(n);
+    if (!topMajor.has(f) || g[0] > topMajor.get(f)) topMajor.set(f, g[0]);
   });
+  const survived = cand.filter(([n, g]) => g[0] === topMajor.get(generationFamily(n)));
+
+  // 阶段 B：产品线内比完整世代
+  const topGen = new Map();
+  survived.forEach(([n, g]) => {
+    const ln = productLine(n);
+    if (!topGen.has(ln) || genGreater(g, topGen.get(ln))) topGen.set(ln, g);
+  });
+  const keep = new Set(
+    survived.filter(([n, g]) => genEqual(g, topGen.get(productLine(n))))
+            .map(([n]) => n));
+
   // 按输入顺序输出，保证同一批输入两次运行结果一致（diff 可复核）
   const seen = new Set();
   return (names || []).filter((n) => {
@@ -382,7 +451,7 @@ const S = {
 };
 
 // 候选身份键。用**行号**而不是 host —— 一个站常有 15 把 Key
-// （实测 gorouter 15、tabitoken 14），用 host 做键时 S.picks 这个 Set 会把
+// （实测 gorou 15、tango 14），用 host 做键时 S.picks 这个 Set 会把
 // 同站同段的 15 个选择去重成 1 个，DOM 定位也只命中第一行。
 // 2026-09-02 现场：「全勾选」显示已勾 26 项，大量段勾不上。
 const pk = (rid, sec) => `${rid}\u0000${sec}`;
@@ -1314,6 +1383,18 @@ function poll() {
       }
       return;
     }
+    if (d.state === 'cancelled') {
+      // 用户按了停止 —— 与出错分开显示（2026-09-12，与后端同一次改动）。
+      // 不加这一支的话轮询既不停、转圈也不停：状态既不是 done 也不是
+      // error，界面会永远停在「探测中」。
+      $('#spin').hidden = true;
+      $('#p2h').textContent = '② 已停止';
+      $('#p2').insertAdjacentHTML('beforeend',
+        '<div class="warn">已按请求停止 —— 未完成的站没有结论，'
+        + '已完成的结果保留在下方。</div>');
+      return;
+    }
+
     if (d.state === 'error') {
       $('#spin').hidden = true;
       $('#p2h').textContent = '② 探测出错';
@@ -1609,7 +1690,7 @@ function siteCard(r) {
       //
       // 但「一个四族的都没有」时退一步收下站方自己报的（2026-09-03，与后端
       // build_plan 的 catalog 分支同一条规则）：那时另一个选项是只显示手填框，
-      // 而后端会写工具猜的名字 —— 这个站从没报过它们。实测 runanytime 与
+      // 而后端会写工具猜的名字 —— 这个站从没报过它们。实测 romeo 与
       // facai 的 compat 段就是这种处境（目录里只有 grok-4.6 / glm-5.2，
       // 而 grok-4.6 是那个站唯一端到端验证过的模型）。
       //
@@ -1920,6 +2001,20 @@ function attemptTable(label, v) {
 function bindResultEvents() {
   const box = $('#results');
 
+  // 幂等闸（2026-09-11）：`#results` 是 index.html 里**持久存在**的容器，
+  // 而本函数每次 renderResults() 都会被调一次（:1592）。原来直接
+  // addEventListener，于是走「改输入重来 / 再投喂一批」再探测第二轮后，
+  // 同一个 change 被处理 2 次、第三轮 3 次，每次各发一个 POST /api/plan；
+  // 「全选」按钮更糟 —— click 处理器 ×N 各自 dispatch 一次 change。
+  // 每份 plan 约 1.7MB（tests/test_server.py:228-236 记过 512M 容器 90 秒 OOM），
+  // 这是可放大的资源问题。
+  //
+  // 用容器自身的标记位而不是 removeEventListener：处理器是匿名闭包，
+  // 拿不到引用；也不用 cloneNode 换容器 —— 那会丢掉 renderResults 刚写进去
+  // 的 DOM 与其它地方持有的引用。
+  if (box.dataset.evBound === '1') return;
+  box.dataset.evBound = '1';
+
   // 目录模型的批量勾选。不自己写入 S.forced —— 改完 checkbox 状态后派发
   // 一次 change，复用下面那个 .cm 处理器（它还要合并手填框里目录外的模型，
   // 两处各写一遍必然分叉）。
@@ -1960,9 +2055,19 @@ function bindResultEvents() {
         S.forced[h][sc] = list;
       } else {
         delete S.forced[h][sc];
+        // 清空模型时**同步取消该段的写入勾选**（2026-09-11）
+        // ----------------------------------------------------
+        // 下面那个 `.fm` 处理器在清空时会 `S.picks.delete(pk(h, sc))`
+        // （见它自己的注释），而这一支从不动 S.picks —— 于是「清空」按钮
+        // 走的这条路会留下「写入列还勾着、模型清单是空的」的状态。
+        // 后端把空清单当作未接管、跳过该段，界面却显示会写入。
+        // 两个入口写同一个段，处置必须一致。
+        if (S.picks) S.picks.delete(pk(h, sc));
       }
       const n = tr && tr.querySelector('.cmn');
-      if (n) n.textContent = String(chosen.length);
+      // 计数要含手填框里目录外的模型 —— 显示的是**这一段实际会写入几个**，
+      // 只数 .cm 会与写回清单对不上（手填 2 个后计数不变）。
+      if (n) n.textContent = String(list.length);
       refreshPlan(true);
       syncPickUI();
       return;
@@ -1988,7 +2093,7 @@ function bindResultEvents() {
       // 但那要等一次 /api/plan 往返；输入框旁边即时提示更直接。
       //
       // 判据用 protoOk（协议层）而不是 famOk（工具选型偏好）：四族之外的
-      // 模型在 compat 段完全合法 —— 实测 runanytime 唯一验证过的就是
+      // 模型在 compat 段完全合法 —— 实测 romeo 唯一验证过的就是
       // grok-4.6。用 famOk 会把它标成红的，而它恰恰是该写进去的那一个。
       const bad = typed.filter((m) => !protoOk(sc, m));
       const off = typed.filter((m) => protoOk(sc, m) && !famOk(sc, m));
@@ -2762,6 +2867,474 @@ $('#btnrestart').onclick = () => {
   $('#parsemsg').textContent = '';
   step(1);
   scrollTo({ top: 0, behavior: 'smooth' });
+};
+
+/* ══════════════════ 路由批量管理 ══════════════════
+
+   为什么单独一块而不是接进投喂流程（① 输入 → ② 探测 → ③ 定档 → ④ 写回）：
+   那条流程处理的是「把**新**凭据插进 config.yaml」，需要定档、去重、影响面
+   一整套推导；批量管理改的是**既有条目的字段**，不新增条目，两者的判据、
+   风险与确认口径都不同，混在一起会让「不新增条目」这个安全前提说不清楚。
+
+   与 CPAMP 那张表的取舍：它按条目扁平分页（158 条 / 10 条一页 / 16 页），
+   看不出「同一个网址下几把 Key 的档位一不一致」—— 而那正是唯一重要的结构，
+   也是本项目自己注入时写坏过的地方（实测：注入前 0 组分裂，注入后 3 组）。
+   所以这里以 (段 · 网址) 为一等公民，分裂的组红框直接顶出来。         */
+
+const BM = { groups: [], sel: new Set(), bulkId: '' };
+
+const BM_SEC_CN = {
+  'gemini-api-key': 'Gemini', 'codex-api-key': 'Codex',
+  'claude-api-key': 'Claude', 'openai-compatibility': 'OpenAI 兼容',
+};
+const BM_SEC_CLS = {
+  'gemini-api-key': 'sec-gemini', 'codex-api-key': 'sec-codex',
+  'claude-api-key': 'sec-claude', 'openai-compatibility': 'sec-compat',
+};
+
+const bmKey = (g) => g.section + ' ' + g.host;
+
+function bmStat() {
+  const t = BM.groups;
+  const split = t.filter((g) => g.split).length;
+  const off = t.reduce((n, g) => n + g.entries.filter((e) => !e.enabled).length, 0);
+  const ent = t.reduce((n, g) => n + g.entries.length, 0);
+  $('#bmstat').innerHTML =
+      `<div><b>${t.length}</b><i>分组（段 × 网址）</i></div>`
+    + `<div><b>${ent}</b><i>条目</i></div>`
+    + `<div class="${split ? 's-bad' : ''}"><b>${split}</b><i>档位分裂</i></div>`
+    + `<div class="${off ? 's-off' : ''}"><b>${off}</b><i>已停用</i></div>`;
+}
+
+function bmCard(g) {
+  const k = bmKey(g);
+  const on = BM.sel.has(k);
+  const pris = g.priorities || [];
+  const rows = g.entries.map((e) => `
+    <div class="bm-row ${e.enabled ? '' : 'off'}">
+      <span class="bm-dot ${e.enabled ? 'on' : 'off'}"></span>
+      <code>${esc(e.api_key_masked)}</code>
+      <span class="m">${e.models} 型</span>
+      <span class="p">${e.priority === null ? '—' : e.priority}</span>
+    </div>`).join('');
+  const warn = g.split ? `
+    <div class="bm-warn"><b>档位分裂</b>：同一网址的 ${g.entries.length} 个条目
+      拿到了 ${pris.length} 个不同 priority（${pris.join(' / ')}）。
+      CPA 按层级取最高那一桶，低档的实质是冷备 —— 高档几条会先被打光配额。
+      勾选本组后点「统一优先级」即可对齐到 ${Math.max(...pris)}。</div>` : '';
+  return `
+  <div class="bm-card ${on ? 'sel' : ''} ${g.split ? 'split' : ''}" data-k="${esc(k)}">
+    <div class="bm-head">
+      <input type="checkbox" class="bmck" ${on ? 'checked' : ''} data-k="${esc(k)}">
+      <span class="bm-sec ${BM_SEC_CLS[g.section] || ''}">${esc(BM_SEC_CN[g.section] || g.section)}</span>
+      <span class="bm-host"><b>${esc(g.host)}</b>
+        <span>${esc(g.base_urls.join(' · '))}</span></span>
+      <span class="bm-pri ${g.split ? 'bad' : ''}">
+        <em>${pris.length ? pris.join('/') : '—'}</em></span>
+    </div>
+    <div class="bm-body">${rows}</div>${warn}
+  </div>`;
+}
+
+/* 当前筛选结果。抽成函数是因为「批量设优先级 / 全选」都要按**筛选结果**
+   而不是全量来算 —— 用户的用法是「筛出某个网站的全部段，一键设同一个档」。 */
+function bmFiltered() {
+  const terms = ($('#bmq').value || '').trim().toLowerCase()
+    .split(/\s+/).filter(Boolean);
+  const sec = $('#bmsec').value;
+  const mode = $('#bmfilter').value;
+  return BM.groups.filter((g) => {
+    if (sec && g.section !== sec) return false;
+    if (terms.length) {
+      // 多关键词按**与**匹配：`alfa codex` 只出那一组。
+      // 网址、段名（英文与中文）都算命中面。
+      const hay = (g.host + ' ' + g.section + ' '
+                   + (BM_SEC_CN[g.section] || '') + ' '
+                   + g.base_urls.join(' ')).toLowerCase();
+      if (!terms.every((t) => hay.includes(t))) return false;
+    }
+    if (mode === 'split') return g.split;
+    if (mode === 'off') return g.entries.some((e) => !e.enabled);
+    if (mode === 'on') return g.entries.every((e) => e.enabled);
+    if (mode === 'sel') return BM.sel.has(bmKey(g));
+    return true;
+  });
+}
+
+function bmRender() {
+  const list = bmFiltered();
+  $('#bmgrid').innerHTML = list.length
+    ? list.map(bmCard).join('')
+    : '<div class="bm-empty">没有匹配的分组</div>';
+  const ent = list.reduce((n, g) => n + g.entries.length, 0);
+  const sp = list.filter((g) => g.split).length;
+  $('#bmscope').innerHTML =
+    `筛选出 <b>${list.length}</b> 组 · ${ent} 个条目`
+    + (sp ? ` · <span style="color:var(--bad)">${sp} 组分裂</span>` : '');
+  const sel = bmSelected();
+  const selEnt = sel.reduce((n, g) => n + g.entries.length, 0);
+  $('#bmn').textContent = String(sel.length);
+  $('#bmn2').textContent = sel.length ? `（含 ${selEnt} 个条目）` : '';
+  $('#bmact').hidden = sel.length === 0;
+  if (!sel.length) { $('#bmdel').hidden = true; }
+}
+
+async function bmLoad() {
+  $('#bmgrid').innerHTML = '<div class="bm-empty">读取中…</div>';
+  try {
+    const d = await api('/api/routes');
+    BM.groups = d.groups || [];
+    // 选中集按 (段,网址) 而不是下标 —— 重新读取后下标可能因别处改动而移位，
+    // 用下标记选中会静默选错组。
+    const live = new Set(BM.groups.map(bmKey));
+    [...BM.sel].forEach((k) => { if (!live.has(k)) BM.sel.delete(k); });
+    bmStat();
+    bmRender();
+  } catch (e) {
+    $('#bmgrid').innerHTML =
+      `<div class="bm-empty" style="color:var(--bad)">读取失败：${esc(e.message)}</div>`;
+  }
+}
+
+function bmSelected() {
+  return BM.groups.filter((g) => BM.sel.has(bmKey(g)));
+}
+
+/* 三种批量动作各自生成 ops。
+   `enable` / `disable` 的字段差异（key 类段写 excluded-models 通配符、
+   compat 段写布尔字段）**全部在后端处理**，且那两个值是从 CPAMP 源码实时
+   解析的 —— 前端不许自己拼，否则上游一改写法这里就静默失效。 */
+function bmOps(kind, arg) {
+  const ops = [];
+  bmSelected().forEach((g) => {
+    if (kind === 'unify' || kind === 'setpri') {
+      // setpri：用户给定的值，整组所有 Key 都写它。
+      // unify：取组内最高档 —— 往高对齐而不是往低，因为低档那几条本来就被
+      // 高档遮住、实质不参与轮询；往低对齐会把整组一起降级。
+      let target;
+      if (kind === 'setpri') {
+        target = arg;
+      } else {
+        const pris = (g.priorities || []).filter((x) => x !== null);
+        if (pris.length < 2) return;            // 本来就一致，不产生噪声
+        target = Math.max(...pris);
+      }
+      g.entries.forEach((e) => {
+        if (e.priority !== target) {
+          ops.push({ section: g.section, index: e.index,
+                     action: 'priority', value: target });
+        }
+      });
+    } else if (kind === 'delete') {
+      // 每条都带 base-url 指纹。后端逐条校验，不符整批拒绝 ——
+      // 下标是位置，位置会因为别人并发改动而指向另一个条目。
+      g.entries.forEach((e) => {
+        ops.push({ section: g.section, index: e.index,
+                   action: 'delete', expect: e.base_url });
+      });
+    } else {
+      const want = kind === 'enable';
+      g.entries.forEach((e) => {
+        if (e.enabled !== want) {
+          ops.push({ section: g.section, index: e.index,
+                     action: want ? 'enable' : 'disable' });
+        }
+      });
+    }
+  });
+  return ops;
+}
+
+async function bmPreview(kind, arg) {
+  const ops = bmOps(kind, arg);
+  const msg = $('#bmmsg');
+  if (!ops.length) {
+    msg.innerHTML = '<span style="color:var(--ink-3)">选中的组已经是目标状态，无需改动</span>';
+    return;
+  }
+  msg.textContent = '生成预览中…';
+  try {
+    const d = await api('/api/bulk-preview', { method: 'POST', body: { ops } });
+    if (!d.changed) {
+      msg.innerHTML = '<span style="color:var(--ink-3)">没有实际改动</span>';
+      return;
+    }
+    BM.bulkId = d.bulk_id;
+    $('#bmcnt').textContent = `${d.changed} 处改动`;
+    $('#bmsem').textContent =
+      `停用语义来源：${d.semantics || '未知'}`
+      + (d.problems && d.problems.length
+         ? ` · 有 ${d.problems.length} 条未能执行：${d.problems.join('；')}` : '');
+    $('#bmdiff').textContent = d.diff
+      + (d.diff_truncated ? '\n…（diff 过长已截断，完整改动以写回结果为准）' : '');
+    $('#bmpreview').hidden = false;
+    msg.textContent = '';
+    $('#bmpreview').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch (e) {
+    msg.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
+  }
+}
+
+$('#pbulk').addEventListener('toggle', () => {
+  if ($('#pbulk').open && !BM.groups.length) bmLoad();
+});
+$('#bmreload').onclick = () => bmLoad();
+$('#bmq').oninput = () => bmRender();
+$('#bmfilter').onchange = () => bmRender();
+$('#bmsec').onchange = () => bmRender();
+// 「选中筛选结果」而不是「全选」—— 用户的用法是先筛出某个网站的全部段，
+// 再一键设同一个档。全量全选反而是危险的默认。
+$('#bmall').onclick = () => {
+  bmFiltered().forEach((g) => BM.sel.add(bmKey(g))); bmRender();
+};
+$('#bmnone').onclick = () => { BM.sel.clear(); bmRender(); };
+$('#bmsplit').onclick = () => {
+  BM.sel.clear();
+  BM.groups.forEach((g) => { if (g.split) BM.sel.add(bmKey(g)); });
+  $('#bmfilter').value = 'split';
+  $('#bmsec').value = '';
+  $('#bmq').value = '';
+  bmRender();
+};
+$('#bmsetpri').onclick = () => {
+  const v = parseInt($('#bmpri').value, 10);
+  if (!Number.isFinite(v) || v < 1) {
+    $('#bmmsg').innerHTML =
+      '<span style="color:var(--bad)">请先填一个 ≥ 1 的档位数字</span>';
+    return;
+  }
+  bmPreview('setpri', v);
+};
+
+/* ── 批量删除：本面板唯一不可逆的动作，所以确认门槛比其余三个都高 ──
+   ① 先列出**每一条**将被删除的条目（不是只报个数）；
+   ② 要求手打 DELETE —— 防误点；
+   ③ 后端还会逐条校验 base-url 指纹，不符整批拒绝；
+   ④ 落盘前自动备份。
+   即便如此仍要说清：CPA 侧没有回滚。 */
+$('#bmdelete').onclick = () => {
+  const sel = bmSelected();
+  if (!sel.length) return;
+  const rows = [];
+  sel.forEach((g) => {
+    g.entries.forEach((e) => {
+      rows.push(`<div><span class="s">${esc(BM_SEC_CN[g.section] || g.section)}</span>`
+        + ` · ${esc(e.base_url)} · <span class="s">${esc(e.api_key_masked)}</span>`
+        + ` · ${e.models} 型</div>`);
+    });
+  });
+  $('#bmdeln').textContent = String(rows.length);
+  $('#bmdellist').innerHTML = rows.join('');
+  $('#bmdelok').value = '';
+  $('#bmdelgo').disabled = true;
+  $('#bmdel').hidden = false;
+  $('#bmdel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+};
+$('#bmdelok').oninput = () => {
+  $('#bmdelgo').disabled = $('#bmdelok').value.trim() !== 'DELETE';
+};
+$('#bmdelno').onclick = () => { $('#bmdel').hidden = true; };
+$('#bmdelgo').onclick = () => {
+  if ($('#bmdelok').value.trim() !== 'DELETE') return;
+  $('#bmdel').hidden = true;
+  bmPreview('delete');
+};
+// 卡片整体可点，勾选框与卡片是同一个动作 —— 少一次精确点击
+$('#bmgrid').addEventListener('click', (e) => {
+  const card = e.target.closest('.bm-card');
+  if (!card) return;
+  const k = card.dataset.k;
+  if (BM.sel.has(k)) BM.sel.delete(k); else BM.sel.add(k);
+  bmRender();
+});
+$('#bmunify').onclick = () => bmPreview('unify');
+$('#bmenable').onclick = () => bmPreview('enable');
+$('#bmdisable').onclick = () => bmPreview('disable');
+$('#bmcancel').onclick = () => { $('#bmpreview').hidden = true; BM.bulkId = ''; };
+$('#bmapply').onclick = async () => {
+  if (!BM.bulkId) return;
+  const btn = $('#bmapply');
+  const msg = $('#bmapplymsg');
+  btn.disabled = true;
+  msg.textContent = '写回中…';
+  try {
+    const d = await api('/api/bulk-apply', {
+      method: 'POST',
+      body: { bulk_id: BM.bulkId, confirm: true, push: bmPush() },
+    });
+    msg.innerHTML = `<span style="color:var(--ok)">已写回 ${d.notes.length} 处，`
+      + `备份 ${esc((d.backup || '').split(/[\\/]/).pop())}</span>`;
+    $('#bmpreview').hidden = true;
+    BM.bulkId = '';
+    BM.sel.clear();
+    await bmLoad();
+  } catch (e) {
+    msg.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
+  } finally {
+    // 正常路径也要解禁：这个面板不像投喂流程那样切走，按钮留在原地
+    btn.disabled = false;
+  }
+};
+
+/* 写回后触发 CPA 重载用的凭据，与投喂流程 ④ 复用**同一组输入框**
+   （`#o_mgmt` / `#o_client` / `#o_cpabase`）—— 两处各摆一份输入框会让人
+   以为是两套凭据。取不到就不传：后端照常落盘，只是重载退回靠 CPA 自己的
+   fsnotify（那条链没有保证，见 writeback.reload_cpa 的说明）。
+
+   **不传 base**：界面上根本没有地址输入框，地址一律由服务端的 `--cpa-url`
+   决定。这是既有写回路径刻意选的安全默认 —— 那个输入框曾硬编码公网地址，
+   导致 PUT 走公网被 Cloudflare 拦成 403，而容器内配好的
+   `cli-proxy-api:8317` 永远用不上（见 `_run_apply_tail` 里的说明）。 */
+function bmPush() {
+  const mk = $('#o_mgmt');
+  const ck = $('#o_client');
+  const out = {};
+  if (mk && mk.value) out.mgmt_key = mk.value;
+  if (ck && ck.value.trim()) out.client_key = ck.value.trim();
+  return out;
+}
+
+
+/* ── 全局调优体检 ────────────────────────────────────────────────────
+   为什么这个面板要显示「为什么」而不只是数字：这几项改的是 CPA 的全局
+   重试行为，改错的两个方向都有确定后果（透传 403 / 524），而正确值取决于
+   本工具自己写的 priority 档位 —— 每次重探都可能变。所以每条建议都带
+   服务端算出来的判据原文，让人能复核而不是凭信任点确认。          */
+const TN = { id: '' };
+
+const TN_SEV = {
+  blocker: { label: '必改', cls: 'b' },
+  warn: { label: '建议', cls: '' },
+  info: { label: '卫生', cls: '' },
+};
+
+async function tnRun() {
+  const btn = $('#tnrun');
+  const basis = $('#tnbasis');
+  btn.disabled = true;
+  basis.innerHTML = '<span class="spin"></span> 读取配置并计算…';
+  try {
+    const d = await api('/api/tuning');
+    TN.id = d.tuning_id || '';
+
+    basis.innerHTML = `单次失败尝试按 <b>${esc(String(d.attempt_sec))}</b> 秒算`
+      + `（${esc(d.attempt_why || '')}）· 回源窗口 `
+      + `<b>${esc(String(d.edge_window_sec))}</b> 秒`;
+
+    // 顶层池实况。这是全部结论的输入，先摆出来 —— 只给建议不给依据，
+    // 操作员没法判断该不该改。
+    $('#tntiers').innerHTML = (d.tiers || []).map((t) => {
+      if (!t.credentials) {
+        return `<div class="bm-card"><b>${esc(t.section)}</b>
+          <span class="hint">顶层没有可计费凭据</span></div>`;
+      }
+      const run = t.longest_same_host_run > 3
+        ? `<span class="tier warn">最长连续同站 ${t.longest_same_host_run} 个
+             （${esc(t.run_host)}）—— 会连打同一个站</span>`
+        : `<span class="hint">最长连续同站 ${t.longest_same_host_run} 个</span>`;
+      return `<div class="bm-card"><b>${esc(t.section)}</b>
+        <div class="hint">顶层档位 ${esc(String(t.top_priority))} ·
+          <b>${t.credentials}</b> 个凭据 · ${t.hosts.length} 个站</div>
+        ${run}</div>`;
+    }).join('');
+
+    $('#tnnotes').innerHTML = (d.notes || []).map(
+      (n) => `<div class="warn b">${esc(n)}</div>`).join('');
+
+    const pending = (d.advices || []).filter((a) => a.changed);
+    $('#tnlist').innerHTML = (d.advices || []).map((a) => {
+      const sev = TN_SEV[a.severity] || TN_SEV.warn;
+      if (!a.changed) {
+        return `<div class="bm-card"><b>${esc(a.key)}</b>
+          <span class="hint">当前 <code>${esc(String(a.current))}</code>
+          已经是建议值，无需改动</span></div>`;
+      }
+      return `<div class="warn ${sev.cls}"><b>${esc(a.key)}</b>
+        <span class="tag">${sev.label}</span><br>
+        <code>${esc(String(a.current))}</code> →
+        <code>${esc(String(a.want))}</code>
+        <div class="hint">${esc(a.why)}</div></div>`;
+    }).join('') || '<p class="hint">没有可改项。</p>';
+
+    (d.problems || []).forEach((p) => {
+      $('#tnlist').insertAdjacentHTML('beforeend',
+        `<div class="warn b">改不动：${esc(p)}</div>`);
+    });
+
+    if (TN.id && d.diff) {
+      $('#tncnt').textContent = `${pending.length} 处`;
+      $('#tndiff').textContent = d.diff
+        + (d.diff_truncated ? '\n…（diff 过长已截断）' : '');
+      $('#tnpreview').hidden = false;
+    } else {
+      $('#tnpreview').hidden = true;
+    }
+  } catch (e) {
+    basis.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* 自己轮询而不复用 pollApply：那个函数把进度写死在 #applymsg（投喂流程的
+   收尾区），在这个面板里调它会把状态写到一个用户看不见的地方。 */
+async function tnPoll(taskId) {
+  const msg = $('#tnmsg');
+  let fails = 0;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 900));
+    let st;
+    try {
+      st = await api(`/api/apply-status/${encodeURIComponent(taskId)}`);
+      fails = 0;
+    } catch (e) {
+      fails += 1;
+      if (fails >= 20) {
+        msg.innerHTML = `<span style="color:var(--bad)">轮询中断
+          （${esc(e.message)}）—— <b>配置可能已写盘</b>，
+          请在 VPS 上核对后再操作</span>`;
+        return null;
+      }
+      continue;
+    }
+    if (st.state === 'running') {
+      msg.innerHTML = `<span class="spin"></span> ${esc(st.stage || '收尾中')}`;
+      continue;
+    }
+    return st;
+  }
+}
+
+$('#tnrun').onclick = () => tnRun();
+$('#tncancel').onclick = () => { $('#tnpreview').hidden = true; TN.id = ''; };
+$('#tnapply').onclick = async () => {
+  if (!TN.id) return;
+  const btn = $('#tnapply');
+  const msg = $('#tnmsg');
+  btn.disabled = true;
+  msg.innerHTML = '<span class="spin"></span> 写回中…';
+  try {
+    const first = await api('/api/tuning-apply', {
+      method: 'POST',
+      body: { tuning_id: TN.id, confirm: true, push: bmPush() },
+    });
+    const st = first.task_id ? await tnPoll(first.task_id) : first;
+    if (!st) return;
+    if (st.state === 'error') {
+      msg.innerHTML = `<span style="color:var(--bad)">${esc(st.error || '写回失败')}</span>`;
+      return;
+    }
+    const bak = (st.backup || '').split(/[\\/]/).pop();
+    msg.innerHTML = '<span style="color:var(--ok)">已写回'
+      + (bak ? `，备份 ${esc(bak)}` : '') + '</span>';
+    $('#tnpreview').hidden = true;
+    TN.id = '';
+    await tnRun();
+  } catch (e) {
+    msg.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
 };
 
 boot();
