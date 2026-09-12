@@ -1368,7 +1368,7 @@ function poll() {
           + `这不是「还没跑完」，重跑只会得到同样的结果，`
           + `除非先解决那些异常。</div>`);
       }
-      S.results = d.results;
+      if (d.results) S.results = d.results;  // 运行中任务保留旧结果，避免清空
       // renderResults 必须包起来。它抛异常时（某个字段形状没料到）原来会
       // 变成 unhandled rejection —— 转圈已停但第 3 步不出现，页面看着像
       // 「探测完了却卡住」，而控制台外没有任何线索。宁可显示错误也不要静默。
@@ -2141,7 +2141,32 @@ function bindResultEvents() {
       // 模型清单的可信度由 model_source 在方案里标注（实测/目录/手填/猜测），
       // 那是「看得见的告知」，比「点不动的勾选框」有用。
       const key = pk(sel.dataset.rid, sel.dataset.sec);
-      if (sel.checked) S.picks.add(key); else S.picks.delete(key);
+      if (sel.checked) {
+        // 档位互斥：勾选时取消同站点其它档位
+        const rid = sel.dataset.rid;
+        const currentSec = sel.dataset.sec;
+        
+        // 从探测结果读当前段的 suggested_priority（档位）
+        const currentResult = (S.results || []).find(r => r.row.rid === rid);
+        const currentTier = currentResult?.sections?.[currentSec]?.suggested_priority;
+        
+        if (currentTier != null) {
+          // 取消同站点、不同档位的勾选
+          Array.from(S.picks).forEach(existingKey => {
+            const [pkRid, pkSec] = existingKey.split('	');
+            if (pkRid === rid && pkSec !== currentSec) {
+              const otherTier = currentResult?.sections?.[pkSec]?.suggested_priority;
+              if (otherTier != null && otherTier !== currentTier) {
+                S.picks.delete(existingKey);
+              }
+            }
+          });
+        }
+        
+        S.picks.add(key);
+      } else {
+        S.picks.delete(key);
+      }
       syncPickUI();
       // 勾选后必须重算 —— 后端只为**已勾选**的段生成方案（/api/plan 收
       // body.selected），未勾的段不在返回里，于是 priority 栏一直停在
