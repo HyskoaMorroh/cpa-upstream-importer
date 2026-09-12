@@ -507,6 +507,108 @@ footer code{color:var(--ink-2)}
   .rail{flex-wrap:wrap}
   .rstep{min-width:calc(50% - 6px)}
 }
+/* ══════════ 路由批量管理 ══════════
+   设计意图：CPAMP 的「AI 提供商」页把 158 条上游拍成 10 条一页的扁平表格，
+   16 页翻下来看不出「同一个网址下有几把 Key、它们档位一不一致」——
+   而这恰恰是唯一重要的结构。所以这里**按 (段, 网址) 分组**呈现：
+   一张卡片 = 一个上游站的一个段，卡片头就把档位、条目数、启停比说清；
+   分裂的组用红色描边直接顶出来，不需要人去逐页比对。 */
+.bm-tools{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0 14px}
+.bm-search{flex:1 1 220px;min-width:180px}
+.bm-stat{display:flex;gap:14px;flex-wrap:wrap;margin:2px 0 12px;
+  padding:10px 12px;background:var(--card-2);border:1px solid var(--line-2);
+  border-radius:10px}
+.bm-stat b{font-size:19px;font-weight:650;letter-spacing:-.4px}
+.bm-stat i{font-style:normal;color:var(--ink-3);font-size:12px;display:block;margin-top:1px}
+.bm-stat .s-bad b{color:var(--bad)}
+.bm-stat .s-off b{color:var(--warn)}
+
+.bm-grid{display:grid;gap:10px;
+  grid-template-columns:repeat(auto-fill,minmax(340px,1fr))}
+.bm-card{background:var(--card);border:1px solid var(--line);border-radius:12px;
+  overflow:hidden;transition:border-color .14s,box-shadow .14s}
+.bm-card:hover{border-color:var(--line);box-shadow:var(--shadow)}
+.bm-card.sel{border-color:var(--accent-2);box-shadow:var(--glow)}
+.bm-card.split{border-color:var(--bad-line)}
+.bm-card.split .bm-head{background:linear-gradient(180deg,var(--bad-bg),transparent)}
+.bm-head{display:flex;align-items:flex-start;gap:9px;padding:10px 12px;
+  border-bottom:1px solid var(--line-2);cursor:pointer;user-select:none}
+.bm-head:hover{background:var(--card-2)}
+.bm-host{flex:1;min-width:0}
+.bm-host b{display:block;font-size:13.5px;font-weight:600;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bm-host span{display:block;font-size:11.5px;color:var(--ink-3);margin-top:2px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bm-sec{font-size:10.5px;padding:2px 7px;border-radius:20px;font-weight:600;
+  border:1px solid transparent;white-space:nowrap;letter-spacing:.2px}
+.sec-gemini{color:#8ab4f8;background:#0f1d33;border-color:#1d3a5f}
+.sec-codex{color:#7ee787;background:#0f2417;border-color:#1f5231}
+.sec-claude{color:#ffab70;background:#2b1a0d;border-color:#5c3417}
+.sec-compat{color:#d2a8ff;background:#221436;border-color:#432a63}
+.bm-pri{display:flex;align-items:center;gap:4px;font-variant-numeric:tabular-nums}
+.bm-pri em{font-style:normal;font-size:15px;font-weight:650}
+.bm-pri.bad em{color:var(--bad)}
+.bm-body{padding:6px 0}
+.bm-row{display:flex;align-items:center;gap:8px;padding:5px 12px;font-size:12px}
+.bm-row:hover{background:var(--card-2)}
+.bm-row.off{opacity:.5}
+.bm-row code{font-size:11px;color:var(--ink-2);flex:1;min-width:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bm-row .p{font-variant-numeric:tabular-nums;color:var(--ink-2);min-width:38px;
+  text-align:right}
+.bm-row .m{color:var(--ink-3);min-width:34px;text-align:right;font-size:11px}
+.bm-dot{width:7px;height:7px;border-radius:50%;flex:none}
+.bm-dot.on{background:var(--ok);box-shadow:0 0 6px -1px var(--ok)}
+.bm-dot.off{background:var(--mute)}
+.bm-warn{margin:6px 12px 8px;padding:7px 9px;font-size:11.5px;line-height:1.55;
+  background:var(--bad-bg);border:1px solid var(--bad-line);border-radius:8px;
+  color:#ffb4ae}
+.bm-warn b{color:var(--bad)}
+.bm-empty{padding:26px;text-align:center;color:var(--ink-3);font-size:13px}
+.bm-actbar{position:sticky;bottom:0;z-index:5;margin-top:12px;padding:10px 12px;
+  background:var(--card-2);border:1px solid var(--accent-2);border-radius:10px;
+  display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+  box-shadow:0 -6px 18px -10px rgba(1,4,9,.9)}
+.bm-actbar .n{font-weight:650;color:var(--accent)}
+.bm-actbar{flex-direction:column;align-items:stretch;gap:9px}
+.bm-actrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.bm-actrow:empty{display:none}
+.bm-cnt{font-size:12.5px}
+.bm-cnt i{font-style:normal;color:var(--ink-3);font-size:11.5px;margin-left:6px}
+.bm-sub{margin:-4px 0 12px;gap:6px}
+.bm-scope{font-size:12px;color:var(--ink-3);margin-right:4px}
+.bm-setpri{font-size:12.5px;color:var(--ink-2);display:flex;align-items:center;gap:6px}
+.bm-setpri input{width:96px;padding:5px 8px;font-size:12.5px;
+  font-variant-numeric:tabular-nums;text-align:center}
+.bm-tip{font-size:11.5px;color:var(--ink-3);flex:1 1 200px}
+
+/* 动作按钮按后果着色：修复=蓝、启用=绿、停用=黄、删除=红。
+   颜色是**语义**不是装饰 —— 不可逆的那个必须一眼与其余三个不同。 */
+.act-fix{--btn:var(--accent);--btnl:var(--accent-2);--btnb:var(--accent-soft)}
+.act-on{--btn:var(--ok);--btnl:var(--ok-line);--btnb:var(--ok-bg)}
+.act-off{--btn:var(--warn);--btnl:var(--warn-line);--btnb:var(--warn-bg)}
+.act-del{--btn:var(--bad);--btnl:var(--bad-line);--btnb:var(--bad-bg)}
+.go.ghost.act-on,.go.ghost.act-off,.go.ghost.act-del,.go.ghost.act-fix{
+  color:var(--btn);border-color:var(--btnl)}
+.go.ghost.act-on:hover,.go.ghost.act-off:hover,
+.go.ghost.act-del:hover,.go.ghost.act-fix:hover{background:var(--btnb)}
+.go.sm.act-del{background:var(--bad);border-color:var(--bad-line);color:#fff}
+.go.sm.act-del:hover{filter:brightness(1.08)}
+
+.bm-danger{margin-top:12px;padding:12px 14px;border-radius:10px;
+  background:var(--bad-bg);border:1px solid var(--bad-line)}
+.bm-danger b{color:var(--bad)}
+.bm-danger p{margin:6px 0 9px;font-size:12.5px;line-height:1.65;color:var(--ink-2)}
+.bm-danger input{width:120px;padding:5px 8px;font-size:12.5px;
+  letter-spacing:1px;text-align:center}
+.bm-danger label{display:flex;align-items:center;gap:7px;font-size:12.5px}
+.bm-dellist{max-height:170px;overflow:auto;margin:0 0 10px;padding:8px 10px;
+  background:var(--bg-2);border:1px solid var(--line-2);border-radius:8px;
+  font-size:11.5px;line-height:1.75;color:var(--ink-2)}
+.bm-dellist div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bm-dellist .s{color:var(--ink-3)}
+@media(max-width:640px){.bm-grid{grid-template-columns:1fr}
+  .bm-tip{display:none}}
 </style>
 
 <div class="top"><div class="wrap">
@@ -777,6 +879,125 @@ https://其他站.com,sk-yyyyyyyyyyyyyyyy
   <div id="donebody"></div>
   <div class="row"><button class="go ghost" id="btnrestart">再投喂一批</button></div>
 </div>
+
+<!-- ═══ 路由批量管理 ═══ -->
+<details class="panel" id="pbulk">
+  <summary class="ph"><h2>路由批量管理</h2>
+    <span class="tag" id="bmtag">按网址分组 · 一次写回</span></summary>
+  <p class="psub">CPAMP 只能一条一条改，158 条上游翻 16 页也看不出
+     「同一个网址下几把 Key 的档位一不一致」。这里按
+     <b>(段 · 网址)</b> 分组，档位分裂的组直接红框顶出来。
+     所有改动仍走 <b>预览 diff → 确认 → 自动备份 → 写回</b>，一道闸都不少。</p>
+
+  <div class="bm-stat" id="bmstat"></div>
+
+  <div class="bm-tools">
+    <input class="bm-search" id="bmq" placeholder="筛选网址或段名…（支持多个关键词，空格分隔）">
+    <select id="bmsec">
+      <option value="">全部段</option>
+      <option value="gemini-api-key">Gemini</option>
+      <option value="codex-api-key">Codex</option>
+      <option value="claude-api-key">Claude</option>
+      <option value="openai-compatibility">OpenAI 兼容</option>
+    </select>
+    <select id="bmfilter">
+      <option value="all">全部状态</option>
+      <option value="split">仅档位分裂</option>
+      <option value="off">含已停用</option>
+      <option value="on">全部启用中</option>
+      <option value="sel">仅已选中</option>
+    </select>
+    <button class="go ghost sm" id="bmreload">重新读取</button>
+  </div>
+
+  <div class="bm-tools bm-sub">
+    <span class="bm-scope" id="bmscope">筛选出 0 组</span>
+    <button class="go ghost sm" id="bmall">选中筛选结果</button>
+    <button class="go ghost sm" id="bmnone">全不选</button>
+    <button class="go ghost sm" id="bmsplit">只选分裂组</button>
+  </div>
+
+  <div class="bm-grid" id="bmgrid"></div>
+
+  <div class="bm-actbar" id="bmact" hidden>
+    <div class="bm-actrow">
+      <span class="bm-cnt">已选 <span class="n" id="bmn">0</span> 组
+        <i id="bmn2"></i></span>
+      <button class="go sm act-fix" id="bmunify">统一优先级</button>
+      <button class="go ghost sm act-on" id="bmenable">批量启用</button>
+      <button class="go ghost sm act-off" id="bmdisable">批量停用</button>
+      <button class="go ghost sm act-del" id="bmdelete">批量删除…</button>
+    </div>
+    <div class="bm-actrow">
+      <label class="bm-setpri">批量设为
+        <input type="number" id="bmpri" min="1" max="100000" placeholder="档位">
+      </label>
+      <button class="go ghost sm act-fix" id="bmsetpri">应用到已选各组</button>
+      <span class="bm-tip">同一组内的所有 Key 会写同一个值 ——
+        这正是「同网址同优先级」那条不变式</span>
+    </div>
+    <div class="bm-actrow"><span class="hint" id="bmmsg"></span></div>
+  </div>
+
+  <div class="bm-danger" id="bmdel" hidden>
+    <b>确认批量删除</b>
+    <p>即将从 <code>config.yaml</code> 中<b>永久移除</b>
+       <span id="bmdeln">0</span> 个条目。写回前会自动备份，但
+       <b>CPA 侧没有回滚</b>。每条删除都会校验 <code>base-url</code> 指纹，
+       不符即整批拒绝。</p>
+    <div id="bmdellist" class="bm-dellist"></div>
+    <div class="row">
+      <label>输入 <code>DELETE</code> 以确认
+        <input id="bmdelok" placeholder="DELETE" autocomplete="off"></label>
+      <button class="go sm act-del" id="bmdelgo" disabled>确认删除</button>
+      <button class="go ghost sm" id="bmdelno">取消</button>
+    </div>
+  </div>
+
+  <div id="bmpreview" hidden>
+    <div class="ph"><h2>改动预览</h2><span class="tag" id="bmcnt"></span></div>
+    <p class="psub" id="bmsem"></p>
+    <div class="diff"><pre id="bmdiff"></pre></div>
+    <div class="row">
+      <button class="go" id="bmapply">确认写回</button>
+      <button class="go ghost" id="bmcancel">取消</button>
+      <span class="hint" id="bmapplymsg"></span>
+    </div>
+  </div>
+</details>
+
+<details class="panel" id="ptune">
+  <summary class="ph"><h2>全局调优体检</h2>
+    <span class="tag" id="tntag">重试预算 × 顶层池</span></summary>
+  <p class="psub">CPA 的 <code>max-retry-credentials</code> 与本工具写的
+     <code>priority</code> 是<b>耦合</b>的，而这份耦合原来只写在
+     <code>config.yaml</code> 的注释里、靠人工每次改完档位回头核对。
+     档位每次重探都可能变，注释不会自己更新 —— 所以这里算给你看：
+     <b>预算 &lt; 顶层池</b> 会让可用凭据轮不到、耗尽后原样透传 403；
+     <b>预算太大</b> 会越过反向代理的回源窗口，客户端拿 524。
+     改动仍走 <b>预览 diff → 确认 → 自动备份 → 写回</b>。</p>
+
+  <div class="bm-tools">
+    <button class="go ghost sm" id="tnrun">开始体检</button>
+    <span class="hint" id="tnbasis"></span>
+  </div>
+
+  <div class="bm-grid" id="tntiers"></div>
+  <div id="tnnotes"></div>
+  <div id="tnlist"></div>
+
+  <div id="tnpreview" hidden>
+    <div class="ph"><h2>改动预览</h2><span class="tag" id="tncnt"></span></div>
+    <p class="psub">只改<b>值</b>：键序、注释、空行、缩进逐字保留 ——
+       那些注释记着每一次调值的实测依据，是「为什么是这个数」的唯一记录。</p>
+    <div class="diff"><pre id="tndiff"></pre></div>
+    <div class="row">
+      <button class="go" id="tnapply">确认写回</button>
+      <button class="go ghost" id="tncancel">取消</button>
+      <span class="hint" id="tnmsg"></span>
+    </div>
+  </div>
+</details>
 
 <div class="panel" id="pbands" hidden>
   <div class="ph"><h2>参考 · 当前档位谱</h2>
