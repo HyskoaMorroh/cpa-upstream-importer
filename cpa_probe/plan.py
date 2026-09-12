@@ -2462,6 +2462,44 @@ def build_plan(
                     section, models, cfg=cfg, remote=remote)
                 if added:
                     model_src = fill_src
+
+            # P0 修复：空模型强制回退（2026-09-12）
+            # -----------------------------------------------
+            # 背景：95% 检测失败（403/405/401/503）→ 空段 → 空模型 → 用户投诉
+            # 即使 topup_to_market_top 理论有回退，实际大量站点仍输出空模型
+            # 根因：检测全灭时 merged=[]，topup 可能因段名不匹配等原因也返回空
+            #
+            # 三层保障：
+            # 1. 优先：topup_to_market_top 的正常回退（已有）
+            # 2. 次之：强制调用 topup 并检查结果（此处新增）
+            # 3. 兜底：直接使用 FALLBACK_MODELS（最后防线）
+            if not models:
+                logger.warning(
+                    f"段 {section} 基址 {base[:40]} 模型为空，触发强制回退")
+
+                # 尝试再次调用 topup（无输入、无 cfg、无 remote）
+                emergency, emergency_added, emergency_src = \
+                    model_catalog.topup_to_market_top(section, [], cfg=None, remote=None)
+
+                if emergency:
+                    models = emergency
+                    model_src = f"emergency-fallback ({emergency_src})"
+                    logger.warning(
+                        f"  → 应急回退成功：{len(emergency)} 个模型从 {emergency_src}")
+                else:
+                    # 最后防线：直接取 FALLBACK_MODELS
+                    from .model_catalog import FALLBACK_MODELS
+                    hardcoded = FALLBACK_MODELS.get(section, [])
+                    if hardcoded:
+                        models = list(hardcoded)
+                        model_src = "hardcoded-fallback"
+                        logger.error(
+                            f"  → 应急回退也空，使用硬编码回退：{len(models)} 个模型")
+                    else:
+                        logger.critical(
+                            f"  → 所有回退均失败，段 {section} 基址 {base[:40]} "
+                            f"无任何模型可用！将生成空模型条目。")
+                        # 不抛异常，让调用方决定如何处理空条目
             catalog_stale, stale_why = False, ""
         provenance = {
             m: ("verified" if v.usable and m in v.models else "inferred")
@@ -2492,6 +2530,23 @@ def build_plan(
             # 段真的探通了就是 probed，补齐几个同族同档变体不改变这件事。
 
         score = score_verdict(v)
+
+        # P0-4: TLS 指纹代理检测与注入（2026-09-12）
+        # -----------------------------------------------
+        # 背景：api.zzzcoding.org 等站点用 TLS Client Hello 指纹识别客户端
+        # 问题：Go http.Client 指纹 ≠ Electron/Chrome 指纹 → 503/403 拒绝
+        # 方案：nginx TLS proxy 中转，改变出口指纹 → 注入 proxy-url 参数
+        #
+        # 检测逻辑：
+        # 1. 黑名单匹配（已知指纹检测站点）
+        # 2. 未来可扩展：检测历史错误中的 "Claude Code" / "fingerprint" 关键字
+        needs_proxy, proxy_url_override = _needs_tls_proxy(base, section)
+        if needs_proxy and proxy_url_override:
+            logger.info(
+                f"段 {section} 基址 {base[:50]} 检测到 TLS 指纹要求，"
+                f"注入 proxy-url: {proxy_url_override}")
+            # 覆盖原有 proxy 设置（指纹代理优先级高于普通代理）
+            proxy = proxy_url_override
 
         # P0-3: 提取历史 max-context-length 值（2026-09-12）
         # -------------------------------------------------------
@@ -3000,26 +3055,64 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
         if not by_host:
             continue
 
-        # 2. 站级排序：先按「有没有实测依据」，再按组内最高分，最后按主机名。
+        # 2. 站级排序：优先基于 CPA 运行时健康分数，回退到检测分数。
         #
-        # 为什么要加第一个键（2026-09-03 真实探测暴露）：`score_verdict` 对
-        # `usable=False` 一律返回 0，于是**探测全灭的站与探测通过但扣满分的站
-        # 排在同一档**，之后只按主机名排 —— 字母序在前的就上去了。
+        # 新设计（2026-09-12）：从 CPA 实际运行状态智能分配优先级
+        # ---------------------------------------------------------
+        # 查询 CPA 管理接口 /v0/management/api-key-usage 获取运行时状态：
+        #   - Success/Failed 计数 → 可调度比例 (60% 权重)
+        #   - RecentRequests 桶活跃度 → 活跃比例 (40% 权重)
+        #   - 健康分数 = schedulable_ratio×0.6 + active_ratio×0.4
         #
-        # 实测那次重探：hotel 四段全灭（WAF ×12）却在 claude 段拿到 160、
-        # gemini 段拿到 217，都是该段第 2 名；而 `ai.` 开头纯粹是因为字母序。
-        # claude-sonnet-5 与 gemini-3.1-pro 的顶层承载因此换到一个刚被判死的
-        # 站上 —— 顶层站不可用时那一层整个白撞一轮（层级隔离，
-        # scheduler.go:402 只取最高那一桶）。
+        # 如果 CPA 未运行或接口不可达，回退到检测结果预测：
+        #   - 检测成功率 40%、响应时间 20%、模型覆盖度 20%
+        #   - 上下文窗口 10%、历史优先级 10%
         #
-        # 判据用 model_source 而不是 score：前者说的是「这一段这次有没有依据」，
-        # 后者是「探测质量」。三档，见 _EVID。
-        # 同档内仍按分数、再按主机名 —— 稳定性不能丢，否则同一批输入两次运行
-        # 给出不同档位，diff 无法复核。
-        ranked = sorted(
-            by_host.items(),
-            key=lambda kv: (_evid(kv[1]), -max(x.score for x in kv[1]), kv[0]),
+        # 排序键：(实测依据档次, -健康分数, 主机名)
+        # - 实测依据档次用 _evid() 保持（防止探测全灭的站抢顶层）
+        # - 健康分数替换原来的"组内最高分"（从静态检测分转为动态运行状态）
+        # - 主机名保持稳定性（同输入同输出）
+
+        from .runtime_health import (
+            fetch_cpa_runtime_health,
+            get_domain_health_scores,
         )
+
+        # 尝试查询 CPA 运行时状态（默认端口 8317，从 config.yaml 读取）
+        cpa_base_url = None
+        if cfg.get("port"):
+            cpa_base_url = f"http://localhost:{cfg['port']}"
+
+        runtime_health = fetch_cpa_runtime_health(cpa_base_url)
+
+        if runtime_health:
+            logger.info(f"段 {section}：已获取 CPA 运行时健康数据，将基于实际运行状态分配优先级")
+            # 计算每个域名的健康分数
+            domain_health = get_domain_health_scores(
+                [sp for sps in by_host.values() for sp in sps],
+                runtime_health,
+                cfg,
+                section
+            )
+        else:
+            logger.info(f"段 {section}：CPA 运行时数据不可用，将基于检测结果预测健康分数")
+            domain_health = {}
+
+        # 构建排序键：每个站取其健康分数（运行时或预测）
+        def _sort_key(kv):
+            host, sps = kv
+            evid = _evid(sps)
+
+            # 优先使用运行时健康分数，否则用检测分数
+            if domain_health and host in domain_health:
+                health_score = domain_health[host]
+            else:
+                # 回退：取组内最高检测分数
+                health_score = max(x.score for x in sps)
+
+            return (evid, -health_score, host)
+
+        ranked = sorted(by_host.items(), key=_sort_key)
 
         # 3. 每个站的上限：走 suggest_priority。安全边界只在那里定义 ——
         #    不劫持顶层、不挡在用站、试用期不越过得分支持的上限，三条都在
@@ -3338,3 +3431,56 @@ def extract_prior_context(cfg: dict, section: str, base_url: str,
         return extract_from_models(e.get("models"))
     
     return {}
+
+
+def _needs_tls_proxy(base_url: str, section: str) -> tuple[bool, str]:
+    """
+    检测上游是否需要 TLS 代理以绕过指纹检测
+    
+    Args:
+        base_url: 上游基址
+        section: 段名
+    
+    Returns:
+        (需要代理, 代理URL)
+        
+    检测逻辑：
+    1. 黑名单匹配 - 已知的指纹检测站点
+    2. 可扩展：检测历史错误信息中的关键字
+    """
+    from urllib.parse import urlparse
+    
+    # 已知需要 TLS 代理的站点（黑名单）
+    # 这些站点使用 TLS Client Hello 指纹或 HTTP/2 指纹识别客户端
+    KNOWN_FINGERPRINT_SITES = [
+        "api.zzzcoding.org",
+        "zzzcoding.org",
+        # 可以添加更多已知站点
+    ]
+    
+    # 默认代理端点（nginx TLS proxy，现有 nginx.conf 的 127.0.0.1:8443）
+    DEFAULT_PROXY_URL = "http://127.0.0.1:8443"
+    
+    try:
+        parsed = urlparse(base_url)
+        hostname = parsed.netloc or parsed.path
+        
+        # 去除端口号
+        if ':' in hostname:
+            hostname = hostname.split(':')[0]
+        
+        # 检查黑名单
+        for site in KNOWN_FINGERPRINT_SITES:
+            if site in hostname.lower():
+                return True, DEFAULT_PROXY_URL
+        
+        # 未来可扩展：检测 v.category 或错误信息中的关键字
+        # 例如：if "fingerprint" in error_msg or "Claude Code" in error_msg
+        
+    except Exception as e:
+        # 解析失败，不注入代理
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"TLS 代理检测失败：{e}，跳过")
+    
+    return False, ""
