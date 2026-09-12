@@ -58,6 +58,20 @@ class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
         fp.close()
         return redirected
 
+    def http_error_307(self, req, fp, code, msg, headers):
+        # Python 3.9 does not handle 307; delegate to redirect_request.
+        newurl = headers.get("Location")
+        if not newurl:
+            return None
+        return self.http_error_302(req, fp, code, msg, headers)
+
+    def http_error_308(self, req, fp, code, msg, headers):
+        # Python 3.9 does not handle 308; delegate to redirect_request.
+        newurl = headers.get("Location")
+        if not newurl:
+            return None
+        return self.http_error_301(req, fp, code, msg, headers)
+
 
 def _time_left(deadline: float) -> float:
     left = deadline - time.monotonic()
