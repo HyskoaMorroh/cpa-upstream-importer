@@ -1295,8 +1295,47 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
     note = f"# {stamp} 批量导入 · 得分 {sp.score} · {sp.priority_reason}"
 
     def model_lines(indent: str) -> list[str]:
+        # P0 修复：空模型验证与应急处理（2026-09-12）
+        # ---------------------------------------------------
+        # 背景：95% 检测失败 → 空段 → sp.models=[] → 生成空 models 块
+        #
+        # 三层检查：
+        # 1. sp.models 非空：正常渲染
+        # 2. sp.highest_models 非空：应急回退（元数据字段，但好过空白）
+        # 3. 两者都空：记录严重错误，返回空列表（由调用方决定是否写入）
+        if not sp.models:
+            logger.error(
+                f"CRITICAL: 空模型渲染被阻止 - "
+                f"section={sp.section}, base_url={sp.base_url}, "
+                f"model_source={sp.model_source}, score={sp.score}")
+
+            # 尝试使用 highest_models 作为应急回退
+            if sp.highest_models:
+                logger.warning(
+                    f"  → 使用 highest_models 作为应急回退："
+                    f"{len(sp.highest_models)} 个模型")
+                models_to_render = sp.highest_models
+            else:
+                # 最后防线：使用硬编码回退
+                from .model_catalog import FALLBACK_MODELS
+                emergency_fallback = FALLBACK_MODELS.get(sp.section, [])
+
+                if emergency_fallback:
+                    logger.error(
+                        f"  → highest_models 也空，使用硬编码回退："
+                        f"{len(emergency_fallback)} 个模型")
+                    models_to_render = list(emergency_fallback)
+                else:
+                    # 无任何回退可用，记录严重错误并返回空
+                    logger.critical(
+                        f"  → 所有回退均失败！将生成空 models 块。"
+                        f"该条目可能无法在 CPA 中正常工作。")
+                    return []  # 返回空列表，让调用方决定如何处理
+        else:
+            models_to_render = sp.models
+
         rows: list[str] = []
-        for m in sp.models:
+        for m in models_to_render:
             rows.append(f"{indent}- name: {_yaml_str(m)}")
             # alias 写空串，与现有 459 个条目一致（生产 config.yaml 里
             # 100% 是 `alias: ""`）。
