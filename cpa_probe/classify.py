@@ -230,7 +230,9 @@ def classify(status: str, body: str) -> tuple[str, str]:
         # 405 兜底：关键词规则没命中时的裸 405
         return "临时", "405 Method Not Allowed"
     if s == "429":
-        return "限流", "429 限流"
+        # BUG 修复 2026-09-13: 429 应归类为「临时」以参与重试，而非「限流」直接放弃
+        # 原因：限流是短期现象，重试后可能恢复；分类为「限流」会让 pipeline._stage1 跳过重试
+        return "临时", "429 限流 (可重试)"
     if s.startswith("5"):
         return "临时", f"{s} 上游错误"
     if s == "000":

@@ -2906,7 +2906,12 @@ $('#btnrestart').onclick = () => {
    也是本项目自己注入时写坏过的地方（实测：注入前 0 组分裂，注入后 3 组）。
    所以这里以 (段 · 网址) 为一等公民，分裂的组红框直接顶出来。         */
 
-const BM = { groups: [], sel: new Set(), bulkId: '' };
+/* `revision` 是这份路由清单对应的配置快照指纹（后端 bulk.config_revision）。
+   /api/bulk-preview 强制要求它：缺失回 428、不符回 409 —— 因为 ops 里的
+   `index` 是**下标**，而下标只在拉取那一刻的配置里有意义。中途别处改过
+   config.yaml（另一个标签页、CPAMP、手工编辑），下标就指向别的条目了。
+   所以每次 bmLoad 都要一并存下它，提交时原样回传。 */
+const BM = { groups: [], sel: new Set(), bulkId: '', revision: '' };
 
 const BM_SEC_CN = {
   'gemini-api-key': 'Gemini', 'codex-api-key': 'Codex',
@@ -3009,6 +3014,7 @@ async function bmLoad() {
   try {
     const d = await api('/api/routes');
     BM.groups = d.groups || [];
+    BM.revision = d.revision || '';
     // 选中集按 (段,网址) 而不是下标 —— 重新读取后下标可能因别处改动而移位，
     // 用下标记选中会静默选错组。
     const live = new Set(BM.groups.map(bmKey));
@@ -3046,7 +3052,7 @@ function bmOps(kind, arg) {
       }
       g.entries.forEach((e) => {
         if (e.priority !== target) {
-          ops.push({ section: g.section, index: e.index,
+          ops.push({ section: g.section, index: e.index, fingerprint: e.fingerprint,
                      action: 'priority', value: target });
         }
       });
@@ -3054,14 +3060,14 @@ function bmOps(kind, arg) {
       // 每条都带 base-url 指纹。后端逐条校验，不符整批拒绝 ——
       // 下标是位置，位置会因为别人并发改动而指向另一个条目。
       g.entries.forEach((e) => {
-        ops.push({ section: g.section, index: e.index,
+        ops.push({ section: g.section, index: e.index, fingerprint: e.fingerprint,
                    action: 'delete', expect: e.base_url });
       });
     } else {
       const want = kind === 'enable';
       g.entries.forEach((e) => {
         if (e.enabled !== want) {
-          ops.push({ section: g.section, index: e.index,
+          ops.push({ section: g.section, index: e.index, fingerprint: e.fingerprint,
                      action: want ? 'enable' : 'disable' });
         }
       });
@@ -3079,7 +3085,11 @@ async function bmPreview(kind, arg) {
   }
   msg.textContent = '生成预览中…';
   try {
-    const d = await api('/api/bulk-preview', { method: 'POST', body: { ops } });
+    // revision 必须带上：后端用它确认 ops 里的 index 仍指向拉取时的那些条目。
+    // 缺失回 428，不符回 409（配置在别处被改过）—— 两种都要提示刷新，
+    // 而不是让用户对着一个沉默失败的按钮反复点。
+    const d = await api('/api/bulk-preview',
+                        { method: 'POST', body: { ops, revision: BM.revision } });
     if (!d.changed) {
       msg.innerHTML = '<span style="color:var(--ink-3)">没有实际改动</span>';
       return;
@@ -3096,7 +3106,12 @@ async function bmPreview(kind, arg) {
     msg.textContent = '';
     $('#bmpreview').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   } catch (e) {
-    msg.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
+    // 428 / 409 都是「你手里的清单过期了」，唯一出路是重新拉取。
+    // 自动刷一次并让用户重选，比只报错更省一次来回。
+    const stale = /revision|stale|过期|刷新/i.test(e.message || '');
+    msg.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`
+      + (stale ? '<span style="color:var(--ink-3)"> · 已自动刷新路由，请重新选择</span>' : '');
+    if (stale) { BM.sel.clear(); bmLoad(); }
   }
 }
 

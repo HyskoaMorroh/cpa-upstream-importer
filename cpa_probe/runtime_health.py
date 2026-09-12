@@ -25,7 +25,8 @@ class AuthHealth:
 
 def fetch_cpa_runtime_health(
     base_url: str = "http://localhost:8317",
-    timeout: int = 5
+    timeout: int = 5,
+    management_token: Optional[str] = None
 ) -> Optional[Dict[str, Dict[str, AuthHealth]]]:
     """
     从 CPA 管理接口获取运行时健康数据
@@ -33,6 +34,7 @@ def fetch_cpa_runtime_health(
     Args:
         base_url: CPA 服务地址（例如 http://localhost:8317）
         timeout: 请求超时（秒）
+        management_token: CPA 管理接口令牌（可选，优先从环境变量 CPA_MANAGEMENT_TOKEN 读取）
 
     Returns:
         按 provider 和 "base_url|api_key" 分组的健康数据
@@ -50,9 +52,19 @@ def fetch_cpa_runtime_health(
     # 构造完整 URL（CPA 路由: /v0/management/api-key-usage）
     url = f"{base_url.rstrip('/')}/v0/management/api-key-usage"
 
+    # 从环境变量读取令牌（优先于参数）
+    token = os.environ.get("CPA_MANAGEMENT_TOKEN") or management_token
+
     try:
         logger.info(f"查询 CPA 运行时健康状态: {url}")
-        resp = requests.get(url, timeout=timeout)
+
+        # 构造请求头
+        headers = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+            logger.debug("使用管理令牌鉴权")
+
+        resp = requests.get(url, timeout=timeout, headers=headers)
         resp.raise_for_status()
 
         raw_data = resp.json()
@@ -161,7 +173,10 @@ def extract_health_from_detection(
     scores = []
 
     # 1. 检测成功率 (40%)
-    if plan.has_base_models or plan.models_final:
+    # Bug 修复 (2026-09-13): SectionPlan 无 has_base_models/models_final 属性，
+    # 改用 models 列表(总是存在)与 highest_models(可选回退)判定探测成功。
+    detected_models = getattr(plan, 'models', []) or getattr(plan, 'highest_models', [])
+    if detected_models:
         success_score = 1.0  # 检测成功
     else:
         success_score = 0.0  # 检测失败
@@ -182,7 +197,7 @@ def extract_health_from_detection(
     scores.append(("latency", 0.2, latency_score))
 
     # 3. 模型覆盖度 (20%)
-    model_count = len(plan.models_final) if plan.models_final else 0
+    model_count = len(detected_models)
     if model_count >= 5:
         model_score = 1.0
     elif model_count >= 3:
@@ -240,11 +255,13 @@ def match_auth_to_plan(
         return None
 
     # 段名到 provider 的映射
+    # Bug 修复 (2026-09-13): CPA 的 provider 值与 parse.SECTIONS 键对齐。
+    # 原先 "gemini" → "gemini-api-key", "openai-api-key" → "openai-compatibility"
     section_to_provider = {
         "claude-api-key": "claude",
         "codex-api-key": "codex",
-        "gemini": "gemini",
-        "openai-api-key": "openai-compatible",  # CPA 中 openai 统一为 openai-compatible
+        "gemini-api-key": "gemini",
+        "openai-compatibility": "openai-compatible",
     }
 
     provider = section_to_provider.get(section)
