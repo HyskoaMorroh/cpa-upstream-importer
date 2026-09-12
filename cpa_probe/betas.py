@@ -44,11 +44,18 @@ _HINTS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 
-def wanted(body: str) -> list[str]:
+def wanted(body: str, *, source_identity=None) -> list[str]:
     """正文点名要求的 beta 项，按 _HINTS 顺序去重返回。正文没点名就是空列表。"""
     text = body or ""
     out: list[str] = []
     for beta, pat in _HINTS:
+        if source_identity is not None:
+            values = (list(source_identity.claude_betas_conditional.values())
+                      + source_identity.claude_betas_unconditional)
+            prefix = beta.rsplit("-", 3)[0] + "-"
+            beta = next((value for value in values if value.startswith(prefix)), beta)
+            if prefix == "context-1m-":
+                beta = source_identity.claude_betas_conditional.get("claudeContext1MBeta", beta)
         if pat.search(text) and beta not in out:
             out.append(beta)
     return out

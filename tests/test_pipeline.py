@@ -102,7 +102,12 @@ class FakeUpstream(BaseHTTPRequestHandler):
         raw = (payload if isinstance(payload, str)
                else json.dumps(payload, ensure_ascii=False)).encode("utf-8")
         self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        # SSE 与 JSON 的 Content-Type 必须分开 —— codex 段回的是事件流，
+        # 标成 application/json 会让客户端侧按整份 JSON 解析（2026-09-12）。
+        ctype = ("text/event-stream; charset=utf-8"
+                 if isinstance(payload, str) and payload.startswith(("event:", "data:"))
+                 else "application/json; charset=utf-8")
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -125,14 +130,62 @@ class FakeUpstream(BaseHTTPRequestHandler):
                 return len(str(part.get("text") or ""))
         return 0
 
-    @staticmethod
-    def _ok_payload(model: str, tokens: int, *, rid: str = "msg_01AbCdEfGhJiKm") -> dict:
-        return {
-            "id": rid,
-            "model": model,
-            "usage": {"input_tokens": tokens, "output_tokens": 12},
-            "content": [{"type": "text", "text": "A hash map is unordered."}],
-        }
+    # 段判定：真实上游按**路径**分协议，假上游也必须照做。
+    #
+    # 2026-09-12：原来四个段一律回 Claude 形态（顶层 `content` 数组），于是
+    # `classify.validate_success` 的协议证据闸只放 claude 过，其余三段判
+    # missing-output / stream-required —— 23 项失败全出自这里。
+    # 那个闸本身是对的（它正是「站在 cc-switch 能用、进 CPA 不能用」要查的
+    # 东西：CPA 按段走不同协议，回错形态就是不可用），错的是这份假数据。
+    def _section_of(self, path: str) -> str:
+        # 判定顺序按**具体度**，与 cpa_probe/parse.py:112-119 的端点表对齐。
+        # `/models/` 不能先判 —— gemini 的 generateContent 路径里有它，
+        # 而 codex 的 `/responses` 路径里没有，先判会把 codex 误认成 gemini。
+        if ":generateContent" in path or ":streamGenerateContent" in path:
+            return "gemini-api-key"
+        if "/responses" in path:
+            return "codex-api-key"
+        if "/messages" in path:
+            return "claude-api-key"
+        if "/chat/completions" in path:
+            return "openai-compatibility"
+        return "openai-compatibility"
+
+    def _ok_payload(self, model: str, tokens: int, *,
+                    rid: str = "msg_01AbCdEfGhJiKm", path: str | None = None):
+        """该段协议下「成功」长什么样。codex 返回 SSE 文本，其余返回 dict。"""
+        section = self._section_of(path if path is not None
+                                   else self._profile_and_path()[1])
+        text = "A hash map is unordered."
+        usage = {"input_tokens": tokens, "output_tokens": 12}
+        if section == "claude-api-key":
+            return {"id": rid, "model": model, "usage": usage,
+                    "content": [{"type": "text", "text": text}]}
+        if section == "gemini-api-key":
+            return {"modelVersion": model,
+                    "usageMetadata": {"promptTokenCount": tokens,
+                                      "candidatesTokenCount": 12},
+                    "candidates": [{"content": {"role": "model",
+                                                "parts": [{"text": text}]},
+                                    "finishReason": "STOP"}]}
+        if section == "codex-api-key":
+            # Responses 流：必须有终止事件，且 output 里有真实内容块。
+            done = {"type": "response.completed",
+                    "response": {"id": rid, "model": model, "status": "completed",
+                                 "usage": {"input_tokens": tokens,
+                                           "output_tokens": 12},
+                                 "output": [{"type": "message", "role": "assistant",
+                                             "content": [{"type": "output_text",
+                                                          "text": text}]}]}}
+            return ("event: response.output_text.delta\n"
+                    "data: " + json.dumps({"type": "response.output_text.delta",
+                                           "delta": text}, ensure_ascii=False) + "\n\n"
+                    "event: response.completed\n"
+                    "data: " + json.dumps(done, ensure_ascii=False) + "\n\n")
+        return {"id": rid, "model": model,
+                "usage": {"prompt_tokens": tokens, "completion_tokens": 12},
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": text}}]}
 
     # ---- 主分发 ----
 
@@ -187,8 +240,25 @@ class FakeUpstream(BaseHTTPRequestHandler):
             return
 
         if profile == "identity":
-            if self.headers.get("User-Agent") or self.headers.get("Originator"):
-                self._send(200, self._ok_payload(model, max(sent, 20)))
+            # 判据按**段**分开（2026-09-12）
+            # ------------------------------------
+            # CPA 默认 `disable-codex-cloaking: false`，无条件给 codex 请求
+            # 打上官方身份头（codex_executor_request.go:372-377），本项目
+            # 的 request.build_request 照做，且**在 extra_headers 之后**应用
+            # —— 于是 codex 段 baseline 与 originator-only / codex-tui 等档
+            # 在线上完全同形（都带 UA + Originator），老判据「有 UA 或
+            # Originator 就放行」在 baseline 就放行，画像梯一档都不爬。
+            #
+            # codex 段能观测到的第一个**只有画像才加**的东西是 `Version`
+            # （profiles.py 的 codex-full 档）。所以 codex 段要求它，
+            # 其余三段 baseline 本来不带身份头，沿用原判据。
+            if self._section_of(path) == "codex-api-key":
+                has_ident = bool(self.headers.get("Version"))
+            else:
+                has_ident = bool(self.headers.get("User-Agent")
+                                 or self.headers.get("Originator"))
+            if has_ident:
+                self._send(200, self._ok_payload(model, max(sent, 20), path=path))
             else:
                 self._send(401, {"error": {"message": "unauthorized client"}})
             return
@@ -521,15 +591,21 @@ def main() -> int:
         # （CPA 上线前会改成真实客户端的大小写，见 claudeWireHeaderCasing）。
         # 原断言写死了 "User-Agent"/"Originator" 的驼峰形态，那是把「假上游
         # 恰好这么写」当成了契约 —— 换成小写后测试假失败，而行为完全正确。
+        #
+        # 2026-09-12：codex 段的可选头集合扩到 version 与传输协商头。
+        # CPA 默认开 codex cloaking（disable-codex-cloaking 默认 false，
+        # codex_executor_request.go:372-377），baseline 就带 UA + Originator，
+        # 所以能把这个段救回来的最省档是**再加 Version** 的 codex-full。
         eq("头是 UA 或 Originator",
-           {k.lower() for k in v.min_headers} <= {"user-agent", "originator"}, True)
+           {k.lower() for k in v.min_headers}
+           <= {"user-agent", "originator", "version", "accept", "connection"}, True)
         eq("走的是 identity 回退",
            any(a.combo.startswith("id:") and a.ok for a in v.attempts), True)
-        # 画像档名要被记下来 —— 报告与写回都靠它，「需要 originator-only」
+        # 画像档名要被记下来 —— 报告与写回都靠它，「需要 codex-full」
         # 比「需要 1 个头」对人有用得多。
         eq("记下了画像档名", bool(v.profile_name), True)
-        eq("最省档优先（originator 不含版本号，最抗客户端升级）",
-           v.profile_name, "originator-only")
+        eq("最省档优先（codex 段 baseline 已自带身份头，再省就没有了）",
+           v.profile_name, "codex-full")
         eq("这一档不需要 body 补丁", v.min_body_kind, "")
 
         # ------------------------------------------------------------------

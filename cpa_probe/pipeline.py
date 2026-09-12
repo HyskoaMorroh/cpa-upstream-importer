@@ -19,11 +19,14 @@
 from __future__ import annotations
 
 import concurrent.futures
+import copy
+import hashlib
 import json
 import re
 import threading
 import time
 import urllib.parse
+import uuid
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -37,9 +40,25 @@ from .classify import MODEL_CHANNEL_BODY as _MODEL_CHANNEL_BODY
 from .classify import body_excerpt as _body_excerpt
 from .classify import classify as _classify
 from .classify import has_error_envelope as _has_error_envelope
+from .classify import looks_like_html as _looks_like_html
 from .classify import time_window as _time_window
+from .classify import validate_success
+from .resources import HOST_LIMITER
 from . import client, fingerprint, model_catalog, profiles, request
 from .parse import SECTIONS, ParsedRow, base_for_section, host_of
+
+# 协议证据闸的机器码 → 给人看的话（2026-09-12）。
+#
+# `classify.validate_success` 返回的是稳定机器码（error-envelope 这类），
+# 事件与界面要说人话。这张表只做翻译，不新增判据 —— 漏了的码按
+# 「200 但<码>」兜底，不会把未知情形说成已知情形。
+_GATE_REASON_CN = {
+    "error-envelope": "200 但正文是错误体",
+    "stream-required": "200 但该发事件流却回了整份 JSON",
+    "missing-output": "200 但正文里没有任何有效输出块",
+    "missing-terminal": "200 但流里没有终止事件（响应未完成）",
+    "invalid-json": "200 但正文不是合法 JSON",
+}
 
 # 每段的种子模型。/models 目录拿不到时兜底；拿到目录时用来定验证顺序。
 # 按段分开 —— claude 段问 gpt-5.6-sol 必然 404，那是 CPA 的段语义决定的。
@@ -348,15 +367,19 @@ class Attempt:
     # 200 但正文是错误体。见 _accept 的说明 —— 这是实测过的假阳性来源，
     # 而 status == "200" 单独看不出来，所以在 _call 里当场判好存下来。
     error_envelope: bool = False
+    response_valid: bool = False
+    validation_reason: str = ""
+    successful_base_url: str = ""
+    identity_verified: bool = False
 
     @property
     def ok(self) -> bool:
-        return self.status == "200"
+        return self.status == "200" and self.response_valid and not self.error_envelope
 
     def as_sample(self) -> dict:
         """转成 fingerprint.swap_rate 需要的形状。"""
         return {
-            "status": self.status,
+            "status": self.status if self.ok else "000",
             "requested": self.model,
             "actual": self.resp_model,
             "backend": self.backend,
@@ -415,6 +438,10 @@ class SectionVerdict:
     # 时的表现分两种 —— 忽略（无害）或 400 拒收（有害），所以要实测。
     prompt_cache_key: bool | None = None
     prompt_cache_note: str = ""
+    # claude 段：对话中途的 system 消息要不要让 CPA 挪到顶层。
+    # None = 未探测 / 未判定；False = 上游自己就收；True = 需要 CPA 代为重建。
+    rebuild_mid_system: bool | None = None
+    rebuild_mid_system_note: str = ""
     category: str = ""
     action: str = ""
     attempts: list[Attempt] = field(default_factory=list)
@@ -427,6 +454,13 @@ class SectionVerdict:
     #
     # 判死的段也要留着它：操作员人工接管时，这是唯一可选的候选清单。
     catalog: list[str] = field(default_factory=list)
+    successful_base_url: str = ""
+    successful_proxy_url: str | None = None
+    profile_id: str = ""
+    unverified_models: list[str] = field(default_factory=list)
+    identity_verified_models: list[str] = field(default_factory=list)
+    budget_exhausted: bool = False
+    source_snapshot_id: str = ""
 
     @property
     def need_ua(self) -> bool:
@@ -499,7 +533,12 @@ class Prober:
         # `codex.header-defaults` 派生真实的 UA 版本号与 X-Stainless 值
         # （profiles.defaults_from_config）。给 None 时回落内置常量 ——
         # 那些常量是从 CPA 源码抄录的，不是猜的，所以缺配置也能工作。
-        self.cfg_snapshot = cfg_snapshot
+        self.cfg_snapshot = copy.deepcopy(cfg_snapshot or {})
+        from .cpa_source_probe import cached_identity
+        self.source_identity = copy.deepcopy(cached_identity(proxy=proxy))
+        self.session_id = uuid.uuid4().hex
+        self.client_headers = dict(self.cfg_snapshot.get("probe-client-headers") or {})
+        self._cancelled = threading.Event()
         self.proxy = proxy
         self.gap = gap
         self.timeout = timeout
@@ -572,6 +611,52 @@ class Prober:
 
     # ---------- 底层 ----------
 
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+    def _check_cancel(self) -> None:
+        if self._cancelled.is_set():
+            raise concurrent.futures.CancelledError()
+
+    def _wait(self, seconds: float) -> None:
+        if self._cancelled.wait(max(0, seconds)):
+            self._check_cancel()
+
+    def _entry(self, section: str, base: str, key: str) -> dict:
+        """Exact path and credential lookup; never infer a sibling channel."""
+        target = base_for_section(base, section, declared_base=True)
+        for entry in self.cfg_snapshot.get(section) or []:
+            if not isinstance(entry, dict) or not entry.get("base-url"):
+                continue
+            if base_for_section(entry["base-url"], section, declared_base=True) != target:
+                continue
+            if section == "openai-compatibility":
+                for item in entry.get("api-key-entries") or []:
+                    if isinstance(item, dict) and item.get("api-key") == key:
+                        return {**entry, **item}
+            elif entry.get("api-key") == key:
+                return dict(entry)
+        return {}
+
+    def _base(self, row: ParsedRow, section: str) -> str:
+        entry = self._entry(section, row.bare, row.api_key)
+        return base_for_section(entry.get("base-url") or row.bare, section,
+                                declared_base=bool(entry))
+
+    def _evidence_key(self, section: str, base: str, key: str):
+        entry = self._entry(section, base, key)
+        context = json.dumps([key, entry, self.cfg_snapshot, self.proxy,
+                              self.client_headers, self.session_id],
+                             sort_keys=True, default=str)
+        return (base_for_section(base, section, declared_base=True), section,
+                hashlib.sha256(context.encode()).hexdigest())
+
+    def _send(self, url: str, **kwargs):
+        host = host_of(url)
+        with HOST_LIMITER.slot(host, max(self.gap, self._host_gap.get(host, 0)),
+                               self._check_cancel):
+            return client.send(url, **kwargs)
+
     @property
     def live_proxy(self) -> str | None:
         """代理地址，仅在预检通过时返回；不通则返回 None。
@@ -626,6 +711,7 @@ class Prober:
         # ("a", "b|c") 与 ("a|b", "c") 拼出同一个 "a|b|c"，两者会共享
         # 同一个 gap 桶（测试抓到过）。host 来自用户输入的 URL，
         # section 虽然是内部常量，也没有理由留这个坑。
+        self._check_cancel()
         bucket = (host, section)
         with self._lock:
             # 站方自报的节奏阈值优先（见 _note_rate_limit）。它是从 429/403
@@ -646,7 +732,7 @@ class Prober:
             else:
                 self._last_call[bucket] = time.monotonic()
         if wait > 0:
-            time.sleep(wait)
+            self._wait(wait)
 
     # 站方自报的探测节奏阈值。形如
     #   bulk probe guard: ip 1.2.3.4 requested 4 distinct models in 60s
@@ -709,7 +795,32 @@ class Prober:
     ) -> Attempt:
         # 按 (host, section) 节流：同站同段保持 gap，其余互不等待
         self._throttle(host_of(base), section)
-        kwargs = {"extra_headers": extra_headers}
+        entry = self._entry(section, base, key)
+        if entry:
+            base = entry["base-url"]
+        proxy = proxy or entry.get("proxy-url") or None
+        # 这一段 CPA 转发时强不强制流式 —— **从源码读**，不写死段名
+        # （docx 第 6 条：严禁硬编码；2026-09-12 接上）。
+        # -----------------------------------------------------------------
+        # 探测要问的是「CPA 这样发通不通」，所以形态必须与 CPA 实际转发的
+        # 一致。原来这里写的是 `section == "codex-api-key"`，而
+        # cpa_source_probe 自己解析出来的表里 **gemini 段也强制 stream=true**
+        # （那个模块 parse_body_shape 的文档就写着「gemini 强制 stream=true；
+        # 删 session_id」）。两处不一致的后果正是用户 2026-09-12 报的
+        # 「空 HTTP 200 + 0 个 SSE 事件」的探测侧盲点：非流式 JSON 探通了，
+        # 而 CPA 走流式，站方流式路径一个事件都不吐 —— 工具判它可用。
+        #
+        # `forces_stream` 读不出结论时（源码拉不到是常态）回落到 codex 段，
+        # 也就是原来的行为：宁可保持既有形态，不因为拉不到源码而突然换一种。
+        from .cpa_source_probe import forces_stream as _forces_stream
+        forced = _forces_stream(self.source_identity, section)
+        if forced is None:
+            forced = section == "codex-api-key"
+        stream = forced or bool((body_patch or {}).get("stream"))
+        kwargs = {"extra_headers": extra_headers, "entry_config": entry,
+                  "cfg": self.cfg_snapshot, "source_identity": self.source_identity,
+                  "declared_base": True, "client_headers": self.client_headers,
+                  "session_id": self.session_id, "stream": stream}
         if text is not None:
             kwargs["text"] = text
         url, headers, body = request.build_request(section, base, model, key, **kwargs)
@@ -718,7 +829,9 @@ class Prober:
             # 补丁只碰顶层键，而顶层同名键就该整体替换（metadata 整个替换，
             # 不是与探测自己的 metadata 合并 —— 探测本来不发 metadata）。
             body.update(body_patch)
-        resp = client.send(
+        if section == "codex-api-key":
+            body["stream"] = True
+        resp = self._send(
             url,
             headers=headers,
             body=_encode(body),
@@ -726,8 +839,33 @@ class Prober:
             timeout=self.timeout,
         )
         category, action = _classify(resp.status, resp.body)
+        valid, reason = validate_success(section, resp.status, resp.body,
+                                         error=resp.error, require_stream=stream)
+        if str(resp.status) == "200":
+            category, action = ("可用", reason) if valid else ("未知", reason)
+            if not valid:
+                # 在**拒收发生的地方**报出来（2026-09-12）
+                # ------------------------------------------
+                # `model-rejected` 原来只在 `_accept` 里发，而 `_accept`
+                # 只有段先通过基线才会被调到。站方四段全回「200 + 错误体」
+                # 时段在基线就判否，于是一个 model-rejected 都没有 ——
+                # 界面只说「未知」，不说到底是正文是错误体、还是该发流没发流。
+                # 那正是第 1/2 条要查的东西（直连能用、进 CPA 不能用），
+                # 把原因藏起来等于让人没法排查。
+                self.on_event("model-rejected", {
+                    "section": section,
+                    "host": host_of(base),
+                    "requested": model,
+                    "actual": None,
+                    "reason": _GATE_REASON_CN.get(reason, f"200 但{reason}"),
+                })
         rid = fingerprint.resp_id(resp.body)
-        sent = len(text) if text is not None else len(request.PROBE_TEXT)
+        # 探测文本按 Key 派生（request.probe_text_for），不再是唯一那句 ——
+        # 所以「没显式传 text」时要问同一个派生函数，不能拿 PROBE_TEXT 的
+        # 长度顶替，否则 sent_chars 会与实际发出去的长度对不上，
+        # 而上下文上限的推算正是拿它做基线的。
+        sent = (len(text) if text is not None
+                else len(request.probe_text_for(key)))
         att = Attempt(
             section=section,
             model=model,
@@ -741,9 +879,23 @@ class Prober:
             resp_id=rid,
             backend=fingerprint.backend_of(rid),
             input_tokens=fingerprint.input_tokens(resp.body),
-            excerpt="" if resp.status == "200" else _body_excerpt(resp.body),
+            # 200 通常不记正文（省内存），但**整页 HTML 的 200 要记** ——
+            # 那是维护页/拦截页，不记的话界面上只剩一个「200」，
+            # 没人看得出它为什么被判成临时（2026-09-11）。
+            excerpt=("" if valid
+                     else _body_excerpt(resp.body)),
             sent_chars=sent,
-            error_envelope=_has_error_envelope(resp.body),
+            # 「200 但正文不是 API 响应」的两种载体合并在这一个字段里：
+            #   · JSON 错误信封 —— 站方把错误放进 200 的正文
+            #   · 整页 HTML     —— 维护页 / WAF 拦截页 / nginx 错误页
+            # 合并而不是各判各的：下游有四个消费点（_accept、诊断梯子、
+            # 事件流、报告），任何一处漏判都会让死站带着模型进 config.yaml。
+            error_envelope=(_has_error_envelope(resp.body)
+                            or _looks_like_html(resp.body)),
+            response_valid=valid, validation_reason=reason,
+            successful_base_url=base_for_section(base, section, declared_base=True) if valid else "",
+            identity_verified=valid and bool(fingerprint.resp_model(resp.body))
+                and fingerprint.model_matches(model, fingerprint.resp_model(resp.body)),
         )
         self.on_event(
             "attempt",
@@ -797,7 +949,7 @@ class Prober:
         所以判的是「正文顶层有错误结构」而不是「缺 model 字段」：
         顶层 error / 顶层 "type":"error"，两者都是明确的错误信号。
         """
-        if att.error_envelope:
+        if not att.ok:
             self.on_event("model-rejected", {
                 "section": v.section,
                 "host": host_of(v.base_url),
@@ -806,7 +958,23 @@ class Prober:
                 "reason": "200 但正文是错误体",
             })
             return []
+        v.successful_base_url = att.successful_base_url or v.base_url
+        v.successful_proxy_url = att.proxy
+        # need_proxy 只增不减（2026-09-12）
+        # --------------------------------
+        # 它的含义是「这个站**得**走代理才能用」，由处置梯给出结论：
+        # baseline 失败、via-proxy 成功时置位（:1098 / :1208）。
+        # 原来这里每收下一个模型就按**当次**的 att.proxy 整体覆盖，于是
+        # 代理救回之后的 model-scan（直连即可成功，本来就不带代理）
+        # 会把它打回 False —— 落盘时 proxy-url 丢掉，写出去的条目在生产
+        # 环境直连不通，正是「导入后这个站用不了」的一种。
+        # 拒收时的还原是另一条路径，仍由 :1220 显式负责。
+        if att.proxy:
+            v.need_proxy = True
+        v.source_snapshot_id = self.source_identity.snapshot_id
         if fingerprint.model_matches(model, att.resp_model):
+            if att.identity_verified and model not in v.identity_verified_models:
+                v.identity_verified_models.append(model)
             return [model]
         self.on_event("model-rejected", {
             "section": v.section,
@@ -829,6 +997,15 @@ class Prober:
     #
     # 取 2：一个够定归属，两个能区分「站级不可用」与「这个模型不在」。
     _BASELINE_MODELS = 2
+
+    # 模型专属死路（404 model_not_found 这类）最多额外补打几个候选。
+    #
+    # 它们不消耗 `_BASELINE_MODELS` 的额度 —— 那个额度是用来判「站行不行」的，
+    # 而这类结果只说明「这个模型不在」。但也要有上限：一个站的目录可能有
+    # 几百个名字而这个分组一个都没有，逐个打既慢又像扫描。
+    # 取 3：加上原本的 2 个，最多 5 发就能覆盖「排在最前的几个恰好不在」
+    # 这种现场形态；再多说明整份目录与这个分组确实无关，判死是对的。
+    _BASELINE_SKIPS = 3
 
     # 目录最多翻几页。只有 gemini 的 /v1beta/models 分页，与 CPAMP 的
     # healthCheck.ts:279-364 取同一个上限，防异常站的无限 nextPageToken。
@@ -894,7 +1071,27 @@ class Prober:
 
         # 基线阶段只打前几个 —— 这里的目的是「定段归属 + 找最小门票」，
         # 不是把目录验穷。验穷是 _stage2 的活，且有 max_model_attempts 兜着。
-        probe_models = self._probe_order(section, v.catalog)[:self._BASELINE_MODELS]
+        #
+        # 但**模型专属的死路不消耗这个额度**（2026-09-12 补）
+        # ------------------------------------------------
+        # 取 2 的理由是「一个够定归属，两个能区分站级不可用与这个模型不在」。
+        # 那个理由在两个候选**都**回 404 model_not_found 时正好不成立：
+        # 两条证据都只说「这两个模型不在」，关于「这个站行不行」一个字都没说，
+        # 而结论却落成「死路 — 分组无该模型渠道」，整段判死。
+        #
+        # 现场形态：站方目录报了几百个名字，而 `_probe_order` 排在最前的两个
+        # 恰好是该分组没有的（目录是站级的，分组权限是 Key 级的）——
+        # 一个完全可用的站因此消失。
+        #
+        # 判据复用 `_model_specific_dead_end`（下面 seen_weak 那一支用的同一个）
+        # ——「这个拒绝只针对当前模型」。这类结果不计入额度，改打下一个候选；
+        # 任何**与模型无关**的结论（门禁 / 余额 / IP封 / 分组无渠道）仍然
+        # 立即收敛，一个都不多打。上限 `_BASELINE_SKIPS` 兜住「整份目录都
+        # 不在这个分组里」的站，避免几百个候选逐个打。
+        order_all = self._probe_order(section, v.catalog)
+        probe_models = order_all[:self._BASELINE_MODELS]
+        spare = order_all[self._BASELINE_MODELS:self._BASELINE_MODELS
+                          + self._BASELINE_SKIPS]
         for model in probe_models:
             att = self._call(section, base, row.api_key, model, combo="baseline")
             v.attempts.append(att)
@@ -931,6 +1128,10 @@ class Prober:
                 # 只针对这个模型的死路 —— 记进兜底表而不是评选表。
                 # 见下方 seen_weak 的说明。
                 seen_weak.append((att.category, att.action))
+                # 这一发没有给出任何关于「这个站」的信息，所以它不该占掉
+                # 基线的额度：补一个候选进来接着打。见上面 spare 的说明。
+                if spare:
+                    probe_models.append(spare.pop(0))
             else:
                 seen.append((att.category, att.action))
 
@@ -1124,9 +1325,33 @@ class Prober:
         每个请求都是新的（真实客户端行为），缓存住会让所有请求共用一个会话 ID。
         """
         if v.profile_name:
+            # `+beta` 后缀要剥掉再查梯子（2026-09-12 修）
+            # ------------------------------------------
+            # beta 重放那一支通过时写的是 `f"{top.name}+beta"`
+            # （本文件 :1466），而梯子里的名字是 `top.name` —— 于是这里
+            # 一个都匹配不上，`body_patch` 静默变成 None，函数落到最后那行
+            # 只带 headers 回去。
+            #
+            # 这正是本函数 docstring 警告的那个坑的实例：stage1 用带 body
+            # 补丁的画像通过，后续四处（模型扫描 / 换模采样 / 上下文二分 /
+            # 换 Key 复验）却不带它。对需要 `metadata.user_id` 的站，后果是
+            # 「段可用但注册 0 个模型」，或者换 Key 复验把好 Key 判成坏 Key。
+            #
+            # headers 侧看不出问题 —— 它走 `v.min_headers`，而那一支把合并好
+            # 的 beta 头存下来了。所以这个缺陷只在 body 补丁上显形。
+            wanted = v.profile_name
+            if wanted.endswith("+beta"):
+                wanted = wanted[:-len("+beta")]
             for prof in profiles.ladder(v.section, self.cfg_snapshot):
-                if prof.name == v.profile_name:
+                if prof.name == wanted:
                     hdrs, patch = profiles.materialize(prof, api_key)
+                    # beta 重放把额外的 anthropic-beta 合并进了 min_headers，
+                    # 那份才是**实测通过**的头；画像重新 materialize 出来的
+                    # 不含那次合并。以实测的为准，画像只补它没有的键。
+                    if v.min_headers:
+                        merged = dict(hdrs or {})
+                        merged.update(v.min_headers)
+                        hdrs = merged
                     return {"extra_headers": hdrs or None,
                             "body_patch": patch or None}
         return {"extra_headers": dict(v.min_headers) or None}
@@ -1406,12 +1631,34 @@ class Prober:
         目录是站方**声明有**的，种子是本工具**猜**的。先验声明的那批，命中率
         高得多，也不会为不存在的模型白烧一次请求。种子仍保留在队尾：有些站
         的目录端点不开放（401/404），但推理端点照常工作。
+
+        目录内部必须按**世代降序**排，不能用字母序（2026-09-10）
+        ----------------------------------------------------------
+        `request.parse_models_response` 返回的是 `sorted(set(...))`，**字母序**。
+        而 `_stage2` 收满 `max_models` 就停（本文件 :1439），`max_model_attempts`
+        再加一道帽。于是目录大的站上，字母序靠前的旧款先被验完、配额用尽，
+        同世代的新变体**根本轮不到** —— 这就是用户报的「勾了 gpt-5.6 却没勾
+        gpt-5.6-sol」：谁被验到谁被勾，与世代无关。
+
+        用 `model_catalog.rank_models` 排：它的六级键第一顺位就是版本降序，
+        且把 `-mini/-lite/-fast` 这类降级档、`-thinking/-latest/-\\d{8}` 这类
+        变体压到后面（model_catalog.py:487）。与「就高选择」同一份判据，
+        避免第三处分叉。
+
+        种子仍留在队尾且**不参与重排** —— 它们是写死的猜测，顺序由
+        `SEED_MODELS` 表达（每段第一个是该段最想验的那个）。
         """
         skip = set(exclude or ())
         order: list[str] = []
         # 目录里与种子同名的排到最前 —— 既在目录里、又是已知好用的模型
         preferred = [m for m in SEED_MODELS[section] if m in catalog]
-        for m in preferred + catalog + SEED_MODELS[section]:
+        try:
+            from .model_catalog import rank_models
+            ranked = rank_models([m for m in catalog if m not in preferred])
+        except Exception:
+            # 排序只是「先验哪个」的优化，排不动不该让整轮探测失败。
+            ranked = [m for m in catalog if m not in preferred]
+        for m in preferred + ranked + SEED_MODELS[section]:
             # 段族闸：三个协议段只探本族。聚合站目录三族混报，不过这道闸
             # 会让 gemini 段拿 claude 模型去打 :generateContent —— CPA 永远
             # 不会那样发，56% 的请求白烧且 55% 回 500。见 SECTION_FAMILY。
@@ -1542,6 +1789,10 @@ class Prober:
             self._probe_websockets(row, v)
         elif v.section == "openai-compatibility":
             self._probe_prompt_cache_key(row, v)
+        elif v.section == "claude-api-key":
+            # claude 段的 `rebuild-mid-system-message`：与上面两个同一类
+            # 「开了可能全废 / 不开可能全废」的开关，判据同样是实打一次。
+            self._probe_mid_system(row, v)
 
     def _probe_websockets(self, row: ParsedRow, v: SectionVerdict) -> None:
         """codex 段：`{base}/responses` 换成 wss 发一次握手。
@@ -1603,11 +1854,20 @@ class Prober:
         if resp.status == "101" and not resp.error:
             v.websockets = True
             v.websockets_note = f"实测握手返回 101（{resp.elapsed_ms}ms）"
-        elif resp.status == "000":
+        elif resp.status == "000" or self._is_transient(resp.status):
             # 连接层失败：与「站方明确拒绝」不同 —— 可能是网络抖动。
             # 记 None 而不是 False，写回时同样不写，但界面说「未测出」。
+            #
+            # 5xx / 429 同理（2026-09-12 补）：那是站方**此刻**过载或限频，
+            # 不是「不支持 WS」。这一段的判错代价最不对称 —— `websockets`
+            # 抄成 false 只是用不上 WS，而抄成 true 时 CPA 走 WS 通道握手失败
+            # **不会回落 HTTP**（codex_websockets_executor.go:71-77）。
+            # 所以判不了就留空，跟随「默认不开」。
             v.websockets = None
-            v.websockets_note = f"握手未得到响应（{resp.error}）—— 未能判定"
+            why = ("握手未得到响应" if resp.status == "000"
+                   else f"上游返回 {resp.status}（过载/限频类）")
+            v.websockets_note = (
+                f"{why}（{resp.error or excerpt[:60]}）—— 未能判定")
         else:
             v.websockets = False
             v.websockets_note = (f"实测握手返回 {resp.status}"
@@ -1653,9 +1913,16 @@ class Prober:
         if att.ok and not att.error_envelope:
             v.prompt_cache_key = True
             v.prompt_cache_note = "实测带 prompt_cache_key 时返回 200"
-        elif att.status == "000":
+        elif att.status == "000" or self._is_transient(att.status):
+            # 5xx / 429 与中途 system 那一支同一个理由：它们说的是「站方此刻
+            # 过载/限频」，不是「站方不认 prompt_cache_key」。判成 False 会让
+            # 写回把 `support-prompt-cache-key` 关掉（_toggle_lines 里 False
+            # 会连原值一起关），凭一次 503 改配置。留空则跟随原值/默认。
             v.prompt_cache_key = None
-            v.prompt_cache_note = f"该次请求未得到响应（{att.excerpt[:60]}）—— 未能判定"
+            why = ("该次请求未得到响应" if att.status == "000"
+                   else f"上游返回 {att.status}（过载/限频类）")
+            v.prompt_cache_note = (
+                f"{why}（{att.excerpt[:60]}）—— 与该字段无关，未能判定")
         else:
             v.prompt_cache_key = False
             v.prompt_cache_note = (
@@ -1665,6 +1932,108 @@ class Prober:
             "section": v.section, "host": row.host,
             "name": "support-prompt-cache-key",
             "result": v.prompt_cache_key, "status": att.status})
+
+    @staticmethod
+    def _is_transient(status: str) -> bool:
+        """这个状态码是不是「站方此刻不行」而非「这个请求形态不行」。
+
+        能力探测（中途 system / prompt_cache_key / WS 握手）问的都是
+        「站方支不支持这种形态」。而 5xx 与 429 说的是站方**此刻**的状态：
+        过载、限频、临时故障 —— 换个时间同一个请求可能就通了。拿它当
+        「不支持」的证据会把一次运气写进 config.yaml。
+        """
+        text = str(status or "").strip()
+        if text == "429":
+            return True
+        return text.startswith("5") and len(text) == 3 and text.isdigit()
+
+    def _probe_mid_system(self, row: ParsedRow, v: SectionVerdict) -> None:
+        """claude 段：对话**中途**带 `role: "system"` 的消息，上游收不收。
+
+        为什么要实测这一项（2026-09-11，用户第 4 条点名要「填写到位」）
+        ------------------------------------------------------------
+        CPA 的 `rebuild-mid-system-message`（config_types.go:403）会把 Claude
+        对话里 role 为 system 的中途消息**挪到顶层 system 字段**再转发。
+        Anthropic 官方协议只认顶层 `system`，而很多客户端（含 Claude Code 的
+        某些路径）会把系统提示塞在 messages 中间：
+
+          · 上游按官方协议严格校验 → 中途 system 直接 400，此时这个开关
+            必须打开，否则**每一个**带中途 system 的请求都失败；
+          · 上游自己就能容忍 → 开着无害，但没必要（多一次请求体改写）。
+
+        与 `support-prompt-cache-key` 是同一类「开了可能全废 / 不开可能全废」
+        的开关，所以判据同样是**实打一次**，不靠猜。
+
+        判据设计
+          · 只在段已可用、且已有实测模型时才跑 —— 段本身不通时这一项无意义；
+          · 基线（不带中途 system）已经通过是前提，所以这次失败只可能来自
+            那条中途 system 消息，归因是干净的；
+          · `000`（连接层失败）判 None 而不是 False：网络抖动不是站方拒绝。
+        """
+        if v.section != "claude-api-key" or not v.models:
+            return
+        base = base_for_section(row.bare, v.section)
+        model = v.models[0]
+        # 与 _probe_prompt_cache_key 同一个坑：画像的 body 补丁必须**合并**，
+        # 不能再显式传一个 body_patch（同名关键字给两次会 TypeError，
+        # 而那个异常会被 probe() 兜底成「死路」，把可用段判死）。
+        kw = dict(self._profile_kwargs(v, row.api_key))
+        patch = dict(kw.pop("body_patch", None) or {})
+        # 三条消息都不能像测活串。全仓有一道闸（tests 的「探测文本非问候」）
+        # 扫主流程里的短文本，而它是对的：站方反测活规则最先拦的就是那种形态。
+        #
+        # 第一条用另一把派生文本，与第三条不同 —— 同一段对话里两句一模一样
+        # 也像脚本。中间那条 system 消息用**真实客户端会发的**系统提示形态
+        # （带工具/代码语境），而不是 "You are a helpful assistant." 那种
+        # 教科书占位串：占位串既缺技术内容、也不像真实流量。
+        first = request.probe_text_for(row.api_key + "|mid1")
+        patch["messages"] = [
+            {"role": "user", "content": first},
+            {"role": "system",
+             "content": ("You are a coding assistant. Answer with one short "
+                         "sentence and prefer standard library functions.")},
+            {"role": "user", "content": request.probe_text_for(row.api_key)},
+        ]
+        att = self._call(
+            v.section, base, row.api_key, model,
+            combo="mid-system",
+            proxy=self.live_proxy if v.need_proxy else None,
+            body_patch=patch,
+            **kw,
+        )
+        v.attempts.append(att)
+        if att.ok and not att.error_envelope:
+            # 上游自己就收 —— 不需要 CPA 代为重建，保持字段缺席（跟随默认）。
+            v.rebuild_mid_system = False
+            v.rebuild_mid_system_note = "实测中途 system 消息可直接被接受"
+        elif att.status == "000" or self._is_transient(att.status):
+            # 判不了就说判不了（2026-09-12 补 5xx / 429 这一支）
+            # ------------------------------------------------
+            # 原来除 `000` 之外的一切失败都归因给「那条中途 system」。
+            # 前提「基线通过，所以差异只可能是它」只在**站方状态没变**时成立，
+            # 而 503 / 500 / 502 / 504 / 429 恰恰说明状态变了：上游过载、
+            # 限频或临时故障，与请求里有没有中途 system 无关。
+            #
+            # 代价不对称，所以宁可留空：判成 True 会让写回给这个站写上
+            # `rebuild-mid-system-message: true`，而那是一个**改变 CPA 发出
+            # 形态**的开关（把中途 system 挪到顶层）。凭一次 503 就改形态，
+            # 等于拿运气决定配置；留空则跟随 CPA 默认，行为不变。
+            v.rebuild_mid_system = None
+            why = ("该次请求未得到响应" if att.status == "000"
+                   else f"上游返回 {att.status}（过载/限频类）")
+            v.rebuild_mid_system_note = (
+                f"{why}（{att.excerpt[:60]}）—— 与中途 system 无关，未能判定")
+        else:
+            # 基线通过而这次失败 → 差异只可能是那条中途 system。
+            v.rebuild_mid_system = True
+            v.rebuild_mid_system_note = (
+                f"实测中途 system 消息返回 {att.status}"
+                f"{'：' + att.excerpt[:80] if att.excerpt else ''}"
+                f" —— 需要 CPA 代为挪到顶层 system")
+        self.on_event("capability", {
+            "section": v.section, "host": row.host,
+            "name": "rebuild-mid-system-message",
+            "result": v.rebuild_mid_system, "status": att.status})
 
     # 上限直接写在错误正文里的常见形态。命中任一即可免掉整轮二分。
     #
@@ -2057,9 +2426,28 @@ class Prober:
         _shape 里还没有条目，于是各自跑一遍完整探测 —— 5 个 Key 就是
         5 倍开销，而它们学到的形态必然相同（形态是主机的属性）。
 
-        用 per-key 的 Event 而不是全局锁：不同 (host, section) 之间不该互等。
+        用 per-key 的 Event 而不是全局锁：不同 (站, section) 之间不该互等。
+
+        「站」这一维对 compat 段含**路径**（2026-09-12 修）
+        ------------------------------------------------
+        原来用 `row.host`，而同一台主机可以按路径挂多个互不相干的上游 ——
+        本项目自己的假上游脚本就是 `127.0.0.1:PORT/good` 与 `.../gate`。
+        形态是「这个上游」的属性，不是「这台主机」的：
+
+          · `_shape` 命中时，`/b` 会直接套用 `/a` 学到的形态（模型清单、
+            上下文上限、能力开关全是 `/a` 的）；
+          · `_dead_shape` 更糟：`/a` 的一次门禁会让 `/b` 连探都不探，
+            直接判死 —— 一个完全可用的上游因为同主机另一条路径被拦而消失。
+
+        判据与写回侧的 `batch.entry_scope` 完全一致：前三段的 base-url 没有
+        路径维度、仍按 host；compat 段用含路径的 provider 身份。两处用同一个
+        函数，不再各写一套。
         """
-        key = (row.host, section)
+        from .batch import entry_scope
+        # 用 `row.bare`（原始裸地址）而不是 `row.base_for(section)`：
+        # 后者是 ParsedRow 才有的派生方法，而这里只需要「同一个上游」这个
+        # 身份，`bare` 已经带着路径了。少依赖一个方法也让调用方更好替身。
+        key = (entry_scope(section, row.bare), section)
         while True:
             with self._lock:
                 shape = self._shape.get(key)

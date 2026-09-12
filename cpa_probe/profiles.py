@@ -156,6 +156,9 @@ def _cc_headers(defaults: dict, *, betas: str, std: bool = False,
     """
     ua = _CC_UA_TEMPLATE.format(
         version=defaults.get("version") or _CC_VERSION_DEFAULT)
+    if defaults.get("claude_betas"):
+        source_betas = defaults["claude_betas"]
+        betas = source_betas[0] if betas == _CC_BETAS_MIN else ",".join(source_betas)
     h = {
         "user-agent": ua,
         "anthropic-beta": betas,
@@ -228,14 +231,15 @@ def _codex_ladder(d: dict) -> list[Profile]:
     UA/Originator 都是真实存在的形态，站方可能只白名单其中一种。
     """
     ua_tui = d.get("codex_user_agent") or _CODEX_UA_DEFAULT
+    originator = d.get("codex_originator") or _CODEX_ORIGINATOR_DEFAULT
     return [
         Profile("baseline", 0, why="站方不查客户端身份"),
         Profile("originator-only", 1, family="codex",
-                headers={"originator": _CODEX_ORIGINATOR_DEFAULT},
+                headers={"originator": originator},
                 why="只查 Originator（不含版本号，最抗客户端升级）"),
         Profile("codex-tui", 2, family="codex",
                 headers={"user-agent": ua_tui,
-                         "originator": _CODEX_ORIGINATOR_DEFAULT},
+                         "originator": originator},
                 why="终端 TUI 形态（CPA 转发时的默认值）"),
         Profile("codex-vscode", 2, family="codex",
                 headers={"user-agent": _CODEX_UA_VSCODE,
@@ -243,7 +247,7 @@ def _codex_ladder(d: dict) -> list[Profile]:
                 why="VSCode 插件形态"),
         Profile("codex-full", 3, family="codex",
                 headers={"user-agent": ua_tui,
-                         "originator": _CODEX_ORIGINATOR_DEFAULT,
+                         "originator": originator,
                          "version": "0.146.0",
                          "accept": "application/json",
                          "connection": "Keep-Alive"},
@@ -273,16 +277,30 @@ def _codex_ladder(d: dict) -> list[Profile]:
         #
         # tier=4 排在 codex-full(3) 之后：它是「headers 全给齐**再加** body
         # 形态」，族内嵌套超集关系成立。
+        # body_patch 按**实际配置**决定要不要发 image_generation（2026-09-10）：
+        # 只有 `disable-image-generation` 为 off/false（默认）时 CPA 才注入
+        # （codex_executor_execute.go:65-66）。生产设的是 "chat"，即不注入 ——
+        # 此时探测也不该发，否则问的是一个 CPA 永远不会发的形态。
+        # 注：请求体的其余字段（数组 input / include / prompt_cache_key /
+        # instructions / reasoning / tool_choice / store）现在已在
+        # `request.build_request` 的 codex 基线里，这一档只补「流式 + 工具注入」
+        # 这两项真正由 CPA 加上去的差异。
         Profile("codex-cpa-shape", 4, family="codex",
                 headers={"user-agent": ua_tui,
-                         "originator": _CODEX_ORIGINATOR_DEFAULT,
+                         "originator": originator,
                          "version": "0.146.0",
                          "accept": "text/event-stream",
                          "connection": "Keep-Alive"},
-                body_patch={"stream": True,
-                            "tools": [{"type": "image_generation",
-                                       "output_format": "png"}]},
-                why="CPA 真实形态：stream=true + 注入 image_generation 工具"),
+                body_patch=({"stream": True,
+                             "tools": [{"type": "image_generation",
+                                        "output_format": "png"}]}
+                            if d.get("codex_injects_image_tool")
+                            else {"stream": True}),
+                why=("CPA 真实形态：stream=true"
+                     + (" + 注入 image_generation 工具"
+                        if d.get("codex_injects_image_tool")
+                        else "（当前配置 disable-image-generation 非 off，"
+                             "CPA 不注入工具，故本档不发 tools）"))),
         Profile("browser-ua", 9, family="browser",
                 headers={"user-agent": _BROWSER_UA}, alt=True,
                 why="站方只认浏览器"),
@@ -354,7 +372,7 @@ _LADDERS = {
 }
 
 
-def defaults_from_config(cfg: dict | None) -> dict:
+def defaults_from_config(cfg: dict | None, *, source_identity=None) -> dict:
     """从 CPA 自己的配置块派生画像值。读不到就返回空 dict（各处回落内置默认）。
 
     为什么要读它：`claude-header-defaults`（config_types.go:115-124）是 CPA
@@ -362,9 +380,18 @@ def defaults_from_config(cfg: dict | None) -> dict:
     或 CPA 升级后换了默认值，探测发的形态就与 CPA 实际转发的不一致 ——
     那会让「探测通了但 CPA 不通」或反之，两种误判都发生过。
     """
-    if not isinstance(cfg, dict):
+    if not isinstance(cfg, dict) and source_identity is None:
         return {}
-    out: dict[str, str] = {}
+    cfg = cfg if isinstance(cfg, dict) else {}
+    out: dict = {}
+    if source_identity is not None:
+        out.update(codex_user_agent=source_identity.codex_user_agent,
+                   codex_originator=source_identity.codex_originator,
+                   claude_betas=list(source_identity.claude_betas_unconditional))
+        cfg = dict(cfg)
+        cfg["claude-header-defaults"] = {
+            **source_identity.claude_header_defaults,
+            **(cfg.get("claude-header-defaults") or {})}
     hd = cfg.get("claude-header-defaults")
     if isinstance(hd, dict):
         ua = str(hd.get("user-agent") or "").strip()
@@ -387,11 +414,36 @@ def defaults_from_config(cfg: dict | None) -> dict:
             v = str(chd.get("user-agent") or "").strip()
             if v:
                 out["codex_user_agent"] = v
+
+    # CPA 到底会不会往 codex 请求的 tools 里注入 image_generation（2026-09-10）
+    # ----------------------------------------------------------------------
+    # `codex_executor_execute.go:65-66`：
+    #     if e.cfg == nil || e.cfg.DisableImageGeneration == DisableImageGenerationOff {
+    #         body = ensureImageGenerationTool(...)
+    #     }
+    # 也就是**只有 off（默认值）才注入**。四态取值见
+    # `internal/config/disable_image_generation_mode.go:23-26`：
+    #   false/off -> 注入；true -> 全不注入；
+    #   "chat" -> 非 images 端点不注入；"passthrough" -> 原样转发不增不删。
+    #
+    # 为什么必须读实际值：生产 config.yaml 设的是 `disable-image-generation: "chat"`
+    # （fsdownload/config.yaml:396），CPA 因此**不会**注入。若探测仍然照默认值
+    # 发 tools，问的就是一个 CPA 永远不会发的形态 —— 站方拒收该工具时会把一个
+    # 可用站判死，正是「按默认值探测、按实际配置运行」的形态错位。
+    #
+    # 顶层键（`config.go` 的 SDKConfig 嵌入），不在 `codex:` 块里面。
+    raw = cfg.get("disable-image-generation")
+    if isinstance(raw, bool):
+        mode = "true" if raw else "false"
+    else:
+        mode = str(raw if raw is not None else "false").strip().strip("\"'").lower()
+    out["codex_injects_image_tool"] = "1" if mode in ("false", "off", "") else ""
     return out
 
 
 def ladder(section: str, cfg: dict | None = None, *,
-           include_alt: bool = True, max_tier: int | None = None) -> list[Profile]:
+           include_alt: bool = True, max_tier: int | None = None,
+           source_identity=None) -> list[Profile]:
     """取一个段的画像梯，按 tier 升序。第一个通过的档即「最省可用档」。
 
     max_tier 用来在「只想快速判断有没有门禁」时截断（比如 max_tier=2 只试到
@@ -399,7 +451,7 @@ def ladder(section: str, cfg: dict | None = None, *,
     """
     if section not in SECTIONS:
         raise ValueError(f"未知段：{section!r}，应为 {SECTIONS}")
-    items = _LADDERS[section](defaults_from_config(cfg))
+    items = _LADDERS[section](defaults_from_config(cfg, source_identity=source_identity))
     if not include_alt:
         items = [p for p in items if not p.alt]
     if max_tier is not None:

@@ -40,6 +40,7 @@ PUT 端点用 bcrypt.CompareHashAndPassword 校验（handler.go:389），哈希�
 from __future__ import annotations
 
 import argparse
+import builtins
 import concurrent.futures
 import io
 import json
@@ -58,9 +59,18 @@ from cpa_probe.writeback import (  # noqa: E402
     validate,
     verify_upstream,
     write_local,
+    redact_yaml_secrets,
+    config_version,
 )
+from server import (_public, _safe_text, _validate_final, _public_with_context,
+                    _verification_target)
 
 C_OK, C_BAD, C_WARN, C_DIM, C_END = "\033[92m", "\033[91m", "\033[93m", "\033[90m", "\033[0m"
+_OUTPUT_CONTEXT = {}
+
+
+def print(*args, **kwargs):
+    builtins.print(*(_public_with_context(str(arg), _OUTPUT_CONTEXT) for arg in args), **kwargs)
 
 
 def _no_color() -> None:
@@ -71,7 +81,8 @@ def _no_color() -> None:
 def _load_cfg(path: str) -> tuple[str, dict]:
     import yaml
 
-    raw = io.open(path, encoding="utf-8").read()
+    with io.open(path, encoding="utf-8") as stream:
+        raw = stream.read()
     cfg = yaml.safe_load(raw)
     if not isinstance(cfg, dict):
         sys.exit(f"{path} 顶层不是映射，结构异常")
@@ -82,8 +93,7 @@ def _print_parse(res: cp.ParseResult) -> None:
     print(f"\n{'='*72}\n解析\n{'='*72}")
     print(f"  有效 {len(res.valid)} 行 · 无效 {len(res.invalid)} 行")
     for r in res.invalid:
-        print(f"  {C_BAD}✗{C_END} 第 {r.line_no} 行：{r.error}")
-        print(f"      {C_DIM}{r.raw[:70]}{C_END}")
+        print(f"  {C_BAD}✗{C_END} 第 {r.line_no} 行：格式无效，请检查网址与凭据分隔")
     if res.valid:
         print(f"\n  {'主机':<32} {'Key（脱敏）':<20} 四段 base-url")
         for r in res.valid:
@@ -170,6 +180,8 @@ def _print_result(res, plan) -> None:
 
 
 def main() -> None:
+    global _OUTPUT_CONTEXT
+    _OUTPUT_CONTEXT = {}
     ap = argparse.ArgumentParser(
         prog="upstream-importer",
         description="批量导入 CPA 上游账号：解析 → 探测 → 定档 → diff → 写回",
@@ -228,8 +240,15 @@ def main() -> None:
     if args.no_color or not sys.stdout.isatty():
         _no_color()
 
-    text = sys.stdin.read() if args.input == "-" else io.open(args.input, encoding="utf-8").read()
+    if args.input == "-":
+        text = sys.stdin.read()
+    else:
+        with io.open(args.input, encoding="utf-8") as stream:
+            text = stream.read()
     parsed = cp.parse_lines(text)
+    _OUTPUT_CONTEXT = {"api-keys": [row.api_key for row in parsed.valid],
+                       "push": {"mgmt_key": args.mgmt_key, "client_key": args.client_key},
+                       "proxy_url": args.proxy}
     _print_parse(parsed)
 
     if not parsed.valid:
@@ -238,7 +257,11 @@ def main() -> None:
         print(f"\n{C_DIM}--dry-run：未发任何请求{C_END}")
         return
 
+    original_version = config_version(args.config)
     raw, cfg = _load_cfg(args.config)
+    _OUTPUT_CONTEXT["config"] = cfg
+    if config_version(args.config) != original_version:
+        sys.exit("读取期间配置已变化，请重新运行")
     print(f"\n{C_DIM}config.yaml {len(raw.splitlines())} 行 · "
           f"四段 {sum(len(cfg.get(s) or []) for s in cp.SECTIONS)} 条目{C_END}")
 
@@ -280,6 +303,7 @@ def main() -> None:
                       f"注意 config.yaml 里有凭据配了 proxy-url，那些站此刻走不通{C_END}")
 
     prober = Prober(
+        cfg_snapshot=cfg,
         proxy=proxy,
         gap=args.gap,
         timeout=args.timeout,
@@ -295,7 +319,7 @@ def main() -> None:
     # 候选并行度上限取「不同主机数」—— 同主机的多个 Key 会被 single-flight
     # 归并成一次形态学习，多开线程只是空转。
     hosts = {r.host for r in parsed.valid}
-    cand_workers = max(1, min(len(hosts), args.candidate_workers))
+    cand_workers = max(1, min(len(hosts), args.candidate_workers, 32))
 
     slots: list = [None] * len(parsed.valid)
     if cand_workers > 1 and len(parsed.valid) > 1:
@@ -366,11 +390,11 @@ def main() -> None:
         return
     for d in diffs:
         print(f"\n  {C_OK}+++{C_END} {d.section}  ← {d.host}  （第 {d.insert_at} 行后）")
-        for line in d.lines:
+        for line in redact_yaml_secrets("\n".join(d.lines)).splitlines():
             print(f"  {C_OK}+{C_END} {line}")
 
     merged = apply_diffs(raw, diffs)
-    ok, msg = validate(merged)
+    ok, msg = _validate_final(merged, plans)
     print(f"\n  校验：{C_OK if ok else C_BAD}{msg}{C_END}")
     if not ok:
         sys.exit("  校验未通过，不写回")
@@ -387,6 +411,12 @@ def main() -> None:
                             "priority": sp.priority,
                             "priority_reason": sp.priority_reason,
                             "models": sp.models,
+                            "highest_models": list(getattr(sp, "highest_models", None) or []),
+                            "model_provenance": dict(getattr(sp, "model_provenance", None) or {}),
+                            "cloak_mode": getattr(sp, "cloak_mode", ""),
+                            "fingerprint_profile": getattr(sp, "fingerprint_profile", ""),
+                            "rebuild_mid_system": getattr(sp, "rebuild_mid_system", None),
+                            "disable_cooling": getattr(sp, "disable_cooling", None),
                             "proxy_url": sp.proxy_url,
                             "headers": sp.headers,
                             "max_context_length": sp.max_context_length,
@@ -402,16 +432,17 @@ def main() -> None:
                 for p in plans
             ],
         }
-        io.open(args.json, "w", encoding="utf-8").write(
-            json.dumps(payload, ensure_ascii=False, indent=2)
-        )
+        with io.open(args.json, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(_public_with_context(payload, _OUTPUT_CONTEXT),
+                                    ensure_ascii=False, indent=2))
         print(f"  已导出 {args.json}")
 
     if not args.write:
         print(f"\n{C_WARN}未写回 —— 加 --write 才落盘。这是硬闸门，不提供跳过。{C_END}")
         return
 
-    bak = write_local(args.config, merged)
+    bak = write_local(args.config, merged, expected_version=original_version)
+    written_version = config_version(args.config)
     print(f"\n  {C_OK}✓{C_END} 已写回 {args.config}")
     print(f"      备份 {bak}")
 
@@ -461,6 +492,8 @@ def main() -> None:
                  "  请传你在 CPA 后台输的那个原始密码。")
 
     print(f"\n  触发 CPA 重载 {cpa_base}")
+    if config_version(args.config) != written_version:
+        sys.exit("写盘后配置又发生变化，拒绝推送旧快照；请重新运行")
     rok, rmsg = reload_cpa(cpa_base, args.mgmt_key, merged)
     if rok:
         print(f"  {C_OK}✓{C_END} {rmsg}")
@@ -485,12 +518,12 @@ def main() -> None:
             for sec, sp in plan.sections.items():
                 if not sp.writable or not sp.models:
                     continue
-                vok, vmsg = verify_upstream(
-                    cpa_base, args.client_key, sec, sp.models[0],
-                )
+                import yaml
+                model, scope = _verification_target(yaml.safe_load(merged) or {}, sp)
+                vok, vmsg = verify_upstream(cpa_base, args.client_key, sec, model)
                 mark = f"{C_OK}✓{C_END}" if vok else f"{C_BAD}✗{C_END}"
-                print(f"    {mark} {plan.host:<26} {sec:<22} "
-                      f"{sp.models[0]:<20} {vmsg}")
+                label = "唯一前缀定向" if scope == "unique_prefix" else "仅网关验证，未证明指定上游"
+                print(f"    {mark} [{label}] {sec:<22} {model:<20} {vmsg}")
                 if not vok:
                     bad += 1
         if bad:
@@ -498,7 +531,7 @@ def main() -> None:
             print(f"  {C_DIM}这些条目直连可能是好的，经 CPA 却不行。"
                   f"按上面的说明处置，或用备份回滚{C_END}")
             sys.exit(1)
-        print(f"\n  {C_OK}全部通过{C_END}")
+        print(f"\n  {C_OK}网关验证通过；未证明指定上游或 Key 被使用{C_END}")
 
 
 if __name__ == "__main__":

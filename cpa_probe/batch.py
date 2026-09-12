@@ -115,6 +115,19 @@ class BatchProber:
                             current, total, row.bare, dict(self._stats)
                         )
 
+                except concurrent.futures.CancelledError:
+                    # 取消**不是**单站失败，不能被下面那一支吞掉（2026-09-12）
+                    # ------------------------------------------------------
+                    # 用户按了停止 / 任务被撤销时，每个还没跑完的站都会从
+                    # `future.result()` 抛出 CancelledError。原来它落进下面的
+                    # `except Exception`，于是：
+                    #   · 每个站各记一条 failure，175 个站的批次报「175 个失败」
+                    #   · `probe_batch` 正常返回一个残缺的 results
+                    #   · 调用方（server 的 Job）看到的是「跑完了，成功 0 个」，
+                    #     而不是「被取消了」—— 界面上分不出这两种，日志里也
+                    #     只留下一片假失败
+                    # 取消是**整批**的状态，原样往上抛，让调用方自己决定怎么记。
+                    raise
                 except Exception as e:                     # noqa: BLE001
                     # 单站抛异常不能让整批停下 —— 175 个站里有一个超时就全废
                     # 不可接受。但**异常本身不能吞掉**：原来这里连 e 都没用，

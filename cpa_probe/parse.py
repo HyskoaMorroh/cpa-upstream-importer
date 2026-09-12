@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit, urlunsplit
 
 SECTIONS = ("gemini-api-key", "codex-api-key", "claude-api-key", "openai-compatibility")
 
@@ -87,17 +88,64 @@ def strip_v1(url: str) -> str:
     """剥离尾部 / 与尾部 /v1，得到裸 base。"""
     s = (url or "").strip().rstrip("/")
     # 只剥离结尾恰好是 /v1 的情形，不动 /v1beta 之类
-    if s.lower().endswith("/v1"):
+    if s.endswith("/v1"):
         s = s[:-3].rstrip("/")
     return s
 
 
-def base_for_section(bare: str, section: str) -> str:
-    """按段补齐 base-url 形态。"""
-    b = strip_v1(bare)
-    if section in _NEEDS_V1:
-        return b + "/v1"
-    return b
+def base_for_section(bare: str, section: str, *, declared_base: bool = False) -> str:
+    """Preserve declared CPA bases and channel case; default only new origins.
+
+    Known full endpoints are accepted for new input only, not silently appended
+    twice. Declared bases are literal CPA configuration, including trailing /v1.
+    """
+    parts = urlsplit((bare or "").strip())
+    if (parts.scheme.lower() not in ("http", "https") or not parts.hostname
+            or parts.username or parts.password or parts.fragment):
+        raise ValueError("invalid base URL")
+    path = parts.path.rstrip("/")
+    if parts.query and not (not declared_base and section == "claude-api-key"
+                            and path.endswith("/v1/messages")
+                            and parts.query == "beta=true"):
+        raise ValueError("query is not supported on a base URL")
+    endpoints = {
+        "codex-api-key": ("/responses", "/models"),
+        "openai-compatibility": ("/chat/completions", "/models"),
+        "claude-api-key": ("/v1/messages", "/v1/models"),
+        "gemini-api-key": ("/v1beta/models",),
+    }
+    if declared_base and (
+            any(path.endswith(s) for group in endpoints.values() for s in group)
+            or ":generateContent" in path or ":streamGenerateContent" in path):
+        raise ValueError("declared base URL looks like a full endpoint")
+    normalized_endpoint = False
+    if not declared_base:
+        for suffix in endpoints.get(section, ()):
+            if path.endswith(suffix):
+                path = path[:-len(suffix)]
+                normalized_endpoint = True
+                break
+        if (":generateContent" in path or ":streamGenerateContent" in path
+                or any(path.endswith(s) for group in endpoints.values() for s in group)):
+            raise ValueError("endpoint does not match the requested protocol")
+        if not normalized_endpoint:
+            if section not in _NEEDS_V1 and path == "/v1":
+                path = ""
+            elif section in _NEEDS_V1 and not path.endswith("/v1"):
+                # codex / compat 必须以 /v1 结尾，**带路径前缀的站也一样**
+                # ------------------------------------------------------
+                # 2026-09-12：判据原来是 `not path` —— 只有根路径才补。
+                # 于是 `https://api.example.com/relay` 这类带前缀的中转站
+                # 补不上，CPA 按 `TrimSuffix(baseURL,"/") + "/responses"`
+                # 拼出 `/relay/responses`，而站方真正的端点是
+                # `/relay/v1/responses` —— 404。
+                #
+                # 这正是用户报的第 1/2 条：同一个网址填进 cc-switch 能用
+                # （cc-switch 直接用整串 `.../v1` 当 base），填进 CPA 不能用。
+                # 段规则是「codex / compat 的 base 一律以 /v1 结尾」，
+                # 与前面有没有路径前缀无关。
+                path = path + "/v1"
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, "", ""))
 
 
 def mask_key(key: str) -> str:
@@ -221,7 +269,14 @@ def _normalize_url(u: str, *, allow_private: bool = False) -> tuple[str, str]:
         why = is_private_target(h)
         if why:
             return "", f"拒绝内网目标：{why}"
-    return strip_v1(s), ""
+    try:
+        parts = urlsplit(s)
+        if parts.username or parts.password or parts.query or parts.fragment:
+            return "", "url 不支持凭据、查询参数或 fragment"
+        return urlunsplit((parts.scheme.lower(), parts.netloc.lower(),
+                           parts.path.rstrip("/"), "", "")), ""
+    except ValueError:
+        return "", "url 形态无法识别"
 
 
 def parse_lines(text: str, *, allow_private: bool = False) -> ParseResult:
