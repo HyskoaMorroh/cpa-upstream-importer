@@ -137,7 +137,7 @@ def test_classify() -> None:
         ("403", "Image generation is not enabled for this group", "注入"),
         # 状态码兜底
         ("200", '{"model":"claude-opus-5"}', "可用"),
-        ("429", "too many requests", "限流"),
+        ("429", "too many requests", "临时"),  # BUG 修复 2026-09-13: 429 改为「临时」以参与重试
         ("503", "upstream busy", "临时"),
         ("500", "internal error", "临时"),
         ("000", "", "未知"),
