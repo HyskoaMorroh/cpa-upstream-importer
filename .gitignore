@@ -58,6 +58,13 @@ mihomo/providers/
 # spec 1、legacy 2），全是注释里的「依据见 xx 章」。缺它不影响运行与测试。
 docs/cpa-atlas.html
 
+# tutorial.html 含本部署的实测案例：sk-xxx key 前缀、fsdownload 路径、
+# 真实域名与档位分布 —— 即使是演示性质，组合起来仍是指纹。不进公开仓库。
+docs/tutorial.html
+
+# handoff 文件是每日交接记录，含具体站名、Key 数量、排障思路。不进仓库。
+docs/*-handoff.md
+
 # ── 工具生成物 ──────────────────────────────────────────────
 #
 # graphify-out/ 是代码图谱（2.1 MB），每次 `graphify .` 重新生成。
