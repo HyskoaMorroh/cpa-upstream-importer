@@ -828,6 +828,50 @@ console.log(JSON.stringify(out));
     truthy("前端认 transient-retry", "transient-retry" in js)
     truthy("前端认 model-rejected", "model-rejected" in js)
 
+    section("③j 首轮方案必须回填，失败必须可见")
+    # 2026-09-13 现场（投喂台 · CPA 上游灌输.mhtml）：173 站 692 行里
+    # 692 个 priority 框全是 placeholder「待定」、54 个可用段的系统建议栏
+    # 全停在「计算中…」、写入勾选 0/54。
+    #
+    # 三个独立缺陷叠出来的：
+    #   1 refreshPlan 首轮 `return refreshPlan(true)` 递归重入，而回填循环
+    #     在 return 之后 —— 首轮拿到的 d.plans 被整帧丢弃
+    #   2 catch 分支 `if (!silent)` 才报错，12 个调用点 7 个传 silent=true，
+    #     于是任何一次失败都被完全吞掉，界面与「还在算」无从区分
+    #   3 applyPickPreset 的「N 段异常无模型」限定 mode==='all'，
+    #     首轮走 'rec' → 那 17 个「可用却零勾选」的段在界面上不可见
+    #
+    # 这一节锁住三条修复，防回归。
+    truthy("回填抽成独立函数（首轮与后续轮共用）",
+           "function fillPlanIntoRows(" in js,
+           "内联在 refreshPlan 里会重现「首轮跳过回填」")
+    # 顺序：先回填、再递归。反过来就是原缺陷。
+    _fill_at = js.find("fillPlanIntoRows(d);")
+    _rec_at = js.find("return refreshPlan(true);")
+    truthy("首轮先回填再递归",
+           _fill_at != -1 and _rec_at != -1 and _fill_at < _rec_at,
+           f"fillPlanIntoRows@{_fill_at} 必须早于 return refreshPlan@{_rec_at}")
+    truthy("定档失败一律显示（不再受 silent 抑制）",
+           "定档失败" in js and "if (!silent) $('#planmeta')" not in js,
+           "silent 只该压成功态提示，不该压错误")
+    truthy("失败提示写到③的表头（#planmeta 属于第④步，首轮还没显示）",
+           "const stat = $('#pickstat');" in js)
+    truthy("「异常无模型」不再限定「全勾选」",
+           "mode !== 'none' && (missing.length || blocked)" in js,
+           "限定 mode==='all' 会藏起后端缺陷")
+    truthy("异常无模型时列出具体站段",
+           "missing.slice(0, 3)" in js,
+           "只报数量，操作员无法定位是哪几段")
+    # #pickstat 必须单一渲染点，否则两个写入方互相覆盖
+    truthy("#pickstat 由 syncPickUI 单点渲染",
+           "let _pickWhy" in js and "_pickWhy = why.join" in js,
+           "applyPickPreset 直接写 DOM 会被 syncPickUI 覆盖")
+    _why_at = js.find("_pickWhy = why.join")
+    _sync_at = js.find("syncPickUI();", _why_at if _why_at != -1 else 0)
+    truthy("_pickWhy 先算后渲染",
+           _why_at != -1 and _sync_at != -1 and _why_at < _sync_at,
+           "晚一步就渲染上一轮的旧诊断")
+
     section("⑨ 部署模板的安全头与 CSP")
     check_nginx_security_headers()
 

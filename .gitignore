@@ -9,6 +9,9 @@ config.yaml
 config.yml
 config.*.yaml
 config.*.yml
+# 例外：模板不含任何真实值，订阅 URL 与 secret 全是 ${ENV} 占位符。
+# 它必须进仓库 —— 没有它，拿到镜像的人不知道该写成什么形状。
+!mihomo-manager/mihomo/config.template.yaml
 *.bak-*
 *.scrub-bak-*
 .env
@@ -26,6 +29,23 @@ accounts.txt
 accounts*.txt
 upstreams.txt
 *.accounts
+
+# ── mihomo 代理：订阅 URL 与拉下来的节点清单 ────────────────
+#
+# mihomo-subscriptions.conf 每行是 `名称=订阅URL`，而机场订阅 URL
+# **本身就是凭据** —— 拿到它就能拉全部节点、跑满流量，等同账号密码。
+# 它与 .env 同级敏感，绝不能进仓库。
+#
+# providers/*.yaml 是按订阅拉下来的节点清单，含机场服务器地址、端口与
+# 每个节点的密码。同理不公开。
+#
+# 进仓库的是这三个：mihomo/config.template.yaml（全 ${ENV} 占位符）、
+# update-mihomo-subscriptions.sh、mihomo/healthcheck.sh，以及
+# mihomo-subscriptions.conf.example（形状示例，无真实 URL）。
+mihomo-manager/mihomo-subscriptions.conf
+mihomo-manager/mihomo/providers/
+mihomo-manager/mihomo/config.yaml
+mihomo/providers/
 
 # ── 本站排障记录：不公开 ────────────────────────────────────
 #
@@ -96,3 +116,14 @@ docs/SITE-CODENAMES.md
 # 通用的机制说明已经写进 README 与 docs/tutorial.html（那两份不含本部署细节）。
 docs/2026-09-10-方案-agi任务.md
 docs/2026-09-11-部署侧整改方案.md
+
+# ── mihomo 代理私密配置（2026-09-13）──────────────────────────────
+# config.yaml：从模板生成，含订阅 URL（token）与 API secret
+# providers/：mihomo 自动拉取的订阅缓存，含节点地址与密码
+# mihomo-subscriptions.conf：订阅清单，含 token
+mihomo-manager/mihomo/config.yaml
+mihomo-manager/mihomo/providers/
+mihomo-manager/mihomo-subscriptions.conf
+
+# .env：部署环境变量，含 MIHOMO_SECRET、MIHOMO_SUB_* 订阅 URL
+.env

@@ -14,6 +14,14 @@
 # 容器里没有它们（cli-proxy-api 容器里也没有，2026-08-29 曾因此把
 # 「wget: not found」误读成代理不通）。
 
+# mihomo 代理镜像。**必须声明在第一个 FROM 之前** —— 只有"全局 ARG"
+# （位于任何 FROM 之上）才能被后面的 FROM 引用；写在 FROM 之后的 ARG
+# 属于那个 stage 的局部作用域，对下一个 FROM 不可见，构建会报
+# "base name (${MIHOMO_IMAGE}) should not be blank"。
+#
+# 版本可 pin：--build-arg MIHOMO_IMAGE=metacubex/mihomo:v1.19.x
+ARG MIHOMO_IMAGE=metacubex/mihomo:latest
+
 # ── 构建阶段：把依赖装进独立的 prefix ──────────────────────────────
 #
 # 为什么要两阶段：bcrypt 在 arm/v7 与部分 musl 平台上**没有预编译 wheel**，
@@ -62,6 +70,16 @@ RUN pip install --prefix=/deps \
       "PyYAML==${PYYAML_VERSION}" \
       "bcrypt==${BCRYPT_VERSION}"
 
+# ── mihomo 代理二进制 ───────────────────────────────────────────────
+# 用户要求「拉一个镜像，代理和工具都跑起来」（2026-09-13）。
+#
+# 为什么从官方镜像 COPY 而不是自己下载：`COPY --from=image` 由 buildx 按
+# **目标平台**解析 —— 构建 arm64 时取的就是 arm64 那层，amd64 同理。
+# 自己 curl 下载则要手工映射 TARGETPLATFORM 到发布包名，多一处会漂的地方。
+#
+# MIHOMO_IMAGE 的默认值在文件顶端以全局 ARG 声明（见那里的说明）。
+FROM ${MIHOMO_IMAGE} AS mihomo
+
 # ── 运行阶段 ────────────────────────────────────────────────────────
 FROM python:3.12-slim
 
@@ -81,6 +99,13 @@ LABEL org.opencontainers.image.title="cpa-upstream-importer" \
 
 COPY --from=builder /deps /usr/local
 
+# mihomo 二进制。上面那个 stage 只是"声明"，不 COPY 出来的话它不会进最终
+# 镜像 —— stage 未被引用时 buildx 直接跳过整层。
+#
+# 官方镜像里二进制就在根目录 /mihomo（entrypoint 也是它），大小约 50 MB。
+# 放到 /usr/local/bin 让 PATH 直接能找到。
+COPY --from=mihomo /mihomo /usr/local/bin/mihomo
+
 WORKDIR /app
 
 # 只拷运行需要的。legacy/ 与 docs/ 是本机排障用，不进容器。
@@ -89,6 +114,28 @@ COPY cpa_probe/ /app/cpa_probe/
 COPY web/       /app/web/
 COPY tools/     /app/tools/
 COPY server.py cli.py /app/
+
+# mihomo 代理的配置模板与运维脚本。
+#
+# 为什么必须进镜像：部署方式是"VPS 只拉镜像"，宿主上不预置任何文件，
+# 所以 config.yaml 必须由容器自己从模板物化（bootstrap-mihomo.sh 干这件事）。
+#
+# healthcheck 用 Python 而不是 shell：两个镜像里**都没有 curl**
+# （实测 2026-09-13：metacubex/mihomo 有 wget/sed/awk/nc 但无 curl；
+# python:3.12-slim 连 wget 都没有）。urllib 是标准库，一定在。
+#
+# 只拷这几样：模板（全 ${ENV} 占位符）、healthcheck、两个脚本、清单示例。
+# 真实的 mihomo-subscriptions.conf 与 providers/ 含凭据，被 .dockerignore
+# 排除，运行时由 compose 从环境变量提供。
+COPY mihomo-manager/mihomo/config.template.yaml \
+     mihomo-manager/mihomo/healthcheck.py \
+     /app/mihomo-manager/mihomo/
+COPY mihomo-manager/update-mihomo-subscriptions.sh \
+     mihomo-manager/bootstrap-mihomo.sh \
+     mihomo-manager/mihomo-subscriptions.conf.example \
+     mihomo-manager/README.md \
+     /app/mihomo-manager/
+RUN chmod +x /app/mihomo-manager/*.sh /app/mihomo-manager/mihomo/healthcheck.py
 
 # 非 root 用户作为镜像默认。**实际生效的 uid 由 compose 的 user: 决定** ——
 # 它必须与宿主 config.yaml 的属主一致，否则写回时 PermissionError。
