@@ -547,6 +547,76 @@ claude-api-key:
         self.assertFalse(ok)
         self.assertNotIn("fixture-client", message)
 
+    # ── request-scoped-errors：新条目必须带上本部署的策略 ────────────
+    #
+    # 2026-09-13 现场：render_entry 是白名单渲染，白名单里没有
+    # request-scoped-errors；carry_lines 又只对既有条目有值。于是原文件没有的
+    # (凭据,段) 写出来一条规则都不带 —— 而那个块是「上游回余额不足/被封/
+    # CF 挑战就立刻跳下一个凭据」的唯一开关（action: continue-and-cooldown）。
+    # 生产 config.yaml 162 个条目里 116 个带它，新站不带等于被排除在容灾外：
+    # 那把 Key 没钱了 CPA 会一直重试它而不降级。
+
+    def test_learn_scoped_error_rules_needs_a_majority(self):
+        # 出现一次的是特例，不推广
+        one = {"claude-api-key": [
+            {"api-key": "k1", "base-url": "https://a.example",
+             "request-scoped-errors": [{"status": 403, "action": "continue"}]},
+            {"api-key": "k2", "base-url": "https://b.example"},
+            {"api-key": "k3", "base-url": "https://c.example"},
+        ]}
+        self.assertEqual(wb.learn_scoped_error_rules(one, "claude-api-key"), [])
+        # 占多数才认
+        rule = [{"status": 403, "match": ["quota_exceeded"],
+                 "action": "continue-and-cooldown"}]
+        many = {"claude-api-key": [
+            {"api-key": f"k{i}", "base-url": f"https://s{i}.example",
+             "request-scoped-errors": rule} for i in range(3)
+        ]}
+        self.assertEqual(wb.learn_scoped_error_rules(many, "claude-api-key"), rule)
+        # 两种形状各半 —— 谁都不占多数，不推广（避免把特例混成谁都不对的规则）
+        other = [{"status": 400, "action": "stop"}]
+        tie = {"claude-api-key": [
+            {"api-key": "k1", "base-url": "https://a.example",
+             "request-scoped-errors": rule},
+            {"api-key": "k2", "base-url": "https://b.example",
+             "request-scoped-errors": rule},
+            {"api-key": "k3", "base-url": "https://c.example",
+             "request-scoped-errors": other},
+            {"api-key": "k4", "base-url": "https://d.example",
+             "request-scoped-errors": other},
+        ]}
+        self.assertEqual(wb.learn_scoped_error_rules(tie, "claude-api-key"), [])
+        # 缺段 / 非法结构不抛
+        self.assertEqual(wb.learn_scoped_error_rules({}, "claude-api-key"), [])
+        self.assertEqual(
+            wb.learn_scoped_error_rules({"claude-api-key": "nope"}, "claude-api-key"), [])
+
+    def test_new_entry_carries_learned_scoped_error_rules(self):
+        rule = [{"status": 403, "match": ["quota_exceeded"],
+                 "action": "continue-and-cooldown"}]
+        sp = plan(scoped_error_rules=rule)
+        rows = rebuild("claude-api-key: []\n", sp)["claude-api-key"]
+        self.assertEqual(rows[0]["request-scoped-errors"], rule)
+
+    def test_existing_entry_does_not_duplicate_scoped_error_rules(self):
+        # 既有条目的规则已在 carry_lines 里逐字保真；再写一遍就是重复键，
+        # UniqueLoader 会拒掉整份文件。
+        rule = [{"status": 403, "match": ["quota_exceeded"],
+                 "action": "continue-and-cooldown"}]
+        sp = plan(carry_lines=wb._dump_fields(
+                      {"request-scoped-errors": rule}, "    "),
+                  scoped_error_rules=rule)
+        text = "\n".join(wb.render_entry(sp, "  - ", "    ", "stamp"))
+        self.assertEqual(text.count("request-scoped-errors:"), 1)
+        rows = rebuild("claude-api-key: []\n", sp)["claude-api-key"]
+        self.assertEqual(rows[0]["request-scoped-errors"], rule)
+
+    def test_compat_provider_also_carries_scoped_error_rules(self):
+        rule = [{"status": 403, "action": "continue-and-cooldown"}]
+        sp = plan("openai-compatibility", scoped_error_rules=rule)
+        rows = rebuild("openai-compatibility: []\n", sp)["openai-compatibility"]
+        self.assertEqual(rows[0]["request-scoped-errors"], rule)
+
     def test_readback_rejects_non_mapping(self):
         with patch.object(wb.urllib.request, "urlopen", return_value=FakeResponse(b"[]")):
             self.assertFalse(wb._readback_check("https://unit.example", "fixture-mgmt", "[]")[0])

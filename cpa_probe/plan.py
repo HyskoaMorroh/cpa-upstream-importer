@@ -1741,6 +1741,27 @@ class SectionPlan:
     # 是对象数组），重新序列化既要处理缩进又要处理引号风格，而原文行拿来就能
     # 用、且逐字保真。键序也跟着原文，diff 干净。
     carry_lines: list[str] = field(default_factory=list)
+    # 新条目要补的 request-scoped-errors（2026-09-13）
+    #
+    # 为什么需要它：carry_lines 只对**既有**条目有值（_prepare_source_plan 从
+    # _original_entry 取），而 render_entry 是白名单渲染、白名单里没有
+    # request-scoped-errors。于是原文件没有的 (凭据,段) 写出来一条规则都不带。
+    #
+    # 这个块是「上游返回余额不足 / 被封 / CF 挑战就立刻跳下一个凭据」的唯一
+    # 开关（action: continue-and-cooldown）。生产 config.yaml 里 162 个条目
+    # 有 116 个带它，且只有 2 种形状、其中一种占 115 个 —— 也就是说这是本部署
+    # 的既定策略，新站不带等于把它排除在容灾之外：那把 Key 没钱了，CPA 会
+    # 一直重试它而不降级到下一个。
+    #
+    # 取值一律**从既有条目学**（writeback.learn_scoped_error_rules），学不到
+    # 就留空、不写 —— 绝不写死一份规则表，那既违反「禁止硬编码」也可能与
+    # 部署策略冲突。
+    #
+    # 存**解析后的值**（对象数组）而不是原文行：缩进只有 render_entry 知道，
+    # 它的 field 参数按段与调用路径变（compat 段的 provider 级与 key 类段
+    # 不同层）。在别处定死缩进会渲染出错位的 YAML —— 实测 compat 段直接语法
+    # 错误、validate 拒收。序列化由 render_entry 用它自己的 field 做。
+    scoped_error_rules: list = field(default_factory=list)
     # 站方目录的最高世代已落后市面最新一个世代以上。
     #
     # 2026-09-02 现场：romeo.example 的 codex 段目录只有 gpt-4 /
@@ -2162,7 +2183,28 @@ def build_plan(
         # 它们的请求体，属于负向调整。
         cloak_mode = ""
         fp_profile = ""
-        if section == "claude-api-key" and getattr(v, "min_body_kind", ""):
+        # 两种触发条件（2026-09-13 补第二种）
+        # --------------------------------------
+        # ① min_body_kind 非空 —— 画像梯实测出「补了 body 才通」。
+        # ② category == "客户端" —— 站方明说只认特定客户端
+        #    （classify.py:103 认的 `only allows … clients`，实测 503）。
+        #
+        # 为什么必须加第二种：这类站**探测阶段就没通过**，min_body_kind 是空的，
+        # 于是上一版一个字段都不写。而它正是用户第 1 条要问的那个现象 ——
+        # 同一个站填进 cc switch 用 Claude Code 直连正常、经 CPA 就 503。
+        #
+        # 成因在 sub2api 侧（backend/internal/service/claude_code_validator.go）：
+        # claude_code_only 分组校验四项 —— UA 匹配 claude-cli/x.y.z、
+        # system prompt 与官方模板 Dice 相似、anthropic-beta 头、
+        # metadata.user_id 格式。四项缺一不可，光补 headers 过不了。
+        # CPA 侧能补齐这四项的开关就是 cloak.mode + fingerprint-profile
+        # （claude_executor_cloaking.go 里 injectFakeUserID 补 user_id、
+        # checkSystemInstructions* 补 system 块、fingerprint 带 OAuth betas）。
+        #
+        # 注意不要退回「注入 proxy-url」那条路 —— 见 :2544 那段的三条论证。
+        _client_gate = getattr(v, "category", "") == "客户端"
+        if section == "claude-api-key" and (getattr(v, "min_body_kind", "")
+                                            or _client_gate):
             try:
                 from .cpa_source_probe import cached_identity
                 ident = cached_identity()
@@ -2177,17 +2219,29 @@ def build_plan(
                 cloak_mode = "always"
             # system 块那一档还要 CLI 指纹：它带的是 OAuth betas + 稳定 CLI 身份，
             # 与 system 块是同一套形态的两半。
-            if "+system" in v.min_body_kind and "claude-code-cli" in profs:
+            #
+            # 「客户端」类同样要：sub2api 的四项校验里 anthropic-beta 与
+            # system prompt 分属两半，只开 cloak 不带 CLI 指纹仍会缺 beta 头。
+            if (("+system" in getattr(v, "min_body_kind", "") or _client_gate)
+                    and "claude-code-cli" in profs):
                 fp_profile = "claude-code-cli"
             if cloak_mode or fp_profile:
-                model_warns.append(
-                    f"该段实测需要**请求体**级 Claude Code 身份"
-                    f"（{v.min_body_kind}），headers 表达不了 —— "
-                    f"已写入 "
-                    + "、".join(filter(None, [
-                        f"cloak.mode={cloak_mode}" if cloak_mode else "",
-                        f"fingerprint-profile={fp_profile}" if fp_profile else ""]))
-                    + " 让 CPA 自己补上")
+                _wrote = "、".join(filter(None, [
+                    f"cloak.mode={cloak_mode}" if cloak_mode else "",
+                    f"fingerprint-profile={fp_profile}" if fp_profile else ""]))
+                if _client_gate and not getattr(v, "min_body_kind", ""):
+                    # 探测没通过，写的是「按站方拒绝理由推断的处置」——
+                    # 必须说清这是推断而非实测，否则操作员会以为验证过了。
+                    model_warns.append(
+                        f"站方明确只认特定客户端（探测判「客户端」类，未通过）"
+                        f" —— 已按 CPA 的客户端身份开关写入 {_wrote}；"
+                        f"这是**依据拒绝理由的推断**，本次未实测通过，"
+                        f"写回后请用 CPAMP 的连通性测试复核")
+                else:
+                    model_warns.append(
+                        f"该段实测需要**请求体**级 Claude Code 身份"
+                        f"（{v.min_body_kind}），headers 表达不了 —— "
+                        f"已写入 {_wrote} 让 CPA 自己补上")
 
         # codex 段：originator 必须无条件写齐（2026-09-10）
         # ---------------------------------------------------
@@ -2254,6 +2308,17 @@ def build_plan(
         catalog_offfamily: list[str] = []
         # 目录是否整体落后市面最新一个世代以上。只影响「建不建议勾」，
         # 不影响清单内容。见下面 catalog 分支与 SectionPlan.catalog_stale。
+        #
+        # 【死字段，2026-09-13 核实】catalog_stale 自本行初始化为 False 之后，
+        # 到 :2503 的重置之间**没有任何一处把它设为 True** —— 旧的「站方目录
+        # 整体落后就不补齐」策略已由 topup_to_market_top 取代（见 :2356 注释）。
+        # 于是 SectionPlan.recommend_reason:1838 的 `if self.catalog_stale:`
+        # 分支恒不成立，server.py:928 也只是把恒 False 传给前端。
+        #
+        # 保留字段是为了 JSON 契约兼容（前端与外部脚本可能读它）。
+        # 排障时请注意：「目录来源的段默认不勾」不是这个字段导致的，而是
+        # `recommended`:1807 的 `model_source != "probed"` —— 找错地方会白费
+        # 一轮（2026-09-13 就误判过一次）。
         catalog_stale, stale_why = False, ""
         # 手填**无条件优先**，不看 usable（2026-09-03 现场，第二次改这一处）。
         #
@@ -2531,22 +2596,43 @@ def build_plan(
 
         score = score_verdict(v)
 
-        # P0-4: TLS 指纹代理检测与注入（2026-09-12）
-        # -----------------------------------------------
-        # 背景：api.zzzcoding.org 等站点用 TLS Client Hello 指纹识别客户端
-        # 问题：Go http.Client 指纹 ≠ Electron/Chrome 指纹 → 503/403 拒绝
-        # 方案：nginx TLS proxy 中转，改变出口指纹 → 注入 proxy-url 参数
+        # 「站方只认特定客户端」的处置 —— 写 cloak / fingerprint-profile，
+        # **不是**塞一个 TLS 代理（2026-09-13 推翻上一版做法）
+        # ------------------------------------------------------------------
+        # 上一版（P0-4，2026-09-12）在这里按域名黑名单注入
+        # `proxy-url: http://127.0.0.1:8443`，指向 nginx 的「TLS 指纹代理」。
+        # 逐条核对 CPA 源码后确认那条路**从协议层就不通**，三处独立错误：
         #
-        # 检测逻辑：
-        # 1. 黑名单匹配（已知指纹检测站点）
-        # 2. 未来可扩展：检测历史错误中的 "Claude Code" / "fingerprint" 关键字
-        needs_proxy, proxy_url_override = _needs_tls_proxy(base, section)
-        if needs_proxy and proxy_url_override:
-            logger.info(
-                f"段 {section} 基址 {base[:50]} 检测到 TLS 指纹要求，"
-                f"注入 proxy-url: {proxy_url_override}")
-            # 覆盖原有 proxy 设置（指纹代理优先级高于普通代理）
-            proxy = proxy_url_override
+        #   1 CPA 的 proxy-url 走 http.Transport.Proxy，对 https 上游发的是
+        #     **CONNECT**；nginx 那个块是普通 HTTP 反代（proxy_pass
+        #     $scheme://$http_host$request_uri），没有 proxy_connect 模块，
+        #     不认 CONNECT。
+        #   2 nginx 监听在**宿主机** 127.0.0.1:8443，而 CPA 在容器里 ——
+        #     容器内 127.0.0.1 是它自己的 lo，到不了宿主机。
+        #   3 listen 是明文 8443，$scheme 恒为 http，转发出去也不是 https。
+        #
+        #   旁证：生产 config.yaml 里 proxy-url 指向 8443 的条目数为 0 ——
+        #   这条路从没真正落过盘。
+        #
+        # 更要紧的是**设 proxy-url 会让指纹变得更糟**。CPA 自带 Claude Code
+        # 的真实 TLS 指纹（helps/utls_client.go:164 claudeCodeTLSClientHelloSpec，
+        # 逐字节复刻 Claude Code 2.1.220 的 ClientHello，连 header 顺序都对齐），
+        # 但 NewUtlsHTTPClient 一旦拿到 proxyURL 就把 standardTransport 换成
+        # buildProxyTransport，utls 那条通道被整个绕开。
+        #
+        # 而 TLS 那一层本项目**根本触及不到**：utls 只对
+        # IsAnthropicUpstreamURL（claude_upstream.go:12 硬性要求 hostname ==
+        # api.anthropic.com）生效，第三方聚合站一律走 Go 默认指纹，
+        # 这是 CPA 的判定、CPA 不可改。
+        #
+        # 能做的是**请求体与头**那一层，而它正是 503 的真实成因：
+        # sub2api 的 claude_code_only 校验四项（claude_code_validator.go）——
+        # UA 匹配 claude-cli/x.y.z、system prompt 与模板 Dice 相似、
+        # anthropic-beta 头、metadata.user_id 格式。CPA 对应的开关就是每 key 的
+        # cloak.mode 与 fingerprint-profile，见下面 identity 那一段（:2176）。
+        #
+        # 所以这里不再动 proxy：v.need_proxy 那条链（:2107）已经按**实测**
+        # 选出可达代理，用探测事实覆盖它只会把可用的配置改坏。
 
         # P0-3: 提取历史 max-context-length 值（2026-09-12）
         # -------------------------------------------------------
@@ -2562,7 +2648,25 @@ def build_plan(
         pri, reason = suggest_priority(band, score, models=models,
                                        probation=probation)
 
+        # 新条目的 request-scoped-errors（2026-09-13）
+        # ------------------------------------------
+        # 只对**本段既有条目**学一次策略；既有条目走 carry_lines 逐字保真，
+        # render_entry 会跳过这一份（判 carry 里有没有）。
+        #
+        # 为什么在这里算而不是 render_entry 里：那个函数拿不到 cfg。
+        # 学不到就是空，什么都不写 —— 绝不内置一份规则表。
+        #
+        # 存**解析后的值**而不是原文行：缩进只有 render_entry 知道
+        # （它的 field 参数按段与调用路径变，compat 段与 key 类段不同层）。
+        # 在这里定死缩进会渲染出错位的 YAML —— 实测 compat 段直接语法错误。
+        try:
+            from .writeback import learn_scoped_error_rules
+            scoped_rules = learn_scoped_error_rules(cfg, section)
+        except Exception:
+            scoped_rules = []
+
         sp = SectionPlan(
+            scoped_error_rules=scoped_rules,
             cloak_mode=cloak_mode,
             fingerprint_profile=fp_profile,
             rebuild_mid_system=getattr(v, "rebuild_mid_system", None),
@@ -3076,16 +3180,26 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
         # - 健康分数替换原来的"组内最高分"（从静态检测分转为动态运行状态）
         # - 主机名保持稳定性（同输入同输出）
 
-        # 尝试导入 runtime_health（需 requests 模块，测试环境可能缺失）
+        # runtime_health 现在只用标准库（2026-09-13 把 requests 换成 urllib）。
+        #
+        # 为什么这件事要紧：它原来顶层 `import requests`，而本项目自述「零第三方
+        # 依赖」、deploy/Dockerfile 只装 PyYAML 与 bcrypt —— 于是容器里这个
+        # import 必然失败，下面的 except 把它咽掉、退回静态检测分。
+        # 结果是「按 CPA 实际运行状态定优先级」这个特性**在生产环境从未生效
+        # 过一次**，日志只有一行 debug。
+        #
+        # try/except 保留：模块级语法/属性错误仍该降级而不是让整轮定档崩掉。
         try:
             from .runtime_health import (
                 fetch_cpa_runtime_health,
                 get_domain_health_scores,
             )
             runtime_health_available = True
-        except ImportError:
+        except ImportError as exc:
             runtime_health_available = False
-            logger.debug("runtime_health 模块不可用（缺少 requests），将回退到静态检测分")
+            # 用 warning 而不是 debug：这条一旦出现就是「特性静默失效」，
+            # 而 debug 级别在生产日志里看不见 —— 正是它藏了这么久的原因。
+            logger.warning(f"runtime_health 不可用（{exc}），本轮回退到静态检测分")
 
         # 尝试查询 CPA 运行时状态（默认端口 8317，从 config.yaml 读取）
         domain_health = {}
@@ -3442,66 +3556,3 @@ def extract_prior_context(cfg: dict, section: str, base_url: str,
     
     return {}
 
-
-def _needs_tls_proxy(base_url: str, section: str) -> tuple[bool, str]:
-    """
-    检测上游是否需要 TLS 代理以绕过指纹检测
-
-    某些上游站点通过 TLS Client Hello 指纹（JA3/JA4）或 HTTP/2 指纹识别客户端，
-    拒绝非 Claude Code 的请求。CPA 使用 Go http.Client，其指纹与 Electron/Chromium
-    不同，导致 503 "Only Claude Code clients" 错误。
-
-    解决方案：通过本地 nginx 反向代理（127.0.0.1:8443）改变 TLS 握手指纹。
-    nginx 用 OpenSSL 指纹重新握手到上游，上游看到的是 nginx 指纹而非 Go 指纹。
-
-    配置位置：nginx.conf 末尾的 "TLS 指纹代理服务器" 块
-
-    Args:
-        base_url: 上游基址（如 https://api.zzzcoding.org/v1）
-        section: 段名（codex-api-key / claude-api-key 等，保留用于未来扩展）
-
-    Returns:
-        (needs_proxy: bool, proxy_url: str)
-        - needs_proxy: 是否需要注入代理
-        - proxy_url: 代理地址（http://127.0.0.1:8443）
-
-    已知受限站点：
-        - api.zzzcoding.org / zzzcoding.org
-        - api.grok2.com / grok2.com（可扩展）
-    """
-    from urllib.parse import urlparse
-
-    # 已知需要 TLS 代理的站点（黑名单）
-    KNOWN_FINGERPRINT_SITES = [
-        "api.zzzcoding.org",
-        "zzzcoding.org",
-        "api.grok2.com",
-        "grok2.com",
-    ]
-
-    # 默认代理端点（nginx TLS proxy，nginx.conf 中的 127.0.0.1:8443）
-    DEFAULT_PROXY_URL = "http://127.0.0.1:8443"
-
-    try:
-        parsed = urlparse(base_url)
-        hostname = parsed.netloc or parsed.path
-
-        # 去除端口号
-        if ':' in hostname:
-            hostname = hostname.split(':')[0]
-
-        # 检查黑名单
-        for site in KNOWN_FINGERPRINT_SITES:
-            if site in hostname.lower():
-                return True, DEFAULT_PROXY_URL
-
-        # 未来可扩展：检测 v.category 或错误信息中的关键字
-        # 例如：if "fingerprint" in error_msg or "Claude Code" in error_msg
-
-    except Exception as e:
-        # 解析失败，不注入代理
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.warning(f"TLS 代理检测失败：{e}，跳过")
-    
-    return False, ""

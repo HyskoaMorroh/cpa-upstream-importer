@@ -75,5 +75,83 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
 
+  # ── mihomo 代理 ─────────────────────────────────────────────────────
+  #
+  # 为什么是两个服务而不是一个：mihomo 要长驻前台跑，配置物化要跑完就退，
+  # 一个容器做不了两件事。init 用同一个镜像（里面有 python3 与模板），
+  # mihomo-proxy 也用同一个镜像（里面有 /usr/local/bin/mihomo 二进制）——
+  # 所以整套仍然只需要拉**一个**镜像，符合"VPS 只拉镜像"的部署方式。
+  #
+  # 两者通过命名卷 mihomo-config 交接：init 写 config.yaml，proxy 读它。
+  # 卷是持久的，所以 probe-upstreams.py 写进 AUTO 组 filter 的探测结果
+  # 在重启后仍然生效（init 默认不覆盖已有配置）。
+  mihomo-init:
+    image: ${IMAGE:-swhesong/cpa-upstream-importer:latest}
+    pull_policy: ${PULL_POLICY:-missing}
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    container_name: ${CONTAINER_NAME:-cpa-upstream-importer}-mihomo-init
+    profiles: ["mihomo"]        # 不需要代理的部署用 --profile 跳过整块
+    restart: "no"               # 跑完就退，重启反而会重复物化
+    user: "0:0"                 # 要写命名卷，用 root 省掉 uid 对齐的麻烦
+    entrypoint: ["/app/mihomo-manager/bootstrap-mihomo.sh"]
+    environment:
+      MIHOMO_TARGET_DIR: "/mihomo-config"
+      # RESTful API 鉴权。留空则不设 —— 但 9090 绑在 0.0.0.0，同一 Docker
+      # 网络内的任何容器都能切换出口、读出全部节点地址，建议必填。
+      MIHOMO_SECRET: "${MIHOMO_SECRET:-}"
+      # 订阅。两种写法二选一：
+      #   MIHOMO_SUBSCRIPTIONS="名称1=URL1;名称2=URL2"   （分号分隔）
+      #   MIHOMO_SUB_<大写名称>=URL                       （每个一个变量）
+      MIHOMO_SUBSCRIPTIONS: "${MIHOMO_SUBSCRIPTIONS:-}"
+      MIHOMO_SUB_WOG: "${MIHOMO_SUB_WOG:-}"
+      MIHOMO_SUB_WOGB: "${MIHOMO_SUB_WOGB:-}"
+      # 设为 1 则用模板覆盖现有配置（会先备份）。日常留空。
+      MIHOMO_FORCE_REBUILD: "${MIHOMO_FORCE_REBUILD:-}"
+    volumes:
+      - mihomo-config:/mihomo-config
+
+  mihomo-proxy:
+    image: ${IMAGE:-swhesong/cpa-upstream-importer:latest}
+    pull_policy: ${PULL_POLICY:-missing}
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    container_name: ${CONTAINER_NAME:-cpa-upstream-importer}-mihomo
+    profiles: ["mihomo"]
+    restart: unless-stopped
+    depends_on:
+      mihomo-init:
+        # 必须等物化完成 —— 配置还没写好就启动，mihomo 会因找不到
+        # config.yaml 而退出，再被 restart 策略拉起，形成启动风暴。
+        condition: service_completed_successfully
+    # 镜像默认 entrypoint 是 importer 的 server.py，这里覆盖成代理本体。
+    # -d 指定配置目录，mihomo 会读其中的 config.yaml。
+    entrypoint: ["/usr/local/bin/mihomo", "-d", "/mihomo-config"]
+    user: "0:0"
+    ports:
+      # 只绑回环。7890 是 CPA 的 proxy-url 目标，9090 供探测脚本调用。
+      # 容器间走服务名（http://mihomo-proxy:7890），不依赖这两个映射。
+      - "${MIHOMO_BIND:-127.0.0.1}:${MIHOMO_MIXED_PORT:-7890}:7890"
+      - "${MIHOMO_BIND:-127.0.0.1}:${MIHOMO_API_PORT:-9090}:9090"
+    volumes:
+      - mihomo-config:/mihomo-config
+    healthcheck:
+      # 不只判活，还会在节点全挂时把 PROXY 组切到 DIRECT ——
+      # docker 的 healthcheck 本身改不了 mihomo 选路，那件事得脚本自己做。
+      # 详见 mihomo-manager/mihomo/healthcheck.py 的开头说明。
+      test: ["CMD", "python3", "/mihomo-config/healthcheck.py"]
+      interval: 60s
+      timeout: 20s
+      retries: 2
+      start_period: 30s
+    environment:
+      MIHOMO_SECRET: "${MIHOMO_SECRET:-}"
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
 volumes:
   importer-backups:
+  mihomo-config:

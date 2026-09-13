@@ -4,10 +4,23 @@ CPA 运行时健康状态查询模块
 支持两种数据源：
 1. HTTP API - 从 CPA 管理接口实时获取（优先）
 2. Detection Fallback - 基于检测结果预测（回退）
+
+只用标准库（2026-09-13）
+------------------------
+本模块原来顶层 `import requests`。本项目自述「零第三方依赖」，
+deploy/Dockerfile 只装 PyYAML 与 bcrypt —— 于是容器里这个 import 必然
+失败，plan.py:3099 的 except 把它咽掉并退回静态检测分。后果是「按 CPA
+实际运行状态定优先级」这个特性**在生产环境从未生效过一次**，而唯一的线索
+是一行 debug 日志。
+
+现在用 urllib（与 client.py 同一套），不再引入任何三方依赖。
 """
 
+import json
 import logging
-import requests
+import os
+import urllib.error
+import urllib.request
 from typing import Dict, Optional, List, Tuple
 from dataclasses import dataclass
 
@@ -64,10 +77,18 @@ def fetch_cpa_runtime_health(
             headers["Authorization"] = f"Bearer {token}"
             logger.debug("使用管理令牌鉴权")
 
-        resp = requests.get(url, timeout=timeout, headers=headers)
-        resp.raise_for_status()
-
-        raw_data = resp.json()
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        # 不走环境代理：CPA 管理口是同栈内网地址，套上 HTTPS_PROXY 会被发到
+        # 外网代理去（与 client.py:126 的 _opener 同一条理由）。
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                logger.warning(f"CPA 管理接口返回错误: {resp.status} - {url}")
+                return None
+            raw_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        if not isinstance(raw_data, dict):
+            logger.warning(f"CPA 管理接口返回非对象：{type(raw_data).__name__}")
+            return None
         logger.debug(f"收到 CPA 运行时数据，providers: {list(raw_data.keys())}")
 
         # 解析为 AuthHealth 对象
@@ -89,17 +110,19 @@ def fetch_cpa_runtime_health(
 
         return result
 
-    except requests.Timeout:
-        logger.warning(f"CPA 管理接口请求超时: {url}")
+    except urllib.error.HTTPError as e:
+        logger.warning(f"CPA 管理接口返回错误: {e.code} - {url}")
         return None
-    except requests.ConnectionError as e:
-        logger.warning(f"无法连接到 CPA 管理接口: {url} - {e}")
+    except urllib.error.URLError as e:
+        # 超时也走这里（socket.timeout 被 URLError 包住），reason 里能看出来
+        logger.warning(f"无法连接到 CPA 管理接口: {url} - {e.reason}")
         return None
-    except requests.HTTPError as e:
-        logger.warning(f"CPA 管理接口返回错误: {e.response.status_code} - {e}")
+    except (TimeoutError, OSError) as e:
+        logger.warning(f"CPA 管理接口请求失败: {url} - {e}")
         return None
-    except Exception as e:
-        logger.error(f"获取 CPA 运行时状态失败: {e}", exc_info=True)
+    except (ValueError, KeyError, TypeError) as e:
+        # JSON 解析失败或结构不符
+        logger.warning(f"CPA 管理接口返回无法解析: {e}")
         return None
 
 
@@ -294,17 +317,34 @@ def get_domain_health_scores(
         section: 段名
 
     Returns:
-        {domain: health_score} 字典
+        {domain: health_score} 字典。**键与 plan.assign_priorities 的分组键
+        完全一致**（都走 parse.host_of），否则消费侧的 `host in domain_health`
+        静默失配、悄悄退回静态检测分。
+
+    键必须用 host_of 而不是 urlparse().netloc（2026-09-13 修）
+    --------------------------------------------------------
+    消费侧 plan.py:2964 用 `host_of(sp.base_url)` 建 by_host，:3127 再用
+    `host in domain_health` 查分。而这里原来用 `urlparse().netloc`，两者在
+    三种真实输入上给出不同的键：
+
+        输入                              netloc            host_of
+        https://API.Example.com/v1        API.Example.com   api.example.com
+        https://api.example.com:8080/v1   api.example.com:8080  api.example.com:8080
+        api.example.com/v1（无 scheme）    ''→path           api.example.com
+
+    第一种（大小写）与第三种（缺 scheme）都会失配。失配不报错、不告警，
+    只是每个站都退回 `max(x.score for x in sps)` 的静态分 —— 于是「健康分
+    定优先级」这个特性在大写 URL 上静默失效，而 config.yaml 里混着两种拼法。
+    host_of 的 docstring 记着同一类缺陷已在 pipeline 的形态缓存键上出过事。
     """
-    from urllib.parse import urlparse
+    from .parse import host_of
 
     domain_scores = {}
     domain_plans = {}
 
     # 按域名分组
     for plan in plans:
-        parsed = urlparse(plan.base_url)
-        domain = parsed.netloc or parsed.path
+        domain = host_of(plan.base_url)
 
         if domain not in domain_plans:
             domain_plans[domain] = []

@@ -1,0 +1,68 @@
+# mihomo 配置 —— 为 CLIProxyAPI 提供可切换出口，绕过按 IP 拦截的上游站点。
+
+# 混合端口：同一端口同时接受 HTTP 代理与 SOCKS5。
+mixed-port: 7890
+
+allow-lan: true
+bind-address: "*"
+mode: rule
+log-level: info
+
+# RESTful API。probe-upstreams.py 依赖它切换节点、读取节点列表。
+external-controller: "0.0.0.0:9090"
+
+dns:
+  enable: true
+  ipv6: false
+  nameserver:
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
+
+proxy-providers:
+  wog:
+    type: http
+    url: "${MIHOMO_SUB_WOG}"
+    path: ./providers/wog.yaml
+    interval: 21600
+    health-check:
+      enable: true
+      url: "https://www.gstatic.com/generate_204"
+      interval: 300
+      lazy: false
+
+  wogb:
+    type: http
+    url: "${MIHOMO_SUB_WOGB}"
+    path: ./providers/wogb.yaml
+    interval: 21600
+    health-check:
+      enable: true
+      url: "https://www.gstatic.com/generate_204"
+      interval: 300
+      lazy: false
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - AUTO
+      - DIRECT
+    use:
+      - wog
+      - wogb
+
+  - name: AUTO
+    type: url-test
+    use:
+      - wog
+      - wogb
+    url: "https://www.gstatic.com/generate_204"
+    interval: 300
+    tolerance: 50
+    # PROBE_FILTER_ANCHOR 请勿删除本行注释：probe-upstreams.py --apply 靠它定位插入点
+    filter: "×1倍率"
+
+rules:
+  - DOMAIN,vpn.chiangma.com,DIRECT
+  - DOMAIN,www.wogb.top,DIRECT
+  - MATCH,PROXY

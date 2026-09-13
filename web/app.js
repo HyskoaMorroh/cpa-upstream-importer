@@ -2257,6 +2257,30 @@ function applyPickPreset(mode) {
       S.picks.add(pk(p.line_no, sec));
     });
   });
+  // 勾不满时必须说清差在哪 —— 只显示一个数字，操作员会以为是自己看错了。
+  // 两种成因分开报：无模型是后端缺陷，不写入是设计如此。
+  //
+  // 2026-09-13：这段原来限定 `mode === 'all'`，而首轮走的是 'rec' ——
+  // 于是现场那 17 个「判定可用、目录也返回了模型、却一个都没勾」的段
+  // （api.facai.cloudns.org 的 codex/claude/compat）在界面上完全不可见。
+  // 后端缺陷被藏起来，正是注释里说「如实报出来而不是静默少勾」要防的事。
+  // 'none' 例外：那是用户主动全不选，报「差在哪」没有意义。
+  //
+  // 必须在 syncPickUI 之前算好：syncPickUI 是 #pickstat 的唯一渲染点，
+  // 读的是 _pickWhy —— 晚一步就渲染上一轮的旧诊断。
+  const why = [];
+  if (mode !== 'none' && (missing.length || blocked)) {
+    if (missing.length) {
+      why.push(`${missing.length} 段异常无模型（后端缺陷，请报）：`
+        + esc(missing.slice(0, 3).join('、'))
+        + (missing.length > 3 ? ` 等 ${missing.length} 段` : ''));
+    }
+    if (blocked) {
+      why.push(`${blocked} 段标为「不写入」（原本没配这一段且清单只是猜测 ——`
+        + `手填真实模型即可放行）`);
+    }
+  }
+  _pickWhy = why.join(' · ');
   syncPickUI();
   // 预设按钮也要重算 —— 与单个勾选同理：后端只为已勾选的段出方案，
   // 不重算的话「全勾选」之后 priority 栏还是 placeholder「待定」。
@@ -2266,17 +2290,6 @@ function applyPickPreset(mode) {
   $$('#pickbtns button[data-mode]').forEach((b) => {
     b.classList.toggle('on', b.dataset.mode === mode);
   });
-  if (mode === 'all' && (missing.length || blocked)) {
-    // 「全勾」勾不满时必须说清差在哪 —— 只显示一个数字，操作员会以为
-    // 是自己看错了。两种成因分开报：无模型是后端缺陷，不写入是设计如此。
-    const why = [];
-    if (missing.length) why.push(`${missing.length} 段异常无模型（后端缺陷，请报）`);
-    if (blocked) {
-      why.push(`${blocked} 段标为「不写入」（原本没配这一段且清单只是猜测 ——`
-        + `手填真实模型即可放行）`);
-    }
-    $('#pickstat').textContent = `已勾选 ${S.picks.size} 项写入 · ` + why.join(' · ');
-  }
 }
 
 // 勾选变化后的方案重算。防抖 —— 「全勾选」会连发几百次 change 事件，
@@ -2289,6 +2302,14 @@ function schedulePlanRefresh() {
   _planTimer = setTimeout(() => { _planTimer = null; refreshPlan(true); }, 180);
 }
 
+// 勾不满的成因（无模型 / 不写入）。applyPickPreset 算出来后存这里，
+// 由 syncPickUI 统一渲染 —— 否则谁最后跑谁的文案胜出。
+//
+// 2026-09-13：这两个函数会互相覆盖 #pickstat。applyPickPreset 先写诊断，
+// 紧接着 schedulePlanRefresh → refreshPlan → syncPickUI 用纯计数覆盖掉；
+// 于是「17 段异常无模型」闪一下就没了。改成单一渲染点。
+let _pickWhy = '';
+
 function syncPickUI() {
   $$('#results .sel').forEach((el) => {
     el.checked = S.picks.has(pk(el.dataset.rid, el.dataset.sec));
@@ -2296,7 +2317,13 @@ function syncPickUI() {
     if (tr) tr.classList.toggle('rec', el.checked);
   });
   const n = S.picks ? S.picks.size : 0;
-  $('#pickstat').textContent = n ? `已勾选 ${n} 项写入` : '未勾选任何项';
+  const head = n ? `已勾选 ${n} 项写入` : '未勾选任何项';
+  const stat = $('#pickstat');
+  if (stat) {
+    stat.innerHTML = _pickWhy
+      ? `${esc(head)} · <span class="warn">${_pickWhy}</span>`
+      : esc(head);
+  }
   $('#btnplan').disabled = n === 0;
 }
 
@@ -2317,18 +2344,58 @@ async function refreshPlan(silent) {
   }
   try { d = await api('/api/plan', { method: 'POST', body }); }
   catch (e) {
-    if (!silent) $('#planmeta').innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    // 失败必须可见 —— silent 只压「成功了但没什么可说」的提示，不压错误。
+    //
+    // 2026-09-13 现场（投喂台 mhtml）：173 站 692 行里 692 个 priority 框
+    // 全是 placeholder「待定」、54 个可用段的建议栏全停在「计算中…」。
+    // 成因就是这里：12 个调用点有 7 个传 silent=true，任何一次 /api/plan
+    // 失败都被完全吞掉 —— 界面停在初始占位符，与「还在算」长得一模一样，
+    // 操作员等不到结果也看不到原因。
+    //
+    // 定档栏就在结果表里，而 #planmeta 属于第 4 步（写回预览），首轮根本
+    // 还没显示 —— 只写那里等于没写。所以两处都写：#planmeta 给写回流程，
+    // #pickstat 给③的表头（那里一定可见）。
+    const msg = esc(e.message || '未知错误');
+    const meta = $('#planmeta');
+    if (meta) meta.innerHTML = `<div class="err">定档失败：${msg}</div>`;
+    const stat = $('#pickstat');
+    if (stat) {
+      stat.innerHTML = `<span class="err">定档失败：${msg}</span>`
+        + ` <span class="hint">priority 与建议栏保持占位符；重试或看容器日志</span>`;
+    }
     return null;
   }
   S.planId = d.plan_id; S.plans = d.plans;
 
-  // 首次：按系统建议预勾选
-  if (S.picks === null) {
+  // 首次：按系统建议预勾选。
+  //
+  // 必须先回填再递归（2026-09-13）：原来这里直接 `return refreshPlan(true)`,
+  // 于是首轮这一帧的 d.plans 被丢掉 —— 而下面的回填循环在 return 之后，
+  // 首轮永远到不了。递归的第二帧只要失败（且它传的就是 silent=true），
+  // 整张表就永久停在「待定 / 计算中…」。
+  //
+  // 现在的顺序：先用首轮方案把 priority 与建议栏填上（拿到什么就先显示
+  // 什么），再按建议预勾选、再重取一次让 diff 与勾选一致。第二帧失败时
+  // 首轮的值仍在表上，操作员看到的是真实档位而不是占位符。
+  const firstPass = S.picks === null;
+  fillPlanIntoRows(d);
+  if (firstPass) {
     applyPickPreset('rec');
     // 预勾选变了选择集，重取一次让 diff 与勾选一致
     return refreshPlan(true);
   }
+  syncPickUI();
+  return d;
+}
 
+// 把 /api/plan 的方案填进结果表：priority、系统建议、fallback 模型清单、
+// 段级警告与 headers 编辑器。
+//
+// 为什么单独抽出来（2026-09-13）：它原来内联在 refreshPlan 里、位置在首轮
+// 递归 `return` 之后，于是首轮拿到的方案**从来没被用过**。抽成函数后首轮
+// 与后续轮都能调它，首轮的档位立刻显示，第二帧失败也不会退回占位符。
+function fillPlanIntoRows(d) {
+  if (!d || !Array.isArray(d.plans)) return;
   d.plans.forEach((p) => {
     Object.entries(p.sections).forEach(([sec, sp]) => {
       const tr = document.querySelector(
@@ -2489,8 +2556,6 @@ async function refreshPlan(silent) {
       }
     });
   });
-  syncPickUI();
-  return d;
 }
 const cssq = (s) => String(s).replace(/["\\]/g, '\\$&');
 

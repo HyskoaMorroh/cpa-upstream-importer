@@ -1,63 +1,80 @@
-# 构建镜像时排除的文件。
-#
-# 这不只是「让镜像小一点」—— 更要紧的是**别把秘密烤进镜像层**。
-# 镜像层是不可变的：即使后续 RUN 删掉某个文件，它仍留在历史层里，
-# `docker save` 或 `docker history` 能挖出来。所以宁可从一开始就不进构建上下文。
-
-# ── 秘密与真实配置：绝不进镜像 ──────────────────────────────
-# config.yaml 含明文上游 Key 与管理密钥的 bcrypt 哈希。
-# 它在运行时以 bind mount 挂进来（compose 的 volumes），不该被 COPY。
+# ── 秘密与私密配置：绝不进镜像 ────────────────────────────────────
+# 真实的 config.yaml 含明文 API Key，不进镜像（运行时由 compose 挂载）。
+# 进镜像的是 mihomo/config.template.yaml（全 ${ENV} 占位符）。
 config.yaml
 config.yml
 config.*.yaml
+config.*.yml
 *.bak-*
 *.scrub-bak-*
 .env
 .env.*
+!.env.example
 secrets/
 auths/
-accounts.txt
-accounts*.txt
 *.key
 *.pem
 *.p12
+*.pfx
+accounts.txt
+accounts*.txt
+upstreams.txt
+*.accounts
 
-# ── 本机排障产物 ────────────────────────────────────────────
+# mihomo 私密配置：订阅 URL（含 token）与拉下来的节点清单
+mihomo-manager/mihomo-subscriptions.conf
+mihomo-manager/mihomo/config.yaml
+mihomo-manager/mihomo/providers/
+mihomo/providers/
+
+# ── 不需要进镜像的开发与文档文件 ──────────────────────────────────
+# 排障记录、设计文档、站点代号对照：本机参考用，运行不需要
+docs/cpa-atlas.html
+docs/SITE-CODENAMES.md
+docs/2026-09-10-方案-agi任务.md
+docs/2026-09-11-部署侧整改方案.md
+
+# legacy 工具：旧版探测脚本，供参考，不进容器
 legacy/
-docs/
-graphify-out/
-logs/
-*.log
-tmp/
 
-# ── 测试与开发文件 ──────────────────────────────────────────
-# 镜像里跑不了它们（要 config.yaml），CI 已经跑过。
+# tests 不进镜像：CI 里已跑过，容器里跑不了（需要真实 config.yaml）
 tests/
-.pytest_cache/
+
+# graphify 生成物：2.1 MB，每次本地重新生成
+graphify-out/
+
+# ── 开发工具生成物 ──────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
 *.egg-info/
+.eggs/
 .venv/
 venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+logs/
+*.log
+backups/
+tmp/
+*.tmp
 
-# ── 版本控制与 CI ───────────────────────────────────────────
-.git/
-.gitignore
-.github/
-.dockerignore
-
-# ── 编辑器 / 系统 ───────────────────────────────────────────
+# ── 编辑器 / 系统 ───────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
+*.swo
+*~
 .DS_Store
 Thumbs.db
-
-# ── 文档：README 保留（有人 docker run 后想看），其余排除 ──
-CHANGELOG.md
-CONTRIBUTING.md
-LICENSE
-
-# ── compose 文件本身不需要进镜像 ────────────────────────────
-docker-compose.yml
-docker-compose.*.yml
+desktop.ini
+.git/
+.gitignore

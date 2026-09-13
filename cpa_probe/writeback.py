@@ -213,6 +213,58 @@ def _source_identity(base: str) -> str:
                        path, parsed.query, parsed.fragment))
 
 
+def learn_scoped_error_rules(cfg: dict, section: str) -> list:
+    """从既有条目学出本部署的 request-scoped-errors 策略。学不到就返回 []。
+
+    为什么必须「学」而不是内置一份（2026-09-13）
+    ------------------------------------------------
+    render_entry 是白名单渲染，白名单里没有 request-scoped-errors；而
+    carry_lines 只对既有条目有值。于是**新条目**（原文件没有的 (凭据,段)）
+    写出来一条规则都不带 —— 那个块是「上游回余额不足 / 被封 / CF 挑战就
+    立刻跳下一个凭据」的唯一开关（action: continue-and-cooldown），
+    不带等于那把 Key 没钱了 CPA 仍死等它、不降级。
+
+    实测生产 config.yaml（162 条目）：116 条带规则，且**只有 2 种形状**，
+    其中一种占 115 条。也就是说这是本部署的既定策略，照它补就对了。
+
+    只在「同段内出现次数 ≥2 且占该段带规则条目的多数」时才认，避免把某一条
+    手工特例推广到全段。取众数而非并集：并集会把两个站各自的特例混成一份
+    谁都不对的规则。
+
+    返回的是**解析后的值**（对象数组），由调用方交给 _dump_fields 序列化。
+    这里不碰原文行 —— 新条目没有原文可搬，而这份值本来就是从别处学的，
+    重新序列化不损失任何东西。
+    """
+    import collections
+    import json
+
+    entries = cfg.get(section)
+    if not isinstance(entries, list):
+        return []
+    counter: collections.Counter = collections.Counter()
+    shapes: dict[str, list] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        rules = entry.get("request-scoped-errors")
+        if not isinstance(rules, list) or not rules:
+            continue
+        try:
+            key = json.dumps(rules, sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError):
+            continue
+        counter[key] += 1
+        shapes.setdefault(key, rules)
+    if not counter:
+        return []
+    key, count = counter.most_common(1)[0]
+    # 出现一次的不算策略，只算特例；不占多数的也不推广。
+    total = sum(counter.values())
+    if count < 2 or count * 2 <= total:
+        return []
+    return copy.deepcopy(shapes[key])
+
+
 def _original_entry(cfg: dict, sp: SectionPlan) -> dict:
     matches = []
     for row in cfg.get(sp.section) or []:
@@ -1481,6 +1533,12 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
         out.extend(_dump_fields(identity, field))
         for ln in sp.carry_lines:
             out.append(ln.rstrip("\n"))
+        # 新 provider 补 request-scoped-errors —— 与 key 类段同一条理由，
+        # 见下面那段说明。compat 段的规则挂在 provider 级（与
+        # api-key-entries 同层），不是 per-key；缩进用本分支的 field。
+        if sp.scoped_error_rules and "request-scoped-errors" not in carry:
+            out.extend(_dump_fields(
+                {"request-scoped-errors": sp.scoped_error_rules}, field))
         out.append(f"{field}models:")
         out.extend(model_lines(f"{field}  "))
         return out
@@ -1536,6 +1594,20 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
     # 已经 rstrip 过换行，写出时由调用方统一补。
     for ln in sp.carry_lines:
         out.append(ln.rstrip("\n"))
+    # 新条目补 request-scoped-errors（2026-09-13）
+    # ------------------------------------------
+    # carry_lines 只对既有条目有值，所以新条目走到这里时上面那个循环是空的。
+    # scoped_error_rules 由 build_plan 用 learn_scoped_error_rules 从同段既有
+    # 条目学出来（学不到就是空，什么都不写）。
+    #
+    # 序列化在这里做、用本函数的 field：缩进随段与调用路径变，
+    # 在 plan 侧定死会渲染出错位的 YAML（实测 compat 段直接语法错误）。
+    #
+    # 加 `not carry` 判据：既有条目的规则已经在 carry_lines 里逐字保真了，
+    # 再写一遍就是重复键 —— UniqueLoader 会直接拒掉整份文件。
+    if sp.scoped_error_rules and "request-scoped-errors" not in carry:
+        out.extend(_dump_fields(
+            {"request-scoped-errors": sp.scoped_error_rules}, field))
     out.append(f"{field}models:")
     out.extend(model_lines(f"{field}  "))
     return out
