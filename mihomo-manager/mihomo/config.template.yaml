@@ -11,6 +11,9 @@ log-level: info
 # RESTful API。probe-upstreams.py 依赖它切换节点、读取节点列表。
 external-controller: "0.0.0.0:9090"
 
+# API 鉴权密钥，从环境变量注入。留空则不设鉴权（同网段容器可直连 9090）。
+secret: "${MIHOMO_SECRET}"
+
 dns:
   enable: true
   ipv6: false
@@ -63,6 +66,9 @@ proxy-groups:
     filter: "×1倍率"
 
 rules:
-  - DOMAIN,vpn.chiangma.com,DIRECT
-  - DOMAIN,www.wogb.top,DIRECT
+  # 订阅域名必须直连，否则形成"要先有代理才能拉到代理"的死循环。
+  # 下面两行只是占位示例 —— bootstrap-mihomo.sh 会按 MIHOMO_SUB_* 里的
+  # 实际订阅域名整段重写它们，不必手工改。
+  - DOMAIN,vpn.example.com,DIRECT
+  - DOMAIN,sub.example.net,DIRECT
   - MATCH,PROXY
