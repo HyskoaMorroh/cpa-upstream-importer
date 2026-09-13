@@ -20,8 +20,8 @@
 
 示例：
 ```
-wog|https://vpn.chiangma.com
-wogb|https://www.wogb.top/abiabi/vip/client/subscribe?token=YOUR_TOKEN
+wog|https://vpn.example.com
+wogb|https://sub.example.net/api/v1/client/subscribe?token=YOUR_TOKEN
 ```
 
 ### 2. 运行更新脚本
