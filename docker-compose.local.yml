@@ -1,0 +1,67 @@
+# 本地测试用 compose 配置
+# 用法：docker compose -f docker-compose.local.yml up --build
+
+version: '3.8'
+
+services:
+  # mihomo 配置初始化（一次性任务）
+  mihomo-init:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    env_file: .env.local
+    environment:
+      MIHOMO_TARGET_DIR: /mihomo-config
+      MIHOMO_FORCE_REBUILD: "0"
+    volumes:
+      - mihomo-config:/mihomo-config
+    entrypoint: ["/app/mihomo-manager/bootstrap-mihomo.sh"]
+    networks:
+      - importer-net
+
+  # mihomo 代理
+  mihomo:
+    image: metacubex/mihomo:latest
+    container_name: mihomo
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7890:7890"  # 混合代理端口
+      - "127.0.0.1:9090:9090"  # RESTful API
+    volumes:
+      - mihomo-config:/root/.config/mihomo
+    depends_on:
+      mihomo-init:
+        condition: service_completed_successfully
+    networks:
+      - importer-net
+
+  # upstream-importer 服务
+  importer:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    container_name: cpa-upstream-importer
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8765:8765"
+    env_file: .env.local
+    environment:
+      IMPORTER_CONFIG: /data/config.yaml
+      IMPORTER_BACKUP_DIR: /backups
+      CPA_UPSTREAM_URL: ${CPA_UPSTREAM_URL:-http://host.docker.internal:8317}
+    volumes:
+      - ./data:/data
+      - ./backups:/backups
+    depends_on:
+      - mihomo
+    networks:
+      - importer-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  mihomo-config:
+
+networks:
+  importer-net:
+    driver: bridge
