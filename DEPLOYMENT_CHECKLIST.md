@@ -49,21 +49,39 @@ proxy-url: http://host.docker.internal:8443
 
 ## 二、部署步骤
 
-### 1. 拉取最新镜像
+### 1. 更新镜像地址（首次部署）
+
+编辑 `/opt/deploy/docker-compose.yml`，找到 `upstream-importer` 服务（约 507 行），将镜像地址改为你的 Docker Hub 仓库：
+
+```yaml
+# 旧地址
+image: swhesong/cpa-upstream-importer:latest
+
+# 新地址（替换为你的用户名）
+image: hyskoamorroh/cpa-upstream-importer:latest
+```
+
+### 2. 拉取最新镜像
 
 ```bash
 cd /opt/deploy
-docker compose pull
+docker compose pull upstream-importer
 ```
 
 **预期输出**：
-- `swhesong/cpa-upstream-importer:latest` 拉取成功
-- `metacubex/mihomo:latest` 拉取成功（已集成在 upstream-importer 镜像内）
+- `hyskoamorroh/cpa-upstream-importer:latest` 拉取成功（或你配置的镜像地址）
+- `metacubex/mihomo:latest` 已集成在 upstream-importer 镜像内（无需单独拉取）
 
-### 2. 启动服务
+### 3. 启动服务
 
 ```bash
-docker compose up -d
+# 首次部署：启动 mihomo 代理
+docker compose up -d mihomo-init
+docker compose logs mihomo-init
+docker compose up -d mihomo
+
+# 启动 upstream-importer
+docker compose up -d upstream-importer
 ```
 
 **启动顺序**：
