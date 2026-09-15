@@ -818,8 +818,13 @@ def main() -> int:
         eq("持续 503 判为临时", v.category, "临时")
         eq("持续 503 不可用", v.usable, False)
         n_retry = sum(1 for a in v.attempts if a.combo.startswith("retry"))
-        eq("重试次数有上限（每种子 1 次）",
-           n_retry <= len(cp.pipeline.SEED_MODELS["claude-api-key"]), True)
+        # 上限是「每个基线模型 `_TRANSIENT_RETRIES` 次」，不是「每段种子数」
+        # （2026-09-16 修）：绑种子数只在种子数 == `_BASELINE_MODELS` 时等价，
+        # 而种子数已经改成每族 1 个（SEED_MODELS 由 model_catalog 兜底名录派生），
+        # claude 段只剩 1 个种子、基线却仍打 2 个模型 —— 于是重试 2 次 > 种子 1，
+        # 断言恒假。真正的不变量是基线模型数 × 每次上限。
+        cap = cp.pipeline.Prober._BASELINE_MODELS * cp.pipeline.Prober._TRANSIENT_RETRIES
+        eq("重试次数有上限（每个基线模型 1 次）", n_retry <= cap, True)
 
         section("onemodel：第二个种子 404 不许判死整段")
         r = probe("onemodel")

@@ -281,6 +281,140 @@ def _original_entry(cfg: dict, sp: SectionPlan) -> dict:
     return copy.deepcopy(matches[0]) if matches else {}
 
 
+def _drop_disabling_lines(carry: list[str], fields: list[str]) -> list[str]:
+    """从 carry 行里删掉停用字段，把条目放回调度池。
+
+    用户 2026-09-16：「无论原来是否被关闭，如果探测可用就要打开」。
+
+    两种形态的删法（与 `plan.reenable_targets` 一一对应）：
+
+      · `disabled: true` —— 删整行。写 `disabled: false` 与删行对 CPA 等价
+        （Go 零值即 false），删行能让「停用→启用」逐字节回到原文。
+      · `excluded-models: ["*"]` —— 只摘掉 `*` 这一项，**整行留着**。
+        这一行里可能还有别的模型名（那是「别调度这些模型」的独立语义），
+        整行删掉等于把操作员的手工排除也一起丢了。摘空之后才删整行 ——
+        与 bulk._set_enabled 的取舍同一条理由（往返可逆）。
+
+    `excluded-models` 有**两种写法**，两种都要认（2026-09-16 自查）：
+      · inline  —— `excluded-models: ["*", "gpt-4"]`
+      · 块序列  —— `excluded-models:` 换行后 `- '*'` 逐项一行
+    后者正是 `_dump_fields` 的产物（PyYAML 对列表默认这么写），而
+    `excluded-models` 不在 `_RENDERED_KEYS` 里，所以 carry 走的就是
+    `_dump_fields` —— **块序列是这里的常态，inline 才是少见的那种**。
+    第一版只认 inline，于是 `- '*'` 那一行被原样留下，写回后变成一个
+    值为 null 的空 `excluded-models:` 键：既没重开成功，还多出一处
+    diff。所以块序列的续行要按缩进整段吃掉。
+
+    只匹配条目级缩进，不递归进 `api-key-entries` 之类嵌套块：停用标记是
+    条目级字段。**缩进深度不写死** —— carry 行的缩进由其来源决定
+    （`_dump_fields` 用调用方给的字段缩进，`_field_fragments` 用原文列宽），
+    条目级缩进取这一组行里**最浅**的那一档。
+
+    删不动时**原样返回**，绝不猜着删 —— 宁可留着停用标记（用户能在界面上
+    看到并手工处理），也不能删错行把别的字段弄丢。
+    """
+    import json as _json
+    widths = [len(l) - len(l.lstrip()) for l in carry
+              if l.strip() and not l.lstrip().startswith("#")]
+    entry_indent = min(widths) if widths else 0
+
+    def _indent(line: str) -> int:
+        return len(line) - len(line.lstrip())
+
+    out: list[str] = []
+    i = 0
+    while i < len(carry):
+        line = carry[i]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or _indent(line) != entry_indent:
+            out.append(line)
+            i += 1
+            continue
+        hit = next((f for f in fields
+                    if stripped == f + ":" or stripped.startswith(f + ":")), None)
+        if hit is None:
+            out.append(line)
+            i += 1
+            continue
+
+        # `disabled` 是布尔标量，删整行即可。
+        if hit == "disabled":
+            i += 1
+            continue
+
+        # `excluded-models`：先把它自己那几行整段收集起来。
+        #
+        # 续行的判据有三档，缺一不可（2026-09-16 实测踩到）：
+        #   · 缩进更深            → 嵌套块，属于本字段
+        #   · 缩进**相同**且以 `- ` 开头 → 本字段的块序列项。PyYAML 对
+        #     「值为列表」的键就是这么写的：序列项与**父键同级**，而嵌套
+        #     映射项一定更深。所以「同级」不等于「另一个字段」。
+        #   · 其余（同级且不是 `- `）→ 下一个字段，停。
+        # 第一版把「同级」一律当字段结束，于是 `- '*'` 被原样留下，写回后
+        # 出现一个值为 null 的空 `excluded-models:` —— 没重开成功还多一处 diff。
+        end = i + 1
+        while end < len(carry):
+            nxt = carry[end]
+            if not nxt.strip():
+                break
+            if nxt.lstrip().startswith("#"):
+                end += 1
+                continue
+            ind = _indent(nxt)
+            if ind < entry_indent:
+                break
+            if ind == entry_indent and not nxt.lstrip().startswith("- "):
+                break
+            end += 1
+        span = carry[i:end]
+        inline = stripped[len("excluded-models:"):].split("#")[0].strip()
+        # 逐项取值，不走 YAML：`textwrap.dedent` 要求**所有非空行**都有公共
+        # 前缀缩进，而这里首行（`excluded-models:`）恰好是最浅的那一行，
+        # 续行比它深 —— dedent 不减，`_load_yaml` 于是把整段解析成一个
+        # 嵌套序列而不是映射，`.get()` 拿不到东西（2026-09-16 实测踩到）。
+        # 形态只有两种，逐行认比引解析器稳，也不会因为条目里有别的
+        # 复杂结构而连带失败。
+        items = None
+        if inline:
+            try:
+                items = _json.loads(inline.replace("'", '"'))
+            except ValueError:
+                items = None
+        if items is None:
+            seq: list = []
+            ok = True
+            for ln in span[1:]:
+                body = ln.strip()
+                if not body or body.startswith("#"):
+                    continue
+                if not body.startswith("- "):
+                    ok = False
+                    break
+                try:
+                    seq.append(_json.loads(body[2:].strip().replace("'", '"')))
+                except ValueError:
+                    seq.append(body[2:].strip())
+            items = seq if ok else None
+        if not isinstance(items, list):
+            # 认不出形态：值为空（null，与「没有这一行」等价）就删，
+            # 其余保守保留 —— 宁可留着标记让用户看见，也不能删错行。
+            if inline or not span[1:]:
+                i = end
+                continue
+            out.extend(span)
+            i = end
+            continue
+        kept = [x for x in items if str(x).strip() != "*"]
+        if not kept:
+            i = end
+            continue                      # 摘空了 → 删整段
+        body = ", ".join(_json.dumps(x, ensure_ascii=False) for x in kept)
+        pad = " " * entry_indent
+        out.append(f"{pad}excluded-models: [{body}]\n")
+        i = end
+    return out
+
+
 def _prepare_source_plan(cfg: dict, sp: SectionPlan,
                          source_block: list[str] | None = None) -> SectionPlan:
     """Rebuild prior data from exact source; never trust host-only carry tables."""
@@ -296,6 +430,18 @@ def _prepare_source_plan(cfg: dict, sp: SectionPlan,
                 sp.carry_lines = kept
         except Exception:
             pass  # External YAML anchors are already resolved in old.
+    # 把原条目的停用标记清掉（用户 2026-09-16：「无论原来是否被关闭，如果
+    # 探测可用就要打开」）。`sp.reenable_fields` 由 plan.build_plan 判定 ——
+    # 只有它同时知道「原条目被停用过」与「本轮探通了」。
+    #
+    # 必须在**两个来源都备好之后**做：上面那行 `_field_fragments` 走的是
+    # 原文行路径，`_dump_fields` 走的是解析值路径，谁最终生效取决于是不是
+    # 逐字段对得上。只清一个会让另一条路径把停用标记又搬回来 —— 那种 bug
+    # 只在「原文行可复用」的条目上出现，正好是最常见的情形。
+    if sp.reenable_fields:
+        sp.carry_lines = _drop_disabling_lines(sp.carry_lines, sp.reenable_fields)
+    # 装配完毕 —— 哪怕结果是空。写回侧据此区分「故意清空」与「还没补」。
+    sp.carry_attached = True
     sp.prior_context = {}
     sp.prior_model_extras = {}
     sp.prior_toggles = {k: old[k] for k in ("websockets", "support-prompt-cache-key")
@@ -3034,7 +3180,11 @@ def rebuild_config_full(
 
     def attach_carry(sp: SectionPlan) -> None:
         """给方案补上该条目原有的 carry 行。已经有了就不动（用户覆盖优先）。"""
-        if sp.carry_lines:
+        # `carry_attached` 而不是 `sp.carry_lines`：重开停用条目时 carry 会被
+        # **故意清空**（见 plan.reenable_fields），那时「空」是结论不是缺省。
+        # 用非空判断会让这里把原文行整份加回来，`excluded-models: ["*"]` 复活，
+        # 重开静默失效（2026-09-16 实测）。
+        if sp.carry_lines or sp.carry_attached:
             return
         d = carry_map.get(sp.section) or {}
         exact = carry_key(_source_identity(sp.base_url), sp.api_key)

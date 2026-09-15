@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 
@@ -52,6 +53,43 @@ def _force_utf8_stdout() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
+
+
+def _count_cases(out: str) -> int:
+    """从一个套件的输出里数出它跑了多少项。
+
+    两种小结格式并存，都要认（2026-09-16 修）
+    ----------------------------------------
+    原来只认「全部通过 · N 项」，而另外两类套件的写法它挑不出来：
+      · unittest 派生：`Ran 42 tests in 0.161s` + `OK`
+        （test_source / transport / writeback / api）
+      · 自写断言器：`29/29 passed; 0 failed`
+        （test_planning / probe_compliance）
+    它们**从不打印**「全部通过」，于是 `total_ok` 少算这 6 个套件的全部
+    用例 —— 实测汇总报「合计 1813 项」时，planning 的 29 项根本没进去。
+
+    后果不是数字难看：这张合计是「跑全了没有」的唯一信号，少算会让人
+    以为遗漏的是别的套件，从而去错地方找。所以三种格式都解析。
+    """
+    for line in out.split("\n"):
+        if "全部通过" in line:
+            try:
+                return int(line.split("·")[1].strip().split()[0])
+            except (IndexError, ValueError):
+                pass
+        # unittest: `Ran 42 tests in 0.161s`
+        m = re.match(r"^Ran (\d+) tests? in ", line.strip())
+        if m:
+            return int(m.group(1))
+        # 自写断言器: `29/29 passed; 0 failed`
+        m = re.match(r"^(\d+)/(\d+) passed", line.strip())
+        if m:
+            return int(m.group(2))
+        # 自写断言器（另一种）: `26 passed, 0 failed`
+        m = re.match(r"^(\d+) passed,\s*\d+ failed", line.strip())
+        if m:
+            return int(m.group(1))
+    return 0
 
 
 def main() -> None:
@@ -98,12 +136,10 @@ def main() -> None:
                 print(f"--- {suite} stderr ---")
                 print(r.stderr[-1500:])
         else:
-            for line in out.split("\n"):
-                if "全部通过" in line:
-                    try:
-                        total_ok += int(line.split("·")[1].strip().split()[0])
-                    except (IndexError, ValueError):
-                        pass
+            # 小结行落在 stdout 还是 stderr 不统一（2026-09-16 实测）：
+            # 自写断言器打 stdout，unittest 默认打 stderr。只读一个流会
+            # 让半数套件的项数静默消失。
+            total_ok += _count_cases(out) or _count_cases(r.stderr or "")
 
     print(f"\n{'=' * 66}")
     if failed:
