@@ -637,7 +637,7 @@ def _http_get(url: str, *, timeout: int = 15,
         return 0, f"{type(e).__name__}: {e}"
 
 
-def extract_remote(*, ref: str = "main", timeout: int = 45,
+def extract_remote(*, ref: str = "main", timeout: int = 60,
                    proxy: str | None = None,
                    use_cache: bool = True, cpamp_ref: str = "main",
                    sub2api_ref: str = "main") -> CpaIdentity:
@@ -647,17 +647,23 @@ def extract_remote(*, ref: str = "main", timeout: int = 45,
     minutes. No source is executed. Missing files and unresolved revisions stay
     explicit. The shared fetch budget stops scheduling requests after timeout.
 
-    预算为什么是 45 秒（2026-09-14 实测定）
+    预算为什么是 60 秒（2026-09-15 实测定）
     ------------------------------------
-    清单现在横跨三个仓库、14 个文件，外加每仓一次 commits 查询解析 revision。
-    实测单次请求 1.4–1.9 秒（直连 GitHub），总量约 17 次 → 25–32 秒。
-    原默认 8 秒是两仓库时代的值，加 sub2api 后连 cpa 那一仓都跑不完 ——
-    实测现象是 `revisions` 只剩 cpa、cpamp 三个文件全 missing、
-    `immutable=False`，而失败会被缓存 10 分钟，界面上看不出原因。
+    清单横跨三个仓库、14 个文件，外加每仓一次 commits 查询解析 revision，
+    共 17 次请求。实测单次 1.4–1.9 秒（直连 GitHub）→ 24–32 秒。
 
-    45 秒留了约 1.4 倍余量。这个预算只在**缓存未命中**时付；命中时是
-    6 小时一次，代价可以忽略。拉不通的环境由 `_REMOTE_FAIL_TTL` 兜住，
-    不会每次打开网页都重付。
+    两次实测教训：
+      · 原默认 8 秒是两仓库时代的值。加 sub2api 后连 cpa 那一仓都跑不完 ——
+        `revisions` 只剩 cpa、cpamp 四个文件全 missing、`immutable=False`，
+        而失败缓存 10 分钟，界面上看不出原因。
+      · 改 45 秒 + 按仓平均分（15 秒/仓）仍不够：cpa 的 9 个文件要约 17 秒，
+        实测 21 个文件 missing、两仓报 deadline exceeded。
+
+    现在按**文件数加权**分配（见下面 `_weights`），60 秒下 cpa 得约 33 秒、
+    cpamp 约 17 秒、sub2api 约 7 秒，各自留 1.5 倍以上余量。
+
+    这个预算只在**缓存未命中**时付；命中时是 6 小时一次，代价可忽略。
+    拉不通的环境由 `_REMOTE_FAIL_TTL` 兜住，不会每次打开网页都重付。
     """
     from urllib.parse import quote, urlsplit
     now = time.time()
@@ -668,20 +674,25 @@ def extract_remote(*, ref: str = "main", timeout: int = 45,
         _remote_cache.update(at=entry.checked_at, ident=entry, ref=ref, ok=entry.ok)
         return entry
     sources, revisions, issues = {}, {}, []
-    # 每仓一份**独立**预算，而不是三仓共享一个 deadline（2026-09-14 改）。
+    # 每仓一份**独立**预算，且按**文件数**加权，不是平均分（2026-09-15）。
     #
     # 共享预算的失效方式：仓库按固定顺序遍历，排第一的 cpa 有 9 个文件，
     # 它慢一点就把后两仓的额度吃光 —— 实测 timeout=25 时 cpamp 三个文件
     # 全 missing、sub2api 整仓没进 revisions，而失败缓存 10 分钟，
     # 界面上只看到「拉不到」，看不出是被前一仓饿死的。
     #
-    # 按仓平分后，某一仓慢只拖垮它自己，另两仓照常拿到结论。
+    # 平均分同样不够：45/3=15 秒给 cpa 的 9 个文件（每次 1.4–1.9 秒，
+    # 另加一次 commits 查询）必然超，实测 21 个文件 missing。
+    # 按文件数 +1（那次 commits 查询）加权后，各仓拿到与工作量匹配的额度。
     _repos = (("cpa", _RAW_BASE, ref),
               ("cpamp", _CPAMP_RAW_BASE, cpamp_ref),
               ("sub2api", _SUB2API_RAW_BASE, sub2api_ref))
-    _per_repo = max(1, timeout) / len(_repos)
+    # +1 = 解析 revision 的那次 commits 查询
+    _weights = {r: len(SOURCE_MANIFEST[r]) + 1 for r, _b, _q in _repos}
+    _total_w = sum(_weights.values()) or 1
+    _budget = max(1, timeout)
     for repo, base, requested in _repos:
-        deadline = time.monotonic() + _per_repo
+        deadline = time.monotonic() + _budget * _weights[repo] / _total_w
         parsed = urlsplit(base)
         if (parsed.scheme != "https" or parsed.netloc != "raw.githubusercontent.com"
                 or not re.fullmatch(r"/[\w.-]+/[\w.-]+", parsed.path)):
@@ -691,8 +702,11 @@ def extract_remote(*, ref: str = "main", timeout: int = 45,
         if not re.fullmatch(r"[0-9a-f]{40}", revision):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                issues.append("source fetch deadline exceeded")
-                break
+                # 只放弃**这一仓**，不终止整轮（2026-09-15）。
+                # 每仓有独立预算，本仓耗尽与其余仓无关；原来的 break
+                # 会让排在后面的仓库一个都拿不到，退回共享预算的老毛病。
+                issues.append(repo + ": revision deadline exceeded")
+                continue
             status, body = _http_get(
                 "https://api.github.com/repos" + parsed.path + "/commits/"
                 + quote(requested, safe=""), timeout=remaining, proxy=proxy)
@@ -707,7 +721,9 @@ def extract_remote(*, ref: str = "main", timeout: int = 45,
         for rel in SOURCE_MANIFEST[repo]:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                issues.append("source fetch deadline exceeded")
+                # 跳出本仓剩余文件，外层继续下一仓 —— 本仓预算耗尽
+                # 不该连累别的仓库。
+                issues.append(repo + ": source fetch deadline exceeded")
                 break
             status, text = _http_get(f"{base}/{quote(revision, safe='')}/{rel}",
                                      timeout=remaining, proxy=proxy)
