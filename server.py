@@ -35,6 +35,7 @@ import hashlib
 import ipaddress
 import io
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -69,6 +70,10 @@ from cpa_probe.writeback import (  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(HERE, "web")
 
+# 本模块自己的 logger。2026-09-13 加：全量重探的定档耗时必须落进日志 ——
+# 它跑过 Cloudflare 的 100 秒就变成 524，而用户侧只看到一页 HTML 错误页。
+# 原来这里一个 logging 都没有，慢在哪只能靠猜。
+logger = logging.getLogger("importer.server")
 
 # --------------------------------------------------------------------------
 # 任务状态
@@ -2059,6 +2064,26 @@ class Handler(BaseHTTPRequestHandler):
         return ok
 
     def _json(self, code: int, payload: dict) -> None:
+        # 定档响应缓存：只对 /api/plan 的成功响应、且只在本请求算出了指纹时
+        # 记账。放在 _json 里而不是两处 return 点，是因为 _api_plan 有两条
+        # 成功出口（全量重探 / 增量），漏掉任何一条就会「改了代码忘了缓存」。
+        # 存**脱敏前**的 payload，脱敏仍由下面的 _public_with_context 逐次做
+        # —— 缓存里留原始对象不增加暴露面（它本来就在内存里），但避免把
+        # 脱敏结果二次脱敏。
+        if code == 200:
+            _ck = getattr(self, "_plan_cache_key", "")
+            if _ck:
+                with Handler._plan_cache_lock:
+                    if len(Handler._plan_cache) >= Handler._PLAN_CACHE_MAX:
+                        # 淘汰最旧的一条。不必 LRU：读命中不刷新时间戳，所以
+                        # 被淘汰的必然是最早那次写的 —— 而它要么已经超 TTL，
+                        # 要么就是本轮最不相关的那份输入。真正的 LRU 要在
+                        # `_api_plan` 的命中分支里回写时间戳，那会让「读」也要
+                        # 拿写锁，为 4 条的小表不值得。
+                        oldest = min(Handler._plan_cache.items(),
+                                     key=lambda kv: kv[1][0])
+                        Handler._plan_cache.pop(oldest[0], None)
+                    Handler._plan_cache[_ck] = (time.time(), payload)
         if code >= 400 and "error_code" not in payload:
             payload = {**payload, "error_code": {
                 400: "invalid_request", 401: "unauthorized", 404: "not_found",
@@ -2280,6 +2305,30 @@ class Handler(BaseHTTPRequestHandler):
     # 顺序执行不会有这个问题（第二次的基线比对会正确地 409），所以这**只**
     # 是并发缺陷，不是逻辑缺陷 —— 也正因如此，顺序跑的测试抓不到它。
     _apply_lock = threading.Lock()
+
+    # ── 定档响应缓存（2026-09-13 现场：CF 524）───────────────────────────
+    #
+    # 全量重探的 /api/plan 要重建整份配置（实测 173 站），跑过了 Cloudflare
+    # 的 100 秒上限 —— 现场表现是 ③ 判定与定档 顶上一条红框，内容是一整页
+    # CF 的「524: A timeout occurred」，priority 与建议栏全停在占位符。
+    #
+    # 但那次请求**并没有白跑**：前端每一次勾选变化都防抖 180ms 后重发一次
+    # /api/plan，而除 `selected` 外的入参（job / overrides / forced / 配置
+    # 原文）完全一样。于是 173 站的重建在一轮操作里被重复做了好几遍。
+    #
+    # 这里按「入参指纹」缓存响应体，命中就原样重放，包括 `plan_id` ——
+    # 同一份输入产出的方案本来就是同一份，`add_plan` 存的 entry 是纯数据，
+    # 没有随调用递增的字段，重放不会把两份方案混起来。
+    #
+    # 键里必须带 `config_revision(raw)`：配置在别处被改过时缓存要立刻失效，
+    # 否则会拿旧基线的方案去写回 —— 那正是 `add_plan` 存 `base_raw` 要防的事。
+    #
+    # 只留 4 条、180 秒：这是「一次操作里的重复调用」优化，不是长期缓存。
+    # 长期缓存会让操作员改完配置回来看到的还是旧档位。
+    _plan_cache: dict[str, tuple[float, dict]] = {}
+    _plan_cache_lock = threading.Lock()
+    _PLAN_CACHE_TTL = 180.0
+    _PLAN_CACHE_MAX = 4
 
     def _load_cfg(self) -> tuple[str, dict]:
         """读并解析 config.yaml。返回 (原文, 解析结果)。
@@ -2919,6 +2968,45 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         raw, cfg = self._load_cfg()
+        try:
+            _ck = hashlib.sha256(json.dumps(
+                {"j": job.id,
+                 "o": body.get("overrides") or {},
+                 "s": body.get("selected"),
+                 "f": body.get("forced") or {},
+                 "b": bool(body.get("by_score")),
+                 "r": cp.bulk.config_revision(raw)},
+                sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
+        except (TypeError, ValueError):
+            _ck = ""               # 入参不可序列化（不该发生）→ 直接不算缓存
+        if _ck:
+            with Handler._plan_cache_lock:
+                hit = Handler._plan_cache.get(_ck)
+                if hit and time.time() - hit[0] < Handler._PLAN_CACHE_TTL:
+                    logger.info("定档命中缓存（同一份输入 180 秒内重放）")
+                    self._json(200, hit[1])
+                    return
+        # 交给 _json 记账。**只在算出指纹时挂**，否则 _json 会把别的路由的
+        # 200 也塞进来（那是静默的错配缓存，比不缓存更坏）。
+        # 每次进 _api_plan 都要重置：同一个 Handler 实例服务多个请求。
+        self._plan_cache_key = _ck
+        try:
+            # 记耗时。**必须有**：这个接口是全量重探里最慢的一环（173 站重建
+            # 整份配置），跑过 CF 的 100 秒就变成 524，而用户侧只看到一页 HTML。
+            # 没有这行日志，「到底哪一步慢」只能靠猜 —— 现场那次没人知道是
+            # 定档慢还是别的路由慢。
+            _t0 = time.time()
+            self._plan_body(body, job, raw, cfg)
+            logger.info("定档完成：%.1f 秒 · 全量重探=%s · %d 个候选",
+                        time.time() - _t0,
+                        bool(job.opts.get("full_redetect")),
+                        len(job.results))
+        finally:
+            # 用完就摘 —— 挂在实例上越过本次请求，会让之后任何一条 200
+            # （同一连接的 keep-alive 复用同一个 handler）都写进这份缓存。
+            self._plan_cache_key = ""
+
+    def _plan_body(self, body: dict, job, raw: str, cfg: dict) -> None:
         # 三个按候选索引的入参。键是**行号字符串**而不是 host ——
         # 一个站常有 15 把 Key（实测 gorou 15、tango 14），用 host
         # 做键会让同站多 Key 互相覆盖：勾选 Set 去重成一个、DOM 定位只命中
@@ -3397,6 +3485,67 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._submit_apply(entry, body)
 
+    @staticmethod
+    def _resolve_op_collisions(cfg: dict,
+                               ops: list[dict]) -> tuple[list[dict], list[str]]:
+        """把一批 `action: priority` 里**同段同值**的站错开，返回新 ops 与说明。
+
+        只看同段：跨段的档位谱互相独立（`priority_collisions` 的注释已写死
+        这条），段间同值毫无关系。
+
+        算法：按段分组 → 每组取「本段全部条目的现有档位」当 `taken` →
+        `resolve_priority_collisions` 给出互不相同的目标值 → 回填到 ops。
+
+        **`taken` 的构成是本函数的关键**，三种值都要进去，少一种就会撞：
+          · 本段**未被本批改动**的条目档位 —— 那是在用站，撞上等于同层轮询；
+          · 本批**不涉及改档**的条目（只启停/只删除的）档位 —— 同上；
+          · 被本批改动的条目自己的旧档位 —— **不能**放进 taken。
+            放进去会让「整体下移一批」自锁：350 想拿走 350，却发现 350
+            被「自己」占着，于是无谓地降到 349。所以先把要改的下标挖掉。
+        """
+        from urllib.parse import urlsplit
+
+        def _host(url: str) -> str:
+            return (urlsplit(str(url or "")).netloc or "").lower()
+
+        pri_ops: dict[str, list[dict]] = {}
+        for op in ops:
+            if op.get("action") == "priority":
+                pri_ops.setdefault(op["section"], []).append(op)
+        if not pri_ops:
+            return ops, []
+
+        adjusted: list[str] = []
+        # 要改的主机集合，按段收 —— 用于从 taken 里挖掉它们自己的旧档位
+        for section, sec_ops in pri_ops.items():
+            arr = cfg.get(section) or []
+            moving = {(section, op["index"]) for op in sec_ops}
+            taken: set[int] = set()
+            for i, e in enumerate(arr):
+                if not isinstance(e, dict) or (section, i) in moving:
+                    continue
+                p = e.get("priority", 0)
+                if type(p) is int:
+                    taken.add(p)
+
+            # 同站多 Key 必须同档，所以按 host 归并而不是按条目：先算出每个
+            # host 的一个目标值，再回填给它的全部条目。
+            by_host: dict[str, int] = {}
+            for op in sec_ops:
+                h = _host(arr[op["index"]].get("base-url") if op["index"] < len(arr) else "")
+                if not h:
+                    continue
+                by_host[h] = int(op["value"])
+            final, notes = cp.bulk.resolve_priority_collisions(
+                by_host, taken=taken)
+            adjusted += notes
+            for op in sec_ops:
+                i = op["index"]
+                h = _host(arr[i].get("base-url") if i < len(arr) else "")
+                if h in final:
+                    op["value"] = final[h]
+        return ops, adjusted
+
     def _api_bulk_preview(self, body: dict) -> None:
         """批量操作的**预览**：只算新文本与 diff，不落盘、不推送。
 
@@ -3448,6 +3597,22 @@ class Handler(BaseHTTPRequestHandler):
             if checked.get("action") == "delete":
                 checked["expect"] = str(arr[idx].get("base-url") or "")
             checked_ops.append(checked)
+        # ── 批量设档的站间撞值消解 ──────────────────────────────────
+        #
+        # 用户第 3⑶ / 第 7 条：同类型不同域名的优先级一定要不同，算出来相同
+        # 也要做微调给出偏差。「批量设为 N」是跨组动作，一次能命中几十个组；
+        # 全落同一个值 = 这些站被并进同一个桶按 weight 轮询，站间次序被推平。
+        #
+        # 放在这里（apply_bulk 之前）而不是前端，是因为前端改档还有单站直改
+        # 那条路，两条路都必须过同一道消解，否则「单站改的撞了、批量改的不撞」
+        # 这类不一致迟早会出现。
+        try:
+            checked_ops, coll_notes = self._resolve_op_collisions(
+                _cfg, checked_ops)
+        except cp.bulk.BulkError as e:
+            self._json(400, {"error": str(e),
+                             "error_code": "priority_collision"})
+            return
         stamp = time.strftime("%Y-%m-%d %H:%M")
         try:
             new_text, notes, problems = cp.bulk.apply_bulk(
@@ -3466,6 +3631,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not notes:
             self._json(200, {"changed": 0, "notes": [], "problems": problems,
+                             "collision_notes": coll_notes,
                              "diff": "", "bulk_id": ""})
             return
 
@@ -3479,6 +3645,9 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {
             "bulk_id": bid, "changed": len(notes), "notes": notes,
             "problems": problems,
+            # 撞档消解的说明单独一份 —— 前端要把它顶到 diff 上方显示，
+            # 因为它解释了「我明明填的 350，落盘却是 349」这个疑惑。
+            "collision_notes": coll_notes,
             # diff 可能很长（158 条全改时）。截断并说明，不把整份塞给浏览器。
             "diff": diff[:200000],
             "diff_truncated": len(diff) > 200000,

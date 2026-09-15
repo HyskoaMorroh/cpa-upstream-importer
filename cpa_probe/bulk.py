@@ -467,3 +467,100 @@ def unify_priority_ops(cfg: dict, section: str, host: str,
     target = value if value is not None else max(p for _s, _i, values in hits for p in values)
     return [{"section": sec, "index": i, "action": "priority",
              "value": target} for sec, i, values in hits if any(p != target for p in values)]
+
+
+# ── 站间档位不得相同：批量设档后的冲突消解 ──────────────────────────
+#
+# 用户第 3⑶ / 第 7 条原话：「同一个类型不同域名的优先级一定要不同，哪怕算出来
+# 相同，也要适当做点微调给出点偏差」。
+#
+# 为什么必须在这里做，而不是让它撞上
+# ----------------------------------
+# 「批量设为 350」是**跨组**动作，一次能命中几十个组。若它们全落 350，
+# CPA 的 selector 会把这一层当**同一个桶**按 weight 轮询 —— 站与站的先后
+# 次序被推平，而 priority 的**唯一**作用就是区分先后（selector.go:527-553
+# 只取最高那一桶）。
+#
+# `priority_collisions`（plan.py:3589）会**报告**这种撞值，但它只在
+# `build_plan` 那条路径上被调用 —— 批量管理这条路直接改既有条目，
+# 不经过 build_plan，所以那边报了也没人看。实测：批量设档从不触发它。
+#
+# 消解方式（不是阻断）
+# -------------------
+# 按 `(-目标值, host)` 排序：字典序最小的一组如愿拿到原值（0 次让位），
+# 其余各组各自往下挪 `step` 的整数倍，直到落在一个没被占用的格子上。
+#
+# 为什么定序键里有 host，而不是「谁先被勾选」：选中集是个 Set，遍历顺序
+# 不稳定 —— 同样的输入两次预览必须给出同样的结果，否则 diff 无法复核。
+#
+# 为什么让位是「各挪到第一个空格」而不是「依次减 1、2、3」：后者只在下界
+# 之上且步长为 1 时才碰巧等价。`step=5` 时三组 100 想给的是 100/95/90，
+# 「依次减」会给出 100/99/98 —— 步长这个口子就白留了。
+#
+# 为什么不往高加：往高加会把整批一起推上去，可能盖过本来更高的在用站
+# （那正是 `assign_priorities` 的注释里记着的「抢顶层」事故）。往低走只会
+# 进入本来就被遮住的区间，影响面小一档。
+#
+# `step` 给调用方留出「微调幅度」的口子（默认 1，即紧凑连号）。
+
+def resolve_priority_collisions(
+    wanted: dict[str, int],
+    *,
+    step: int = 1,
+    taken: set[int] | None = None,
+    floor: int = 1,
+) -> tuple[dict[str, int], list[str]]:
+    """把「多个组想拿同一个 priority」消解成互不相同的值。
+
+    Args:
+        wanted: {host: 目标 priority}。host 是站的身份（同站多 Key 同一个）。
+        step:   相邻两组之间的差值。1 = 紧凑连号；5 = 留出插队余地。
+        taken:  本段**已存在**的档位集合 —— 消解出来的值不许撞上它们，
+                否则等于与那个在用站同层轮询。
+        floor:  下界。CPA 不校验 priority 下界，但 0 与负数语义未定义
+                （plan.py:1361 记着这条），所以不许降到 0 以下。
+
+    Returns:
+        (host -> 最终 priority, 说明清单)。被挪动过的组各有一条说明，
+        说明里带原来想拿的值与最终值 —— 前端直接显示，不用自己拼。
+    """
+    if step < 1:
+        raise BulkError("微调步长必须 >= 1")
+    if floor < 1:
+        raise BulkError("档位下界必须 >= 1")
+
+    out: dict[str, int] = {}
+    notes: list[str] = []
+    used: set[int] = set(taken or ())
+
+    # 挪位的次数上限。**必须有**：`while value in used or value < floor` 在
+    # 「目标值贴近下界且下方全被占」时会一直往下走 —— 而 `used` 每轮只增不减，
+    # 条件永远为真，于是死循环。2026-09-13 实测：`{x:1, y:1}` 这一步直接挂住
+    # 测试进程（不是慢，是永不返回）。
+    #
+    # 上界取 `(组数 + 既有档位数) * step` —— 合法情形下每个组最多需要绕开
+    # 「已占的格子」，而格子总数就是这两个数之和；再乘 step 是因为每挪一格
+    # 值减 step。越界即说明档位谱已经密到放不下这么多组。
+    budget = (len(wanted) + len(used)) * max(1, step)
+
+    # 按目标值降序（高的先占位），同目标值内按 host 字典序 —— 全程确定性。
+    for host in sorted(wanted, key=lambda h: (-wanted[h], h)):
+        want = wanted[host]
+        if type(want) is not int:
+            raise BulkError(f"{host} 的 priority 必须是整数")
+        value = want
+        # 撞上「同批里已分配的值」或「本段既有档位」就往下挪
+        moved = 0
+        while value in used or value < floor:
+            value -= step
+            moved += 1
+            if moved > budget:
+                raise BulkError(
+                    f"{host} 想拿 {want}，但下方 {budget} 个档位都被占用 —— "
+                    f"该段档位太密（下界 {floor}），请改一个更高或更稀疏的目标值，"
+                    f"或先批量删除多余条目")
+        used.add(value)
+        out[host] = value
+        if value != want:
+            notes.append(f"{host}：{want} → {value}（与其它站撞档，下移微调）")
+    return out, notes

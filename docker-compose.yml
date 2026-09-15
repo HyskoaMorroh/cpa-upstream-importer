@@ -45,6 +45,16 @@ services:
       # 写回后主动 PUT 让 CPA 立即重载 —— inotify 事件可能丢，而 CPA 没有
       # 轮询兜底。同栈填服务名，独立部署填宿主可达地址。
       CPA_UPSTREAM_URL: "${CPA_UPSTREAM_URL:-http://127.0.0.1:8317}"
+      # CPA 管理接口令牌。**不配就等于「按运行状态定优先级」静默失效** ——
+      # `plan.py` 调 `fetch_cpa_runtime_health(base_url)` 时不传 token 参数，
+      # 只读环境变量；拿不到授权头时 `/v0/management/api-key-usage` 返回
+      # 401/403，函数返回 None，于是健康分退回静态检测分（用户第 3⑶ 条要求的
+      # 「按真实运行状态定档」落空），而日志里只有一行 info 级的
+      # 「CPA 运行时数据不可用」。这个变量直到 2026-09-16 才补进本文件 ——
+      # 在此之前照本文件部署的实例，那条特性一次都没生效过。
+      # 取值：CPA 后台管理密码，或 config.yaml 里 remote-management.secret-key
+      # 对应的原始密码（CPA 自己会把哈希贴到该字段）。
+      CPA_MANAGEMENT_TOKEN: "${CPA_MANAGEMENT_TOKEN:-}"
       # 可选：CLIProxyAPI 源码根（配 CPA_SOURCE 挂载时才有意义）。
       # 给了才能精确核对画像梯是否随 CPA 升级而过期 —— 它会解析
       # claude_executor_request.go 里的 beta 常量表与 codex 的 UA/originator。

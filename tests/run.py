@@ -105,10 +105,21 @@ def main() -> None:
     # 子进程也要按 UTF-8 输出，否则它们自己先在 GBK 上崩
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
+    # 真实 config.yaml 走**环境变量**而不是命令行位置参数。
+    #
+    # 2026-09-16 实测：原来写成 `cmd = [py, path] + ([cfg] if cfg else [])`，
+    # 而 `unittest.main()` 会把 `argv[1]` 当成待加载的**测试模块名**：
+    #
+    #     AttributeError: module '__main__' has no attribute 'C:/.../config'
+    #
+    # 那次七个套件一起红（四个报错、三个静默返回 0 却什么都没跑），
+    # 而合计项数照常统计 —— 校准模式其实从来没跑过真实数据。
+    if cfg:
+        env["IMPORTER_TEST_CONFIG"] = cfg
 
     for suite in SUITES:
         path = os.path.join(HERE, suite)
-        cmd = [sys.executable, path] + ([cfg] if cfg else [])
+        cmd = [sys.executable, path]
         print(f"\n{'#' * 66}\n# {suite}\n{'#' * 66}")
         r = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace",
                            capture_output=True, env=env)

@@ -18,6 +18,16 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Windows 控制台默认 GBK，打不出 ⑪ / ✓ / 长破折号，会 UnicodeEncodeError 中断
+# 整个套件（2026-09-13 实测：单独跑 `python tests/test_bulk.py` 在第 ⑪ 节崩，
+# 而 `tests/run.py` 里没事 —— 那边给子进程设了 PYTHONIOENCODING）。单独跑
+# 一个套件是最常用的调试动作，不能因为终端编码而失败。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:                                               # noqa: BLE001
+    pass
+
 import yaml                                                      # noqa: E402
 
 from cpa_probe import bulk, host_of                              # noqa: E402
@@ -38,6 +48,16 @@ def eq(name, got, want):
 
 def section(t):
     print(f"\n── {t} " + "─" * max(0, 62 - len(t)))
+
+
+def truthy(name, got, hint=""):
+    global _fail, _pass
+    if got:
+        _pass += 1
+        print(f"  ok  {name}")
+    else:
+        _fail += 1
+        print(f"\n  ✗ {name}\n      {hint}")
 
 
 # 夹具：四段俱全，含注释、含既有 excluded-models、含 compat 的多 Key
@@ -252,6 +272,78 @@ def main():
     # 这一组既删条目又改档：改档同样写出处注释（+1），而被删掉的那条
     # 条目本来没有自己的整行注释，所以原有注释应当一条不少。
     eq("原有注释一条都没少", comments_kept(d10, RAW), [])
+
+    section("⑫ 站间档位不得相同：批量设档的撞值消解")
+    # 用户第 3⑶ / 第 7 条：「同一个类型不同域名的优先级一定要不同，哪怕算出来
+    # 相同，也要适当做点微调给出点偏差」。批量设为同一个值是跨组动作，一次能
+    # 命中几十个组 —— 全落同一个值就被 CPA 并进一个桶轮询。
+    out12, notes12 = bulk.resolve_priority_collisions(
+        {"b.example.com": 350, "a.example.com": 350, "c.example.com": 350})
+    eq("三组都拿到互不相同的值",
+       sorted(out12.values(), reverse=True), [350, 349, 348])
+    # 字典序最高的那组如愿拿到 350，只有被让位的两组需要说明。
+    # 这个「只给被挪动过的组写说明」是有意的：全写等于把没变的组也报成
+    # 改动，diff 复核时看不出谁真的动了。
+    eq("只给被让位的两组写说明", len(notes12), 2)
+    # 定序键是 (-目标值, host)：同目标值内字典序最小者（a.example.com）
+    # 先占位拿到原值，后两位依次下移。
+    eq("字典序最小的组拿到原值", out12["a.example.com"], 350)
+    truthy("说明里带原值与最终值", any("350 → " in x for x in notes12), notes12)
+
+    # 确定性：同样的输入两次必须给出同样的结果。选中集是 Set，若按遍历顺序
+    # 分配就会随机，diff 无法复核。
+    out12b, _n = bulk.resolve_priority_collisions(
+        {"c.example.com": 350, "a.example.com": 350, "b.example.com": 350})
+    eq("两次结果一致（按 host 字典序定序）", out12, out12b)
+
+    # 不撞的组一个都不动 —— 消解不该顺手重排整段档位谱
+    out13, notes13 = bulk.resolve_priority_collisions(
+        {"a.example.com": 900, "b.example.com": 500, "c.example.com": 100})
+    eq("本来就不撞的组原样保留", out13, {"a.example.com": 900,
+                                     "b.example.com": 500,
+                                     "c.example.com": 100})
+    eq("无说明", notes13, [])
+
+    # 必须避开本段已存在的档位：撞上在用站 = 与它同层轮询
+    out14, notes14 = bulk.resolve_priority_collisions(
+        {"x.example.com": 350}, taken={350, 349})
+    eq("避开既有档位", out14["x.example.com"], 348)
+    eq("被让位的组有说明", len(notes14), 1)
+
+    # 下界：CPA 不校验，但 0 与负数语义未定义（plan.py:1361），不许写出去。
+    # 目标值贴到下界时空间不够就该报错，而不是静默写出 0 —— 报错能让操作员
+    # 换一个更高的目标值，写 0 会让那条条目在 CPA 里行为未定义。
+    try:
+        bulk.resolve_priority_collisions(
+            {"x.example.com": 2, "y.example.com": 2, "z.example.com": 2})
+        eq("下界放不下必须报错而不是写出 0", "没报错", "应报 BulkError")
+    except bulk.BulkError as e:
+        truthy("报错说明档位太密", "太密" in str(e), str(e))
+    # 抬高到 3 就放得下：三组依次拿 3 / 2 / 1，一格不越界
+    out15, _n = bulk.resolve_priority_collisions(
+        {"x.example.com": 3, "y.example.com": 3, "z.example.com": 3})
+    eq("不降到 0 以下", min(out15.values()), 1)
+    eq("三组各占一格", sorted(out15.values(), reverse=True), [3, 2, 1])
+
+    # 步长：留给「微调幅度」的口子
+    out16, _n = bulk.resolve_priority_collisions(
+        {"a.example.com": 100, "b.example.com": 100}, step=5)
+    eq("步长 5 时相差 5", sorted(out16.values(), reverse=True), [100, 95])
+
+    section("⑬ 消解不能把 ops 的目标值丢掉（端到端过一遍 apply_bulk）")
+    # 消解只改 ops 的 value，其余字段（section/index）必须原样活着，
+    # 否则 apply_bulk 会按错误的条目改档 —— 那是静默改错站。
+    ops13 = [{"section": "gemini-api-key", "index": i, "action": "priority",
+              "value": dest}
+             for i, dest in ((0, out12["a.example.com"]),
+                             (1, out12["b.example.com"]))]
+    d13, n13, p13 = bulk.apply_bulk(RAW, ops13, stamp="2026-09-13")
+    eq("无问题", p13, [])
+    eq("改了两条", len(n13), 2)
+    c13 = yaml.safe_load(d13)
+    got13 = [e.get("priority") for e in c13["gemini-api-key"]]
+    eq("两条拿到不同的值", len(set(got13)) == len(got13), True)
+    eq("条目数守恒", counts(d13), counts(RAW))
 
     section("⑪ 全量重建不许让文件膨胀（2026-09-11 实跑发现的生产缺陷）")
     from cpa_probe import writeback as wb

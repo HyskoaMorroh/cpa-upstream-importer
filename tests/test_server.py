@@ -1021,12 +1021,28 @@ def main() -> int:
         # 传真实 config.yaml 进来就必然失败（2026-08-31 实测：gemini 实为六档）。
         # 断言挂在会变的外部文件上，是这一整轮修的同一类缺陷：报红却指不出
         # 任何真问题。改成从被测的那份文件现算期望值，两种输入都成立。
+        #
+        # 2026-09-16 再修一次：期望值不能简单数「文件里每个 priority」。
+        # `/api/context` 的档位谱走 `build_band`，而它**有意跳过**已被 CPA
+        # 排除出调度池的条目（`entry_out_of_pool`：`excluded-models: ["*"]`
+        # 或 compat 段的 `disabled: true`）—— plan.py 那里的注释写明理由：
+        # 「它不在池里，让它占一个档位、或者声明『这个模型的最高档是我』，
+        # 都会让新站被错误地压低」。
+        #
+        # 实测差异（真实 config.yaml）：claude 段文件里 16 个档位，档位谱只有
+        # 10 个 —— 缺的 116 / 117 / 118 / 119 / 120 全是某一个站的 11 条
+        # `excluded-models: ["*"]` 停用条目，500 那条是另一个停用站。
+        # codex 缺 500、compat 缺 22 同理。具体站名不写进仓库。
+        # 那是**契约**不是缺陷，所以期望值必须用同一套判据算出来。
         import yaml as _yaml
+        from cpa_probe.plan import entry_out_of_pool as _oop
         _cfg = _yaml.safe_load(io.open(cfg_path, encoding="utf-8").read())
         for _sec in ("gemini-api-key", "codex-api-key", "claude-api-key",
                      "openai-compatibility"):
             _pris = {e.get("priority") for e in (_cfg.get(_sec) or [])
-                     if isinstance(e, dict) and isinstance(e.get("priority"), int)}
+                     if isinstance(e, dict) and isinstance(e.get("priority"), int)
+                     # 不在调度池里的条目不算档位 —— 与 build_band 同判据
+                     and not _oop(_sec, e)}
             eq(f"{_sec} 档位数与文件一致",
                len(ctx["sections"][_sec]["tiers"]), len(_pris))
             if _pris:

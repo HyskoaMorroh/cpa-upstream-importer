@@ -326,11 +326,69 @@ def main() -> int:
             "minidrop": ["gpt-6", "gpt-6-mini", "gpt-6-nano",
                          "gpt-6-lite"],
         }
+
+        # ── 就地编辑草稿 → ops（2026-09-13，用户现场反馈）──────────────
+        #
+        # 用户原话：「根本没法对每个相同域名的上游优先值进行手工调整」。
+        # 修法是把卡片头部的档位从死文本换成输入框；改完的值进 BMD 队列，
+        # 由 `bmDraftOps` 转成后端认得的 ops。
+        #
+        # 为什么这组要进 node 测：这里每一条错了都不报错，而是**静默改错站**
+        # 或**静默不改**。比如同站多 Key 只发了一条 op，后端会因「同网址不同
+        # priority」拒整批，界面上只有一条红字，用户不知道自己哪一步错了。
+        # 夹具用真实形状：同站两把 Key、一开一停。
+        _G_TEST = {
+            "section": "codex-api-key", "host": "b.example.com",
+            "base_urls": ["https://b.example.com/v1"], "split": False,
+            "site_split": False, "priorities": [300],
+            "entries": [
+                {"index": 0, "fingerprint": "f0", "priority": 300,
+                 "enabled": True, "base_url": "https://b.example.com/v1"},
+                {"index": 1, "fingerprint": "f1", "priority": 300,
+                 "enabled": False, "base_url": "https://b.example.com/v1"},
+            ],
+        }
+        _DRAFT_CASES = {
+            # 只改档：同站两条都要发，一条都不能漏
+            "priOnly": [[{"section": "codex-api-key", "host": "b.example.com",
+                          "priority": 900}], _G_TEST],
+            # 只启用：第二条 enabled=False，所以只发 index 1 一条
+            "enOn": [[{"section": "codex-api-key", "host": "b.example.com",
+                       "enabled": True}], _G_TEST],
+            # 停用：两条都是 True，两条都发
+            "enOff": [[{"section": "codex-api-key", "host": "b.example.com",
+                        "enabled": False}], _G_TEST],
+            # 叠加：改档 + 启用，两组 op 都要有
+            "both": [[{"section": "codex-api-key", "host": "b.example.com",
+                       "priority": 900, "enabled": True}], _G_TEST],
+            # 已经是目标值：不该发任何 op（少一行 diff）
+            "noop": [[{"section": "codex-api-key", "host": "b.example.com",
+                       "priority": 300, "enabled": True}], _G_TEST],
+            # 段/站不存在：整个跳过，不产出指向别的条目的 op
+            "gone": [[{"section": "codex-api-key", "host": "zzz.example.com",
+                       "priority": 900}], _G_TEST],
+        }
+        # 反代错误页夹具：形状照抄现场（CF 522/524 的正文就是这些）
+        _CF524 = (
+            '<!DOCTYPE html>\n'
+            '<!--[if lt IE 7]> <html class="no-js ie6 oldie" lang="en-US"> '
+            '<![endif]-->\n<head>\n'
+            '<title>example.com | 524: A timeout occurred</title>\n'
+            '<meta charset="UTF-8" />\n'
+            '<style>/*! normalize.css v3.0.2 */html{font-family:sans-serif}'
+            '</style></head></html>')
+        _PROXY_CASES = {
+            "cf524": [_CF524, 524],
+            "unknown": ["<html><title>x</title></html>", 418],
+            "plain": ["oh no", 400],
+            "long": ["x" * 900, 400],
+        }
         payload = _json.dumps({"secs": list(_SECS), "models": _SAMPLES,
-                               "gen": _GEN_CASES})
+                               "gen": _GEN_CASES, "draft": _DRAFT_CASES,
+                               "proxy": _PROXY_CASES})
         script = js[:cut] + f"""
 const IN = {payload};
-const out = {{allow: {{}}, proto: {{}}, gen: {{}}, line: {{}}}};
+const out = {{allow: {{}}, proto: {{}}, gen: {{}}, line: {{}}, draft: {{}}, proxy: {{}}}};
 IN.secs.forEach((s) => {{
   out.allow[s] = IN.models.filter((m) => famOk(s, m));
   out.proto[s] = IN.models.filter((m) => protoOk(s, m));
@@ -339,6 +397,15 @@ Object.keys(IN.gen).forEach((k) => {{
   out.gen[k] = newestGenerationPerLine(IN.gen[k]);
 }});
 IN.models.forEach((m) => {{ out.line[m] = productLine(m); }});
+out.draft = {{}};
+Object.keys(IN.draft).forEach((k) => {{
+  const [drafts, g] = IN.draft[k];
+  out.draft[k] = bmDraftOps(new Map(drafts.map((d) => [d.section + '|' + d.host, d])),
+                            [g]);
+}});
+Object.keys(IN.proxy).forEach((k) => {{
+  out.proxy[k] = _proxyErrText(IN.proxy[k][0], IN.proxy[k][1]);
+}});
 console.log(JSON.stringify(out));
 """
         r = subprocess.run([node, "-e", script], capture_output=True,
@@ -397,6 +464,56 @@ console.log(JSON.stringify(out));
             # 产品线拆分也要逐条一致 —— 它决定分组，错一个就全错
             for m in _SAMPLES:
                 eq(f"产品线 · {m}", got["line"][m], _mc._product_line(m))
+
+            # ── 反代 HTML 错误页 → 人话 ──────────────────────────────
+            section("① 反代错误页不许原样倒进界面")
+            pe = got["proxy"]
+            truthy("524 的 HTML 页被认出来", "Cloudflare 524" in pe["cf524"],
+                   pe["cf524"])
+            truthy("524 提到 CF 的 100 秒上限", "100 秒" in pe["cf524"],
+                   "用户要知道断在哪一层，否则只会反复重试")
+            truthy("标题里的站名被带出来", "example.com" in pe["cf524"],
+                   pe["cf524"])
+            truthy("原文的 <style> 不残留", "<style" not in pe["cf524"]
+                   and "normalize.css" not in pe["cf524"],
+                   "原样倒 HTML 正是这次要修的症状")
+            truthy("未知状态码也给得出话", pe["unknown"].startswith("反代返回 418"),
+                   pe["unknown"])
+            eq("正常 JSON 报错原样透传", pe["plain"], "oh no")
+            # 非 HTML 的截断：长文本仍要截，但保留前缀
+            truthy("超长纯文本被截断", len(pe["long"]) == 400, len(pe["long"]))
+
+            # ── 就地编辑草稿 → ops ────────────────────────────────────
+            section("① 就地改档 / 启停：草稿转 ops")
+            dr = got["draft"]
+            eq("只改档 · 同站两条都发",
+               [(o["index"], o["action"], o["value"]) for o in dr["priOnly"]],
+               [(0, "priority", 900), (1, "priority", 900)])
+            eq("只启用 · 只发停用那条",
+               [(o["index"], o["action"]) for o in dr["enOn"]],
+               [(1, "enable")])
+            # 停用：夹具里 index 0 已启用（要发 disable）、index 1 本来就停着
+            # （不发）—— 「已经是目标状态的不产生噪声」这条与下方 noop 同源。
+            eq("停用 · 只发还在启用的那条",
+               [(o["index"], o["action"]) for o in dr["enOff"]],
+               [(0, "disable")])
+            # 叠加：priority 与 enable 两组独立产出，互不吞掉。
+            # 两条 Key：index 0 已是 300→900 且已启用（只发 priority），
+            # index 1 是 300→900 且停用（priority + enable 各一条）。
+            eq("改档 + 启用 · 两组 op 都在",
+               sorted((o["index"], o["action"]) for o in dr["both"]),
+               [(0, "priority"), (1, "enable"), (1, "priority")])
+            # 档位已是目标值 → 不发 priority；但夹具 index 1 是停用的，
+            # 草稿里的 enabled=True 对它仍是一条真改动，所以只剩一条 enable。
+            eq("档位已经是目标值 · 不发 priority op",
+               [(o["index"], o["action"]) for o in dr["noop"]],
+               [(1, "enable")])
+            eq("站不存在 · 整条跳过", dr["gone"], [])
+            # 每条 op 都要带指纹 —— 后端靠它确认下标没指向别的条目。
+            # 缺指纹会让 /api/bulk-preview 少一道防并发错位的保护。
+            truthy("每条 op 都带 fingerprint",
+                   all(o.get("fingerprint") for lst in dr.values() for o in lst),
+                   "缺指纹 = 后端无法确认下标仍指向同一条目")
 
     # ── ③ 响应字段契约 ─────────────────────────────────────────────
     section("③ 前端依赖的响应字段，后端真的会给")

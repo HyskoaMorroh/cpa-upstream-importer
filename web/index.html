@@ -582,6 +582,70 @@ footer code{color:var(--ink-2)}
   font-variant-numeric:tabular-nums;text-align:center}
 .bm-tip{font-size:11.5px;color:var(--ink-3);flex:1 1 200px}
 
+/* ── 单站就手改档 ──────────────────────────────────────────────
+   用户现场反馈（2026-09-13）：「根本没法对每个相同域名的上游优先值进行手工
+   调整」。原因是档位在卡片里是**死文本**（`<span class="p">`），要改必须
+   先勾选卡片、再滚到面板底部的操作栏、填数字、点应用 —— 三步且视线要离开
+   卡片。这里把它换成卡片头部的就地输入框：改完即进待提交队列。
+
+   为什么不给每行（每个 Key）都放一个输入框：priority 是**站级**属性，
+   同站多 Key 必须同档（`_validate_final` 会在服务端拒绝不一致的写入）。
+   每行一个框会误导用户以为可以逐 Key 设不同值。 */
+.bm-priin{width:72px;padding:4px 6px;font-size:13px;font-weight:650;
+  font-variant-numeric:tabular-nums;text-align:center;
+  background:var(--card-2);border:1px solid var(--line);border-radius:7px;
+  color:var(--ink);transition:border-color .12s,box-shadow .12s}
+.bm-priin:hover{border-color:var(--accent-2)}
+.bm-priin:focus{outline:none;border-color:var(--accent-2);
+  box-shadow:0 0 0 3px var(--accent-soft)}
+.bm-priin.dirty{border-color:var(--accent);color:var(--accent);
+  box-shadow:0 0 0 2px var(--accent-soft)}
+.bm-priin.bad{border-color:var(--bad-line);color:var(--bad)}
+
+/* 档位分色：同色 = 同档。扫一眼就知道哪些站撞在一起了。
+   用 HSL 轮转而不是固定色表 —— 档位数不定，写死色表第 9 档就没有颜色了。 */
+.bm-tint{display:inline-block;width:8px;height:8px;border-radius:2px;
+  flex:none;margin-right:-3px}
+
+/* 卡片内联操作条：悬停/聚焦时出现，不占常态版面。
+   `pointer-events` 而不是 `display:none` —— 后者会让 tab 键跳不进来。 */
+.bm-cardacts{display:flex;gap:4px;opacity:0;transition:opacity .12s;
+  pointer-events:none}
+.bm-card:hover .bm-cardacts,.bm-card:focus-within .bm-cardacts{
+  opacity:1;pointer-events:auto}
+.bm-mini{font-size:11px;padding:2px 7px;border-radius:6px;cursor:pointer;
+  border:1px solid var(--line);background:var(--card-2);color:var(--ink-2);
+  line-height:1.5}
+.bm-mini:hover{background:var(--card)}
+.bm-mini.on{color:var(--ok);border-color:var(--ok-line)}
+.bm-mini.off{color:var(--warn);border-color:var(--warn-line)}
+.bm-mini.del{color:var(--bad);border-color:var(--bad-line)}
+
+/* 编辑中的卡片给一道左侧色条，配合「未提交改动」计数 */
+.bm-card.edited{border-left:3px solid var(--accent)}
+.bm-dirty{margin:0 0 10px;padding:8px 11px;border-radius:9px;font-size:12px;
+  background:var(--accent-soft);border:1px solid var(--accent-2);
+  display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.bm-dirty .n{font-weight:650;color:var(--accent)}
+.bm-presets{display:flex;gap:4px;flex-wrap:wrap;align-items:center}
+.bm-presets button{font-size:11px;padding:2px 7px;border-radius:6px;
+  cursor:pointer;border:1px solid var(--line);background:var(--card-2);
+  color:var(--ink-2)}
+.bm-presets button:hover{background:var(--card);border-color:var(--accent-2)}
+
+/* 撞档消解说明：解释了「我填 350、落盘却是 349」这个疑惑，必须显眼 */
+.bm-coll{margin:8px 0 0;padding:8px 11px;border-radius:9px;font-size:11.5px;
+  line-height:1.6;background:var(--warn-bg);border:1px solid var(--warn-line);
+  color:var(--ink-2)}
+.bm-coll b{color:var(--warn)}
+.bm-coll div{margin-top:3px}
+
+/* 操作栏常驻：未选中时置灰并说明为什么点不动。
+   原来它是 `hidden = sel.length === 0` —— 用户 2026-09-13 的截图里 54 个
+   卡片全未勾选，于是整条操作栏不渲染，看起来「这个面板根本没有批量功能」。 */
+.bm-actbar[data-idle="1"] .bm-actrow{opacity:.5}
+.bm-idle{font-size:11.5px;color:var(--ink-3)}
+
 /* 动作按钮按后果着色：修复=蓝、启用=绿、停用=黄、删除=红。
    颜色是**语义**不是装饰 —— 不可逆的那个必须一眼与其余三个不同。 */
 .act-fix{--btn:var(--accent);--btnl:var(--accent-2);--btnb:var(--accent-soft)}
@@ -919,7 +983,7 @@ https://其他站.com,sk-yyyyyyyyyyyyyyyy
 
   <div class="bm-grid" id="bmgrid"></div>
 
-  <div class="bm-actbar" id="bmact" hidden>
+  <div class="bm-actbar" id="bmact" data-idle="1">
     <div class="bm-actrow">
       <span class="bm-cnt">已选 <span class="n" id="bmn">0</span> 组
         <i id="bmn2"></i></span>
@@ -927,16 +991,24 @@ https://其他站.com,sk-yyyyyyyyyyyyyyyy
       <button class="go ghost sm act-on" id="bmenable">批量启用</button>
       <button class="go ghost sm act-off" id="bmdisable">批量停用</button>
       <button class="go ghost sm act-del" id="bmdelete">批量删除…</button>
+      <span class="bm-idle" id="bmwhy">勾选上方卡片后可批量操作；单站改档直接在卡片头部输入</span>
     </div>
     <div class="bm-actrow">
       <label class="bm-setpri">批量设为
         <input type="number" id="bmpri" min="1" max="100000" placeholder="档位">
       </label>
+      <div class="bm-presets" id="bmpresets"></div>
       <button class="go ghost sm act-fix" id="bmsetpri">应用到已选各组</button>
       <span class="bm-tip">同一组内的所有 Key 会写同一个值 ——
         这正是「同网址同优先级」那条不变式</span>
     </div>
     <div class="bm-actrow"><span class="hint" id="bmmsg"></span></div>
+  </div>
+
+  <div class="bm-dirty" id="bmdirty" hidden>
+    <span>有 <span class="n" id="bmdirtyn">0</span> 处未提交的就地改动</span>
+    <button class="go sm act-fix" id="bmdirtygo">预览并写回这些改动</button>
+    <button class="go ghost sm" id="bmdirtyclr">放弃</button>
   </div>
 
   <div class="bm-danger" id="bmdel" hidden>
@@ -957,6 +1029,7 @@ https://其他站.com,sk-yyyyyyyyyyyyyyyy
   <div id="bmpreview" hidden>
     <div class="ph"><h2>改动预览</h2><span class="tag" id="bmcnt"></span></div>
     <p class="psub" id="bmsem"></p>
+    <div class="bm-coll" id="bmcoll" hidden></div>
     <div class="diff"><pre id="bmdiff"></pre></div>
     <div class="row">
       <button class="go" id="bmapply">确认写回</button>
