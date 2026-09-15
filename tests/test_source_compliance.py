@@ -386,7 +386,11 @@ enabled: provider.disabled !== true,
             patch.object(csp.time, "time", return_value=1000):
         first = csp.extract_remote(ref="release", cpamp_ref="panel")
     assert first.ok, first.coverage
-    assert first.immutable and first.revisions == {"cpa": "a" * 40, "cpamp": "a" * 40}
+    # 三个源都要被钉到 commit sha —— 2026-09-14 新增 sub2api 后这里曾漏掉它，
+    # 断言写死 {cpa, cpamp} 而实现已返回三个 key，套件因此红。
+    # 用 SOURCE_MANIFEST 推导而非再写死：以后加第四个源不必改这行。
+    assert first.immutable
+    assert first.revisions == {repo: "a" * 40 for repo in csp.SOURCE_MANIFEST}
     assert all("/" + "a" * 40 + "/" in url for url in seen if "/commits/" not in url)
     with patch.object(csp, "_http_get", side_effect=AssertionError("must use cache")), \
             patch.object(csp.time, "time", return_value=1701):

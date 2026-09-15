@@ -52,6 +52,26 @@ _CPAMP_UTILS = "apps/web/src/components/providers/utils.ts"
 _CPAMP_TYPES = "apps/web/src/types/provider.ts"
 _CPAMP_RAW_BASE = "https://raw.githubusercontent.com/seakee/CPA-Manager-Plus"
 
+# sub2api 侧：claude_code_only 分组的**校验判据**权威来源（2026-09-14 加）。
+#
+# 为什么需要它（用户第 1 条问的那个 503）
+# ------------------------------------
+# 同一个站填进 cc switch 用 Claude Code 直连正常、经 CPA 就 503
+# `No available accounts: this group only allows Claude Code clients`。
+# 拒绝发生在 sub2api 侧的 ClaudeCodeValidator，它校验四项：
+#   · User-Agent 匹配 `claude-cli/x.y.z`
+#   · system prompt 与官方模板的 Dice 相似度 >= 阈值
+#   · anthropic-beta / anthropic-version / X-App 头非空
+#   · metadata.user_id 存在
+# 本项目对应的处置是给条目写 `cloak.mode` + `fingerprint-profile`
+# （见 plan.py 的 claude 段身份分支）—— 那两个值的**合法取值**已从 CPA
+# 源码解析，但「补成什么样才算过」的判据此前只写在注释里，是死知识。
+#
+# 拉它是为了让判据跟着上游走：sub2api 改了 UA 正则或相似度阈值，
+# 本项目的探测形态与警告文案自动跟上，不用手工同步。
+_SUB2API_VALIDATOR = "backend/internal/service/claude_code_validator.go"
+_SUB2API_RAW_BASE = "https://raw.githubusercontent.com/Wei-Shaw/sub2api"
+
 # 远程模式：直接从 GitHub 拉这两个文件。
 #
 # 为什么值得单独有这条路：本地源码模式要么 git clone（宿主机加一条 cron、
@@ -113,6 +133,15 @@ class CpaIdentity:
     # 从 CPA-Manager-Plus 的前端源码解析，供 bulk.py 使用。
     cpamp_disable_all_rule: str = ""
     cpamp_disabled_field: str = ""
+    # sub2api 的 claude_code_only 校验判据（2026-09-14）。空 = 没拉到，
+    # 那时 plan.py 的警告文案退回泛化措辞，不猜具体阈值。
+    #
+    # 用途：判死原因是「客户端」类（503 only allows Claude Code clients）时，
+    # 把「上游到底在校验什么」写进 warning，让操作员知道 cloak 要补齐哪几项。
+    s2a_ua_pattern: str = ""            # 如 `^claude-cli/\d+\.\d+\.\d+`
+    s2a_prompt_threshold: float = 0.0   # Dice 相似度阈值，如 0.5
+    s2a_system_prompts: list[str] = field(default_factory=list)
+    s2a_required_headers: list[str] = field(default_factory=list)
     source_root: str = ""
     errors: list[str] = field(default_factory=list)
     body_rules: dict = field(default_factory=dict)
@@ -222,6 +251,7 @@ def cached_identity(*, source_root: str = "", ttl: int = _IDENT_TTL,
     if not root:
         return extract_remote(ref=ref or os.environ.get("CPA_SOURCE_REF", "main"),
                               cpamp_ref=cpamp_ref or os.environ.get("CPAMP_SOURCE_REF", "main"),
+                              sub2api_ref=os.environ.get("SUB2API_SOURCE_REF", "main"),
                               proxy=proxy)
     # Read the bounded manifest to detect dirty trees and ZIP roots too. Never
     # complete a local revision with unrelated remote traits.
@@ -505,6 +535,61 @@ def parse_cpamp_disable_rule(src: str) -> tuple[str, str]:
     return rule, field_name
 
 
+def parse_sub2api_validator(src: str) -> dict:
+    """从 sub2api 的 claude_code_validator.go 解析 claude_code_only 的校验判据。
+
+    为什么要解析而不是抄下来（2026-09-14）
+    ----------------------------------
+    用户第 1 条问的 503 —— `only allows Claude Code clients` —— 拒绝就发生在
+    这个文件里。本项目的处置是给条目写 `cloak.mode` + `fingerprint-profile`，
+    让 CPA 自己补齐身份；但「补成什么样才算过」此前只写在 plan.py 的注释里。
+    注释不会随上游更新，阈值一改就成了错的知识。
+
+    解析目标（全部是文件里的**具名常量**，不是行为推断）：
+        claudeCodeUAPattern    = regexp.MustCompile(`(?i)^claude-cli/\\d+\\.\\d+\\.\\d+`)
+        systemPromptThreshold  = 0.5
+        claudeCodeSystemPrompts = []string{ "You are Claude Code, ...", ... }
+        必需头：r.Header.Get("X-App") / ("anthropic-beta") / ("anthropic-version")
+
+    返回 dict 而不是多个返回值：字段会随上游增删，dict 让调用方按需取、
+    缺项就是空，不会因为解包个数对不上而整条链崩掉。
+
+    拿不到任何一项时返回空 dict —— 调用方据此退回泛化文案，绝不猜。
+    """
+    out: dict = {}
+
+    m = re.search(r'claudeCodeUAPattern\s*=\s*regexp\.MustCompile\(`([^`]+)`\)', src)
+    if m:
+        out["ua_pattern"] = m.group(1)
+
+    m = re.search(r'systemPromptThreshold\s*=\s*([0-9.]+)', src)
+    if m:
+        try:
+            out["prompt_threshold"] = float(m.group(1))
+        except ValueError:
+            pass
+
+    # system prompt 模板：`var claudeCodeSystemPrompts = []string{ ... }` 里的
+    # 双引号字面量。只取块内的，避免把文件别处的字符串也收进来。
+    blk = re.search(r'claudeCodeSystemPrompts\s*=\s*\[\]string\{(.*?)\n\}',
+                    src, re.S)
+    if blk:
+        prompts = re.findall(r'"((?:[^"\\]|\\.)*)"', blk.group(1))
+        out["system_prompts"] = [p for p in prompts if len(p) > 12]
+
+    # 必需头：文件里 `r.Header.Get("X")` 后紧跟「空则 return false」的那几个。
+    # 只收大小写敏感的原写法，交给调用方去做不区分大小写的比对。
+    heads = re.findall(r'r\.Header\.Get\("([\w-]+)"\)', src)
+    seen: list[str] = []
+    for h in heads:
+        if h.lower() != "user-agent" and h not in seen:
+            seen.append(h)
+    if seen:
+        out["required_headers"] = seen
+
+    return out
+
+
 def parse_cpamp_disable_semantics(utils: str, rows: str) -> dict:
     """Recognize panel enable/disable predicates, not provider weight heuristics."""
     rule, _ = parse_cpamp_disable_rule(utils)
@@ -552,26 +637,51 @@ def _http_get(url: str, *, timeout: int = 15,
         return 0, f"{type(e).__name__}: {e}"
 
 
-def extract_remote(*, ref: str = "main", timeout: int = 8,
+def extract_remote(*, ref: str = "main", timeout: int = 45,
                    proxy: str | None = None,
-                   use_cache: bool = True, cpamp_ref: str = "main") -> CpaIdentity:
+                   use_cache: bool = True, cpamp_ref: str = "main",
+                   sub2api_ref: str = "main") -> CpaIdentity:
     """Fetch the bounded manifest from public GitHub, pinning each repository.
 
     A successful complete snapshot lives six hours; partial/failure results ten
     minutes. No source is executed. Missing files and unresolved revisions stay
     explicit. The shared fetch budget stops scheduling requests after timeout.
+
+    预算为什么是 45 秒（2026-09-14 实测定）
+    ------------------------------------
+    清单现在横跨三个仓库、14 个文件，外加每仓一次 commits 查询解析 revision。
+    实测单次请求 1.4–1.9 秒（直连 GitHub），总量约 17 次 → 25–32 秒。
+    原默认 8 秒是两仓库时代的值，加 sub2api 后连 cpa 那一仓都跑不完 ——
+    实测现象是 `revisions` 只剩 cpa、cpamp 三个文件全 missing、
+    `immutable=False`，而失败会被缓存 10 分钟，界面上看不出原因。
+
+    45 秒留了约 1.4 倍余量。这个预算只在**缓存未命中**时付；命中时是
+    6 小时一次，代价可以忽略。拉不通的环境由 `_REMOTE_FAIL_TTL` 兜住，
+    不会每次打开网页都重付。
     """
     from urllib.parse import quote, urlsplit
     now = time.time()
-    key = (_RAW_BASE, _CPAMP_RAW_BASE, ref, cpamp_ref, proxy)
+    key = (_RAW_BASE, _CPAMP_RAW_BASE, _SUB2API_RAW_BASE,
+           ref, cpamp_ref, sub2api_ref, proxy)
     entry = _remote_cache.get(key)
     if use_cache and entry and now < entry.expires_at:
         _remote_cache.update(at=entry.checked_at, ident=entry, ref=ref, ok=entry.ok)
         return entry
     sources, revisions, issues = {}, {}, []
-    deadline = time.monotonic() + max(1, timeout)
-    for repo, base, requested in (("cpa", _RAW_BASE, ref),
-                                   ("cpamp", _CPAMP_RAW_BASE, cpamp_ref)):
+    # 每仓一份**独立**预算，而不是三仓共享一个 deadline（2026-09-14 改）。
+    #
+    # 共享预算的失效方式：仓库按固定顺序遍历，排第一的 cpa 有 9 个文件，
+    # 它慢一点就把后两仓的额度吃光 —— 实测 timeout=25 时 cpamp 三个文件
+    # 全 missing、sub2api 整仓没进 revisions，而失败缓存 10 分钟，
+    # 界面上只看到「拉不到」，看不出是被前一仓饿死的。
+    #
+    # 按仓平分后，某一仓慢只拖垮它自己，另两仓照常拿到结论。
+    _repos = (("cpa", _RAW_BASE, ref),
+              ("cpamp", _CPAMP_RAW_BASE, cpamp_ref),
+              ("sub2api", _SUB2API_RAW_BASE, sub2api_ref))
+    _per_repo = max(1, timeout) / len(_repos)
+    for repo, base, requested in _repos:
+        deadline = time.monotonic() + _per_repo
         parsed = urlsplit(base)
         if (parsed.scheme != "https" or parsed.netloc != "raw.githubusercontent.com"
                 or not re.fullmatch(r"/[\w.-]+/[\w.-]+", parsed.path)):
@@ -607,7 +717,7 @@ def extract_remote(*, ref: str = "main", timeout: int = 8,
     out.revisions = revisions
     out.snapshot_id = hashlib.sha256(
         (out.snapshot_id + repr((key[:4], revisions))).encode()).hexdigest()
-    out.immutable = (len(revisions) == 2 and all(
+    out.immutable = (len(revisions) == len(_REPO_BASES) and all(
         re.fullmatch(r"[0-9a-f]{40}", r) for r in revisions.values()))
     out.uncertainty.extend(issues)
     if not out.immutable:
@@ -669,6 +779,14 @@ SOURCE_MANIFEST = {
     "cpamp": (_CPAMP_UTILS, _CPAMP_TYPES,
               "apps/web/src/components/providers/ProviderTable/rowData.ts",
               "apps/web/src/services/api/providers.ts"),
+    "sub2api": (_SUB2API_VALIDATOR,),
+}
+
+# 仓库 → raw 基址。遍历与 immutable 判据都按这张表走，加仓库只改这里。
+_REPO_BASES = {
+    "cpa": _RAW_BASE,
+    "cpamp": _CPAMP_RAW_BASE,
+    "sub2api": _SUB2API_RAW_BASE,
 }
 
 
@@ -796,6 +914,15 @@ def _parse_sources(sources: dict, *, source_root: str) -> CpaIdentity:
     out.cpamp_disable_semantics = parse_cpamp_disable_semantics(
         u, sources.get(("cpamp",
                        "apps/web/src/components/providers/ProviderTable/rowData.ts"), ""))
+
+    # sub2api 的 claude_code_only 校验判据（2026-09-14）。
+    # 拉不到就全空 —— plan.py 那边据此退回泛化文案，不猜阈值。
+    s2a = parse_sub2api_validator(
+        sources.get(("sub2api", _SUB2API_VALIDATOR), ""))
+    out.s2a_ua_pattern = s2a.get("ua_pattern", "")
+    out.s2a_prompt_threshold = s2a.get("prompt_threshold", 0.0)
+    out.s2a_system_prompts = s2a.get("system_prompts", [])
+    out.s2a_required_headers = s2a.get("required_headers", [])
     defaults = _const_map(sources.get(
         ("cpa", "internal/runtime/executor/helps/claude_device_profile.go"), ""))
     for name, value in defaults.items():

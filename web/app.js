@@ -2402,7 +2402,8 @@ function fillPlanIntoRows(d) {
         `#results tr[data-rid="${cssq(p.line_no)}"][data-sec="${cssq(sec)}"]:not(.wrow)`);
       if (!tr) return;
       const inp = tr.querySelector('.pi');
-      if (inp && !inp.value) inp.value = sp.priority;
+      // priority=0 是无效值（CPA 要求 >=1），保持空字符串显示 placeholder
+      if (inp && inp.value === '' && sp.priority > 0) inp.value = sp.priority;
 
       // 目录读不到的段：把后端方案里的模型填成勾选框。
       //

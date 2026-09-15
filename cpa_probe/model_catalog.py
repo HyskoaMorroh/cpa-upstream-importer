@@ -434,6 +434,10 @@ def newest_generation_per_line(names: list[str], *,
                                keep_low_tier: bool = False) -> list[str]:
     """只留最高档：先按族比主版本，再按产品线比完整世代。
 
+    **这是选型的唯一生产入口**（2026-09-14 标注）——`plan.py` 的三个调用点
+    与 `server.py:1456` 的界面预勾都走它。同名的 `newest_per_series` 只剩
+    测试在用，改那个不影响任何实际行为。
+
     两阶段（2026-09-12 定案，用户裁定的三个判例 + docx 第 4 条）
     ------------------------------------------------------
     阶段 A —— 按**族**（`generation_family`）比**主版本**。
@@ -547,10 +551,28 @@ def newest_generation_per_line(names: list[str], *,
 
 
 def newest_per_series(names: list[str]) -> list[str]:
-    """同系列只留最新版。顺序按输入首次出现，便于复核 diff。
+    """同系列只留最新版，但同版本的所有变体都保留。顺序按输入首次出现，便于复核 diff。
+
+    **生产路径不走这个函数**（2026-09-14 核实）
+    -----------------------------------------
+    全项目只有 `tests/test_probe.py:841` 在调它，用于守「同版本时裸名优先于
+    带前缀的」这一条语义。真正决定「界面上勾哪些模型」的是
+    `newest_generation_per_line` —— 那个函数按「族比主版本、产品线比完整世代」
+    两阶段筛，`plan.py` 与 `server.py` 的四个调用点全指向它。
+
+    改这里**不会**改变任何实际行为。要调整选型规则请改
+    `newest_generation_per_line`，别改这个。
+
+    保留它的理由：它守着的那条语义（带前缀与裸名的取舍）与选型规则正交，
+    将来若有别的调用方需要「只按系列去旧、不做世代折叠」，这份实现是对的。
 
     用户 2026-09-02 的要求：「相同系列模型以最新版为准，如内置 gpt-5.6，
     未来 CPA 可能更新 gpt-5.7，这个时候以最新的出现，旧的不放入」。
+
+    用户 2026-09-13 补充：「同级模型（如 gpt-5.6, gpt-5.6-sol, gpt-5.6-nxt）
+    应该全部勾选，不能只留第一个」—— 同版本的后缀变体不互相淘汰。
+    （这条要求在生产路径上由 `newest_generation_per_line` 的阶段 B 满足，
+     实测 `['gpt-5.6','gpt-5.6-sol','gpt-5.6-nxt']` 三个全留。）
 
     版本认不出的（`gpt-4o`）自成一系，永远保留 —— 无从比较就不淘汰，
     宁可多留一个也不要因为解析不出版本号而丢掉一个可用模型。
@@ -559,24 +581,72 @@ def newest_per_series(names: list[str]) -> list[str]:
     系列键取 `bare_name` 之后的形态，所以两者会互相比较，**裸名优先**。
     理由：前缀是站方特有的写法（`anthropic/` 只在某几个站成立），
     而这个函数的产物会当作「通用最新清单」用到别的站上。
+
+    实现细节（2026-09-13）：
+    - 按系列分组（series_and_version 返回的系列键）
+    - 每组内按版本比较：只保留最高版本
+    - **同版本的所有变体都保留**（这是关键修复点）
+      例如：gpt-5.6-sol 与 gpt-5.6-nxt 系列键不同但版本相同 (5,6)
+      → 都保留，不互相淘汰
+    - 同版本中裸名优先于带前缀的
     """
-    best: dict[str, tuple[tuple[int, ...] | None, str]] = {}
+    # 第一遍：按系列分组，收集每个系列的所有候选
+    groups: dict[str, list[tuple[tuple[int, ...] | None, str]]] = {}
     order: list[str] = []
+
     for n in names:
         if not n:
             continue
         series, ver = series_and_version(n)
-        if series not in best:
-            best[series] = (ver, n)
+        if series not in groups:
+            groups[series] = []
             order.append(series)
-            continue
-        prev_ver, prev = best[series]
-        if ver is not None and (prev_ver is None or ver > prev_ver):
-            best[series] = (ver, n)
-        elif ver == prev_ver and "/" in prev and "/" not in n:
-            # 同版本、旧的带前缀而新的没有 —— 换成裸名
-            best[series] = (ver, n)
-    return [best[s][1] for s in order]
+        groups[series].append((ver, n))
+
+    # 第二遍：每组内只保留最高版本，但同版本的所有变体都保留
+    result = []
+    for series in order:
+        candidates = groups[series]
+
+        # 找出最高版本
+        max_ver = None
+        for ver, _ in candidates:
+            if ver is not None:
+                if max_ver is None or ver > max_ver:
+                    max_ver = ver
+
+        # 保留所有最高版本的条目（包括同版本的多个变体）
+        kept = []
+        for ver, name in candidates:
+            if ver is None and max_ver is None:
+                # 无版本信息，全部保留
+                kept.append(name)
+            elif ver == max_ver:
+                # 最高版本，保留
+                kept.append(name)
+            # 否则：旧版本，丢弃
+
+        # 同版本中裸名优先：同一模型（bare_name 相同）只保留裸名、去掉带前缀的。
+        #
+        # 这是两种不同的情况，不能混：
+        #   · `anthropic/claude-opus-5` 与 `claude-opus-5` —— bare_name 相同，
+        #     是**同一模型**的两种写法，只留裸名（既有测试守着这条语义）。
+        #   · `gpt-5.6-sol` 与 `gpt-5.6-nxt` —— bare_name 不同，是**同级变体**，
+        #     用户 2026-09-13 要求全部保留，一个都不能丢。
+        dedup: dict[str, str] = {}
+        order_kept: list[str] = []
+        for name in kept:
+            b = bare_name(name)
+            if b in dedup:
+                # 已有同模型；若已有带前缀而新的是裸名，换成裸名
+                if "/" in dedup[b] and "/" not in name:
+                    dedup[b] = name
+            else:
+                dedup[b] = name
+                order_kept.append(b)
+        result.extend(dedup[b] for b in order_kept)
+
+    return result
 
 
 # 降级档标记。同族里它们排在主力款之后 —— 不排除（有些站只卖这些），

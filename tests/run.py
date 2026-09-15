@@ -34,6 +34,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SUITES = ["test_probe.py", "test_server.py", "test_pipeline.py",
           "test_edges.py", "test_reload.py", "test_speed.py", "test_web.py",
           "test_tiering.py", "test_full_redetect.py", "test_bulk.py",
+          "test_priority_consistency.py", "test_sub2api_source.py",
           "test_source_compliance.py", "test_transport_compliance.py",
           "test_writeback_compliance.py", "test_planning_compliance.py",
           "test_probe_compliance.py", "test_api_compliance.py"]
