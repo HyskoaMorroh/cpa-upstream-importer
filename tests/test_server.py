@@ -368,7 +368,7 @@ def test_plan_response_redacts_secrets():
         '    headers:\n'
         '      anthropic-beta: "context-1m-2025-08-07"\n'
         'openai-compatibility:\n'
-        '  - name: "chma"\n'
+        '  - name: "cielo"\n'
         '    base-url: "https://b.example/v1"\n'
         '    api-key-entries:\n'
         '      - api-key: sk-bare-no-quotes-1234567890\n'

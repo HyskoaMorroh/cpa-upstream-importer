@@ -7,7 +7,7 @@
 
 ## Problem Statement
 
-**Affected Upstream**: https://api.zzzcoding.org/v1
+**Affected Upstream**: https://zulu.example/v1
 
 **Symptoms**:
 - Direct curl/PowerShell calls: 503 "No available accounts: this group only allows Claude Code clients"
@@ -31,7 +31,7 @@
 └─────────────────────────────────────────────────────────────┘
 
 WITHOUT PROXY (Current - FAILS):
-CPA (Go http.Client) → api.zzzcoding.org
+CPA (Go http.Client) → zulu.example
                           ↓
                        TLS fingerprint check
                           ↓
@@ -44,7 +44,7 @@ CPA (Go http.Client) → localhost:8443 (nginx)
                           ↓
                New TLS connection with Chrome/curl fingerprint
                           ↓
-                    api.zzzcoding.org
+                    zulu.example
                           ↓
                     "Looks like Claude Code" → 200
 ```
@@ -96,9 +96,9 @@ http {
     proxy_read_timeout 60s;
     proxy_buffering off;
 
-    # Upstream for api.zzzcoding.org
-    upstream zzzcoding {
-        server api.zzzcoding.org:443;
+    # Upstream for zulu.example
+    upstream zulu {
+        server zulu.example:443;
         keepalive 32;
     }
 
@@ -112,16 +112,16 @@ http {
             # Determine upstream based on Host header or X-Upstream-Target
             set $upstream_target $http_x_upstream_target;
             
-            # Default to zzzcoding if no override
+            # Default to zulu if no override
             if ($upstream_target = "") {
-                set $upstream_target "zzzcoding";
+                set $upstream_target "zulu";
             }
 
             # Proxy pass with HTTPS
             proxy_pass https://$upstream_target;
             
             # Forward headers from CPA
-            proxy_set_header Host api.zzzcoding.org;
+            proxy_set_header Host zulu.example;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
@@ -158,9 +158,9 @@ http {
         listen 8443;
         
         location / {
-            proxy_pass https://api.zzzcoding.org;
+            proxy_pass https://zulu.example;
             proxy_ssl_server_name on;
-            proxy_set_header Host api.zzzcoding.org;
+            proxy_set_header Host zulu.example;
             proxy_set_header Authorization $http_authorization;
             proxy_http_version 1.1;
         }
@@ -188,7 +188,7 @@ def needs_tls_proxy(base_url: str, section: str) -> tuple[bool, str]:
     """
     # 已知需要代理的站点（黑名单）
     KNOWN_FINGERPRINT_SITES = [
-        "api.zzzcoding.org",
+        "zulu.example",
         # 其他已知站点可以添加在这里
     ]
     
@@ -271,13 +271,13 @@ python3 server.py --config config.yaml
 # Check logs for "注入 TLS 代理" messages
 
 # 4. Verify config.yaml has proxy-url
-grep -A 10 "api.zzzcoding.org" config.yaml | grep proxy-url
+grep -A 10 "zulu.example" config.yaml | grep proxy-url
 # Should show: proxy-url: http://localhost:8443
 
 # 5. Test with CPA
 cd /c/Users/devin/OneDrive/Desktop/CLIProxyAPI-main
 ./cpa --config /path/to/generated/config.yaml
-# Make request through CPA to api.zzzcoding.org
+# Make request through CPA to zulu.example
 # Should succeed via proxy
 ```
 
@@ -319,7 +319,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         cmd = [
             './curl-impersonate-chrome',
             '-X', method,
-            f'https://api.zzzcoding.org{self.path}',
+            f'https://zulu.example{self.path}',
             '-H', f'Authorization: {self.headers.get("Authorization", "")}',
             '-H', f'Content-Type: {self.headers.get("Content-Type", "application/json")}',
         ]
@@ -398,7 +398,7 @@ So this is NOT an option.
 
 **Current Solution**: One proxy endpoint per fingerprint type
 ```
-http://localhost:8443 → Chrome-like fingerprint (zzzcoding)
+http://localhost:8443 → Chrome-like fingerprint (zulu)
 http://localhost:8444 → Firefox-like fingerprint (other sites)
 http://localhost:8445 → Safari-like fingerprint (iOS sites)
 ```
@@ -410,7 +410,7 @@ http://localhost:8445 → Safari-like fingerprint (iOS sites)
 ### Before Fix:
 ```yaml
 codex-api-key:
-  - base-url: https://api.zzzcoding.org/v1
+  - base-url: https://zulu.example/v1
     api-key: sk-ant-xxx
     priority: 80
     models: []  # EMPTY - 503 errors during detection
@@ -419,7 +419,7 @@ codex-api-key:
 ### After Fix:
 ```yaml
 codex-api-key:
-  - base-url: https://api.zzzcoding.org/v1
+  - base-url: https://zulu.example/v1
     api-key: sk-ant-xxx
     priority: 80
     proxy-url: http://localhost:8443  # AUTO-INJECTED

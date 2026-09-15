@@ -113,7 +113,7 @@ curl -I http://127.0.0.1:8765/
 # 应返回 200 OK
 ```
 
-访问 https://importer.chiangma.com，登录后点击「全量检测」。
+访问 https://importer.cielo.example，登录后点击「全量检测」。
 
 ---
 

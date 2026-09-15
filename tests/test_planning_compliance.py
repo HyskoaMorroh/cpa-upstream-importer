@@ -85,6 +85,59 @@ def test_same_generation_topup_without_limit():
     assert set(added) == set(names[1:])
 
 
+def test_topup_proven_generation_survives_higher_market_major():
+    """`proven`（实测通过的名字）那一代不被市面更高主版本淘汰。
+
+    直接测归并函数，不走 build_plan —— `proven` 的语义边界就在这里：
+    它是「本轮真的打通了」的第二证据层，与「目录声称有」必须分开。
+    """
+    R = ["gpt-5", "gpt-5.6", "gpt-5.6-sol",
+         "gpt-6", "gpt-6-astra", "gpt-6-sol"]
+
+    # 实测通了 gpt-5.6 → 它和目录最高代 gpt-6 并存
+    got, added, _ = mc.topup_to_market_top(C, ["gpt-5.6"], remote=R,
+                                          proven=["gpt-5.6"])
+    assert "gpt-5.6" in got, got
+    assert "gpt-6" in got, got
+    # 同代变体跟着补进来（用户「同等级系列全勾上」）
+    assert "gpt-5.6-sol" in got, got
+    # 同主版本的更旧代不搭救
+    assert "gpt-5" not in got, got
+
+    # proven 为空 = 没有实测依据 → 原来的「整代换代」判据原样生效
+    got2, _, _ = mc.topup_to_market_top(C, ["gpt-5.6"], remote=R)
+    assert "gpt-5.6" not in got2, got2
+    assert "gpt-5.6-sol" not in got2, got2
+    assert "gpt-6" in got2, got2
+
+    # 实测通的就是最高代时，行为与不传 proven 完全一致（无副作用）
+    got3, _, _ = mc.topup_to_market_top(C, ["gpt-6"], remote=R,
+                                        proven=["gpt-6"])
+    assert got3 == got2, (got3, got2)
+
+
+def test_topup_proven_does_not_resurrect_unlisted_names():
+    """`proven` 只能豁免「归并后仍在清单里」的那一代，不能凭空复活名录不认识的名字。
+
+    边界：`have` 是进入归并的清单（plan.py 传的 `models`）。`proven` 的职责
+    只是阻止阶段 A **再删一次**，不是恢复上游已决的结论。所以：
+
+      · 名录里有 `gpt-5.6` 时它被 Phase B 的正常补齐路径带回来 —— 这是
+        补齐规则的作用，不是 `proven` 的作用（下面第一个断言钉住这点）。
+      · 名录里**没有** `gpt-5.6-site-only` 时，`proven` 带着它也不会让它
+        进清单 —— 否则 `proven` 就变成了「绕过目录直接写名字」的后门。
+    """
+    # ① 名录里有这个名字 → 走补齐路径进来（与 proven 无关）
+    got, _, _ = mc.topup_to_market_top(C, ["gpt-6"], remote=["gpt-5.6", "gpt-6"],
+                                       proven=["gpt-5.6"])
+    assert "gpt-5.6" in got, got
+
+    # ② 名录里没有这个名字 → proven 也不放行
+    got2, _, _ = mc.topup_to_market_top(C, ["gpt-6"], remote=["gpt-6"],
+                                        proven=["gpt-5.6-site-only"])
+    assert "gpt-5.6-site-only" not in got2, got2
+
+
 def test_build_probed_peers_and_provenance():
     v = verdict(models=["gpt-5.6"], catalog=["gpt-5.6-local"])
     before = copy.deepcopy(v)
@@ -115,13 +168,128 @@ def test_build_probed_peers_and_provenance():
 
 
 def test_failed_and_lower_probe_fill_highest():
-    for models in ([], ["gpt-5.5"]):
-        v = verdict(models=models, catalog=["gpt-5.5"])
-        v.usable = bool(models)
-        sp = build([v], ["gpt-6", "gpt-6-sol"]).sections[C]
-        assert set(sp.models) == {"gpt-6", "gpt-6-sol"}
-        assert set(sp.model_provenance.values()) == {"inferred"}
-        assert not sp.catalog_stale
+    """探测没探到就填最高代；探到的那一代不被「更高代」顶掉。
+
+    用户 2026-09-16 给的口径（原话）：「gpt-5 和 gpt-5.6 理论上不可能保留，
+    因为目前最新模型为 gpt-6 系列，但是**如果检测 gpt-6 系列明显不通，这个
+    时候 gpt-6 系列按模型目录最高级别保留同时保留实测最高的 gpt-5.6 系列**」。
+
+    两种情形必须分开，差别只在「`v.models` 里有没有实测通过的名字」：
+
+      · `models=[]` —— 什么都没探到。`have` 只有历史遗留（这里为空或低代），
+        `proven` 为空 → 实测豁免集合为空 → 阶段 A 逐字回到原判据：
+        目录最高代 `gpt-6` 与它的同代变体 `gpt-6-sol` 都进，低代不留。
+      · `models=["gpt-5.5"]` —— 这是**实测通过**的名字（`SectionVerdict.models`
+        的语义就是「本轮 `_accept` 收下的名字」），由 plan.py 以 `proven` 传进
+        归并。它所属的那一代因此豁免「被更高主版本作废」。
+
+    第二条是 2026-09-16 改的：原来这一项两种情形都断言 `gpt-5.5` 不留。
+    那在 `models=["gpt-5.5"]` 下与用户新口径相反 —— 实测通的模型被删掉、
+    只留一串从没打通的目录名，CPA 每次轮到这个站都对着死模型发请求。
+
+    注意豁免的粒度是**完整世代**不是主版本：`gpt-5.6` 被豁免时 `gpt-5`
+    仍然出局（用户同一句里点名的「gpt-5 不可能保留」）。
+    """
+    # 情形一：什么也没探到 → 只留目录最高代
+    sp = build([verdict(models=[], catalog=["gpt-5.5"])], ["gpt-6", "gpt-6-sol"]).sections[C]
+    assert set(sp.models) == {"gpt-6", "gpt-6-sol"}
+    assert set(sp.model_provenance.values()) == {"inferred"}
+    assert not sp.catalog_stale
+
+    # 情形二：gpt-5.5 是**实测通过**的 → 它与目录最高代并存
+    sp = build([verdict(models=["gpt-5.5"], catalog=["gpt-5.5"])],
+               ["gpt-6", "gpt-6-sol"]).sections[C]
+    assert set(sp.models) == {"gpt-5.5", "gpt-6", "gpt-6-sol"}
+    assert sp.model_provenance["gpt-5.5"] == "verified"
+    assert sp.model_provenance["gpt-6"] == "inferred"
+
+
+def test_proven_generation_exempts_only_its_own_generation():
+    """实测豁免只放行**那一代**，同主版本的更旧代不搭救。
+
+    `gpt-5.6` 与 `gpt-5` 主版本相同（都是 5）。按主版本放行会把 `gpt-5`
+    一起留下，而用户口径是「gpt-5 和 gpt-5.6 理论上不可能保留」——
+    要留的只有实测过的那一代本身。所以判据用完整世代 `(5, 6)` 而不是 `5`。
+    """
+    v = verdict(models=["gpt-5.6"],
+                catalog=["gpt-5", "gpt-5.6", "gpt-5.6-sol"])
+    sp = build([v], ["gpt-5", "gpt-5.6", "gpt-5.6-sol",
+                     "gpt-6", "gpt-6-sol"]).sections[C]
+    assert "gpt-5" not in sp.models, sp.models
+    assert "gpt-5.6" in sp.models, sp.models
+    # 实测那一代的同代变体照样补齐（用户「同等级系列全勾上」的要求）
+    assert "gpt-5.6-sol" in sp.models, sp.models
+
+
+def test_proven_exemption_keeps_verified_names_when_catalog_is_dead():
+    """站方实测通 gpt-5.6、目录报的 gpt-6 实际不通时，两代都在。
+
+    这是用户那句话的完整场景：目录（以及市面名录）报 gpt-6，而 gpt-6
+    明显不通 —— 只有 gpt-5.6 实测出了 200。此时清单必须同时含
+    「目录最高代」（保证站方以后补上 gpt-6 时立刻可用）与
+    「实测最高的那一代」（保证现在就有能用的模型）。
+    """
+    v = verdict(models=["gpt-5.6"], catalog=["gpt-6"])
+    sp = build([v], ["gpt-5.6", "gpt-6"]).sections[C]
+    assert {"gpt-5.6", "gpt-6"} <= set(sp.models), sp.models
+    assert sp.model_provenance["gpt-5.6"] == "verified"
+
+
+def test_reenable_targets_only_for_real_disable_markers():
+    """`reenable_targets` 只认两种真停用标记，别的一概不算。
+
+    用户 2026-09-16：「无论原来是否被关闭，如果探测可用就要打开」。
+    停用在本部署有两种表达（见 entry_out_of_pool）：
+      · compat 段 `disabled: true`
+      · 任意段 `excluded-models: ["*"]`
+    其余「像停用但不是」的形态必须**不被**当成停用，否则会去改用户
+    手工设的东西：`disabled: false`（显式启用）、`excluded-models: ["gpt-4"]`
+    （正常的模型排除，与停用无关）、`weight: 0`（权重表达，不是开关）。
+    """
+    from cpa_probe.plan import reenable_targets
+
+    assert reenable_targets("openai-compatibility", {"disabled": True}) == ["disabled"]
+    assert reenable_targets("openai-compatibility", {"disabled": False}) == []
+    assert reenable_targets("openai-compatibility", {}) == []
+    assert reenable_targets(C, {"excluded-models": ["*"]}) == ["excluded-models"]
+    assert reenable_targets(C, {"excluded-models": ["*", "gpt-4"]}) == ["excluded-models"]
+    assert reenable_targets(C, {"excluded-models": ["gpt-4"]}) == []
+    assert reenable_targets(C, {"excluded-models": []}) == []
+    assert reenable_targets(C, {"weight": 0}) == []
+
+
+def test_drop_disabling_lines_handles_both_excluded_shapes():
+    """清停用标记要认 `excluded-models` 的**两种**写法，且只摘 `*`。
+
+    `excluded-models` 不在 `_RENDERED_KEYS` 里，所以既有条目走 carry
+    （`_dump_fields`）—— 而 PyYAML 对列表写的是**块序列**，序列项与父键
+    **同级缩进**。第一版按「缩进必须更深」收集续行，于是 `- '*'` 落单被
+    原样留下，写回后出现一个值为 null 的空 `excluded-models:`：没重开成功
+    还多一处 diff。inline 写法则是另一种形态。两种都得覆盖。
+
+    只摘 `*` 不删整行：同一行里可能还有操作员手工排除的模型名，那是独立
+    语义（「别把请求分给这些模型」），不是停用。
+    """
+    from cpa_probe.writeback import _dump_fields, _drop_disabling_lines
+
+    # 块序列（PyYAML 的产物，常态）
+    assert _drop_disabling_lines(_dump_fields({"excluded-models": ["*"]}, "    "),
+                                 ["excluded-models"]) == []
+    kept = _drop_disabling_lines(
+        _dump_fields({"excluded-models": ["*", "gpt-4"]}, "    "),
+        ["excluded-models"])
+    assert kept and "gpt-4" in kept[0] and "*" not in kept[0], kept
+    # inline
+    assert _drop_disabling_lines(['    excluded-models: ["*"]\n'],
+                                 ["excluded-models"]) == []
+    # compat 的布尔字段整行删
+    assert _drop_disabling_lines(["    disabled: true\n"], ["disabled"]) == []
+    # 空值（null）与「没有这一行」等价，删
+    assert _drop_disabling_lines(["    excluded-models:\n"], ["excluded-models"]) == []
+    # 注释行不误伤，其它字段原样留
+    assert _drop_disabling_lines(['    # excluded-models: ["*"]\n'],
+                                 ["excluded-models"]) == ['    # excluded-models: ["*"]\n']
+    assert _drop_disabling_lines(["    priority: 10\n"], ["disabled"]) == ["    priority: 10\n"]
 
 
 def test_catalog_registration_not_probe_budget():

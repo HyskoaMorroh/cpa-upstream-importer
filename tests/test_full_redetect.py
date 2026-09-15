@@ -872,6 +872,18 @@ def test_profile_verdict_reuse_saves_calls():
     种子试完整梯全败之后，同段的后续种子不必重问。
 
     实测（假上游全 403）：57 次 → 30 次，省 47%。
+
+    2026-09-16 改判据：省下的**比例**不再是好的判据
+    --------------------------------------------
+    上面那个 47% 是「每段 2-3 个种子、每个种子都跑一遍整梯」时代的数。
+    种子已改成每族 1 个（`SEED_MODELS` 从 `model_catalog` 兜底名录派生），
+    而画像梯的长度没变 —— 于是可省的份额本身变小了：claude / codex / gemini
+    三段各只剩一个种子，复用在那三段**结构上无东西可省**，唯一还能省的是
+    compat 段（多族各一，`_BASELINE_MODELS` 会打两个模型）。实测只剩 16%，
+    与参数上限差得不多，再按 30% 卡就是在给一条已经变窄的收益定死数。
+
+    改成直接验证**机制**（真正的诉求）：开复用必须出现 `profile-skipped`
+    事件、不发重复的画像请求，且总请求数不增加。比例只作为信息打出来。
     """
     import json
     import socket
@@ -919,25 +931,48 @@ def test_profile_verdict_reuse_saves_calls():
     try:
         row = parse_lines(f"http://127.0.0.1:{port},sk-test", allow_private=True).valid[0]
 
-        calls["n"] = 0
-        Prober(gap=0.0, probe_context=False, swap_samples=0, workers=4,
-               reuse_profile_verdict=True).probe(row)
-        with_reuse = calls["n"]
+        def run(reuse: bool) -> tuple[int, list, dict]:
+            evs: list[tuple[str, dict]] = []
+            c = {"n": 0}
+            with lock:
+                calls["n"] = 0
+            pr = Prober(gap=0.0, probe_context=False, swap_samples=0, workers=4,
+                        reuse_profile_verdict=reuse)
+            pr.on_event = lambda k, d=None: evs.append((k, d or {}))
+            res = pr.probe(row)
+            with lock:
+                c["n"] = calls["n"]
+            return c["n"], evs, res
 
-        calls["n"] = 0
-        Prober(gap=0.0, probe_context=False, swap_samples=0, workers=4,
-               reuse_profile_verdict=False).probe(row)
-        without = calls["n"]
+        with_reuse, ev_reuse, res_reuse = run(True)
+        without, _ev_plain, _res_plain = run(False)
     finally:
         srv.shutdown()
 
-    assert with_reuse < without, (
-        f"开复用应更省，实际 开={with_reuse} 关={without}")
+    skipped = [(k, d) for k, d in ev_reuse if k == "profile-skipped"]
+    assert skipped, (
+        "开复用却没发出 profile-skipped 事件 —— 整梯全败的结论没有被复用")
+    assert not any(k == "profile-skipped" for k, _ in _ev_plain), (
+        "关复用时不该出现 profile-skipped")
+
+    # compat 段：开了复用后，整梯只该为一个模型跑一次。第二个模型若又跑一遍
+    # 整梯，说明复用没接上（这正是本用例存在的意义）。
+    combos = [a.combo for a in res_reuse.sections["openai-compatibility"].attempts]
+    prof_combos = [c for c in combos if c.startswith("id:")]
+    dupes = len(prof_combos) - len(set(prof_combos))
+    assert dupes == 0, (
+        f"compat 段画像请求重复 {dupes} 次（{prof_combos}）—— 复用没生效")
+
+    assert with_reuse <= without, (
+        f"开复用不该更多请求，实际 开={with_reuse} 关={without}")
     saved_pct = (1 - with_reuse / without) * 100
-    assert saved_pct >= 30, f"省得太少（{saved_pct:.0f}%），复用可能没生效"
+    # 比例只做参考：种子数已收敛到每族 1 个，可省的份额本身随种子数变化，
+    # 把它卡成阈值等于给一条会随参数漂移的数定死数（见 docstring）。
+    assert skipped and dupes == 0, "复用机制没生效"
 
     print(f"[OK] Profile reuse: {without} → {with_reuse} 次请求"
-          f"（省 {saved_pct:.0f}%）")
+          f"（省 {saved_pct:.0f}%），profile-skipped × {len(skipped)}，"
+          f"compat 段画像请求无重复")
 
 
 def test_profile_drift_detection():
@@ -2725,7 +2760,7 @@ def test_offfamily_manual_and_catalog():
 
     真实反例：romeo 的 compat 段唯一端到端验证过的模型就是 grok-4.6
     （配置注释：「整个 vip 分组当前只有 grok-4.6 有渠道，已通过端到端验证的
-    只有它」），facai 段有 grok-4.6 + glm-5.2。按族拒掉之后那两段会从
+    只有它」），foxtrot 段有 grok-4.6 + glm-5.2。按族拒掉之后那两段会从
     「有一个确认可用的模型」变成「只剩两个确认 503 的」。
 
     而 compat 段确实能跑它们：走 `/chat/completions`
@@ -3392,7 +3427,7 @@ def test_find_compat_provider_strips_trailing_comments():
                       (" # 注意带 /v1", "空格 + 注释"),
                       ("  # 直连，不走网关", "多空格 + 中文注释")):
         src = f'''openai-compatibility:
-  - name: "chma" # 短名，与 host 不同
+  - name: "cielo" # 短名，与 host 不同
     base-url: "https://cielo.example/v1"{tail}
     api-key-entries:
       - api-key: "sk-a" # 2026-08-20 新增
@@ -3404,7 +3439,7 @@ def test_find_compat_provider_strips_trailing_comments():
         got = find_compat_provider(src.splitlines(keepends=True),
                                    "https://cielo.example/v1")
         assert got is not None, f"{why}：没命中现有 provider —— 会新建重复条目"
-        assert got["name"] == "chma", f"{why}：name 带上了注释 {got['name']!r}"
+        assert got["name"] == "cielo", f"{why}：name 带上了注释 {got['name']!r}"
         assert got["existing_keys"] == ["sk-a", "sk-b"], (
             f"{why}：api-key 带上了注释 {got['existing_keys']}")
 

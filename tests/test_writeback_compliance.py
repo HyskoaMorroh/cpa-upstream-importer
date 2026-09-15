@@ -621,6 +621,145 @@ claude-api-key:
         with patch.object(wb.urllib.request, "urlopen", return_value=FakeResponse(b"[]")):
             self.assertFalse(wb._readback_check("https://unit.example", "fixture-mgmt", "[]")[0])
 
+    # ── 探测可用 → 清掉原条目的停用标记（用户 2026-09-16）──────────────
+    #
+    # 用户原话：「无论原来是否被关闭，如果探测可用就要打开」。
+    #
+    # 这一组必须走**完整写回**（`_prepare_source_plan` → `attach_carry` →
+    # render），不能只测 `_drop_disabling_lines`：实测踩到的两个 bug 都在
+    # 装配那一层，函数本身是对的。
+    #   ① `attach_carry` 用 `if sp.carry_lines:` 判断「补过了没」，而重开时
+    #      carry 被**故意清空** —— 判断认为没补，把 `excluded-models: ["*"]`
+    #      整份加了回来。现在用 `carry_attached` 区分「空」与「没补」。
+    #   ② PyYAML 写列表用块序列（序列项与父键**同级缩进**），按「缩进更深」
+    #      收集续行会让 `- '*'` 落单，写回后留下值为 null 的空
+    #      `excluded-models:` —— 没重开成功还多一处 diff。
+
+    def test_reenable_clears_excluded_models_and_keeps_other_fields(self):
+        raw = """claude-api-key:
+  - api-key: "unit-key"
+    base-url: "https://unit.example/A"
+    prefix: "KEEP"
+    priority: 10
+    excluded-models: ["*"]
+    headers:
+      x-keep: "yes"
+"""
+        sp = plan(key="unit-key", base="https://unit.example/A",
+                  prefix="KEEP", reenable_fields=["excluded-models"])
+        row = rebuild(raw, sp)["claude-api-key"][0]
+        self.assertNotIn("excluded-models", row, row)
+        # 其余字段与值一个不能动 —— 清停用标记不是「重建条目」
+        self.assertEqual(row["prefix"], "KEEP")
+        self.assertEqual(row["headers"], {"x-keep": "yes"})
+
+    def test_reenable_keeps_operator_exclusions_other_than_star(self):
+        """只摘 `*`，操作员手工排除的模型名要留着。
+
+        `excluded-models: ["*", "gpt-4"]` 里 `*` 是停用、`gpt-4` 是「别调度
+        这个模型」—— 两个独立语义。整行删掉会把后者也弄丢。
+        """
+        raw = """claude-api-key:
+  - api-key: "unit-key"
+    base-url: "https://unit.example/A"
+    priority: 10
+    excluded-models: ["*", "gpt-4"]
+"""
+        sp = plan(key="unit-key", base="https://unit.example/A",
+                  reenable_fields=["excluded-models"])
+        row = rebuild(raw, sp)["claude-api-key"][0]
+        self.assertEqual(row["excluded-models"], ["gpt-4"], row)
+
+    def test_reenable_clears_block_sequence_excluded_models(self):
+        """块序列写法的 `excluded-models` 也要清干净 —— 而且必须是 PyYAML 那种缩进。
+
+        这条用例的 YAML 形态是**关键**，不能随手写成「序列项比父键更深」：
+        PyYAML 对列表写块序列时，**序列项与父键同级**：
+
+            excluded-models:
+            - '*'
+
+        而 `excluded-models` 不在 `_RENDERED_KEYS` 里，既有条目于是走 carry，
+        carry 正是 `_dump_fields`（PyYAML）生成的 —— 所以这是**真实路径的
+        常态形态**。按「缩进必须更深」收集续行会让 `- '*'` 落单，写回后留下
+        一个值为 null 的空 `excluded-models:`：既没重开成功，还凭空多一处 diff。
+
+        验证方法：把收集续行的判据改回「缩进 <= 条目级即停」，只有这条用例
+        会红 —— 手写深缩进那种形态两条路都对，抓不住这个 bug（实测）。
+        """
+        raw = """claude-api-key:
+  - api-key: "unit-key"
+    base-url: "https://unit.example/A"
+    priority: 10
+    excluded-models:
+    - '*'
+"""
+        sp = plan(key="unit-key", base="https://unit.example/A",
+                  reenable_fields=["excluded-models"])
+        row = rebuild(raw, sp)["claude-api-key"][0]
+        self.assertNotIn("excluded-models", row, row)
+
+    def test_reenable_block_sequence_keeps_operator_exclusions(self):
+        raw = """claude-api-key:
+  - api-key: "unit-key"
+    base-url: "https://unit.example/A"
+    priority: 10
+    excluded-models:
+    - '*'
+    - gpt-4
+"""
+        sp = plan(key="unit-key", base="https://unit.example/A",
+                  reenable_fields=["excluded-models"])
+        row = rebuild(raw, sp)["claude-api-key"][0]
+        self.assertEqual(row["excluded-models"], ["gpt-4"], row)
+
+    def test_reenable_compat_clears_boolean_disabled(self):
+        raw = """openai-compatibility:
+  - name: "keep-me"
+    base-url: "https://unit.example/C"
+    disabled: true
+    api-key-entries:
+      - api-key: "unit-key"
+"""
+        sp = plan("openai-compatibility", key="unit-key",
+                  base="https://unit.example/C", reenable_fields=["disabled"])
+        row = rebuild(raw, sp)["openai-compatibility"][0]
+        self.assertNotIn("disabled", row, row)
+        self.assertEqual(row["name"], "keep-me", row)
+
+    def test_no_reenable_when_probe_failed(self):
+        """没探通就**不能**打开 —— 否则会把一个仍然不可用的站塞回调度池。"""
+        raw = """claude-api-key:
+  - api-key: "unit-key"
+    base-url: "https://unit.example/A"
+    priority: 10
+    excluded-models: ["*"]
+"""
+        sp = plan(key="unit-key", base="https://unit.example/A",
+                  reenable_fields=[])
+        row = rebuild(raw, sp)["claude-api-key"][0]
+        self.assertEqual(row["excluded-models"], ["*"], row)
+
+    def test_reenable_does_not_touch_unrelated_entries(self):
+        """清停用标记只作用于被重开的那一条，同段别的条目逐字保留。"""
+        raw = """claude-api-key:
+  - api-key: "unit-key"
+    base-url: "https://unit.example/A"
+    priority: 10
+    excluded-models: ["*"]
+  - api-key: "other-key"
+    base-url: "https://other.example/A"
+    priority: 20
+    excluded-models: ["*"]
+"""
+        sp = plan(key="unit-key", base="https://unit.example/A",
+                  reenable_fields=["excluded-models"])
+        rows = rebuild(raw, sp)["claude-api-key"]
+        mine = next(r for r in rows if r["api-key"] == "unit-key")
+        other = next(r for r in rows if r["api-key"] == "other-key")
+        self.assertNotIn("excluded-models", mine, mine)
+        self.assertEqual(other["excluded-models"], ["*"], other)
+
 
 if __name__ == "__main__":
     unittest.main()

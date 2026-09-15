@@ -52,9 +52,9 @@ if empty_segments:
     for url in empty_segments[:10]:
         print(f"  - {url}")
 
-# 5. 查找 zzzcoding 相关的所有信息
-print("\n\n=== api.zzzcoding.org Detail ===")
-zzz_lines = [line for line in decoded.split('\n') if 'zzzcoding' in line.lower()]
+# 5. 查找 zulu 相关的所有信息
+print("\n\n=== zulu.example Detail ===")
+zzz_lines = [line for line in decoded.split('\n') if 'zulu' in line.lower()]
 for line in zzz_lines[:20]:
     # 解码并清理
     clean = re.sub(r'<[^>]+>', ' ', line)

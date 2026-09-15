@@ -138,7 +138,7 @@ grep -rn "待定" . --include="*.py"
 ## Hypothesis Ranking
 
 **Most Likely (80%)**: Detection results show v.models=[] for many stations
-- TLS fingerprinting blocks (like api.zzzcoding.org)
+- TLS fingerprinting blocks (like zulu.example)
 - 403/401/503 errors prevent model discovery
 - Timeout before any model detected
 - topup_to_market_top somehow returning empty (despite tests showing it works)

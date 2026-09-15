@@ -339,7 +339,7 @@ def existing_weights(cfg: dict) -> dict[tuple[str, str, str], int]:
     为什么键里必须有段（2026-09-03 对账发现，与 existing_proxies 同一个成因）
     ------------------------------------------------------------------
     原来按 (host, api_key) 索引、跨段共用一个值。实测生产 config.yaml：
-    facai 的 3 把 Key 在 codex 与 claude 段是 `weight: 0`（那两条路径实测
+    foxtrot 的 3 把 Key 在 codex 与 claude 段是 `weight: 0`（那两条路径实测
     静默换模，已封），在 compat 段**故意没写**（那条路径可用）；xray 的
     3 把 Key 同样只在 claude 段封。按两元组搬运会把 0 灌进 compat 段 ——
     6 个 (凭据, 段) 组合被无声封禁。
@@ -559,7 +559,7 @@ def existing_provider_names(cfg: dict) -> dict[str, str]:
     三处都按它索引。
 
     实测生产配置里 12/13 个 provider 的 name 是人读短名（`romeo`、
-    `chma`、`facai`），与 host 不同。用 host 现编会把它们全部改名：冷却状态
+    `cielo`、`foxtrot`），与 host 不同。用 host 现编会把它们全部改名：冷却状态
     与能力缓存作废，而且本项目自己的 `name_alias_map`（注释里的短名 → 域名）
     也跟着失效 —— 下一轮读注释拿健康度就大面积漏判。
 

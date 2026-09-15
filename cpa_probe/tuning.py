@@ -50,7 +50,7 @@ DEFAULT_EDGE_WINDOW_SEC = 120.0
 # 留给「一个慢站」的余量。窗口不是给重试独占的：任何一次尝试都可能是那个
 # 首字节特别慢的上游，而它的耗时不在「平均每次」里。
 #
-# 依据：config.yaml 原注释记的实测「facai 首字节 18-33 秒、123nhh 约 19.3 秒」，
+# 依据：config.yaml 原注释记的实测「foxtrot 首字节 18-33 秒、nova 约 19.3 秒」，
 # 取 30 秒覆盖到那批里最慢的。
 DEFAULT_SLOW_SITE_MARGIN_SEC = 30.0
 

@@ -67,6 +67,9 @@ _LR = "run" + "anytime"; _LG = "agent" + "router"; _LH = "hyb" + "gzs"
 _LK = "kk" + "token";    _LT = "tabi" + "token";   _LGO = "go" + "router"
 _LJ = "just" + "woker";  _LN = "123" + "nhh";      _LX = "100x" + "labs"
 _LC = "chiang" + "ma";   _LO = "oai" + "pro";      _LF = "fate" + "newapi"
+_LFC = "fa" + "cai"     # foxtrot 的裸标签，注释里当简称用
+_LCX = "ch" + "ma"      # cielo 的另一种裸简称（batch.py:562 用过）
+_LM  = "mu" + "yuan"    # mike 的裸标签
 
 DOMAIN_MAP: list[tuple[str, str]] = [
     # 自有基础设施（子域必须排在主域之前）
@@ -115,7 +118,8 @@ LABEL_MAP: list[tuple[str, str]] = [
     (_LZ, "zulu"), (_LA, "alfa"), (_LP, "papa"), (_LR, "romeo"),
     (_LG, "golf"), (_LH, "hotel"), (_LK, "kilo"), (_LT, "tango"),
     (_LGO, "gorou"), (_LJ, "juliet"), (_LN, "nova"), (_LX, "xray"),
-    (_LC, "cielo"), (_LO, "oscar"), (_LF, "fate"),
+    (_LC, "cielo"), (_LO, "oscar"), (_LF, "fate"), (_LFC, "foxtrot"),
+    (_LCX, "cielo"), (_LM, "mike"),
 ]
 
 SKIP_DIRS = {".git", "graphify-out", "__pycache__", "node_modules", ".venv"}

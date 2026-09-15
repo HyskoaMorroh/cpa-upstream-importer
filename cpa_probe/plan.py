@@ -185,6 +185,75 @@ def extract_existing_entries(cfg: dict) -> list[tuple[str, str, str, dict]]:
     return entries
 
 
+# 运行期健康分在最终得分里的权重（用户 2026-09-11 给的公式：
+# 「健康分数 = 可调度比例×60% + 活跃比例×40%」，那个 60/40 是**健康分内部**
+# 的两项权重，见 runtime_health.calculate_health_score）。
+#
+# 这里是**另一层**权重：最终档位 ∈ [1,100]。运行期证据（CPA 自己记的成功/
+# 失败计数）比一次探测的结论强得多 —— 它来自真实流量的累积。所以给它 60，
+# 检测分 40。两者都拿不到时退回纯检测分，不产生「无依据的中间值」。
+_RUNTIME_HEALTH_WEIGHT = 0.6
+
+
+def _blended_score(static_best: int, health: float | None) -> int:
+    """档位用的最终得分：检测分与运行期健康分融合，取整到 [1,100]。
+
+    为什么要有这一层（2026-09-15）
+    ----------------------------
+    上一版把 `domain_health` **只**用在 `_sort_key` 的排序上，而喂给
+    `suggest_priority` 的仍是 `max(x.score for x in sps)` —— 纯检测分。
+    于是「按 CPA 实际运行状态分配优先级」这句注释与实际行为不符：健康分
+    只能改变站与站之间的先后，改不动任何站的档位。探测一次成功的新站与
+    CPA 记着 3000 次成功的老站，只要检测分相同就拿到同一个档位上限。
+
+    `health=None`（该域名没有运行期数据）时返回纯检测分 —— 与传入前完全
+    一致，不影响任何拿不到运行数据的部署。
+    """
+    if health is None:
+        return max(int(static_best), 1)
+    # health 是 [0,1] 的浮点，先放大到 0-100 再按权重融合。
+    blended = (_RUNTIME_HEALTH_WEIGHT * float(health) * 100.0
+               + (1.0 - _RUNTIME_HEALTH_WEIGHT) * float(static_best))
+    return max(int(round(blended)), 1)
+
+
+def _cpa_base_url(cfg: dict) -> str:
+    """CPA 管理接口在哪。先看部署环境给的地址，再看 config.yaml 的 port。
+
+    2026-09-15 修：原来只有 `f"http://localhost:{cfg['port']}"` 一条路
+    ---------------------------------------------------------------
+    importer 是**独立容器**（部署版 docker-compose.yml:536-635），它容器内的
+    `localhost` 是它自己，不是 `cli-proxy-api`。而 compose 已经把正确的容器内
+    地址通过 `CPA_UPSTREAM_URL: "http://cli-proxy-api:8317"` 注入了环境变量
+    （同一段 compose 里就有），本函数原来根本没读它。后果：
+    `fetch_cpa_runtime_health()` 每次连接被拒 → 返回 None → `domain_health`
+    恒为空 → 每个站都退回 `max(x.score for x in sps)` 的静态检测分。
+    也就是说「按 CPA 实际运行状态分配优先级」这个特性**在生产里从未拿到过
+    一次数据**，日志里只有一行 `info: 运行时数据不可用`。
+
+    为什么用环境变量而不是写死服务名：服务名是部署拓扑的一部分，会随
+    compose 改（本项目自己的 compose 叫 `mihomo-proxy`、部署版叫 `mihomo`；
+    CPA 同理）。硬编码任何一个都会在下一次改名时静默失效 —— 而静默失效
+    正是这个 bug 藏了这么久的原因（用户第 5 条：严禁硬编码）。
+
+    顺序说明：
+      1. `CPA_UPSTREAM_URL` —— 部署方显式给的，最可信
+      2. `http://127.0.0.1:{cfg['port']}` —— 单机/本地跑、CPA 同机时成立
+      3. 空串 —— 让 `fetch_cpa_runtime_health` 自己跳过（它会打 debug 返回
+         None），调用方照常回退静态分，不会崩
+    """
+    env = (os.environ.get("CPA_UPSTREAM_URL") or "").strip()
+    if env:
+        return env.rstrip("/")
+    try:
+        port = int(cfg.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if port:
+        return f"http://127.0.0.1:{port}"
+    return ""
+
+
 def _proxy_url_for_config() -> str:
     """Only use an explicit runtime choice; never guess deployment addresses."""
     cands = [u.strip() for u in os.environ.get("PROBE_PROXY", "").split(",")
@@ -197,6 +266,37 @@ def _source_url(url: str) -> str:
     """Normalize authority only; paths and credentials remain separate evidence."""
     p = urlsplit(url.strip().rstrip("/"))
     return urlunsplit((p.scheme.lower(), p.netloc.lower(), p.path, p.query, p.fragment))
+
+
+def reenable_targets(section: str, entry: dict) -> list[str]:
+    """探测判定可用时，这个条目里**该清掉的停用字段**名列表。没有则空。
+
+    用户 2026-09-16：「无论原来是否被关闭，如果探测可用就要打开」。
+
+    两种停用形态与 `entry_out_of_pool` 一一对应，清法不同：
+
+      · compat 段 `disabled: true` —— 清这个布尔字段本身。
+        `internal/watcher/synthesizer/config.go:288-290` 遇 Disabled 直接
+        continue，那条 provider 连 Auth 都不合成。
+      · 任意段 `excluded-models: ["*"]` —— 清这个通配符项。
+        `service_models.go:541-574` 的 applyExcludedModels 拿空清单就
+        UnregisterClient。
+
+    只报**字段名**，具体删除动作交给 writeback（它拿得到原文行，能在保留
+    注释的前提下精确删行）。这里判定的依据是 YAML 解析后的值 —— 与原条目
+    的注释形态无关。
+
+    不收 `weight: 0`：那是权重不是停用开关。它在 weighted-round-robin 下
+    同样把凭据逐出调度池，但它是操作员的**定量表达**（「这个站先用一点」），
+    改成 1 属于替用户改语义，超出「重新打开」的范围。
+    """
+    out: list[str] = []
+    if section == "openai-compatibility" and entry.get("disabled") is True:
+        out.append("disabled")
+    ex = entry.get("excluded-models")
+    if isinstance(ex, list) and any(str(x).strip() == "*" for x in ex):
+        out.append("excluded-models")
+    return out
 
 
 def _cooling_override(v) -> bool | None:
@@ -1676,6 +1776,27 @@ class SectionPlan:
     # 原条目里这两个开关的值，{字段名: 值}。只收显式写了 true 的
     # （CPA 的零值即关闭，写 false 与不写等价，所以不必区分）。
     prior_toggles: dict[str, bool] = field(default_factory=dict)
+    # 原条目曾被停用（`disabled: true` 或 `excluded-models: ["*"]`），
+    # 而本轮探测判定可用 —— 这两行要在写回时清掉，把这个站放回调度池。
+    #
+    # 用户 2026-09-16 的要求（原话）：「无论原来是否被关闭，如果探测可用就要打开」。
+    #
+    # 为什么是一个「动作」标志而不是直接在 carry 里删：carry_lines 按原文行
+    # 搬运，删掉与否得由写回那一层做（它才拿得到原文行）。而这里判定「该不该
+    # 删」的时机最好 —— 只有 build_plan 同时知道「原条目停用过」与「本轮探通了」。
+    # 值是要清掉的字段名列表（compat 段是 ["disabled"]，其余段是
+    # ["excluded-models"]），空列表 = 不动。
+    #
+    # 判据不含 weight: 0：那是**权重**不是停用开关（weighted-round-robin 下
+    # 等效逐出调度池，但它是操作员的定量表达），改它属于改语义，不做。
+    reenable_fields: list[str] = field(default_factory=list)
+    # carry 行是否已经装配过。存在的唯一理由是**区分「空」与「没补」**
+    # （2026-09-16 实测踩到）：写回侧 `attach_carry` 原来用
+    # `if sp.carry_lines: return` 判断「已经补过了」，而重开停用条目时
+    # 我们**故意**把 carry 清成空 —— 那个判断随即认为「还没补」，
+    # 把原条目的 `excluded-models: ["*"]` 整份加了回来，重开静默失效。
+    # 三个判据（非空 / 已装配且故意为空 / 尚未装配）必须分开表达。
+    carry_attached: bool = False
     # 原条目里**每个模型自己**的 max-context-length，{模型名: 值}。
     #
     # 为什么要单独一份（2026-09-03 逐字段对账发现）：这个值在 `models:` 块里，
@@ -2075,7 +2196,7 @@ def build_plan(
         #      为什么必须放行（真实配置的反例）：romeo 的 compat 段
         #      **唯一端到端验证过的模型就是 grok-4.6**（配置注释：「整个 vip
         #      分组当前只有 grok-4.6 有渠道，已通过端到端验证的只有它」），
-        #      facai 段同样有 grok-4.6 + glm-5.2。按族挡掉手填，操作员就
+        #      foxtrot 段同样有 grok-4.6 + glm-5.2。按族挡掉手填，操作员就
         #      再也没有办法把这个**已知可用**的模型写回去 —— 那一段会从
         #      「有一个确认可用的模型」变成「只剩两个确认 503 的」。
         #
@@ -2424,7 +2545,7 @@ def build_plan(
             # 选择变成了：
             #   (a) 写工具猜的名字 —— 这个站**从没报过**它们，CPA 路由过去 404
             #   (b) 写站方自己报的名字 —— 未验证，但至少是这个站说它有的
-            # (b) 严格更好。实测 romeo 与 facai 的 compat 段目录里
+            # (b) 严格更好。实测 romeo 与 foxtrot 的 compat 段目录里
             # grok-4.6 就是这种处境（配置注释：那是唯一端到端验证过的模型）。
             #
             # 判据仍是 protocol_ok 而不是无条件收：前三段仍按族拒
@@ -2546,10 +2667,22 @@ def build_plan(
                 not model_catalog.family(m) for m in models)
             if not custom_only:
                 remote, _why = model_catalog.remote_names()
+                # `proven=v.models` = 本轮实测出 200 且被 `_accept` 收下的名字。
+                # 它是 topup 的第二证据层：族内有更高主版本时，实测通过过的
+                # 那一代**不**被淘汰（用户 2026-09-16：「检测 gpt-6 系列明显
+                # 不通，这个时候 gpt-6 系列按模型目录最高级别保留同时保留实测
+                # 最高的 gpt-5.6 系列」）。不传就等于退回「目录说更高就换代」，
+                # 会把唯一验过的模型删掉。
                 models, added, fill_src = model_catalog.topup_to_market_top(
-                    section, models, cfg=cfg, remote=remote)
+                    section, models, cfg=cfg, remote=remote,
+                    proven=list(v.models))
                 if added:
                     model_src = fill_src
+                # 归并淘汰了站方报过的低代名字时，把理由挂进该段警告 ——
+                # 「少了 gpt-5.6」这种事必须能追到原因，不能悄悄消失。
+                _note = model_catalog.take_merge_note(section)
+                if _note:
+                    model_warns.append(_note)
 
             # P0 修复：空模型强制回退（2026-09-12）
             # -----------------------------------------------
@@ -2688,12 +2821,34 @@ def build_plan(
         except Exception:
             scoped_rules = []
 
+        # 原条目被停用、而本轮**探测判定可用** —— 要把它放回调度池
+        # （用户 2026-09-16：「无论原来是否被关闭，如果探测可用就要打开」）。
+        #
+        # 判据必须两半都成立：原条目确实带停用标记 **且** 本轮探通了。
+        # 只看前半句会把一个仍然不可用的站错误地打开；只看后半句则永远
+        # 触不到这个分支（没被停用过就没什么可清的）。
+        #
+        # 用 `v.usable` 而不是「清单非空」：`v.usable` 是「端点响应正常、
+        # 凭证有效」的实测结论，而清单可能为空（静默换模 / 200 包错误体）。
+        # 用户的口径是「探测可用」，那正是 v.usable 的定义。
+        reenable = []
+        if v.usable:
+            try:
+                from .writeback import _original_entry as _orig
+                _old = _orig(cfg, SectionPlan(section=section, base_url=base,
+                                              api_key=row.api_key))
+            except Exception:
+                _old = {}
+            if _old:
+                reenable = reenable_targets(section, _old)
+
         sp = SectionPlan(
             scoped_error_rules=scoped_rules,
             cloak_mode=cloak_mode,
             fingerprint_profile=fp_profile,
             rebuild_mid_system=getattr(v, "rebuild_mid_system", None),
             disable_cooling=_cooling_override(v),
+            reenable_fields=reenable,
             section=section,
             base_url=base,
             api_key=row.api_key,
@@ -3227,9 +3382,13 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
         # 尝试查询 CPA 运行时状态（默认端口 8317，从 config.yaml 读取）
         domain_health = {}
         if runtime_health_available:
-            cpa_base_url = None
-            if cfg.get("port"):
-                cpa_base_url = f"http://localhost:{cfg['port']}"
+            # 容器里必须用 CPA_UPSTREAM_URL（compose 已注入服务名）；
+            # 只有本地同机跑才退到 config 的 port。见 _cpa_base_url 的说明。
+            cpa_base_url = _cpa_base_url(cfg) or None
+            if not cpa_base_url:
+                logger.warning(
+                    f"段 {section}：未配置 CPA 地址（CPA_UPSTREAM_URL 为空且 "
+                    f"config 无 port），本轮按检测结果预测健康分")
 
             runtime_health = fetch_cpa_runtime_health(cpa_base_url)
 
@@ -3245,19 +3404,22 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
             else:
                 logger.info(f"段 {section}：CPA 运行时数据不可用，将基于检测结果预测健康分数")
 
-        # 构建排序键：每个站取其健康分数（运行时或预测）
+        # 每个站的**最终得分**只算一次，排序与定档共用同一个值。
+        #
+        # 2026-09-15：原来排序用融合后的值、定档用纯检测分，两者不一致 ——
+        # 一个站可能因为运行期健康分高而被排到前面，却拿着按低检测分算的
+        # 档位上限，于是「排在前面的站档位反而更低」，位次与档位自相矛盾。
+        def _final_score(host: str, sps: list) -> int:
+            static_best = max(x.score for x in sps)
+            health = domain_health.get(host) if domain_health else None
+            return _blended_score(static_best, health)
+
+        # 构建排序键：(实测依据档次, -最终得分, 主机名)
+        # evid 保持在第一顺位 —— 探测全灭的站不能仅因历史数据好看而抢顶层
+        # （用户 2026-08-30 定的，见 _EVID 的说明）。
         def _sort_key(kv):
             host, sps = kv
-            evid = _evid(sps)
-
-            # 优先使用运行时健康分数，否则用检测分数
-            if domain_health and host in domain_health:
-                health_score = domain_health[host]
-            else:
-                # 回退：取组内最高检测分数
-                health_score = max(x.score for x in sps)
-
-            return (evid, -health_score, host)
+            return (_evid(sps), -_final_score(host, sps), host)
 
         ranked = sorted(by_host.items(), key=_sort_key)
 
@@ -3276,7 +3438,9 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
                 for m in sp.models:
                     if m not in union:
                         union.append(m)
-            best = max(x.score for x in sps)
+            # 与 _sort_key 同一个值 —— 健康分在这里真正参与定档，
+            # 不再只影响先后顺序。
+            best = _final_score(host, sps)
             cap, _reason = suggest_priority(
                 band, best, models=union, probation=probation)
             caps.append((host, sps, max(int(cap), 1), best))

@@ -1880,7 +1880,7 @@ def test_field_names_are_not_mistaken_for_hosts():
                  "foxtrot.example", "golf.example", "gorou.example",
                  "kilo.example", "tango.example", "juliet.example"):
         truthy(f"真站名仍认 · {host}", _L(host))
-    for label in ("cielo", "alfa", "muyuan", "facai", "gorou",
+    for label in ("cielo", "alfa", "mike", "foxtrot", "gorou",
                   "kilo", "hotel", "nova"):
         truthy(f"站名标签仍认 · {label}", _L(label))
 

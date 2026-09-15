@@ -63,18 +63,62 @@ _GATE_REASON_CN = {
 # 每段的种子模型。/models 目录拿不到时兜底；拿到目录时用来定验证顺序。
 # 按段分开 —— claude 段问 gpt-5.6-sol 必然 404，那是 CPA 的段语义决定的。
 #
-# 2026-09-02 跟着新规则更新：
-#   · gemini 段去掉 flash（新规则只要 *-pro >= 2.5），换成 3.1-pro 与 2.5-pro
-#     —— 两个版本都探一下：3.1 是最新，但不少站还只开到 2.5
-#   · claude 段加 fable-5，codex 段加 gpt-5.6（用户指定清单里有）
-# 每段仍只放 2-3 个：这是**基线阶段**逐个打的清单，多一个就多一轮请求。
-# 完整的「市面最新清单」在 model_catalog.latest_models，那是写回时用的。
-SEED_MODELS: dict[str, list[str]] = {
-    "gemini-api-key": ["gemini-3.1-pro", "gemini-2.5-pro"],
-    "codex-api-key": ["gpt-5.6-sol", "gpt-5.6-terra"],
-    "claude-api-key": ["claude-opus-5", "claude-sonnet-5"],
-    "openai-compatibility": ["gpt-5.6-sol", "claude-opus-5", "gemini-3.1-pro"],
+# 2026-09-15：**不再是本文件写死的表**
+# ------------------------------------------------
+# 原来这里硬编码四行模型名，与 `model_catalog.FALLBACK_MODELS` 是同一批信息
+# 的第二份拷贝 —— 上游出一个新世代（如 gpt-6 系列），就得分头改两处，漏一处
+# 就出现「名录里是新款、探测用的是旧款」，于是拿站方根本没有的旧名去撞，
+# 撞回 404/503 再判站死。用户第 5 条明确禁止这种第二份事实源。
+#
+# 现在的定义：**段 → 该段该族在 `FALLBACK_MODELS` 里的头部几个**。
+# 单一事实来源在 model_catalog，那份清单本身已由「CPA 权威名录 + 本地
+# config.yaml + 内置兜底」三层维护（见 model_catalog.latest_models）。
+#
+# 每段取 2 个（compat 段取多族各 1 个，见 _SEED_FAMILIES）：这是**基线阶段**
+# 逐个打的清单，多一个就多一轮请求。完整的「市面最新清单」在
+# model_catalog.latest_models，那是写回时用的。
+#
+# `SEED_MODELS` 这个名字与用法保持不变 —— server.py:2622、tools/diag-identity.py
+# 与两处测试按它引用，改的是内容来源而不是接口。
+
+# 各段探测时该覆盖哪些族。顺序即优先级（每族取头部一个）。
+#
+# 为什么 compat 段要跨族：它走 `/chat/completions` 万能口，本身就转多族，
+# 只拿 gpt 一族去探会让 claude / gemini 专供的 compat 站被误判死路。
+_SEED_FAMILIES: dict[str, tuple[str, ...]] = {
+    "gemini-api-key": ("gemini",),
+    "codex-api-key": ("gpt",),
+    "claude-api-key": ("claude",),
+    "openai-compatibility": ("gpt", "claude", "gemini"),
 }
+
+
+def _seed_models() -> dict[str, list[str]]:
+    """按 `_SEED_FAMILIES` 从兜底名录里取每段的探测种子。
+
+    `FALLBACK_MODELS` 已经按「每族头部型号」排好序（`gpt-5.6-sol` 在
+    `gpt-5.6` 之前），所以取该族第一个就是「这个段最想验的那个」。
+
+    兜底清单本身为空时（改坏了、或 import 顺序异常）回退到最保守的一条：
+    返回空列表而不是抛异常 —— 探测路径不该因为种子表有问题就整轮失败，
+    `_probe_order` 对空种子是安全的（目录里的模型照常排，见 :1651）。
+    """
+    out: dict[str, list[str]] = {}
+    for section, fams in _SEED_FAMILIES.items():
+        names = model_catalog.FALLBACK_MODELS.get(section, ())
+        per_section: list[str] = []
+        for fam in fams:
+            for n in names:
+                if model_catalog.family(n) == fam:
+                    per_section.append(n)
+                    break
+        # 族一个都没匹配上时整段退回兜底清单的头两个 —— 宁可探两个旧款，
+        # 也不要留空种子（空种子让「目录端点也关了」的站完全无从下手）。
+        out[section] = per_section or list(names)[:2]
+    return out
+
+
+SEED_MODELS: dict[str, list[str]] = _seed_models()
 
 # 保留的模型族。2026-08-29 定 gemini/gpt/claude 三类，2026-09-02 加 kimi
 # （用户把它列进 compat 段的允许清单）。仍然有意排除 deepseek / grok /

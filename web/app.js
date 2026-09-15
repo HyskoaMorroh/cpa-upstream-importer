@@ -1691,7 +1691,7 @@ function siteCard(r) {
       // 但「一个四族的都没有」时退一步收下站方自己报的（2026-09-03，与后端
       // build_plan 的 catalog 分支同一条规则）：那时另一个选项是只显示手填框，
       // 而后端会写工具猜的名字 —— 这个站从没报过它们。实测 romeo 与
-      // facai 的 compat 段就是这种处境（目录里只有 grok-4.6 / glm-5.2，
+      // foxtrot 的 compat 段就是这种处境（目录里只有 grok-4.6 / glm-5.2，
       // 而 grok-4.6 是那个站唯一端到端验证过的模型）。
       //
       // 判据用 protoOk（协议层）而不是 famOk：前三段仍按族拒，只有 compat 段
@@ -2262,7 +2262,7 @@ function applyPickPreset(mode) {
   //
   // 2026-09-13：这段原来限定 `mode === 'all'`，而首轮走的是 'rec' ——
   // 于是现场那 17 个「判定可用、目录也返回了模型、却一个都没勾」的段
-  // （api.facai.cloudns.org 的 codex/claude/compat）在界面上完全不可见。
+  // （foxtrot.example 的 codex/claude/compat）在界面上完全不可见。
   // 后端缺陷被藏起来，正是注释里说「如实报出来而不是静默少勾」要防的事。
   // 'none' 例外：那是用户主动全不选，报「差在哪」没有意义。
   //

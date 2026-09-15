@@ -22,34 +22,34 @@ Stations with usable segments: 1   (5%)
 
 ### Empty Segment Examples (19 out of 20 stations):
 
-1. **https://chiangma.com**
+1. **https://cielo.example**
    - Usable segments: `[]` ← EMPTY
    - Requests: 4
    - Errors: 403限频, 401鉴权, 503死路由, 404死路
 
-2. **https://fatenewapi.xxxxo.bond**
+2. **https://fate.example**
    - Usable segments: `[]` ← EMPTY
    - Requests: 8
    - Errors: 405临时, 403限频, 401鉴权, 503死路由, 404死路, 模型不匹配
 
-3. **https://api.wapq.cn**
+3. **https://wapq.example**
    - Usable segments: `[]` ← EMPTY
    - Requests: 30
    - Errors: 405临时, 403限频, 401鉴权, 503死路由
 
-4. **https://api.zzzcoding.org/v1**
+4. **https://zulu.example/v1**
    - Usable segments: `[]` ← EMPTY
    - Requests: 20
    - Errors: 405临时, 403限频, 401鉴权, 503死路由, 404死路
 
-5. **https://runanytime.hxi.me**
+5. **https://romeo.example**
    - Usable segments: `[]` ← EMPTY
    - Requests: 5-30
    - Errors: 401鉴权, 503死路由, 404死路
 
 ### Only 1 Working Station (out of 20):
 
-**https://anyrouter.top**
+**https://alfa.example**
 - Usable segments: `[codex]` ← HAS SEGMENTS
 - Requests: 28
 - Errors: Some 405/401/503/404 but still has usable codex segment
@@ -105,7 +105,7 @@ def model_lines(indent: str) -> list[str]:
 **1. 405 临时错误 (Temporary Error)**
 - Server returning 405 Method Not Allowed
 - Likely TLS fingerprinting or anti-bot detection
-- Similar to api.zzzcoding.org issue
+- Similar to zulu.example issue
 
 **2. 403 限频/边缘 (Rate Limiting / Edge Protection)**
 - Cloudflare or similar protection
@@ -265,7 +265,7 @@ def model_lines(indent: str) -> list[str]:
 3. ✅ Test with actual failed detection data
 4. ⏳ Run detection again and verify fallback triggers
 5. ⏳ Implement nginx TLS proxy solution
-6. ⏳ Solve api.zzzcoding.org 405 errors specifically
+6. ⏳ Solve zulu.example 405 errors specifically
 
 ---
 

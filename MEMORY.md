@@ -22,7 +22,7 @@
 
 - 177 个条目 → 79 个凭据（去重键 `(host, api_key)`）→ 14 个站
 - 快照里 78 张卡片 / 14 个站，**逐站数量完全对得上**：
-  gorou 15、tango 14、golf 7、romeo 7、muyuan 6、
+  gorou 15、tango 14、golf 7、romeo 7、mike 6、
   juliet 5、kilo 5、其余各 3
 - 唯一缺口：`cielo.example sk-Wxy…ic59`（只配在 gemini 段）——
   与「两份不同快照」一致，不是去重缺陷

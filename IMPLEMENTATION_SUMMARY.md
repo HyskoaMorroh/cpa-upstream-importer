@@ -31,7 +31,7 @@ Empty models fallback fixes compiled correctly
 
 ### 2. TLS Fingerprint Proxy Detection (P0) ✅
 
-**Problem**: api.zzzcoding.org returns 503 "Only Claude Code clients" due to TLS fingerprint mismatch
+**Problem**: zulu.example returns 503 "Only Claude Code clients" due to TLS fingerprint mismatch
 
 **Solution**: nginx TLS proxy + auto-inject proxy-url parameter
 
@@ -46,8 +46,8 @@ Empty models fallback fixes compiled correctly
 **Detection Logic**:
 ```python
 KNOWN_FINGERPRINT_SITES = [
-    "api.zzzcoding.org",
-    "zzzcoding.org",
+    "zulu.example",
+    "zulu.example",
 ]
 # Returns: (needs_proxy=True, proxy_url="http://localhost:8443")
 ```
@@ -63,9 +63,9 @@ if needs_proxy and proxy_url_override:
 **Test Results**:
 ```bash
 $ python3 -c "from cpa_probe.plan import _needs_tls_proxy; ..."
-NEEDS PROXY: https://api.zzzcoding.org/v1 -> http://localhost:8443
+NEEDS PROXY: https://zulu.example/v1 -> http://localhost:8443
 NO PROXY: https://example.com/v1 -> 
-NEEDS PROXY: https://zzzcoding.org -> http://localhost:8443
+NEEDS PROXY: https://zulu.example -> http://localhost:8443
 ```
 
 **Status**: Code compiled and tested, nginx config ready
@@ -131,8 +131,8 @@ for section in ['claude-api-key', 'codex-api-key', 'gemini-api-key']:
 print(f"\nResult: {empty} empty entries (should be 0)")
 EOF
 
-# Check api.zzzcoding.org has proxy-url
-grep -A 15 "api.zzzcoding.org" config.yaml | grep proxy-url
+# Check zulu.example has proxy-url
+grep -A 15 "zulu.example" config.yaml | grep proxy-url
 # Should show: proxy-url: http://localhost:8443
 ```
 
@@ -141,7 +141,7 @@ grep -A 15 "api.zzzcoding.org" config.yaml | grep proxy-url
 cd /c/Users/devin/OneDrive/Desktop/CLIProxyAPI-main
 ./cpa --config /path/to/generated/config.yaml
 
-# Make test request via api.zzzcoding.org
+# Make test request via zulu.example
 # Should succeed through proxy
 ```
 
@@ -333,7 +333,7 @@ _CATALOG_URLS = (
 3. ✅ Monitor logs for fallback/proxy triggers
 4. ✅ Verify config.yaml quality (no empty models, proxy-url injected)
 5. ⏳ Test with CPA
-6. ⏳ Verify api.zzzcoding.org works through proxy
+6. ⏳ Verify zulu.example works through proxy
 7. ⏳ Address detection failure rate (rate limiting, retries)
 8. ⏳ Implement frontend batch management UI
 

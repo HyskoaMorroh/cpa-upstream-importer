@@ -20,9 +20,9 @@
   OK: openai-compatibility: 4 models
 
 [3/5] Testing TLS proxy detection...
-  OK: https://api.zzzcoding.org/v1: PROXY
+  OK: https://zulu.example/v1: PROXY
   OK: https://example.com/v1: DIRECT
-  OK: https://zzzcoding.org: PROXY
+  OK: https://zulu.example: PROXY
 
 [4/5] Checking nginx config...
   OK: nginx config exists and valid
@@ -60,7 +60,7 @@
 
 ### Fix 2: TLS Fingerprint Proxy
 
-**Problem**: api.zzzcoding.org returns 503 "Only Claude Code clients"
+**Problem**: zulu.example returns 503 "Only Claude Code clients"
 
 **Root Cause**: Go http.Client TLS fingerprint ≠ Electron/Chrome fingerprint
 
@@ -73,7 +73,7 @@
 - `cpa_probe/plan.py` lines 2532-2545 (injection logic)
 - `cpa_probe/plan.py` end of file (_needs_tls_proxy helper)
 
-**Result**: api.zzzcoding.org auto-detected, proxy-url injected automatically
+**Result**: zulu.example auto-detected, proxy-url injected automatically
 
 ---
 
@@ -131,7 +131,7 @@ grep -E "模型为空|应急回退|硬编码回退" server.log
 grep "TLS 指纹" server.log
 
 # Expected logs:
-# INFO: 段 codex-api-key 基址 https://api.zzzcoding.org 检测到 TLS 指纹要求，注入 proxy-url: http://localhost:8443
+# INFO: 段 codex-api-key 基址 https://zulu.example 检测到 TLS 指纹要求，注入 proxy-url: http://localhost:8443
 ```
 
 ---
@@ -162,7 +162,7 @@ EOF
 
 **Check proxy-url Injection**:
 ```bash
-grep -A 15 "api.zzzcoding.org" config.yaml | grep proxy-url
+grep -A 15 "zulu.example" config.yaml | grep proxy-url
 # Should show: proxy-url: http://localhost:8443
 ```
 
@@ -181,7 +181,7 @@ cd /c/Users/devin/OneDrive/Desktop/CLIProxyAPI-main
 ./cpa --config /path/to/generated/config.yaml
 ```
 
-**Test Request via zzzcoding.org**:
+**Test Request via zulu.example**:
 ```bash
 # Should succeed through proxy
 curl http://localhost:8317/v1/chat/completions \
@@ -199,7 +199,7 @@ curl http://localhost:8317/v1/chat/completions \
 ### Before Fix (User Complaint):
 ```yaml
 codex-api-key:
-  - base-url: https://api.zzzcoding.org/v1
+  - base-url: https://zulu.example/v1
     api-key: sk-ant-xxx
     priority: 待定
     models: []  # EMPTY
@@ -209,7 +209,7 @@ codex-api-key:
 ### After Fix:
 ```yaml
 codex-api-key:
-  - base-url: https://api.zzzcoding.org/v1
+  - base-url: https://zulu.example/v1
     api-key: sk-ant-xxx
     priority: 80
     proxy-url: http://localhost:8443  # AUTO-INJECTED
@@ -282,7 +282,7 @@ codex-api-key:
 
 ### 2. nginx Must Run Alongside CPA
 
-**Requirement**: nginx proxy must be running for api.zzzcoding.org to work
+**Requirement**: nginx proxy must be running for zulu.example to work
 
 **User Action**: Start nginx before CPA
 ```bash
@@ -327,7 +327,7 @@ nginx.exe -c C:/Users/devin/OneDrive/Desktop/fsdownload/nginx-tls-proxy.conf
 - [x] Documentation complete
 - [ ] Full detection run completes
 - [ ] config.yaml has zero empty models
-- [ ] api.zzzcoding.org has proxy-url injected
+- [ ] zulu.example has proxy-url injected
 - [ ] CPA accepts generated config.yaml
 - [ ] Requests through proxy succeed
 
@@ -361,7 +361,7 @@ DEFAULT_PROXY_URL = "http://localhost:8444"
 tail -f C:\nginx\logs\tls-proxy-error.log
 
 # Test direct connection
-curl -v https://api.zzzcoding.org/v1/models
+curl -v https://zulu.example/v1/models
 ```
 
 ---

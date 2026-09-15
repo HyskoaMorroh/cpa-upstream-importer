@@ -80,7 +80,7 @@ ENDVERIFY
 
 **Test 2: Verify proxy-url Injection**:
 ```bash
-grep -B 2 -A 10 "api.zzzcoding.org" config.yaml | grep "proxy-url"
+grep -B 2 -A 10 "zulu.example" config.yaml | grep "proxy-url"
 ```
 
 **Expected**: `proxy-url: http://localhost:8443`
@@ -127,7 +127,7 @@ If no logs, fallback didn't trigger. Check detection succeeded first.
 ### Issue 3: proxy-url Not Injected
 
 ```bash
-python3 -c "from cpa_probe.plan import _needs_tls_proxy; print(_needs_tls_proxy('https://api.zzzcoding.org/v1', 'codex-api-key'))"
+python3 -c "from cpa_probe.plan import _needs_tls_proxy; print(_needs_tls_proxy('https://zulu.example/v1', 'codex-api-key'))"
 ```
 
 Expected: `(True, 'http://localhost:8443')`
@@ -139,7 +139,7 @@ Expected: `(True, 'http://localhost:8443')`
 - [ ] nginx proxy starts without errors
 - [ ] Detection completes without crashes
 - [ ] config.yaml has zero empty models
-- [ ] api.zzzcoding.org has proxy-url injected
+- [ ] zulu.example has proxy-url injected
 - [ ] All priority values are numeric
 - [ ] CPA loads config without errors
 - [ ] Requests through proxy return 200

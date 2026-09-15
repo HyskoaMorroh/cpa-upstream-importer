@@ -44,6 +44,19 @@ import re
 import time
 import urllib.request
 
+# ---------------- 归并留痕 ----------------
+
+# `topup_to_market_top` 淘汰同线低代时把原因记在这里（段名 → 说明），
+# plan.py 取走后写进该段的 `model_warns`，界面与日志都能看见「为什么少了
+# 某个站方报过的名字」。取值即消费（取走就清），避免下一次归并读到旧条目。
+_LAST_MERGE_NOTES: dict[str, str] = {}
+
+
+def take_merge_note(section: str) -> str:
+    """取走并清空该段最近一次归并留下的说明；没有就返回空串。"""
+    return _LAST_MERGE_NOTES.pop(section, "")
+
+
 # ---------------- 族判定 ----------------
 
 # OpenAI 的推理系列不叫 gpt-*。用正则而不是前缀元组：`o1`、`o3`、`o4-mini`
@@ -315,7 +328,7 @@ def section_protocol_ok(section: str, name: str) -> bool:
         CPA 对模型名零校验（buildOpenAICompatibilityConfigModels 照单注册，
         service_models.go:713-739）—— 能不能用只取决于上游认不认。
         实测 romeo 的 compat 段**唯一端到端验证过的就是 grok-4.6**，
-        facai 段有 grok-4.6 + glm-5.2。按族拒掉手填，操作员就再也没办法把
+        foxtrot 段有 grok-4.6 + glm-5.2。按族拒掉手填，操作员就再也没办法把
         这些已知可用的模型写回去。
       · 前三段仍按族拒：claude 段走 Anthropic 原生 `/v1/messages`
         （claude_executor_execute.go:23），gemini 段走 generateContent ——
@@ -967,7 +980,8 @@ def top_generation_per_line(names: list[str]) -> dict[str, tuple[int, int]]:
 
 def topup_to_market_top(section: str, models: list[str], *,
                         cfg: dict | None = None,
-                        remote: list[str] | None = None
+                        remote: list[str] | None = None,
+                        proven: list[str] | None = None
                         ) -> tuple[list[str], list[str], str]:
     """没检测出高级模型时，按该段该族的**市面最高级**填充并勾上。
 
@@ -999,7 +1013,103 @@ def topup_to_market_top(section: str, models: list[str], *,
 
     Returns:
         (合并后的清单, 新填进去的名字, 来源说明)
-        第二项只包含新加入的名字；第一项同时剔除已被淘汰的低代。
+        第二项只包含新加入的名字。
+
+    2026-09-15 修正：**只加不删**
+    ----------------------------
+    上一版在结尾调用 `newest_generation_per_line(have + latest)`，那是把站方
+    报过的名字和市面名录**放在一起重选**，于是市面名录里更高的世代会把站方
+    的名字整个淘汰掉。用 live 名录（79 条）复现：
+
+        站方实测报 gpt-5.6              → 写入 ['gpt-6-astra']   站方名字全丢
+        站方实测报 gpt-5.6-sol          → 写入 ['gpt-6-astra']   站方名字全丢
+        站方实测报 gpt-5.6 + gpt-5.6-sol → 写入 ['gpt-6-astra']   站方名字全丢
+
+    `gpt-6-astra` 这个站从没报过，CPA 路由过去大概率 404 —— 正是本模块
+    `:1015-1019` 自己写下的禁令。而站方报的那个名字是**探测拿回来的事实**，
+    可信度高于市面名录里的推测。
+
+    所以现在的规则是：
+
+      · 站方的每个名字**原样保留**，不因为市面有更高世代而删除
+        （！！已由下节 2026-09-16 收窄取代：同族更高主版本在场时旧代仍会删）
+      · 市面名录里**同一条产品线**（`_product_line`）且**世代不低于站方该线
+        上限**的名字追加进来 —— 既补同代变体（用户要的「不许漏勾」），
+        也补站方目录落后时的高代
+      · 站方报的名字已经在市面名录里时天然不会重复（`n in have` 挡掉）
+      · 加不进去任何东西时就原样返回，**绝不删改**
+
+    为什么不是「严格更高才加」：那会砍掉同代补齐。实测
+    `topup_to_market_top(O, ["gpt-6-a"], remote=["gpt-6-a".."gpt-6-f"])`
+    必须返回全部 6 个 —— 同代变体补齐正是用户第 4 条点名的诉求。
+
+    2026-09-16 收窄：「不拿名录顶掉名录不认识的名字」才是真规则
+    --------------------------------------------------------
+    上一版的「不删」是无条件的，于是把「同一产品线的旧世代」也留下了：
+    站方报 `gpt-5.5`、市面名录有 `gpt-6` / `gpt-6-sol` 时三个都留。
+    那与用户 docx 第 3⑵ 条「每种类型只能选择该类型对应的最高级别模型」
+    以及 `newest_generation_per_line` 的阶段 A/B 判据直接冲突 ——
+    plan.py 在调本函数之前刚用同一个函数淘汰过旧代，本函数又加回来，
+    等于自己拆自己的台。测试
+    `test_planning_compliance.test_failed_and_lower_probe_fill_highest`
+    断言的正是这件事（最早提交 924330f 就写了）：`gpt-6` 出现时
+    `gpt-5.5` 不留。
+
+    但 `:1004-1029` 那条要被保护的诉求仍然成立，只是此前**判据找错了**：
+    真正不该发生的是「用市面名录里的名字顶掉**名录不认识**的名字」
+    （`gpt-6-astra` 顶掉站方实测的 `gpt-5.6-sol` 是这种），
+    而不是「淘汰名录认识、但已被更高世代取代的旧代」（`gpt-5.5`）。
+
+    所以现在归并分两步走，判据**不看名录认不认识，只看世代**：
+
+      1. **淘汰**：站方名字里，版本可比且所属族的最高主版本已被更高的主版本
+         取代的，一概出局（`gpt-6` 在场 → `gpt-5.5`、`gpt-5.6`、`gpt-6-astra`
+         都走）。判据是 `generation_family` 的**主版本**，与
+         `newest_generation_per_line` 的阶段 A 同一口径 —— 这条与
+         「名录认不认识」无关：站方自己报过的旧代也是旧代。
+      2. **补齐**：站方报过的**产品线**上，市面最高世代的全部变体都算进来
+         （`gpt-6` 与 `gpt-6-sol` 一起），不看名录那一代是否比站方更高 ——
+         站方目录落后市面整整一代时也要补齐，不是只补同代。
+
+    判据从「名录认不认识」改成「世代」的代价与收益：
+      · 收益 —— `test_failed_and_lower_probe_fill_highest`（924330f 起就在）
+        与 `test_lower_generation_removal_warning_is_truthful` 断言的
+        `gpt-6` 出现时 `gpt-5.5` 不留，只有在名录也认识 `gpt-5.5` 时才成立；
+        改判据后不需要名录配合。
+      · 代价 —— 站方特供的**旧代**型号（`gpt-5.6-site-only`）会被淘汰。
+        这是有意的：用户 docx 第 3⑵ 条要求每类型只留最高级别，旧代留着
+        只会让 CPA 路由到站方可能已下线的型号。真正认不出世代的站方特供名
+        （`opus-5` 这类非 gpt/claude/gemini 命名）版本不可比，**一律保留**。
+
+    `have` 为空是 plan.py 的兜底路径（探测与目录都空）—— 此时没有站方事实
+    可守，市面最新就是唯一能填的东西，退回原来的全量行为。
+
+    2026-09-16 再收窄：**实测通过的世代不受「更高主版本」淘汰**
+    ------------------------------------------------------
+    用户原话：「gpt-5 和 gpt-5.6 理论上不可能保留，因为目前最新模型为
+    gpt-6 系列，但是**如果检测 gpt-6 系列明显不通，这个时候 gpt-6 系列按
+    模型目录最高级别保留同时保留实测最高的 gpt-5.6 系列**」。
+
+    阶段 A 原来的判据是「同族出现更高主版本 → 低主版本全丢」，它把这句话
+    的前半段实现了，后半段却做反了：站方**实测通** `gpt-5.6`、目录里躺着
+    没验过的 `gpt-6` 时，`gpt-5.6` 被删掉，清单里只剩一串从没打通过的
+    名字 —— CPA 每次轮到这个站都对着死模型发请求。
+
+    所以 `proven`（本轮实测出 200 且被 `_accept` 收下的名字，plan.py 传
+    `v.models`）作为**第二证据层**参与阶段 A：某族里凡是实测通过的名字，
+    其主版本一律豁免淘汰。判据仍然是「世代」而不是「名录认不认识」——
+    只是把「目录声称有」与「实测确实通」分开对待：
+
+        have={gpt-5.6} proven={gpt-5.6} 目录有 gpt-6  → gpt-6 与 gpt-5.6 都留
+        have={gpt-5.6} proven={}        目录有 gpt-6  → 只留 gpt-6（原行为）
+        have={gpt-6}   proven={gpt-6}   目录有 gpt-6  → 自然只剩 gpt-6
+
+    第二种是 `test_failed_and_lower_probe_fill_highest` 固化的口径（探测
+    什么都没探到、`have` 里只有历史遗留的低代），它**不受**这次改动影响：
+    `proven` 为空时豁免集合为空，阶段 A 逐字回到原判据。
+
+    完整世代之间的收敛（阶段 B 的产品线取最高代）不动 —— `proven` 只影响
+    「整代被更高主版本作废」这一条，不影响「同线取最高」。
     """
     latest, src = latest_models(section, cfg=cfg, remote=remote, limit=0)
     latest = [m for m in latest if section_allows(section, m)]
@@ -1007,29 +1117,182 @@ def topup_to_market_top(section: str, models: list[str], *,
         return list(models), [], ""
 
     have = [m for m in (models or []) if m]
-    # 只补**这个站已经报过的产品线**（2026-09-12）
-    # ------------------------------------------------
-    # 用户第 4 条点名的失误是「勾了 gpt-5.6 却没勾 gpt-5.6-sol」——
-    # 那两个是**同一条产品线**（`gpt`）的同代变体，补齐指的就是这件事。
+    if not have:
+        return list(latest), list(latest), src
+
+    # `latest` 已过 `latest_models` 内部两轮筛选（`newest_generation_per_line`
+    # → `rank_models`），同线只剩最高世代 —— 拿它判断「市面有没有同代变体」
+    # 会漏：站方报 `gpt-5.6` 时那条线已被收敛成 `gpt-6`，`>= (5,6)` 虽成立却
+    # 只补出 `gpt-6`，同代的 `gpt-5.6-sol` / `gpt-5.6-luna` 全看不见。
+    # 所以世代比较一律拿**原始名录** `remote`（plan.py 传的就是它），
+    # `latest` 退回「remote 缺席时的代用品」。
+    registry = [m for m in (remote or []) if m] or list(latest)
+    registry = [m for m in registry if section_allows(section, m)]
+    if not registry:
+        registry = list(latest)
+
+    # 判据与 latest_models 内部一致：gemini 只认 pro、降级档
+    # （mini/nano/lite）不参与、认不出版本的不参与。
+    def _cmp_gen(n: str) -> tuple[int, int] | None:
+        if family(n) == "gemini" and not gemini_pro_ok(n):
+            return None
+        if is_low_tier(n):
+            return None
+        return generation(series_and_version(n)[1])
+
+    def _tops(names: list[str]) -> dict[str, tuple[int, int]]:
+        out: dict[str, tuple[int, int]] = {}
+        for n in names:
+            g = _cmp_gen(n)
+            if g is None:
+                continue
+            line = _product_line(n)
+            if line not in out or g > out[line]:
+                out[line] = g
+        return out
+
+    # 市面对照池：`registry` ∪ `latest`。两条都要 —— `registry` 是原始名录
+    # （同代变体只在它这里有），`latest` 是 market 收敛后的「当前最新」，
+    # `remote` 缺席时它就是唯一依据。
+    market_pool = list(dict.fromkeys(list(registry) + list(latest)))
+    station_top = _tops(have)
+    market_top = _tops(market_pool)
+
+    # ── 阶段 A：族内比主版本（与 `newest_generation_per_line` 同口径）──
+    # 「站方报 `gpt-5.6`、市面已是 `gpt-6`」时该整代换代，这是 docx 3⑵ 的
+    # 明文要求，也是 `test_failed_and_lower_probe_fill_highest` 固化的口径。
+    # 站方与市面一起比：任一方出现更高主版本，整族的低主版本全出局。
+    top_major: dict[str, int] = {}
+    for n in list(have) + market_pool:
+        g = _cmp_gen(n)
+        if g is None:
+            continue
+        fam = generation_family(n)
+        if fam not in top_major or g[0] > top_major[fam]:
+            top_major[fam] = g[0]
+
+    # ── 实测豁免：本族**实测通过**的最高世代不作废 ──
+    # 见 docstring「2026-09-16 再收窄」。`proven` 是本轮真正打通的名字；
+    # 目录声称、原配置遗留、市面补齐都不算 —— 那正是「检测 gpt-6 明显不通
+    # 时仍要保住 gpt-5.6」这句话能被实现的前提。
     #
-    # 判据一度放宽到「同族」，那太松：claude 族里 opus / sonnet / fable /
-    # haiku 是四条独立产品线，一个只报了 claude-opus-5 的站会被补进
-    # claude-sonnet-5、claude-fable-5-1 甚至 claude-haiku-4-5 ——
-    # 后者还是更低世代。那些名字这个站从没报过，CPA 路由过去大概率 404，
-    # 与本模块反复记录的「别写站方没报过的名字」是同一个坑。
-    # 用户的原话也是「各自**检测出来的**最高级模型」。
+    # 判据必须是**完整世代**而不是主版本：按主版本放行会把 `gpt-5` 也一起
+    # 搭救（它与 `gpt-5.6` 同主版本），而用户的口径是「gpt-5 和 gpt-5.6
+    # 理论上不可能保留」—— 要留的只有实测过的那一代本身。
+    _proven_gen: dict[str, tuple[int, int]] = {}
+    for n in (proven or []):
+        g = _cmp_gen(n)
+        if g is None:
+            continue
+        fam = generation_family(n)
+        if fam not in _proven_gen or g > _proven_gen[fam]:
+            _proven_gen[fam] = g
+
+    def _stale_major(n: str) -> bool:
+        """该名字所属族的主版本是否已被更高主版本取代。
+
+        实测通过的那一代（`_proven_gen`）不作废：CPA 路由到一个实测通的模型
+        是**确定的收益**，而丢掉它换一个没验过的名额是确定的损失。作废只针对
+        「从没打通、且已被更高主版本取代」的名字。
+        """
+        g = _cmp_gen(n)
+        if g is None:
+            return False
+        fam = generation_family(n)
+        top = top_major.get(fam)
+        if top is None or g[0] >= top:
+            return False
+        kept = _proven_gen.get(fam)
+        if kept is not None and (g[0], g[1]) == kept:
+            return False
+        return True
+
+    # ── 阶段 B：产品线内比完整世代 ──
+    # 站方**报过**（实测事实）的名字各线到过的最高世代；市面在这条线上
+    # **严格更高**时按市面换代，否则以站方为准。站方没报过的线不进
+    # `lines` —— 不替站方发明它没卖过的产品线（`:1015-1019` 的禁令）。
     #
-    # `have` 为空时不设限：那是 plan.py 的兜底路径（探测与目录都空），
-    # 此时「当前市面最新」本来就是唯一可填的东西。
-    if have:
-        seen_lines = {_product_line(m) for m in have}
-        latest = [m for m in latest if _product_line(m) in seen_lines]
-        if not latest:
-            return list(models), [], ""
-    # Include every known same-generation peer, and remove superseded names.
-    merged = newest_generation_per_line(have + latest)
-    add = [m for m in merged if m not in have]
-    return merged, add, src if add else ""
+    # 这里必须是「严格更高」而不是 `max()`：两者在「站方报的就是最高代、
+    # 只是缺同代变体」（站方报 `gpt-6`、名录有 `gpt-6` 与 `gpt-6-sol`）
+    # 时给出同一个值，但语义不同 —— 我们要的是「市面能提供站方那一代
+    # 的同代兄弟就补上，不能因为市面有更高代就把站方整代删掉」（后者的
+    # 处理在阶段 A，只按主版本、只删被取代的族）。
+    lines: dict[str, tuple[int, int]] = {}
+    for line, g in station_top.items():
+        mkt = market_top.get(line)
+        lines[line] = mkt if (mkt is not None and mkt > g) else g
+
+    # 站方报过的名字，只要所属族的主版本已被更高主版本取代就丢
+    # （`gpt-6` 出现 → `gpt-5.5` / `gpt-5.6` / `gpt-6-astra` 全走）。
+    # 判据是**世代本身**，与名录无关：站方自己报了 `gpt-6` 还留着 `gpt-5.5`
+    # 一样是旧代，这正是 `test_failed_and_lower_probe_fill_highest` 与
+    # `test_lower_generation_removal_warning_is_truthful` 固化的口径。
+    #
+    # 版本认得出才淘汰：`_cmp_gen` 返回 `None`（gemini 非 pro、mini/nano/lite
+    # 降级档、非 gpt/claude/gemini 命名的站方特供名）一律保留 —— 对它们
+    # 工具没有任何世代依据，删了才是真丢东西。
+    drop = [n for n in have if _stale_major(n)]
+    kept = [n for n in have if not _stale_major(n)]
+
+    # 最终清单拼接顺序：站方保留的（实测事实）→ 市面补齐的。
+    # 先站方后市面，让 diff 一眼看出哪些名字来自实测、哪些是补齐的。
+    merged: list[str] = []
+    seen: set[str] = set()
+
+    def push(n: str) -> None:
+        if n and n not in seen:
+            seen.add(n)
+            merged.append(n)
+
+    def _proven_ok(n: str) -> bool:
+        """这一代被实测豁免放行了吗（族内实测最高世代）。"""
+        g = _cmp_gen(n)
+        if g is None:
+            return False
+        kept = _proven_gen.get(generation_family(n))
+        return kept is not None and g == kept
+
+    for n in kept:
+        push(n)
+
+    added: list[str] = []
+    for n in market_pool:
+        if n in seen:
+            continue
+        g = _cmp_gen(n)
+        if g is None:
+            continue
+        line = _product_line(n)
+        top = lines.get(line)
+        # 实测豁免放行的那一代，市面上的**同代变体**也要一起补进来
+        # （用户要求「所有相同等级系列的模型全部都要勾选上」）——
+        # 只认 `lines[line] == g` 会把 `gpt-5.6-sol` 挡在门外，因为
+        # `lines` 记的是目录顶代（gpt-6）。
+        if top is None or (g != top and not _proven_ok(n)):
+            continue
+        # 站方这一线整代作废时（阶段 A 判的），市面那一代的变体也要一起
+        # 筛掉 —— 否则 `gpt-5.6` 被淘汰、`gpt-5.6-sol` 又被补回来。
+        if _stale_major(n):
+            continue
+        added.append(n)
+        push(n)
+    # 只有站方没报过的才算「补齐」。站方已报的名字留在 `kept` 里，不是补齐。
+    added = [n for n in added if n not in have]
+
+    if not added and not drop:
+        # 站方清单已是市面最新：原样返回，**不做任何删改**。
+        return list(models or []), [], ""
+
+    # 淘汰了什么要说得出来：名字进了 `drop` 时把理由挂到 `_LAST_MERGE_NOTES`，
+    # plan.py 取走后写进该段的 model_warns，界面上能看见（「少了 gpt-5.6」
+    # 这种事必须能追到原因，不能悄悄消失）。
+    # 本模块刻意不引 logging —— 它是纯选型库，只依赖标准库与 urllib。
+    if drop:
+        _LAST_MERGE_NOTES[section] = (
+            f"按市面更高主版本淘汰同族低代：{'、'.join(drop[:6])}"
+            + ("…" if len(drop) > 6 else ""))
+
+    return merged, added, src
 
 
 def latest_models(section: str, *, cfg: dict | None = None,

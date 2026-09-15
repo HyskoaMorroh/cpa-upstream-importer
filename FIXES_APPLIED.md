@@ -14,7 +14,7 @@
 **Detection Results**:
 - Total stations: 20
 - Empty segments: 19 (95%)
-- Usable segments: 1 (5% - only https://anyrouter.top with codex)
+- Usable segments: 1 (5% - only https://alfa.example with codex)
 
 ---
 
@@ -279,7 +279,7 @@ echo "Complete failures: $(grep -c 'All fallbacks failed' server.log)"
 
 ### P0 (Critical - Still Blocking):
 
-1. **TLS Fingerprinting (api.zzzcoding.org)**
+1. **TLS Fingerprinting (zulu.example)**
    - Status: Root cause identified, solution designed
    - Next: Implement nginx TLS proxy + auto-inject proxy-url
    - File: Design documented in Word requirement #1
