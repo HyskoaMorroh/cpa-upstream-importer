@@ -1040,12 +1040,29 @@ def test_real_config(path: str) -> None:
     # 数字本身是夹具的副产物。2026-09-10 起实测清单也要过「每条产品线只留最高
     # 世代」（plan.py 的 probed 分支）—— 夹具给的
     # `["claude-opus-5", "claude-opus-4-8"]` 是同一产品线 claude-opus 的
-    # (5,0) 与 (4,8) 两个世代，按「就高」只留 claude-opus-5，所以是 1 个。
-    # 「不重复」这层本意用集合判据单独钉住，不再依赖具体数字。
+    # (5,0) 与 (4,8) 两个世代，按「就高」只留 5 那一代。
+    #
+    # 2026-09-16 改成三条不变式，不再断言「只剩一个名字」
+    # ------------------------------------------------
+    # 原来写的是 `eq(..., _mn, ["claude-opus-5"])`，而那条**只在自带最小样本
+    # 下成立**：那份样本里没有 `-max` / `-xhigh` / `-thinking` 这类同代变体。
+    # 换成真实 config.yaml 后它必然失败 —— 实测那份配置里有 7 个站在卖
+    # `claude-opus-5-max`、2 个站在卖 `-thinking`、2 个在卖 `-xhigh`。
+    #
+    # 而「保留同代变体」正是用户 docx 第 3⑵ 条的原话：「所有相同等级系列的
+    # 模型全部都要勾选上，检测的时候发现如勾选的了 gpt-5.6 却没有勾选
+    # gpt-5.6-sol 这种重大失误」。所以正确判据不是「只剩一个」，而是
+    # 「**没有更低世代**、同代变体共存」。旧断言把契约写反了。
     _mm = kk[0].get("models") or []
     _mn = [m.get("name") if isinstance(m, dict) else m for m in _mm]
     eq("模型清单没重复", len(_mn), len(set(_mn)))
-    eq("模型清单就高后只剩最高世代", _mn, ["claude-opus-5"])
+    truthy("低世代 claude-opus-4-8 被淘汰", "claude-opus-4-8" not in _mn, _mn)
+    truthy("最高世代 claude-opus-5 在清单里", "claude-opus-5" in _mn, _mn)
+    # 清单里每个名字的世代都必须是 claude-opus 线里最高的那一代 ——
+    # 这条才是「就高选择」的真正判据，且对自带样本与真实配置都成立。
+    from cpa_probe import model_catalog as _mcg
+    _gens = {_mcg.generation(_mcg.series_and_version(n)[1]) for n in _mn}
+    eq("清单里只有一个世代", len(_gens), 1)
     eq("headers 只写一次", kk[0].get("headers"),
        {"User-Agent": "cli-proxy-openai-compat"})
 

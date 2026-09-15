@@ -364,12 +364,25 @@ def main() -> int:
        len(prov[0].get("api-key-entries") or []), 100)
     # 本意是「100 把 Key 归并后模型不被写 100 遍」。2026-09-10 起实测清单也过
     # 「就高」闸：MODELS = ["claude-opus-5", "claude-opus-4-8"] 同属产品线
-    # claude-opus，(5,0) 高于 (4,8)，故只留前者。用集合判据钉住「不重复」，
-    # 用显式清单钉住「就高」。
+    # claude-opus，(5,0) 高于 (4,8)，故只留 5 那一代。
+    #
+    # 2026-09-16 改判据：原来断言 `_mn == ["claude-opus-5"]`（只剩一个名字），
+    # 而那条**只在自带最小样本下成立** —— 样本里没有 `-max` / `-xhigh` /
+    # `-thinking` 这类同代变体。传真实 config.yaml 进来就必然失败：那份配置里
+    # 有 7 个站在卖 `claude-opus-5-max`、2 个在卖 `-thinking`、2 个在卖 `-xhigh`，
+    # 而它们**本来就该留着** —— 用户 docx 第 3⑵ 条原话：「所有相同等级系列的
+    # 模型全部都要勾选上，检测的时候发现如勾选的了 gpt-5.6 却没有勾选
+    # gpt-5.6-sol 这种重大失误」。
+    #
+    # 所以正确判据是「**只淘汰更低世代**、同代变体共存」，不是「只剩一个」。
     _mm = prov[0].get("models") or []
     _mn = [m.get("name") if isinstance(m, dict) else m for m in _mm]
     eq("模型清单不重复", len(_mn), len(set(_mn)))
-    eq("模型清单就高后只剩最高世代", _mn, ["claude-opus-5"])
+    eq("低世代 claude-opus-4-8 被淘汰", "claude-opus-4-8" in _mn, False)
+    eq("最高世代 claude-opus-5 在清单里", "claude-opus-5" in _mn, True)
+    from cpa_probe import model_catalog as _mcg
+    _gens = {_mcg.generation(_mcg.series_and_version(n)[1]) for n in _mn}
+    eq("清单里只有一个世代（同代变体共存）", len(_gens), 1)
     eq("无重名 provider", h.no_dup_names(r["new"]), [])
 
     # ---------------------------------------------------------------- ②

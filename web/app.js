@@ -345,6 +345,63 @@ function staleCheck(sec, catalog) {
   return { keep };
 }
 
+/* 就地草稿 → ops。放在 `SECTION_LABEL` **之前**是有意的：`tests/test_web.py`
+   只取 app.js 到此为止的那一段丢进 node 跑（后面碰 DOM，node 里会崩），
+   所以纯逻辑必须住在这一侧才进得了测试。 */
+function bmDraftOps(drafts, groups) {
+  const out = [];
+  drafts.forEach((d) => {
+    const g = groups.find((x) => x.section === d.section && x.host === d.host);
+    if (!g) return;
+    if (typeof d.priority === 'number') {
+      g.entries.forEach((e) => {
+        if (e.priority !== d.priority) {
+          out.push({ section: g.section, index: e.index, fingerprint: e.fingerprint,
+                     action: 'priority', value: d.priority });
+        }
+      });
+    }
+    if (typeof d.enabled === 'boolean') {
+      g.entries.forEach((e) => {
+        if (e.enabled !== d.enabled) {
+          out.push({ section: g.section, index: e.index, fingerprint: e.fingerprint,
+                     action: d.enabled ? 'enable' : 'disable' });
+        }
+      });
+    }
+  });
+  return out;
+}
+
+/* 反代/CF 的 HTML 错误页不许原样进错误消息。
+ *
+ * 2026-09-13 现场（投喂台 mhtml 快照）：③ 判定与定档 顶上那条红框里是
+ * **一整页 `<style>/*! normalize.css …</style>` 的 HTML**，用户看到的是
+ * 一屏 CSS 与 `[endif]-->` 注释，真实信息（"524: A timeout occurred"）埋在
+ * 第 300 个字符里。成因是 `api()` 的兜底 `JSON.parse(txt)` 失败后把
+ * `txt.slice(0, 400)` 当 error 丢出来 —— 而 CF 的 524 页正文就是 HTML。
+ *
+ * 放在 `SECTION_LABEL` 之前是有意的：`tests/test_web.py` 只把 app.js 到此
+ * 为止的那段丢进 node 跑（后面碰 DOM，node 里会崩），纯逻辑住这一侧才进得了
+ * 测试。这条判据值得测 —— 它的失效表现是「用户看到一屏 CSS」。
+ */
+function _proxyErrText(txt, status) {
+  const looksHtml = /^\s*(<!DOCTYPE|<html|<!--)/i.test(txt)
+    || /<html[\s>]/i.test(txt.slice(0, 2000));
+  if (!looksHtml) return txt.slice(0, 400);
+  const title = (txt.match(/<title[^>]*>([^<]{0,120})<\/title>/i) || [])[1];
+  const known = {
+    524: 'Cloudflare 524：源站在超时窗口内没有回应。定档计算比 CF 的 100 秒'
+       + '上限慢，请求已被反代切断（nginx 侧是 600 秒，所以断在 CF 那一层）',
+    522: 'Cloudflare 522：连接源站超时，容器可能未启动或端口不通',
+    502: '502：反代连不上容器，检查容器是否在跑、8765 是否监听',
+    504: '504：反代等后端超时',
+  };
+  const head = known[status]
+    || `反代返回 ${status} 的 HTML 错误页（不是本项目的 JSON 响应）`;
+  return head + (title ? `；上游标题「${title.trim()}」` : '');
+}
+
 const SECTION_LABEL = {
   'gemini-api-key': 'gemini',
   'codex-api-key': 'codex',
@@ -484,7 +541,8 @@ async function api(path, opts = {}) {
   const r = await fetch(path, o);
   const txt = await r.text();
   let data;
-  try { data = JSON.parse(txt); } catch { data = { error: txt.slice(0, 400) }; }
+  try { data = JSON.parse(txt); }
+  catch { data = { error: _proxyErrText(txt, r.status) }; }
   if (!r.ok) throw Object.assign(new Error(data.error || r.statusText),
     { data, status: r.status });
   return data;
@@ -2979,6 +3037,53 @@ $('#btnrestart').onclick = () => {
    所以每次 bmLoad 都要一并存下它，提交时原样回传。 */
 const BM = { groups: [], sel: new Set(), bulkId: '', revision: '' };
 
+/* ── 未提交的就地改动 ──────────────────────────────────────────────
+   用户现场反馈（2026-09-13）：「根本没法对每个相同域名的上游优先值进行手工
+   调整」。原来改档要「勾选卡片 → 滚到面板底部 → 填数字 → 点应用」四步，
+   视线全程离开卡片。现在卡片头部就是输入框，改完进这个队列，统一预览写回。
+
+   键为什么是 (段, host) 而不是下标：priority 是**站级**属性 ——
+   `_validate_final`（server.py）会拒绝「同 host 不同档」的写入，所以一次
+   编辑必然作用于该站的全部条目。用下标当键会漏掉同站的其他条目。
+
+   `enabled` 与 `priority` 分开存：两者可以叠加（改成 350 同时启用），
+   而分开存让「只改了优先级」与「只改了启停」在计数与放弃时都分得清。 */
+const BMD = new Map();          // `${section}\u0000${host}` -> {section, host, priority, enabled}
+const bmdKey = (sec, host) => sec + '\u0000' + host;
+
+/* 档位 → 颜色。用黄金角轮转而不是固定色表：档位数由配置决定，
+   写死八色表到第 9 档就没颜色了，而「同色 = 同档」正是这里要的可读性。
+   饱和度/亮度压得低 —— 它是背景提示，不该盖过分裂组的红框。 */
+const bmTint = (() => {
+  const cache = new Map();
+  return (pri) => {
+    if (pri == null) return 'var(--mute)';
+    if (cache.has(pri)) return cache.get(pri);
+    // 同一份清单内按**值**排序定色，保证同样的档位谱每次渲染同色
+    const all = [...new Set(BM.groups.flatMap((g) => g.priorities || []))]
+      .sort((a, b) => b - a);
+    const i = all.indexOf(pri);
+    const c = i < 0 ? 'var(--mute)'
+      : `hsl(${(i * 137.508) % 360} 46% 52%)`;
+    cache.set(pri, c);
+    return c;
+  };
+})();
+
+function bmdSync() {
+  const n = BMD.size;
+  $('#bmdirty').hidden = n === 0;
+  $('#bmdirtyn').textContent = String(n);
+  $('#bmdirtygo').disabled = n === 0;
+}
+
+/* 就地编辑的取值。非法（空 / 非整数 / <1）返回 null，卡片上标红，不提交。
+   不在输入时立刻钳制 —— 用户敲「35」的过程中不该被判非法。 */
+function bmdPriOf(sec, host) {
+  const d = BMD.get(bmdKey(sec, host));
+  return d && typeof d.priority === 'number' ? d.priority : null;
+}
+
 const BM_SEC_CN = {
   'gemini-api-key': 'Gemini', 'codex-api-key': 'Codex',
   'claude-api-key': 'Claude', 'openai-compatibility': 'OpenAI 兼容',
@@ -2988,11 +3093,15 @@ const BM_SEC_CLS = {
   'claude-api-key': 'sec-claude', 'openai-compatibility': 'sec-compat',
 };
 
-const bmKey = (g) => g.section + ' ' + g.host;
+const bmKey = (g) => g.section + '\u0000' + g.host;
 
 function bmStat() {
   const t = BM.groups;
-  const split = t.filter((g) => g.split).length;
+  // 分裂按**两种**口径统计：段内（同段同 host 多档）与跨协议（同 host 跨段
+  // 多档）。只数前者会漏掉「同一个网站在 claude 段 900、codex 段 350」那种
+  // —— 那同样违反「同网址同优先级」，而 `/api/routes` 早就把 `site_split`
+  // 算好给了前端，原代码却从没显示它。
+  const split = t.filter((g) => g.split || g.site_split).length;
   const off = t.reduce((n, g) => n + g.entries.filter((e) => !e.enabled).length, 0);
   const ent = t.reduce((n, g) => n + g.entries.length, 0);
   $('#bmstat').innerHTML =
@@ -3006,6 +3115,10 @@ function bmCard(g) {
   const k = bmKey(g);
   const on = BM.sel.has(k);
   const pris = g.priorities || [];
+  const edit = BMD.get(bmdKey(g.section, g.host));
+  const dirty = edit !== undefined;
+  const shown = dirty && edit.priority != null ? edit.priority : (pris.length ? Math.max(...pris) : '');
+  const bad = dirty && edit.priority == null;
   const rows = g.entries.map((e) => `
     <div class="bm-row ${e.enabled ? '' : 'off'}">
       <span class="bm-dot ${e.enabled ? 'on' : 'off'}"></span>
@@ -3018,17 +3131,37 @@ function bmCard(g) {
       拿到了 ${pris.length} 个不同 priority（${pris.join(' / ')}）。
       CPA 按层级取最高那一桶，低档的实质是冷备 —— 高档几条会先被打光配额。
       勾选本组后点「统一优先级」即可对齐到 ${Math.max(...pris)}。</div>` : '';
+  // 站级跨段分裂（`site_split`）与段内分裂（`split`）是两件事：
+  // 后者是同段同 host 多档，前者是**同一网站在不同协议段**拿到不同档 ——
+  // 后者同样违反「同网址同优先级」，但原卡片完全没显示它。
+  const sitewarn = (g.site_split && (g.site_priorities || []).length > 1) ? `
+    <div class="bm-warn">跨协议：本站 ${esc(g.host)} 在各段拿到
+      ${g.site_priorities.join(' / ')} 共 ${g.site_priorities.length} 个档位，
+      同样违反「同网址同优先级」。</div>` : '';
+  const allOff = g.entries.every((e) => !e.enabled);
   return `
-  <div class="bm-card ${on ? 'sel' : ''} ${g.split ? 'split' : ''}" data-k="${esc(k)}">
+  <div class="bm-card ${on ? 'sel' : ''} ${g.split || g.site_split ? 'split' : ''} ${dirty ? 'edited' : ''}" data-k="${esc(k)}">
     <div class="bm-head">
       <input type="checkbox" class="bmck" ${on ? 'checked' : ''} data-k="${esc(k)}">
       <span class="bm-sec ${BM_SEC_CLS[g.section] || ''}">${esc(BM_SEC_CN[g.section] || g.section)}</span>
       <span class="bm-host"><b>${esc(g.host)}</b>
         <span>${esc(g.base_urls.join(' · '))}</span></span>
-      <span class="bm-pri ${g.split ? 'bad' : ''}">
-        <em>${pris.length ? pris.join('/') : '—'}</em></span>
+      <span class="bm-cardacts">
+        <button class="bm-mini ${allOff ? 'off' : 'on'}" data-act="toggle"
+          title="${allOff ? '把本站全部条目重新启用' : '把本站全部条目停用'}">${allOff ? '启用' : '停用'}</button>
+        <button class="bm-mini del" data-act="del" title="把本站全部条目列入删除预览">删除…</button>
+      </span>
+      <span class="bm-pri ${g.split || g.site_split ? 'bad' : ''}">
+        <span class="bm-tint" style="background:${bmTint(pris.length ? Math.max(...pris) : null)}"></span>
+        ${pris.length > 1 ? `<em class="s">${pris.join('/')}</em>` : ''}
+        <input class="bm-priin ${dirty ? 'dirty' : ''} ${bad ? 'bad' : ''}"
+          type="number" min="1" max="100000" value="${shown}"
+          data-sec="${esc(g.section)}" data-host="${esc(g.host)}"
+          aria-label="${esc(g.host)} 的优先级"
+          title="改这里 = 把本站全部 Key 一起改成同一个档（同网址同优先级）">
+      </span>
     </div>
-    <div class="bm-body">${rows}</div>${warn}
+    <div class="bm-body">${rows}</div>${warn}${sitewarn}
   </div>`;
 }
 
@@ -3063,7 +3196,7 @@ function bmRender() {
     ? list.map(bmCard).join('')
     : '<div class="bm-empty">没有匹配的分组</div>';
   const ent = list.reduce((n, g) => n + g.entries.length, 0);
-  const sp = list.filter((g) => g.split).length;
+  const sp = list.filter((g) => g.split || g.site_split).length;
   $('#bmscope').innerHTML =
     `筛选出 <b>${list.length}</b> 组 · ${ent} 个条目`
     + (sp ? ` · <span style="color:var(--bad)">${sp} 组分裂</span>` : '');
@@ -3071,9 +3204,39 @@ function bmRender() {
   const selEnt = sel.reduce((n, g) => n + g.entries.length, 0);
   $('#bmn').textContent = String(sel.length);
   $('#bmn2').textContent = sel.length ? `（含 ${selEnt} 个条目）` : '';
-  $('#bmact').hidden = sel.length === 0;
-  if (!sel.length) { $('#bmdel').hidden = true; }
+  // 操作栏**常驻**（原来是 `hidden = sel.length === 0`，用户 2026-09-13 截图里
+  // 54 卡全未勾选 → 整条栏不渲染 → 看起来「这个面板根本没有批量功能」）。
+  // 改成常驻 + 未选中时置灰，并把「为什么点不动」写在旁边。
+  const idle = sel.length === 0;
+  $('#bmact').dataset.idle = idle ? '1' : '0';
+  ['#bmunify', '#bmenable', '#bmdisable', '#bmdelete', '#bmsetpri']
+    .forEach((s) => { $(s).disabled = idle; });
+  $('#bmwhy').hidden = !idle;
+  bmPresets();
+  bmdSync();
+  if (idle) { $('#bmdel').hidden = true; }
 }
+
+/* 档位预设按钮：从**当前筛选结果**里取现成的档位值。
+   用户凭什么知道该填 350 还是 555？原来那个裸 input 没给任何参照。
+   这里把该段现有的档位谱列出来，点一下就填进去，另有 [-1] [+1] [居中最密处]。 */
+function bmPresets() {
+  const list = bmFiltered();
+  const all = [...new Set(list.flatMap((g) => g.priorities || []))]
+    .filter((x) => typeof x === 'number').sort((a, b) => b - a);
+  const box = $('#bmpresets');
+  if (!all.length) { box.innerHTML = ''; return; }
+  const top = all[0];
+  const low = all[all.length - 1];
+  const frag = all.slice(0, 8).map((v) =>
+    `<button type="button" data-v="${v}">${v}</button>`).join('');
+  box.innerHTML = frag
+    + `<button type="button" data-adj="1" title="比当前最高档再高 1">最高+1</button>`
+    + `<button type="button" data-adj="-1" title="比当前最低档再低 1">最低-1</button>`
+    + `<button type="button" data-adj="mid" title="最高与最低的中值，插进现有谱系中间"
+       >中值${Math.floor((top + low) / 2)}</button>`;
+}
+
 
 async function bmLoad() {
   $('#bmgrid').innerHTML = '<div class="bm-empty">读取中…</div>';
@@ -3085,6 +3248,11 @@ async function bmLoad() {
     // 用下标记选中会静默选错组。
     const live = new Set(BM.groups.map(bmKey));
     [...BM.sel].forEach((k) => { if (!live.has(k)) BM.sel.delete(k); });
+    // 就地编辑的草稿一律作废：它们记的是「相对拉取那一刻的值」，
+    // 重新读取意味着底层已经变了，留着就是拿旧基线做新决定。
+    // 放弃草稿确实会丢用户输入，所以只在**显式重新读取**时丢，
+    // 不在每次 bmRender 时丢。
+    BMD.clear();
     bmStat();
     bmRender();
   } catch (e) {
@@ -3097,12 +3265,19 @@ function bmSelected() {
   return BM.groups.filter((g) => BM.sel.has(bmKey(g)));
 }
 
-/* 三种批量动作各自生成 ops。
+/* 就地草稿 → ops 的实现住在 `SECTION_LABEL` 之前（那一段才是
+   `tests/test_web.py` 拿进 node 跑的部分）。同一条草稿可以同时产生
+   priority 与 enable/disable 两组 op —— 用户完全可能「把这一站改成 900，
+   同时把它重新启用」，两个字段独立叠加。 */
+
+/* 五种批量动作各自生成 ops。
    `enable` / `disable` 的字段差异（key 类段写 excluded-models 通配符、
    compat 段写布尔字段）**全部在后端处理**，且那两个值是从 CPAMP 源码实时
    解析的 —— 前端不许自己拼，否则上游一改写法这里就静默失效。 */
 function bmOps(kind, arg) {
-  const ops = [];
+  // 就地草稿先落进 ops —— 它与批量动作是**叠加**关系：用户可以
+  // 「把 A 站改成 900 的同时把选中的 5 个站统一到 500」。
+  const ops = bmDraftOps(BMD, BM.groups);
   bmSelected().forEach((g) => {
     if (kind === 'unify' || kind === 'setpri') {
       // setpri：用户给定的值，整组所有 Key 都写它。
@@ -3116,6 +3291,10 @@ function bmOps(kind, arg) {
         if (pris.length < 2) return;            // 本来就一致，不产生噪声
         target = Math.max(...pris);
       }
+      // 就地草稿已经定过的站，批量值不覆盖它 —— 用户对单站的显式指定
+      // 优先于批量动作，后者是粗粒度默认。少了这一条，用户「A 站 900」
+      // 会被随后的「全选统一到 500」静默吃掉。
+      if (BMD.has(bmdKey(g.section, g.host))) return;
       g.entries.forEach((e) => {
         if (e.priority !== target) {
           ops.push({ section: g.section, index: e.index, fingerprint: e.fingerprint,
@@ -3166,6 +3345,14 @@ async function bmPreview(kind, arg) {
       `停用语义来源：${d.semantics || '未知'}`
       + (d.problems && d.problems.length
          ? ` · 有 ${d.problems.length} 条未能执行：${d.problems.join('；')}` : '');
+    // 撞档消解说明顶在 diff 上方 —— 它解释了「我填 350、落盘却是 349」，
+    // 埋在 diff 里等于没写。
+    const coll = d.collision_notes || [];
+    $('#bmcoll').hidden = coll.length === 0;
+    $('#bmcoll').innerHTML = coll.length
+      ? `<b>站间档位已自动错开</b>（同类型不同域名不得同档，第 7 条）
+         <div>${coll.map(esc).join('</div><div>')}</div>`
+      : '';
     $('#bmdiff').textContent = d.diff
       + (d.diff_truncated ? '\n…（diff 过长已截断，完整改动以写回结果为准）' : '');
     $('#bmpreview').hidden = false;
@@ -3245,13 +3432,86 @@ $('#bmdelgo').onclick = () => {
   $('#bmdel').hidden = true;
   bmPreview('delete');
 };
-// 卡片整体可点，勾选框与卡片是同一个动作 —— 少一次精确点击
+// 卡片整体可点 = 勾选；但**卡片内的交互控件必须被排除**，否则点输入框、
+// 点「停用」小按钮都会顺带改变勾选状态（2026-09-13 加就地编辑后新增的冲突）。
 $('#bmgrid').addEventListener('click', (e) => {
+  if (e.target.closest('.bm-priin, .bm-cardacts, button, input')) return;
   const card = e.target.closest('.bm-card');
   if (!card) return;
   const k = card.dataset.k;
   if (BM.sel.has(k)) BM.sel.delete(k); else BM.sel.add(k);
   bmRender();
+});
+
+/* 卡片内的小按钮：整站启停 / 整站删除预览。
+   走的是**就地草稿**那条路（启停）与既有的批量删除预览（删除），
+   不新开一条写回路径 —— 三道闸（revision / 指纹 / confirm）一道不少。 */
+$('#bmgrid').addEventListener('click', (e) => {
+  const btn = e.target.closest('.bm-mini');
+  if (!btn) return;
+  e.stopPropagation();
+  const card = btn.closest('.bm-card');
+  if (!card) return;
+  const g = BM.groups.find((x) => bmKey(x) === card.dataset.k);
+  if (!g) return;
+  if (btn.dataset.act === 'toggle') {
+    const allOff = g.entries.every((x) => !x.enabled);
+    const d = BMD.get(bmdKey(g.section, g.host)) || { section: g.section, host: g.host };
+    d.enabled = allOff;                    // 全停 → 全开；否则 → 全停
+    if (typeof d.priority !== 'number') d.priority = undefined;
+    BMD.set(bmdKey(g.section, g.host), d);
+    bmRender();
+  } else if (btn.dataset.act === 'del') {
+    BM.sel.clear();
+    BM.sel.add(bmKey(g));
+    bmRender();
+    $('#bmdelete').click();
+  }
+});
+
+/* 就地改档：`input` 事件即时记草稿（不回读 DOM，避免重排时打断输入），
+   `change`（失焦/回车）时才校验并重绘着色。空值与非法值不写进草稿 ——
+   写进去会让 bmOps 生成一条 value: null 的 op，后端直接拒整批。 */
+$('#bmgrid').addEventListener('input', (e) => {
+  const inp = e.target.closest('.bm-priin');
+  if (!inp) return;
+  const raw = inp.value.trim();
+  const v = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
+  const k = bmdKey(inp.dataset.sec, inp.dataset.host);
+  const d = BMD.get(k) || { section: inp.dataset.sec, host: inp.dataset.host };
+  d.priority = (Number.isFinite(v) && v >= 1) ? v : undefined;
+  if (d.priority === undefined && d.enabled === undefined) BMD.delete(k);
+  else BMD.set(k, d);
+  inp.classList.toggle('bad', d.priority === undefined && raw !== '');
+  inp.classList.toggle('dirty', d.priority !== undefined);
+  inp.closest('.bm-card').classList.toggle('edited', BMD.has(k));
+  bmdSync();
+});
+$('#bmgrid').addEventListener('change', (e) => {
+  if (e.target.closest('.bm-priin')) bmRender();
+});
+// 就地编辑的提交与放弃
+$('#bmdirtygo').onclick = () => bmPreview('draft');
+$('#bmdirtyclr').onclick = () => { BMD.clear(); bmRender(); };
+// 档位预设：只填 `#bmpri`，不直接改任何站 —— 直接改会绕过预览，
+// 而「先看清改哪些再确认」是这个面板的立身之本。
+$('#bmpresets').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  const list = bmFiltered();
+  const all = [...new Set(list.flatMap((g) => g.priorities || []))]
+    .filter((x) => typeof x === 'number').sort((a, b2) => b2 - a);
+  if (!all.length) return;
+  let v;
+  if (b.dataset.v) {
+    v = parseInt(b.dataset.v, 10);
+  } else {
+    const adj = b.dataset.adj;
+    if (adj === '1') v = all[0] + 1;
+    else if (adj === '-1') v = Math.max(1, all[all.length - 1] - 1);
+    else v = Math.max(1, Math.floor((all[0] + all[all.length - 1]) / 2));
+  }
+  $('#bmpri').value = String(v);
 });
 $('#bmunify').onclick = () => bmPreview('unify');
 $('#bmenable').onclick = () => bmPreview('enable');

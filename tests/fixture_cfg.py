@@ -178,18 +178,40 @@ openai-compatibility:
 """
 
 
+# 环境变量名：`tests/run.py` 用它把真实 config.yaml 传给每个子套件。
+#
+# **为什么不能用 argv**（2026-09-16 实测）：`run.py` 原来把路径当位置参数
+# 追加到每个子套件的命令行上，而 `test_api_compliance` / `test_probe_compliance`
+# / `test_transport_compliance` / `test_writeback_compliance` 用的是
+# `unittest.main()` —— 它把 `argv[1]` 当成**待加载的测试模块名**：
+#
+#     AttributeError: module '__main__' has no attribute 'C:/.../config'
+#
+# 后果不只是那四个套件报错：那次是**七个**套件一起红，而其中
+# `test_probe.py` / `test_server.py` / `test_edges.py` 的 main() 在被这样调用时
+# 仍返回 0，于是 run.py 判它们「通过」，项数还照常计入合计 ——
+# 校准模式从来没真正跑过一次真实数据，而汇报上看起来是「全部套件通过」。
+ENV_CONFIG = "IMPORTER_TEST_CONFIG"
+
+
 def resolve(argv: list[str], *, label: str = "") -> tuple[str, bool, str]:
     """给套件用的统一入口。返回 (config 路径, 是否自带样本, 临时目录)。
 
-    传了路径且文件存在就用它；否则把 MINIMAL_CFG 写进一个临时目录。
+    取值顺序：环境变量 `IMPORTER_TEST_CONFIG` > `argv[1]` > 自带最小样本。
+    环境变量优先是因为它对着所有入口都有效（含 `unittest.main()` 那些）；
+    argv 这条路留着，是为了「单独手跑一个套件」时仍能
+    `python tests/test_edges.py /path/to/config.yaml`。
+
     临时目录一并返回，调用方负责 shutil.rmtree —— 不在这里注册
     atexit，因为有套件要在跑完后检查目录里有没有多出 .bak 文件。
 
     绝不回落到 `../config.yaml`：那是生产配置，测试既不该依赖它的内容，
     也不该在它旁边留下备份文件。要跑真实数据请显式传路径。
     """
-    if len(argv) > 1:
+    given = (os.environ.get(ENV_CONFIG) or "").strip()
+    if not given and len(argv) > 1:
         given = argv[1]
+    if given:
         if not os.path.isfile(given):
             raise SystemExit(f"找不到 config.yaml：{given}")
         return given, False, ""

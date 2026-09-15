@@ -693,16 +693,22 @@ def test_three_paths_share_the_gates():
     WANT = ("_clean_override_models", "mark_new_sections",
             "assign_priorities")
     tree = _ast.parse(src)
-    fn = next((n for n in _ast.walk(tree)
-               if isinstance(n, _ast.FunctionDef) and n.name == "_api_plan"),
-              None)
-    assert fn is not None, "server.py 里找不到 _api_plan"
+    # `_api_plan` 在 2026-09-13 拆成两半：壳（校验 + 缓存 + 计时）与
+    # `_plan_body`（真正的建方案逻辑）。拆的理由是缓存与耗时日志要包住整个
+    # 建方案过程，又要保证任何出口都摘掉 `_plan_cache_key`。
+    # 所以这里必须把两个函数体**合起来**看，否则 AST 里一条调用都找不到，
+    # 断言会以一个空序列的形式失败（现场就是这样：`[]`）。
+    fns = [n for n in _ast.walk(tree)
+           if isinstance(n, _ast.FunctionDef)
+           and n.name in ("_api_plan", "_plan_body")]
+    assert fns, "server.py 里找不到 _api_plan / _plan_body"
     calls = []
-    for n in _ast.walk(fn):
-        if isinstance(n, _ast.Call):
-            name = getattr(n.func, "attr", None) or getattr(n.func, "id", None)
-            if name in WANT or name in ("rebuild_config_full", "build_diffs"):
-                calls.append((n.lineno, name))
+    for fn in fns:
+        for n in _ast.walk(fn):
+            if isinstance(n, _ast.Call):
+                name = getattr(n.func, "attr", None) or getattr(n.func, "id", None)
+                if name in WANT or name in ("rebuild_config_full", "build_diffs"):
+                    calls.append((n.lineno, name))
     calls.sort()
 
     # 两条路各出现一次这三个调用，且顺序相同

@@ -49,6 +49,8 @@ services:
       IMPORTER_CONFIG: /data/config.yaml
       IMPORTER_BACKUP_DIR: /backups
       CPA_UPSTREAM_URL: ${CPA_UPSTREAM_URL:-http://host.docker.internal:8317}
+      # 见 docker-compose.yml 的同名项说明 —— 不配则健康分定档静默失效
+      CPA_MANAGEMENT_TOKEN: ${CPA_MANAGEMENT_TOKEN:-}
     volumes:
       - ./data:/data
       - ./backups:/backups

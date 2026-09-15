@@ -176,6 +176,76 @@ class ComplianceTests(unittest.TestCase):
             {"section": "codex-api-key", "index": 0, "action": "disable"}]})
         self.assertEqual(h.response[0], 409)
 
+    # ── 批量设档的站间撞值消解（2026-09-13）───────────────────────────
+    #
+    # 用户第 3⑶ / 第 7 条：同类型不同域名的优先级一定要不同。
+    # 「批量设为 N」是跨组动作，一次能命中几十个组 —— 全落同一个值就会被
+    # CPA 的 selector 并进**一个桶**按 weight 轮询，站间次序被推平。
+    #
+    # 这条只在服务端测：单站直改与批量设档是两条路，两条都必须过同一道消解。
+    # 前端只负责把用户填的值发过来，不参与错开。
+    _COLLIDE = """codex-api-key:
+  - api-key: fixture-a
+    base-url: https://a.invalid/v1
+    priority: 900
+  - api-key: fixture-b
+    base-url: https://b.invalid/v1
+    priority: 800
+  - api-key: fixture-c
+    base-url: https://c.invalid/v1
+    priority: 700
+"""
+
+    def test_bulk_setpri_offsets_colliding_hosts(self):
+        h = handler(self._COLLIDE)
+        raw = self._COLLIDE
+        cfg = yaml.safe_load(raw)
+        ops = [{"section": "codex-api-key", "index": i, "action": "priority",
+                "value": 500,
+                "fingerprint": bulk.entry_fingerprint(cfg["codex-api-key"][i])}
+               for i in range(3)]
+        h._api_bulk_preview({"revision": bulk.config_revision(raw), "ops": ops})
+        code, body = h.response
+        self.assertEqual(code, 200, body)
+        # 三组原本都填 500，必须被错开成互不相同的值
+        self.assertIn("collision_notes", body)
+        self.assertEqual(len(body["collision_notes"]), 2,
+                         "三组撞值应当只有两组被让位")
+        for note in body["collision_notes"]:
+            self.assertIn("撞档", note)
+
+    def test_bulk_setpri_avoids_existing_tiers(self):
+        """错开时不许撞上本段未被改动的在用站档位。
+
+        撞上等于与那个站在同层按 weight 轮询 —— 而 priority 的唯一作用是
+        区分先后。夹具 900/800/700 是 a/b/c 的现有档位，批量设 900 时
+        三组要拿到三个互不相同的值，且都不等于 800 或 700。
+
+        直接断言返回值而不是解析 diff：三组里字典序最小者（a）如愿拿 900，
+        那一行**与原文相同**、不进 diff，用正则从 diff 里捞只能捞到两条。
+        """
+        cfg = yaml.safe_load(self._COLLIDE)
+        ops = [{"section": "codex-api-key", "index": i, "action": "priority",
+                "value": 900, "fingerprint": ""} for i in range(3)]
+        out, notes = server.Handler._resolve_op_collisions(cfg, ops)
+        got = sorted(o["value"] for o in out)
+        self.assertEqual(len(set(got)), 3, f"三站没拿到不同档位：{got}")
+        self.assertNotIn(0, got, "priority 0 语义未定义，不许写出去")
+        for reserved in (800, 700):
+            self.assertNotIn(reserved, got,
+                             f"撞上了未被改动的在用站档位 {reserved}")
+        self.assertEqual(len(notes), 2, notes)
+
+    def test_resolve_op_collisions_leaves_non_priority_ops_alone(self):
+        """只改启停的 ops 不该被消解动到。"""
+        h = handler(self._COLLIDE)
+        ops = [{"section": "codex-api-key", "index": 0, "action": "disable"},
+               {"section": "codex-api-key", "index": 1, "action": "enable"}]
+        out, notes = server.Handler._resolve_op_collisions(
+            yaml.safe_load(self._COLLIDE), list(ops))
+        self.assertEqual(notes, [])
+        self.assertEqual(out, ops)
+
     def test_apply_requires_exact_true(self):
         store = server.Store()
         store.add_plan("p", {"preview": RAW, "base_raw": RAW, "diffs": []})
