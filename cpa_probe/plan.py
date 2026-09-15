@@ -2232,11 +2232,34 @@ def build_plan(
                 if _client_gate and not getattr(v, "min_body_kind", ""):
                     # 探测没通过，写的是「按站方拒绝理由推断的处置」——
                     # 必须说清这是推断而非实测，否则操作员会以为验证过了。
+                    #
+                    # 判据附在后面（2026-09-14）：上游 sub2api 的
+                    # ClaudeCodeValidator 校验哪几项，从它的源码解析而来
+                    # （cpa_source_probe.parse_sub2api_validator）。拉不到就
+                    # 只写泛化措辞 —— 绝不把阈值写死在这里，那会随上游漂移。
+                    _gate = ""
+                    try:
+                        _heads = ident.s2a_required_headers or []
+                        _thr = ident.s2a_prompt_threshold or 0.0
+                        _ua = ident.s2a_ua_pattern or ""
+                        _bits = []
+                        if _ua:
+                            _bits.append(f"UA 匹配 `{_ua}`")
+                        if _thr:
+                            _bits.append(
+                                f"system prompt 与官方模板 Dice 相似度 >= {_thr}")
+                        if _heads:
+                            _bits.append(f"{'、'.join(_heads)} 头非空")
+                        if _bits:
+                            _gate = ("；上游校验四项（据 sub2api 源码）："
+                                     + "，".join(_bits) + "，metadata.user_id 存在")
+                    except Exception:
+                        _gate = ""
                     model_warns.append(
                         f"站方明确只认特定客户端（探测判「客户端」类，未通过）"
                         f" —— 已按 CPA 的客户端身份开关写入 {_wrote}；"
                         f"这是**依据拒绝理由的推断**，本次未实测通过，"
-                        f"写回后请用 CPAMP 的连通性测试复核")
+                        f"写回后请用 CPAMP 的连通性测试复核{_gate}")
                 else:
                     model_warns.append(
                         f"该段实测需要**请求体**级 Claude Code 身份"

@@ -142,6 +142,7 @@ def _dead_section_params() -> None:
         eq("模型取自目录", sp.models, ["claude-opus-5", "claude-sonnet-5"])
         eq("标注来源是目录", sp.model_source, "catalog")
         eq("priority 是确定的整数", bool(isinstance(sp.priority, int)), True)
+        eq("priority >= 1", sp.priority >= 1, True)
         eq("priority 有理由", bool(bool(sp.priority_reason)), True)
         eq("headers 非空（门票不能空着写进去）", bool(bool(sp.headers)), True)
         eq("可勾选", bool(sp.writable), True)
@@ -159,6 +160,7 @@ def _dead_section_params() -> None:
         eq("种子段不建议写", sp_seed.recommended, False)
         eq("种子段 priority 是确定整数",
            bool(isinstance(sp_seed.priority, int)), True)
+        eq("种子段 priority >= 1", sp_seed.priority >= 1, True)
 
     # 手填接管：同一个段补上模型名就该进来
     plan2 = cp.build_plan(row, res, cfg, bands={},

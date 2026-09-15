@@ -1766,6 +1766,7 @@ def build_diffs(raw: str, plans: list[ImportPlan]) -> list[Diff]:
             # 可并、且同 host 有多个能力分组的情形。
             if found:
                 head.priority = max(
+                    1,
                     head.priority,
                     *(int(r.get("priority") or 0) for r in providers
                       if r.get("name") == found["name"]),
@@ -3181,8 +3182,11 @@ def rebuild_config_full(
                 # 哪一套 headers/priority/models。
                 head = copy.deepcopy(max(group, key=lambda x: x.priority))
                 # Capability splits stay at the same site tier.
-                head.priority = max(x.priority for x in sections_data[section]
-                                    if _host_of(x.base_url) == _host_of(head.base_url))
+                head.priority = max(
+                    1,
+                    *(x.priority for x in sections_data[section]
+                      if _host_of(x.base_url) == _host_of(head.base_url))
+                )
                 old = _original_entry(cfg, head)
                 own_keys = {k["api-key"]: _dump_fields(
                     {f: v for f, v in k.items() if f != "api-key"}, field + "    ")
