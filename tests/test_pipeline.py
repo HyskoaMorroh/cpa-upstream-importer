@@ -509,6 +509,7 @@ def test_temp_failure_circuit_breaker():
     hits = []
     mode = {"status": 502, "alternate": False}
     flip = {"n": 0}
+    flip_lock = _threading.Lock()
 
     class _Fake(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -518,8 +519,10 @@ def test_temp_failure_circuit_breaker():
             hits.append(self.path)
             if mode["alternate"]:
                 # 真在抖的站：502 与 429 交替 —— 不该熔断
-                flip["n"] += 1
-                code = 502 if flip["n"] % 2 else 429
+                # flip_lock 防止多线程同时递增导致竞态（2026-09-17 修）
+                with flip_lock:
+                    flip["n"] += 1
+                    code = 502 if flip["n"] % 2 else 429
             else:
                 code = mode["status"]
             b = b'{"error":{"message":"upstream failure"}}'
