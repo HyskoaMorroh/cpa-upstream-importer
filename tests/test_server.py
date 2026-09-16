@@ -285,11 +285,12 @@ def test_store_tables_are_bounded():
     truthy("刚访问过的不被清掉", S4.get_plan("fresh") is not None,
            "TTL 按创建时间算会误清正在看的任务")
 
-    # ⑤ sizes() 三张表都报
+    # ⑤ sizes() 表都报（plan_tasks 是 2026-09-17 加的异步定档表）
     S5 = server.Store()
     S5.add_plan("a", {})
     got = S5.sizes()
-    eq("sizes 报三张表", sorted(got), ["applies", "jobs", "plans"])
+    eq("sizes 报必须包含三张核心表",
+       all(k in got for k in ("applies", "jobs", "plans")), True)
     eq("sizes 数对得上", got["plans"], 1)
 
     print("[OK] Store bounds: 三张表有上限与 TTL、跑着的不被淘汰、"
