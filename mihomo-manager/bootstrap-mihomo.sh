@@ -66,7 +66,7 @@ fi
 #   MIHOMO_SUBSCRIPTIONS="wog=https://a;wogb=https://b"  （分号或换行分隔）
 #   MIHOMO_SUB_WOG=... / MIHOMO_SUB_WOGB=...             （每个订阅一个变量）
 python3 - "$TEMPLATE" "$CONFIG" <<'PY'
-import io, os, re, sys
+import io, json, os, re, sys
 
 tpl, out = sys.argv[1], sys.argv[2]
 with io.open(tpl, encoding="utf-8") as f:
@@ -115,10 +115,28 @@ text = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", expand, text)
 # 模板里预置的是 wog/wogb 两个示例。用户给了别的订阅名时，这三处都要跟着变，
 # 否则生成的配置引用一堆不存在的 provider，mihomo 启动即报错。
 if subs:
-    def hc_block(url):
+    # name 与 url **一次填完**，不再分两段（2026-09-16 修）。
+    #
+    # 原来的写法是两段式：这里先填 url、留一个字面 "%s" 给 name，调用方再
+    # `hc_block(url) % name` 填第二次。于是 url 自己带的百分号会在第二次
+    # 格式化时被当成格式符 ——
+    #
+    #   url = "https://x.example/sub?t=a%2Fb"
+    #     → 第二次 % 把 "%2F" 读成「宽度 2 的 f 转换」
+    #     → TypeError: must be real number, not str
+    #
+    # 而 `%2F` / `%3D` / `%3A` 在订阅链接里是常态（路径与 token 都要
+    # percent-encode）。崩溃点在 init 容器里，表现是它非零退出、
+    # `mihomo-proxy` 的 `service_completed_successfully` 依赖不满足 ——
+    # **整个代理永不启动**，而 config.yaml 里 34 条 `proxy-url: http://mihomo:7890`
+    # 的条目跟着全废。日志里只有一行 TypeError，与「订阅写错了」长得一样。
+    #
+    # 顺带把 url 从裸插值改成 json.dumps：YAML 的双引号串与 JSON 字符串
+    # 转义规则一致，这样 url 里真的出现引号或反斜杠时也不会破坏结构。
+    def hc_block(name, url):
         return (
             '    type: http\n'
-            '    url: "%s"\n'
+            '    url: %s\n'
             '    path: ./providers/%s.yaml\n'
             '    interval: %s\n'
             '    health-check:\n'
@@ -126,14 +144,15 @@ if subs:
             '      url: "https://www.gstatic.com/generate_204"\n'
             '      interval: %s\n'
             '      lazy: false\n'
-            % (url, "%s", os.environ.get("MIHOMO_PROVIDER_INTERVAL", "21600"),
+            % (json.dumps(url, ensure_ascii=False), name,
+               os.environ.get("MIHOMO_PROVIDER_INTERVAL", "21600"),
                os.environ.get("MIHOMO_HC_INTERVAL", "300"))
         )
 
     lines = ["proxy-providers:"]
     for name, url in subs:
         lines.append("  %s:" % name)
-        lines.append(hc_block(url) % name)
+        lines.append(hc_block(name, url))
     providers_block = "\n".join(lines).rstrip("\n") + "\n"
 
     # 替换整个 proxy-providers 段（到下一个顶级键为止）

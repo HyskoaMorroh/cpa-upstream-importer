@@ -2644,6 +2644,32 @@ def build_plan(
             candidates = preferred or [
                 m for m in candidates
                 if model_catalog.section_protocol_ok(section, m)]
+            # 产品线可信度闸：查无此线、且本轮没实测过的名字不进清单
+            # （2026-09-16，修 `claude-fake-5`）
+            # ------------------------------------------------------------
+            # 放在这里而不是各分支里：`candidates` 是四条来源（catalog /
+            # prior / seed / v.models）唯一的汇合点，一道闸全覆盖。分头加
+            # 等于把同一条判据抄四遍 —— 本项目的模型规则已经分叉过两次。
+            #
+            # `proven=v.models` 是安全阀：那批名字每一个都过了
+            # `pipeline._accept`（真 200 + 模型名对得上 + 正文不是错误体），
+            # 实测证据比名录硬。名录只说明「CPA 官方知道有这个」，
+            # 站方特供卖什么它管不着。
+            #
+            # 滤空就整体退回（`or candidates`）：这道闸是为了拦掉凭空捏造的
+            # 名字，不是为了把清单清零。清单为空会让下方的强制回退填进一批
+            # 这个站从没报过的「市面最新」，比留着可疑名字更坏 ——
+            # 与上面 `merged or v.models` 同一条取舍。
+            _implausible = model_catalog.implausible_models(
+                candidates, proven=list(v.models))
+            if _implausible:
+                _kept = [m for m in candidates if m not in set(_implausible)]
+                if _kept:
+                    candidates = _kept
+                    model_warns.append(
+                        "名录查无此产品线且本轮未实测，已剔除："
+                        + "、".join(_implausible[:6])
+                        + ("…" if len(_implausible) > 6 else ""))
             merged = model_catalog.newest_generation_per_line(candidates)
             # 过滤把清单清空时，退回站方自己报的名字（2026-09-12）
             # ------------------------------------------------------

@@ -258,6 +258,12 @@ def main() -> int:
         # claude 族
         "claude-opus-5", "claude-fable-5", "claude-sonnet-5", "claude-opus-4-8",
         "anthropic/claude-opus-5",
+        # 降级档的 flash / fast 写法（用户 2026-09-16 第 ① 条）。
+        # 这三个名字进 famOk / protoOk 的逐条比对 —— 两侧任一边漏掉
+        # flash|fast 就立刻红。带 provider 前缀的那个是现场实测形态
+        # （快照里 anthropic/claude-opus-5-fast 曾被勾上）。
+        "claude-opus-5-fast", "anthropic/claude-opus-5-fast",
+        "gpt-6-fast", "gpt-6-flash", "kimi-k3-fast", "breakfast-1",
         # gemini：pro 变体 / 低版本 / flash / 图像 / 批处理 / 无版本
         "gemini-3.1-pro", "gemini-3.1-pro-high", "gemini-3.1-pro-low",
         "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-search",
@@ -325,6 +331,20 @@ def main() -> int:
                          "kimi-k3", "kimi-k3-256k"],
             "minidrop": ["gpt-6", "gpt-6-mini", "gpt-6-nano",
                          "gpt-6-lite"],
+            # flash / fast：用户 2026-09-16 第 ① 条补的两个词。
+            #
+            # 为什么必须单列一组（2026-09-16 实测出来的分叉）：这批名字
+            # 原来**一个都不在样本里**，于是后端补了 flash/fast、前端没补，
+            # 两侧比对照样全绿 —— 2042 项测试对这个洞完全无感。
+            # 后果不是「界面显示得难看」：界面预勾之后进 S.forced 走手填通道，
+            # 而手填只过 section_protocol_ok（不查档次），降级档因此绕过
+            # 后端那道闸真的落进 config.yaml。
+            "flashdrop": ["gpt-6", "gpt-6-flash", "gpt-6-fast",
+                          "claude-opus-5", "claude-opus-5-fast",
+                          "kimi-k3", "kimi-k3-fast"],
+            # fast 的 token 边界：breakfast 里的 fast 不算降级档标记。
+            # 与 minisafe 同一条理由 —— 判据一致比碰运气好。
+            "fastsafe": ["breakfast-1", "breakfast-2"],
         }
 
         # ── 就地编辑草稿 → ops（2026-09-13，用户现场反馈）──────────────
