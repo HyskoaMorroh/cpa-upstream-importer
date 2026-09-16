@@ -346,6 +346,44 @@ class ApplyTask:
             }
 
 
+class PlanTask:
+    """异步定档任务（2026-09-17）。
+
+    `/api/plan` 把原来的同步计算变成两步：
+      1. `POST /api/plan`  → 立即返回 `{"plan_task_id": "...", "state": "pending"}`
+      2. `GET  /api/plan-status?plan_task_id=...` → 轮询直到 state == "done" | "error"
+
+    为什么必须异步：定档要重建整份 config.yaml（173 站），实测 > 60 秒。
+    Cloudflare Free 套餐回源超时硬限 100 秒、不可调，同步版本在冷启动时
+    必然返回 524，priority 全停在「待定」占位符。改成立即返回 + 轮询后，
+    每个 HTTP 请求都在 1 秒内完成，CF 超时彻底无关。
+
+    缓存命中仍然同步返回（< 1ms），走原来的 `/api/plan` 响应体 ——
+    那不走本类，本类只在真正要算的时候创建。
+    """
+
+    def __init__(self, task_id: str, body: dict):
+        self.id = task_id
+        self.state = "running"      # running | done | error
+        self.body = body            # 入参存档，前端轮询时不用重传
+        self.result: dict = {}      # 计算完毕后填入，与原 /api/plan 响应体一致
+        self.error = ""
+        self.started = time.time()
+        self.finished = 0.0
+        self.lock = threading.Lock()
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "plan_task_id": self.id,
+                "state": self.state,
+                "error": self.error,
+                "elapsed": round((self.finished or time.time()) - self.started, 1),
+                # 只在 done 时才带上完整结果，避免 running 阶段返回半截数据
+                **({"result": self.result} if self.state == "done" else {}),
+            }
+
+
 class CapacityError(ValueError):
     pass
 
@@ -385,13 +423,14 @@ class Store:
         self.apply_generation = 0
         self.jobs: dict[str, Job] = {}
         self.plans: dict[str, dict] = {}
+        self.plan_tasks: dict[str, PlanTask] = {}   # 异步定档任务（2026-09-17）
         self.applies: dict[str, ApplyTask] = {}
         # 批量管理的预览结果（每份两段整份配置文本）
         self.bulks: dict[str, dict] = {}
         # {表名: {id: 最后访问时间}} —— 与数据分开存，避免污染 payload
         # 新增表**必须同时在这里登记**，否则 `_touch` 会 KeyError。
         self._touched: dict[str, dict[str, float]] = {
-            "jobs": {}, "plans": {}, "applies": {}, "bulks": {}}
+            "jobs": {}, "plans": {}, "plan_tasks": {}, "applies": {}, "bulks": {}}
         self.lock = threading.Lock()
 
     def _touch(self, table: str, key: str) -> None:
@@ -533,7 +572,22 @@ class Store:
         """三张表的条数。给 /api/context 用，便于运维看有没有堆积。"""
         with self.lock:
             return {"jobs": len(self.jobs), "plans": len(self.plans),
+                    "plan_tasks": len(self.plan_tasks),
                     "applies": len(self.applies)}
+
+    def add_plan_task(self, task: "PlanTask") -> None:
+        with self.lock:
+            self._evict("plan_tasks", self.plan_tasks, 8,
+                        lambda t: t.state == "running")
+            self.plan_tasks[task.id] = task
+            self._touch("plan_tasks", task.id)
+
+    def get_plan_task(self, tid: str) -> "PlanTask | None":
+        with self.lock:
+            got = self.plan_tasks.get(tid)
+            if got:
+                self._touch("plan_tasks", tid)
+            return got
 
 
 STORE = Store()
@@ -2239,6 +2293,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_probe(body)
             elif route == "/api/plan":
                 self._api_plan(body)
+            elif route == "/api/plan-status":
+                # 异步定档轮询（2026-09-17）
+                ptid = (body.get("plan_task_id") or
+                        self.path.split("plan_task_id=")[-1].split("&")[0])
+                self._api_plan_status(ptid)
             elif route == "/api/apply":
                 self._api_apply(body)
             elif route == "/api/tuning-apply":
@@ -2957,7 +3016,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _api_plan(self, body: dict) -> None:
-        """把探测结果变成写入方案 + diff 预览。不落盘。"""
+        """把探测结果变成写入方案 + diff 预览。异步版本（2026-09-17）。
+
+        原来同步跑 _plan_body 会超过 Cloudflare Free 的 100 秒回源限制，导致
+        priority 全停在「待定」占位符。现在改成：
+          1. 缓存命中 → 同步返回（< 1ms，CF 不会超时）
+          2. 需要计算 → 立即返回 {plan_task_id, state: "running"}（202），
+             后台线程跑 _plan_body，前端轮询 /api/plan-status 拿结果
+        """
         _validate_body(body)
         job = STORE.get_job(body.get("job_id") or "")
         if not job:
@@ -2978,7 +3044,7 @@ class Handler(BaseHTTPRequestHandler):
                  "r": cp.bulk.config_revision(raw)},
                 sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
         except (TypeError, ValueError):
-            _ck = ""               # 入参不可序列化（不该发生）→ 直接不算缓存
+            _ck = ""
         if _ck:
             with Handler._plan_cache_lock:
                 hit = Handler._plan_cache.get(_ck)
@@ -2986,25 +3052,75 @@ class Handler(BaseHTTPRequestHandler):
                     logger.info("定档命中缓存（同一份输入 180 秒内重放）")
                     self._json(200, hit[1])
                     return
-        # 交给 _json 记账。**只在算出指纹时挂**，否则 _json 会把别的路由的
-        # 200 也塞进来（那是静默的错配缓存，比不缓存更坏）。
-        # 每次进 _api_plan 都要重置：同一个 Handler 实例服务多个请求。
+
+        # 缓存未命中 → 启动异步任务，立即返回 task_id
+        task = PlanTask(secrets.token_hex(10), body)
+        STORE.add_plan_task(task)
         self._plan_cache_key = _ck
+
+        def _run():
+            try:
+                _t0 = time.time()
+                # _plan_body 写到 self._plan_result 而非直接发送
+                self._plan_async_body(body, job, raw, cfg, task)
+                logger.info("异步定档完成：%.1f 秒 · 全量重探=%s · %d 个候选",
+                            time.time() - _t0,
+                            bool(job.opts.get("full_redetect")),
+                            len(job.results))
+            except Exception as exc:
+                with task.lock:
+                    task.state = "error"
+                    task.error = str(exc)
+                    task.finished = time.time()
+                logger.exception("异步定档异常")
+            finally:
+                self._plan_cache_key = ""
+
+        threading.Thread(target=_run, daemon=True).start()
+        self._json(202, {"plan_task_id": task.id, "state": "running"})
+
+    def _api_plan_status(self, plan_task_id: str) -> None:
+        """轮询异步定档任务状态。state=done 时响应体里带完整 result。"""
+        task = STORE.get_plan_task(plan_task_id or "")
+        if not task:
+            self._json(404, {"error": f"没有这个定档任务：{plan_task_id}"})
+            return
+        snap = task.snapshot()
+        # state=done 时 result 已填充，前端直接取；state=running 时只有进度
+        self._json(200, snap)
+
+    def _plan_async_body(self, body: dict, job, raw: str, cfg: dict,
+                         task: PlanTask) -> None:
+        """在后台线程里跑 _plan_body，把结果存进 task.result。"""
+        # 拦截 _json 让它写入 task.result 而不是发送 HTTP 响应
+        captured: list[tuple[int, dict]] = []
+
+        original_json = self._json
+
+        def _capture_json(code: int, data: dict) -> None:
+            captured.append((code, data))
+
+        self._json = _capture_json  # type: ignore[method-assign]
         try:
-            # 记耗时。**必须有**：这个接口是全量重探里最慢的一环（173 站重建
-            # 整份配置），跑过 CF 的 100 秒就变成 524，而用户侧只看到一页 HTML。
-            # 没有这行日志，「到底哪一步慢」只能靠猜 —— 现场那次没人知道是
-            # 定档慢还是别的路由慢。
-            _t0 = time.time()
             self._plan_body(body, job, raw, cfg)
-            logger.info("定档完成：%.1f 秒 · 全量重探=%s · %d 个候选",
-                        time.time() - _t0,
-                        bool(job.opts.get("full_redetect")),
-                        len(job.results))
         finally:
-            # 用完就摘 —— 挂在实例上越过本次请求，会让之后任何一条 200
-            # （同一连接的 keep-alive 复用同一个 handler）都写进这份缓存。
-            self._plan_cache_key = ""
+            self._json = original_json  # type: ignore[method-assign]
+
+        if captured:
+            code, data = captured[0]
+            with task.lock:
+                if code == 200:
+                    task.result = data
+                    task.state = "done"
+                else:
+                    task.error = data.get("error", f"HTTP {code}")
+                    task.state = "error"
+                task.finished = time.time()
+        else:
+            with task.lock:
+                task.error = "定档未产生响应"
+                task.state = "error"
+                task.finished = time.time()
 
     def _plan_body(self, body: dict, job, raw: str, cfg: dict) -> None:
         # 三个按候选索引的入参。键是**行号字符串**而不是 host ——
