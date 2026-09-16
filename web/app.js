@@ -2421,19 +2421,22 @@ async function refreshPlan(silent) {
   if (S.picks) {
     body.selected = [...S.picks].map((k) => k.split('\u0000'));
   }
-  try { d = await api('/api/plan', { method: 'POST', body }); }
-  catch (e) {
-    // 失败必须可见 —— silent 只压「成功了但没什么可说」的提示，不压错误。
-    //
-    // 2026-09-13 现场（投喂台 mhtml）：173 站 692 行里 692 个 priority 框
-    // 全是 placeholder「待定」、54 个可用段的建议栏全停在「计算中…」。
-    // 成因就是这里：12 个调用点有 7 个传 silent=true，任何一次 /api/plan
-    // 失败都被完全吞掉 —— 界面停在初始占位符，与「还在算」长得一模一样，
-    // 操作员等不到结果也看不到原因。
-    //
-    // 定档栏就在结果表里，而 #planmeta 属于第 4 步（写回预览），首轮根本
-    // 还没显示 —— 只写那里等于没写。所以两处都写：#planmeta 给写回流程，
-    // #pickstat 给③的表头（那里一定可见）。
+
+  // ── 异步定档（2026-09-17）──────────────────────────────────────
+  // 原来同步 POST /api/plan 会阻塞 > 60s，触发 Cloudflare Free 的 100s 回源
+  // 超时（524），priority 全停在「待定」占位符。
+  // 新流程： POST → 立即返回 plan_task_id → 每 2s 轮询 /api/plan-status
+  // 每个 HTTP 请求都 < 1s，CF 超时彻底无关。
+  // ──────────────────────────────────────────────────────────
+  let taskId = null;
+  try {
+    const init = await api('/api/plan', { method: 'POST', body });
+    if (init && init.plan_task_id && init.state === 'running') {
+      taskId = init.plan_task_id;
+    } else {
+      d = init;
+    }
+  } catch (e) {
     const msg = esc(e.message || '未知错误');
     const meta = $('#planmeta');
     if (meta) meta.innerHTML = `<div class="err">定档失败：${msg}</div>`;
@@ -2444,35 +2447,121 @@ async function refreshPlan(silent) {
     }
     return null;
   }
+
+  if (taskId) {
+    const stat = $('#pickstat');
+    if (stat) stat.innerHTML = `<span class="hint">定档计算中…（后台运行，请稍候）</span>`;
+    for (let i = 0; i < 180; i++) {        // 最长等 360s
+      await new Promise((r) => setTimeout(r, 2000));
+      let poll;
+      try {
+        poll = await api('/api/plan-status', {
+          method: 'POST', body: { plan_task_id: taskId },
+        });
+      } catch (_) { continue; }             // 网络抖动 → 继续等
+      if (!poll) continue;
+      if (poll.state === 'done') { d = poll.result; break; }
+      if (poll.state === 'error') {
+        const msg = esc(poll.error || '定档后台异常');
+        const meta = $('#planmeta');
+        if (meta) meta.innerHTML = `<div class="err">定档失败：${msg}</div>`;
+        if (stat) {
+          stat.innerHTML = `<span class="err">定档失败：${msg}</span>`
+            + ` <span class="hint">priority 与建议栏保持占位符；重试或看容器日志</span>`;
+        }
+        return null;
+      }
+      if (stat) stat.innerHTML = `<span class="hint">定档计算中… ${Math.round(poll.elapsed || 0)}s</span>`;
+    }
+    if (!d) {
+      const meta = $('#planmeta');
+      if (meta) meta.innerHTML = `<div class="err">定档超时（>360s）</div>`;
+      const stat2 = $('#pickstat');
+      if (stat2) stat2.innerHTML = `<span class="err">定档超时，请重试</span>`;
+      return null;
+    }
+  }
+
   S.planId = d.plan_id; S.plans = d.plans;
 
   // 首次：按系统建议预勾选。
   //
-  // 必须先回填再递归（2026-09-13）：原来这里直接 `return refreshPlan(true)`,
-  // 于是首轮这一帧的 d.plans 被丢掉 —— 而下面的回填循环在 return 之后，
+  // 必须先回填再递剷2026-09-13）：原来这里直接 `return refreshPlan(true)`,
+  // 于是首轮这一帧的 d.plans 被丢掉—— 而下面的回填循环在 return 之后，
   // 首轮永远到不了。递归的第二帧只要失败（且它传的就是 silent=true），
   // 整张表就永久停在「待定 / 计算中…」。
-  //
-  // 现在的顺序：先用首轮方案把 priority 与建议栏填上（拿到什么就先显示
-  // 什么），再按建议预勾选、再重取一次让 diff 与勾选一致。第二帧失败时
-  // 首轮的值仍在表上，操作员看到的是真实档位而不是占位符。
   const firstPass = S.picks === null;
   fillPlanIntoRows(d);
   if (firstPass) {
     applyPickPreset('rec');
-    // 预勾选变了选择集，重取一次让 diff 与勾选一致
     return refreshPlan(true);
   }
   syncPickUI();
   return d;
 }
+function planWarnings(d) {
+  const ws = Array.isArray(d.warnings) ? d.warnings : [];
+  if (!ws.length) return '';
+  return `<div class="note w"><b>定档提示 ${ws.length} 条</b>
+    —— 影响的是站与站的先后，不影响单个条目能否用
+    <div class="mlist">${ws.map((w) => `· ${esc(w)}`).join('<br>')}</div></div>`;
+}
 
-// 把 /api/plan 的方案填进结果表：priority、系统建议、fallback 模型清单、
-// 段级警告与 headers 编辑器。
+$('#btnplan').onclick = async () => {
+  const d = await refreshPlan(false);
+  if (!d) return;
+
+  const nLines = d.diffs.reduce((a, x) => a + x.lines.length, 0);
+  const skipped = d.plans.flatMap((p) =>
+    Object.entries(p.skipped).map(([s, why]) =>
+      `${p.host} · ${SECTION_LABEL[s] || s}：${why}`));
+
+  $('#planmeta').innerHTML = `
+    <div class="stat">
+      <span>插入 <b>${d.diffs.length}</b> 处</span>
+      <span>新增 <b>${nLines}</b> 行</span>
+      <span>${fmt(d.lines_before)} → <b>${fmt(d.lines_after)}</b> 行</span>
+    </div>
+    <div class="note ${d.valid ? 'g' : 'b'}">${esc(d.validate_msg)}</div>
+    ${planWarnings(d)}
+    ${skipped.length ? `<div class="note">不写入 ${skipped.length} 项：
+      <div class="mlist">${skipped.map(esc).join('<br>')}</div></div>` : ''}`;
+
+  $('#diffs').innerHTML = d.diffs.length ? d.diffs.map((x, i) => `
+    <div class="diff">
+      <div class="dh"><span class="pill p-ok">+${x.lines.length}</span>
+        <span class="m">${esc(x.section)}</span>
+        <span class="hint">← ${esc(x.host)} · 第 ${x.insert_at} 行后</span>
+        <button class="cp" data-i="${i}">复制</button></div>
+      <pre>${x.lines.map((l) => `<span class="a">+ ${esc(l)}</span>`).join('')}</pre>
+    </div>`).join('')
+    : `<div class="note w">无可写入条目 —— 没勾选，或全部不可用 / 已存在</div>`;
+
+  $$('#diffs .cp').forEach((b) => {
+    b.onclick = () => {
+      navigator.clipboard.writeText(d.diffs[+b.dataset.i].lines.join('\n')).then(() => {
+        b.textContent = '已复制'; b.classList.add('done');
+        setTimeout(() => { b.textContent = '复制'; b.classList.remove('done'); }, 1400);
+      });
+    };
+  });
+
+  $('#btnapply').disabled = !d.valid || !d.diffs.length;
+  $('#p3').hidden = true; $('#p4').hidden = false;
+  step(4);
+  $('#p4').scrollIntoView({ behavior: 'smooth', block: 'start' });
+};
+
+$('#btnreplan').onclick = () => {
+  $('#p4').hidden = true; $('#p3').hidden = false; step(3);
+};
+
+// ── 写回 ──
+// 写回收尾的轮询。落盘那一步已经在 /api/apply 里同步完成 —— 这里只等
+// 「重载 + 端到端验证」，并把阶段与验证进度显示出来。
 //
-// 为什么单独抽出来（2026-09-13）：它原来内联在 refreshPlan 里、位置在首轮
-// 递归 `return` 之后，于是首轮拿到的方案**从来没被用过**。抽成函数后首轮
-// 与后续轮都能调它，首轮的档位立刻显示，第二帧失败也不会退回占位符。
+// 与步骤②的探测轮询同一套思路：断连要重试，不能因为一次网络抖动就让用户
+// 以为写回失败（写盘早就成了）。
 function fillPlanIntoRows(d) {
   if (!d || !Array.isArray(d.plans)) return;
   d.plans.forEach((p) => {
@@ -2696,199 +2785,6 @@ const KNOWN_HEADERS = [
   'authorization', 'x-api-key', 'content-type',
 ];
 
-function bindHeaderEditor(wb, rid, sec) {
-  const det = wb.querySelector('.hedit');
-  if (!det) return;
-  const rowsBox = det.querySelector('.hrows');
-  const msg = det.querySelector('.hmsg');
-
-  const collect = () => {
-    const out = {};
-    [].slice.call(rowsBox.querySelectorAll('.hrow')).forEach((r) => {
-      const k = r.querySelector('.hk').value.trim();
-      const v = r.querySelector('.hv').value.trim();
-      // 空 key 或空 value 一律丢弃 —— 与 CPAMP 的 buildHeaderObject 同口径，
-      // 两边行为不同会让人在一处试通、另一处失败时找不到原因。
-      if (k && v) out[k] = v;
-    });
-    return out;
-  };
-
-  const check = (h) => {
-    const bad = Object.keys(h).filter(
-      (k) => !KNOWN_HEADERS.includes(k.toLowerCase()));
-    const under = Object.keys(h).filter((k) => k.includes('_'));
-    const bits = [];
-    if (under.length) {
-      bits.push(`${under.join('、')} 含下划线 —— HTTP 头一般用连字符，`
-        + `确认不是 anthropic_beta 这类手滑`);
-    }
-    if (bad.length) bits.push(`未见过的头名：${bad.join('、')}`);
-    msg.textContent = bits.length ? `⚠ ${bits.join('；')}` : '';
-    msg.style.color = bits.length ? 'var(--warn)' : '';
-  };
-
-  // 写进 S.overrides 但**不**立刻 refreshPlan —— 那会重渲染整个 .wbox，
-  // 把正在输入的框连焦点带光标一起换掉。边打字边跳焦点是不能用的。
-  const stash = () => {
-    const h = collect();
-    check(h);
-    S.overrides[rid] = S.overrides[rid] || {};
-    S.overrides[rid][sec] = S.overrides[rid][sec] || {};
-    S.overrides[rid][sec].headers = h;
-    det.querySelector('.hreset').disabled = false;
-  };
-
-  let timer = null;
-  det.addEventListener('input', (e) => {
-    if (!e.target.classList.contains('hk')
-        && !e.target.classList.contains('hv')) return;
-    stash();
-    // 停手 700ms 才重算方案。数字是权衡：太短仍会在连续输入中打断，
-    // 太长会让「改了头之后 priority 建议随之变化」这件事显得没反应。
-    clearTimeout(timer);
-    timer = setTimeout(() => { S.keepOpen = pk(rid, sec); refreshPlan(); }, 700);
-  });
-  // 失焦立即结算 —— 用户已经改完了，不该再等那 700ms
-  det.addEventListener('focusout', () => {
-    if (!timer) return;
-    clearTimeout(timer); timer = null;
-    S.keepOpen = pk(rid, sec);
-    refreshPlan();
-  });
-  det.addEventListener('click', (e) => {
-    const add = e.target.closest('.hadd');
-    const del = e.target.closest('.hdel');
-    const rst = e.target.closest('.hreset');
-    if (add) {
-      e.preventDefault();
-      rowsBox.insertAdjacentHTML('beforeend',
-        hdrRow('', '', rowsBox.children.length));
-      rowsBox.lastElementChild.querySelector('.hk').focus();
-      return;
-    }
-    if (del) {
-      e.preventDefault();
-      del.closest('.hrow').remove();
-      // 这里原本写的是 commit() —— 那个函数不存在（闭包里只有 collect /
-      // check / stash），于是抛 ReferenceError：行从 DOM 上消失了，
-      // 但 S.overrides 里还留着被删的那个头，看起来删掉了实际没有。
-      stash();
-      S.keepOpen = pk(rid, sec);
-      refreshPlan();
-      return;
-    }
-    if (rst) {
-      e.preventDefault();
-      // 删掉这个键而不是置空 —— 「没改过」与「改成空」是两件事，
-      // 后者应当真的写出一个空 headers。
-      if (S.overrides[rid] && S.overrides[rid][sec]) {
-        delete S.overrides[rid][sec].headers;
-      }
-      refreshPlan();
-    }
-  });
-}
-
-// 逐模型影响面。抢顶层与挡下层是两件事，都要能看见。
-function impactTable(sp) {
-  const imps = sp.impacts || [];
-  if (!imps.length) return '';
-  const rows = imps.map((i) => {
-    const hosts = i.shadowed_hosts || [];
-    let verdict, cls;
-    if (i.hijacks) { verdict = `抢走顶层（原 ${i.current_top}）`; cls = 'p-b'; }
-    else if (i.shares) { verdict = `与顶层同层（${i.current_top}）`; cls = 'p-w'; }
-    else { verdict = `低于顶层 ${i.current_top}`; cls = 'p-ok'; }
-    return `<tr>
-      <td class="m">${esc(i.model)}</td>
-      <td><span class="pill ${cls}">${esc(verdict)}</span></td>
-      <td class="hint">${hosts.length
-        ? `挡住 ${hosts.length} 站：${esc(hosts.slice(0, 6).join(' '))}${hosts.length > 6 ? ' …' : ''}`
-        : '不挡任何站'}</td>
-    </tr>`;
-  }).join('');
-  return `<div class="tw" style="margin-top:9px"><table>
-    <thead><tr><th>模型</th><th style="width:190px">相对现有顶层</th>
-      <th>被挡在其后</th></tr></thead>
-    <tbody>${rows}</tbody></table></div>`;
-}
-
-$('#btnback').onclick = () => {
-  $('#p2').hidden = true; $('#p3').hidden = true; $('#p1').hidden = false;
-  step(1);
-};
-
-// 方案级警告（/api/plan 的 warnings）。段级警告在结果表的 wrow 里，
-// 但这些不属于任何单段 —— 「整批下移到更低的空档」「N 个站共用同一档位」
-// 说的是**站与站的相对关系**，只有在这里给一处才看得全。
-//
-// 为什么必须显示（2026-09-02）：后端一直返回它，前端从来不读。定档退化
-// （空档不够、越过现有档位、用户手工改成同值）会改变哪个站先被尝试，
-// 而那正是这一轮要修的东西 —— 悄悄发生等于没修。
-function planWarnings(d) {
-  const ws = Array.isArray(d.warnings) ? d.warnings : [];
-  if (!ws.length) return '';
-  return `<div class="note w"><b>定档提示 ${ws.length} 条</b>
-    —— 影响的是站与站的先后，不影响单个条目能否用
-    <div class="mlist">${ws.map((w) => `· ${esc(w)}`).join('<br>')}</div></div>`;
-}
-
-$('#btnplan').onclick = async () => {
-  const d = await refreshPlan(false);
-  if (!d) return;
-
-  const nLines = d.diffs.reduce((a, x) => a + x.lines.length, 0);
-  const skipped = d.plans.flatMap((p) =>
-    Object.entries(p.skipped).map(([s, why]) =>
-      `${p.host} · ${SECTION_LABEL[s] || s}：${why}`));
-
-  $('#planmeta').innerHTML = `
-    <div class="stat">
-      <span>插入 <b>${d.diffs.length}</b> 处</span>
-      <span>新增 <b>${nLines}</b> 行</span>
-      <span>${fmt(d.lines_before)} → <b>${fmt(d.lines_after)}</b> 行</span>
-    </div>
-    <div class="note ${d.valid ? 'g' : 'b'}">${esc(d.validate_msg)}</div>
-    ${planWarnings(d)}
-    ${skipped.length ? `<div class="note">不写入 ${skipped.length} 项：
-      <div class="mlist">${skipped.map(esc).join('<br>')}</div></div>` : ''}`;
-
-  $('#diffs').innerHTML = d.diffs.length ? d.diffs.map((x, i) => `
-    <div class="diff">
-      <div class="dh"><span class="pill p-ok">+${x.lines.length}</span>
-        <span class="m">${esc(x.section)}</span>
-        <span class="hint">← ${esc(x.host)} · 第 ${x.insert_at} 行后</span>
-        <button class="cp" data-i="${i}">复制</button></div>
-      <pre>${x.lines.map((l) => `<span class="a">+ ${esc(l)}</span>`).join('')}</pre>
-    </div>`).join('')
-    : `<div class="note w">无可写入条目 —— 没勾选，或全部不可用 / 已存在</div>`;
-
-  $$('#diffs .cp').forEach((b) => {
-    b.onclick = () => {
-      navigator.clipboard.writeText(d.diffs[+b.dataset.i].lines.join('\n')).then(() => {
-        b.textContent = '已复制'; b.classList.add('done');
-        setTimeout(() => { b.textContent = '复制'; b.classList.remove('done'); }, 1400);
-      });
-    };
-  });
-
-  $('#btnapply').disabled = !d.valid || !d.diffs.length;
-  $('#p3').hidden = true; $('#p4').hidden = false;
-  step(4);
-  $('#p4').scrollIntoView({ behavior: 'smooth', block: 'start' });
-};
-
-$('#btnreplan').onclick = () => {
-  $('#p4').hidden = true; $('#p3').hidden = false; step(3);
-};
-
-// ── 写回 ──
-// 写回收尾的轮询。落盘那一步已经在 /api/apply 里同步完成 —— 这里只等
-// 「重载 + 端到端验证」，并把阶段与验证进度显示出来。
-//
-// 与步骤②的探测轮询同一套思路：断连要重试，不能因为一次网络抖动就让用户
-// 以为写回失败（写盘早就成了）。
 async function pollApply(taskId, first) {
   const box = $('#applymsg');
   let fails = 0;
