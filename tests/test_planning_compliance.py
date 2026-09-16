@@ -104,16 +104,34 @@ def test_topup_proven_generation_survives_higher_market_major():
     # 同主版本的更旧代不搭救
     assert "gpt-5" not in got, got
 
-    # proven 为空 = 没有实测依据 → 原来的「整代换代」判据原样生效
+    # 没有实测依据时，判据退到第二层「站方报过 + 市面名录里那一代还在售」。
+    #
+    # 2026-09-16 用户第 2 条：「如果检测出来没有最高级模型，比如检测出来
+    # 最新模型 gpt-6 系列不通，直接按最新模型 gpt-6 填充。但是次高级模型
+    # 如 gpt-5.6 通的，这个时候将 gpt-5.6 系列与 gpt-6 系列都勾选保留。」
+    #
+    # 这里 `have=["gpt-5.6"]` 就是「站方报过 gpt-5.6」，而 R 里 gpt-5.6 与
+    # gpt-5.6-sol 都在售 —— 名录还认识这一代，所以它与 gpt-6 并存。
+    # 原来断言 `"gpt-5.6" not in got2` 钉的是 2026-09-11 的旧口径（只留顶代），
+    # 那条在 mhtml 快照上的后果是：整轮 0 次 200 时，站方报过的名字被换成
+    # 站方从没报过的 gpt-6-astra，CPA 对着不存在的型号发请求。
     got2, _, _ = mc.topup_to_market_top(C, ["gpt-5.6"], remote=R)
-    assert "gpt-5.6" not in got2, got2
-    assert "gpt-5.6-sol" not in got2, got2
+    assert "gpt-5.6" in got2, got2
+    assert "gpt-5.6-sol" in got2, got2          # 同代变体一起补齐
     assert "gpt-6" in got2, got2
+    assert "gpt-5" not in got2, got2            # 同主版本的更旧代仍不搭救
 
-    # 实测通的就是最高代时，行为与不传 proven 完全一致（无副作用）
+    # 名录里连同代的影子都没有（陈年目录）→ 照常顶成市面最高级
+    R_old = ["gpt-5.6", "gpt-5.6-sol", "gpt-6"]
+    got_old, _, _ = mc.topup_to_market_top(C, ["gpt-4", "gpt-4-32k"],
+                                           remote=R_old)
+    assert not any(m.startswith("gpt-4") for m in got_old), got_old
+
+    # 实测通的就是最高代时，行为与「站方报的就是最高代」一致（无副作用）
     got3, _, _ = mc.topup_to_market_top(C, ["gpt-6"], remote=R,
                                         proven=["gpt-6"])
-    assert got3 == got2, (got3, got2)
+    got4, _, _ = mc.topup_to_market_top(C, ["gpt-6"], remote=R)
+    assert got3 == got4, (got3, got4)
 
 
 def test_topup_proven_does_not_resurrect_unlisted_names():
@@ -233,6 +251,89 @@ def test_proven_exemption_keeps_verified_names_when_catalog_is_dead():
     sp = build([v], ["gpt-5.6", "gpt-6"]).sections[C]
     assert {"gpt-5.6", "gpt-6"} <= set(sp.models), sp.models
     assert sp.model_provenance["gpt-5.6"] == "verified"
+
+
+def test_low_tier_never_survives_any_path():
+    """降级档（mini / nano / lite）**从任何一条路进来都不许留**。
+
+    用户 2026-09-16 第 1 条原话：「凡是 mini 系列永远不可能勾选，因为这是
+    低档次模型」。
+
+    为什么要专门钉这一条（2026-09-16 实测的漏网）
+    ------------------------------------------
+    `section_allows` 早就拒降级档，但 `topup_to_market_top` 的 `have` 通道
+    **不过那道闸** —— 它直接收调用方传进来的站方清单。而降级档在世代比较里
+    是「认不出版本」的（`_cmp_gen` 对 `is_low_tier` 的名字返回 None），于是
+    `_stale_major` 一律放行，整条淘汰逻辑碰都碰不到它们：
+
+        have=['gpt-4o-mini', 'gpt-5.6']  名录 gpt-6
+        → ['gpt-4o-mini', 'gpt-5.6', 'gpt-5.6-sol', 'gpt-6']
+                   ^^^^ 2024 年的降级档混进 2026 年的清单
+
+    三条路径各测一次：站方清单带 mini、名录里有 mini、两边都有。
+    """
+    R = ["gpt-5.6", "gpt-5.6-sol", "gpt-6", "gpt-6-mini", "gpt-6-nano"]
+
+    # ① 站方清单里带降级档
+    got, _a, _s = mc.topup_to_market_top(C, ["gpt-4o-mini", "gpt-5.6"],
+                                         remote=R)
+    assert not any(mc.is_low_tier(m) for m in got), got
+
+    # ② 站方只报了降级档 —— 清单不能空，但也不能留它
+    got2, _a, _s = mc.topup_to_market_top(C, ["gpt-6-mini"], remote=R)
+    assert not any(mc.is_low_tier(m) for m in got2), got2
+    assert got2, "清空会让这个段勾不上"
+
+    # ③ 名录里的降级档也不许被补进来
+    got3, _a, _s = mc.topup_to_market_top(C, ["gpt-6"], remote=R)
+    assert not any(mc.is_low_tier(m) for m in got3), got3
+
+    # ④ 走完整 build_plan 也一样（探测与目录两条来源）
+    sp = build([verdict(models=["gpt-6-mini"], catalog=["gpt-6-mini", "gpt-6"])],
+               R).sections[C]
+    assert not any(mc.is_low_tier(m) for m in sp.models), sp.models
+
+
+def test_station_reported_generation_survives_when_market_still_sells_it():
+    """站方报过、市面名录里那一代**还在售** → 与顶代并存；已下线才顶掉。
+
+    用户 2026-09-16 第 2 条原话：「如果检测出来没有最高级模型，比如检测出来
+    最新模型 gpt-6 系列不通，直接按最新模型 gpt-6 填充。但是次高级模型如
+    gpt-5.6 通的，这个时候将 gpt-5.6 系列与 gpt-6 系列都勾选保留。」
+
+    为什么判据不能是 `proven`（本轮实测 200）
+    -------------------------------------
+    真实现场可以整轮一次都不成功：那份 10.9 MB 的全量检测快照实测 45 次请求，
+    403×698 / 503×287 / 429×269，**几乎 0 次 200**。`proven` 恒空则豁免恒不
+    成立，站方报过的 `gpt-5.6-sol` 被换成站方从没报过的 `gpt-6-astra` ——
+    写进 config.yaml 后 CPA 每次轮到这个站都对着不存在的型号发请求。
+
+    为什么判据也不能是「主版本差几代」
+    ------------------------------
+    主版本号不连续（gpt 4 → 5 之间没有真正的世代），差值恒为 1 的两个场景
+    一个该豁免一个该顶掉，阈值分不开。真正的区别是**市面名录里还认不认识
+    站方那一代**：还在售 = 站方只是新代没上架；名录里连同代的影子都没有
+    = 已下线。
+    """
+    # ① 还在售：5.6 与 6 并存，且同代变体一起补齐
+    R = ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-6", "gpt-6-sol"]
+    got, _a, _s = mc.topup_to_market_top(C, ["gpt-5.6"], remote=R)
+    assert "gpt-5.6" in got, got
+    assert "gpt-6" in got, got
+    assert "gpt-5.6-sol" in got, got
+
+    # ② 已下线（陈年目录）：名录里一个 (4,0) 都没有 → 顶成市面最高级
+    got2, _a, _s = mc.topup_to_market_top(C, ["gpt-4", "gpt-4-32k"], remote=R)
+    assert not any(m.startswith("gpt-4") for m in got2), got2
+    assert "gpt-6" in got2, got2
+
+    # ③ mhtml 快照的原始形状（live catalog 里没有裸 gpt-5.6、没有裸 gpt-6）
+    LIVE = ["gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra",
+            "gpt-5.6-sol", "gpt-5.3-codex-spark"]
+    got3, _a, _s = mc.topup_to_market_top(C, ["gpt-5.6-sol"], remote=LIVE)
+    assert "gpt-5.6-sol" in got3, (
+        f"站方报过、名录里还在售的名字被换成了它没报过的：{got3}")
+    assert "gpt-6-astra" in got3, got3
 
 
 def test_reenable_targets_only_for_real_disable_markers():

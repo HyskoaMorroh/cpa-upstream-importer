@@ -155,28 +155,41 @@ def gemini_pro_ok(name: str) -> bool:
         return False
 
 
-# 降级档：名字里带 mini / nano / lite 的一律不选（用户 2026-09-12 定，
+# 降级档：名字里带 mini / nano / lite / flash / fast 的一律不选
+# （用户 2026-09-12 定 mini，2026-09-16 补 flash 与 fast，
 # **不分类型、不看版本号**）。
 # ------------------------------------------------------------------------
-# 用户原话：「本项目无论什么类型，凡是模型名称中带 mini 的就算版本很高也不
-# 应该勾选应该排除」。nano / lite 是同一档的其它写法，一并挡掉。
+# 用户原话（2026-09-12）：「本项目无论什么类型，凡是模型名称中带 mini 的就算
+# 版本很高也不应该勾选应该排除」。
+# 用户原话（2026-09-16 第 ① 条）：「所有带 mini、flash、fast 的模型都不勾选，
+# 这种模型属于低档次模型，没有存在的价值」。
+# nano / lite 是同一档的其它写法，一并挡掉。
+#
+# 为什么 flash 必须单列，而不是靠 gemini 段的 pro 闸兜住
+# --------------------------------------------------
+# `gemini_pro_ok` 只在 **gemini 段**生效。compat 段对 gpt / claude / kimi 三族
+# 不查 pro —— 实测 2026-09-16：`claude-opus-5-fast` 在 compat 段
+# `section_allows` 返回 True，`gemini-3.1-flash` 也只是因为不属四族之一才被
+# 挡下。换句话说降级档在 compat 段原本是漏的。
 #
 # 为什么单独一条而不是塞进 `_NON_CHAT`：那个正则管的是「协议不同、路由过去
-# 必然失配」（图像 / 语音 / 嵌入 / 批处理）。mini 是能对话的，只是档次低 ——
-# 判据不同，混在一起下次读的人会以为 mini 也是协议问题。
+# 必然失配」（图像 / 语音 / 嵌入 / 批处理）。mini / flash / fast 是能对话的，
+# 只是档次低 —— 判据不同，混在一起下次读的人会以为它们也是协议问题。
 #
 # 为什么必须按 **token 边界** 匹配：`gemini` 与 `kimi` 的字面里就含 `mini`
 # 与 `imi`。裸 `in` 判会把整个 gemini 族和 kimi 族全部挡掉 —— 那是静默的
-# 灾难（gemini 段会一个模型都挑不出来）。
+# 灾难（gemini 段会一个模型都挑不出来）。`fast` 同理要防 `breakfast` 这类
+# 子串（模型名里虽不常见，但判据一致比碰运气好）。
 #
 # 这一条同时解决了本项目两套测试互斥的老问题：`o4-mini` 被这里先剔除，
 # 于是「族内比主版本」不会让它挤掉 `o3` / `o3-pro`，
 # 见 `newest_generation_per_line` 的两阶段说明。
-_LOW_TIER = re.compile(r"(?<![a-z0-9])(?:mini|nano|lite)(?![a-z0-9])")
+_LOW_TIER = re.compile(
+    r"(?<![a-z0-9])(?:mini|nano|lite|flash|fast)(?![a-z0-9])")
 
 
 def is_low_tier(name: str) -> bool:
-    """名字里带 mini / nano / lite —— 降级档，工具一律不挑。
+    """名字里带 mini / nano / lite / flash / fast —— 降级档，工具一律不挑。
 
     只管**工具自己挑不挑**。操作员显式手填的走 `section_protocol_ok`，
     那一层不问档次（手填是显式意图，见 plan.py 的 forced_models 分支）。
@@ -1116,7 +1129,25 @@ def topup_to_market_top(section: str, models: list[str], *,
     if not latest:
         return list(models), [], ""
 
-    have = [m for m in (models or []) if m]
+    # 降级档（mini / nano / lite）**无论从哪条路进来都不许留**
+    # （用户 2026-09-16 第 1 条：「凡是 mini 系列永远不可能勾选，因为这是
+    # 低档次模型」）。
+    #
+    # 为什么必须在这里再拦一道：`have` 是调用方直接传进来的站方清单，它
+    # **没过 `section_allows`**。而降级档在世代比较里是「认不出版本」的
+    # ——`_cmp_gen` 对 `is_low_tier` 的名字返回 `None`，于是 `_stale_major`
+    # 一律返回 False，整条淘汰逻辑碰都碰不到它们。实测（2026-09-16）：
+    #
+    #     have=['gpt-4o-mini', 'gpt-5.6']  名录 gpt-6
+    #     → ['gpt-4o-mini', 'gpt-5.6', 'gpt-5.6-sol', 'gpt-6']
+    #                ^^^^ 一个 2024 年的降级档混进了 2026 年的清单
+    #
+    # 站方报过也不算数：降级档是**选型偏好**层面的硬拒（用户明示），
+    # 与「站方报过的名字是实测事实」那条不冲突 —— 那条管的是「同一档次里
+    # 信谁」，这条管的是「哪些档次根本不进候选」。
+    #
+    # 手填那条路不受影响：它走 `plan.py` 的 `forced_kept`，根本不经过本函数。
+    have = [m for m in (models or []) if m and not is_low_tier(m)]
     if not have:
         return list(latest), list(latest), src
 
@@ -1188,12 +1219,103 @@ def topup_to_market_top(section: str, models: list[str], *,
         if fam not in _proven_gen or g > _proven_gen[fam]:
             _proven_gen[fam] = g
 
+    # ── 第三证据层：站方**报过**的那一代（2026-09-16，mhtml 快照复盘）──
+    #
+    # 为什么光有 `proven` 不够
+    # ----------------------
+    # `proven` 的来源是「本轮实测出 200」。而真实现场里整轮探测可以一次都
+    # 不成功：那份 10.9 MB 的全量检测快照实测 45 次请求，403×698 /
+    # 503×287 / 429×269，**几乎 0 次 200**。于是 `proven` 恒为空、豁免恒
+    # 不成立，阶段 A 照常整代作废，结果是：
+    #
+    #     站方报 gpt-5.6-sol（live catalog 里确实有）
+    #     目录里躺着 gpt-6-astra
+    #     → 落盘只剩 ['gpt-6-astra']   ← 站方从没报过这个名字
+    #
+    # 这违反本文件 :1015-1019 自己写的禁令（不替站方发明它没卖过的东西），
+    # 也违反用户 docx 第 3⑵ 条后半段的原话：「如果检测 gpt-6 系列明显不通
+    # （包括代理检测或其他办法也不通），这个时候 gpt-6 系列按模型目录最高
+    # 级别保留**同时保留实测最高的 gpt-5.6 系列**」—— 要的是**两者都留**，
+    # 而不是「探不通就只留目录顶代」。
+    #
+    # 三层证据的强弱（这是本函数的核心次序）
+    # ------------------------------------
+    #   1. proven   本轮实测 200        —— 最硬，豁免一定成立
+    #   2. have     站方 /models 报过   —— 次之，站方声明它卖这个
+    #   3. 目录补齐 名录里有这个名字     —— 最弱，工具的猜测
+    #
+    # 站方报过的名字与目录猜的名字**不是一个量级**：前者是上游自己声明的
+    # 商品清单，后者只是「市面上存在这个型号」。拿 3 去替换 2，等于用猜测
+    # 覆盖事实 —— 那正是快照里那个缺陷的形状。
+    #
+    # 为什么不干脆让站方清单完全免疫阶段 A
+    # ---------------------------------
+    # 那会把**整份陈年目录**也保住，而用户 2026-09-11 明确推翻过那种做法
+    # （docx 第 4 条）：「检测出来没有高级模型就按该系列该类型的最高级填充
+    # 勾选」—— 一个站的目录全是 gpt-4 / gpt-4-32k / gpt-4o 而市面已到 5.6 时，
+    # 清单**要被顶成市面最高级**，不留老款。`test_stale_catalog_not_recommended`
+    # 固化的就是这条。
+    #
+    # 那两种情形靠什么区分
+    # ------------------
+    # 不是「主版本差几代」—— 主版本号不连续（gpt 4 → 5 之间没有真正的世代），
+    # 差值恒为 1 的两个场景一个该豁免一个该顶掉，阈值分不开。
+    #
+    # 真正的区别是「**市面名录里还认不认识站方那一代**」：
+    #
+    #     站方 gpt-5.6  名录里 gpt-5.6-terra / -luna / -sol 都在 → 还在售
+    #     站方 gpt-4    名录里一个 (4,0) 的都没有              → 已下线
+    #
+    # 还在售就说明站方只是「新代刚出还没上架」，它报的名字此刻确实能用；
+    # 名录里连同代的影子都没有，那些名字多半已经下线 —— 写进 config.yaml
+    # 会让 CPA 路由到死模型，比不写更糟。
+    #
+    # 这个判据不需要任何阈值常数，也不受主版本号是否连续影响。
+    _market_gens: dict[str, set[tuple[int, int]]] = {}
+    for n in market_pool:
+        g = _cmp_gen(n)
+        if g is None:
+            continue
+        _market_gens.setdefault(generation_family(n), set()).add(g)
+
+    _have_gen: dict[str, tuple[int, int]] = {}
+    for n in have:
+        g = _cmp_gen(n)
+        if g is None:
+            continue
+        fam = generation_family(n)
+        if fam not in _have_gen or g > _have_gen[fam]:
+            _have_gen[fam] = g
+
+    def _exempt_gen(fam: str) -> tuple[int, int] | None:
+        """该族里**受保护**的那一代。实测优先，其次站方报过的最高代。
+
+        两者都存在且不同代时取实测那一代：实测是更硬的证据，而同族里
+        同时保两代（实测的 + 站方报过的更高但没验过的）会让清单里混进
+        没有任何证据支持的名字。
+
+        站方那一层还要过「市面名录认不认识这一代」那道闸 —— 名录里连同代
+        的影子都没有，说明它已经下线，照常顶成市面最高级。见上面的说明。
+        """
+        hit = _proven_gen.get(fam)
+        if hit is not None:
+            return hit
+        hit = _have_gen.get(fam)
+        if hit is None:
+            return None
+        if hit not in _market_gens.get(fam, ()):
+            return None                 # 名录已不认识这一代：陈年目录
+        return hit
+
     def _stale_major(n: str) -> bool:
         """该名字所属族的主版本是否已被更高主版本取代。
 
-        实测通过的那一代（`_proven_gen`）不作废：CPA 路由到一个实测通的模型
-        是**确定的收益**，而丢掉它换一个没验过的名额是确定的损失。作废只针对
-        「从没打通、且已被更高主版本取代」的名字。
+        受保护的那一代（`_exempt_gen`）不作废：
+          · 实测通过 —— CPA 路由到它是**确定的收益**，丢掉换一个没验过的
+            名额是确定的损失
+          · 站方报过 —— 上游自己声明卖这个，比工具从目录里猜的名字硬
+
+        作废只针对「既没打通、站方也没报过、且已被更高主版本取代」的名字。
         """
         g = _cmp_gen(n)
         if g is None:
@@ -1202,7 +1324,7 @@ def topup_to_market_top(section: str, models: list[str], *,
         top = top_major.get(fam)
         if top is None or g[0] >= top:
             return False
-        kept = _proven_gen.get(fam)
+        kept = _exempt_gen(fam)
         if kept is not None and (g[0], g[1]) == kept:
             return False
         return True
@@ -1245,11 +1367,17 @@ def topup_to_market_top(section: str, models: list[str], *,
             merged.append(n)
 
     def _proven_ok(n: str) -> bool:
-        """这一代被实测豁免放行了吗（族内实测最高世代）。"""
+        """这一代被豁免放行了吗（族内受保护的那一代）。
+
+        与阶段 A 的 `_stale_major` 共用 `_exempt_gen` —— 两处判据必须同源，
+        否则会出现「阶段 A 保住了 gpt-5.6，阶段 B 却不给它补同代的
+        gpt-5.6-sol」这种半吊子结果，而用户 docx 第 3⑵ 条要的正是
+        「所有相同等级系列的模型全部都要勾选上」。
+        """
         g = _cmp_gen(n)
         if g is None:
             return False
-        kept = _proven_gen.get(generation_family(n))
+        kept = _exempt_gen(generation_family(n))
         return kept is not None and g == kept
 
     for n in kept:
@@ -1476,3 +1604,82 @@ def _cfg_models(cfg: dict | None, section: str) -> list[str]:
     for entry in cfg.get(section) or []:
         take(entry)
     return [n for n in order if len(hosts[n]) >= _CFG_MODEL_MIN_HOSTS]
+
+
+# ---------------- 产品线可信度闸（2026-09-16，修 claude-fake-5）----------
+
+def known_product_lines(*, timeout: int = 8,
+                        proxy: str | None = None) -> set[str]:
+    """CPA 权威名录里出现过的**产品线**集合。拉不通返回空集。
+
+    返回产品线而不是名字本身：站方特供变体（`claude-opus-5-max`、
+    `gemini-3.1-pro-request-antigravity`）不在名录里，但它们的产品线
+    （`claude-opus` / `gemini`）在 —— 按名字比会把这些真模型全杀掉，
+    按产品线比才能只杀掉凭空捏造的那一类。
+    """
+    names, _why = remote_names(timeout=timeout, proxy=proxy)
+    return {_product_line(n) for n in names if n}
+
+
+def implausible_models(models: list[str], *, proven: list[str] | None = None,
+                       lines: set[str] | None = None) -> list[str]:
+    """挑出「产品线在权威名录里查无此线、且本轮没实测过」的名字。
+
+    为什么需要这道闸（2026-09-16，`claude-fake-5` 的第二次）
+    ------------------------------------------------------
+    `_CFG_MODEL_MIN_HOSTS` 那道闸（本文件 :1552）只管 **cfg 层**，判据是
+    「≥2 个站在用就不算手误」。实测它已经失守：线上 config.yaml 的 claude 段
+    有 **10 个不同的站**在用 `claude-fake-5`，门槛 2 形同虚设 —— 一旦一个假名
+    被写回去，下一轮重探就把它当成「多站公认」再抄一遍，自我加固。
+
+    而走 `v.catalog`（站方 /models 列表）与 `prior`（原 config.yaml 条目清单）
+    这两条路进来的名字**一道校验都没有**：站方目录说有什么就是什么。
+    现场快照实测：`claude-fake-5` 在 12 个站上处于勾选态、共 132 次。
+
+    判据为什么是「产品线 + 未实测」这个**合取**，不是单看产品线
+    -------------------------------------------------------
+    单看产品线会误杀。拿线上 config.yaml 的 77 个模型名实测过：产品线不在
+    名录里的有 10 个，其中 `claude-glm-5.2` / `Claude4.6` 这类**可能是真的**
+    （站方把别家模型挂在 claude 前缀下卖，CPA 的 compat 段确实能转）。
+
+    所以加上「本轮实测过就一律放行」这个安全阀：`v.models` 里的每一个名字
+    都过了 `pipeline._accept`（真 200 + 模型名对得上 + 正文不是错误体），
+    **实测证据比名录硬** —— 名录只是「CPA 官方知道有这个」，站方卖什么
+    它管不着。于是：
+      · 实测通过        → 放行（哪怕名录里没有）
+      · 未实测 + 线在册 → 放行（`claude-opus-5-max` 这类特供变体）
+      · 未实测 + 线不在册 → 拦下（`claude-fake-5` 死在这里）
+
+    拉不通名录时**整体放行**（`lines` 为空即返回 `[]`）
+    ------------------------------------------------
+    国内 VPS 直连 GitHub 不通是常态（见 `remote_names` 的说明）。那时若按
+    「不在册就拦」处理，等于一次网络抖动把所有段的模型清单清空 —— 写进
+    config.yaml 的是 0 个模型，比填错严重得多。失败必须朝安全侧倒。
+
+    **四族之外的名字一律不判**（2026-09-16 被 test_offfamily 抓到）
+    ----------------------------------------------------------
+    CPA 权威名录收录的是 CPA 自己认识的模型，而 `FAMILIES` 之外的
+    grok / glm / deepseek / qwen / llama **本来就不在册** —— 名录对它们
+    没有发言权，拿它判等于把「名录没收录」当成「这个模型不存在」。
+
+    而这批恰恰是 compat 段最需要保住的：那条路走 `/chat/completions`，
+    CPA 对模型名零校验（见 `section_protocol_ok` 的源码引用），能不能用
+    只取决于上游认不认。配置注释记的实测是 romeo 的 vip 分组**只有
+    grok-4.6 有渠道**、且它是唯一端到端验证过的模型。误杀它等于把
+    「有一个确认可用的模型」变成「一个都没有」。
+
+    所以只对四族内的名字判在册性：`claude-fake-5` 族是 claude、线是
+    `claude-fake`、名录里查无此线 → 拦；`glm-5.2` 族认不出 → 不判。
+
+    返回的是**要拦下的名字**，由调用方决定怎么处置（过滤 / 只告警）。
+    """
+    if lines is None:
+        lines = known_product_lines()
+    if not lines:
+        return []                       # 名录拉不通 —— 不拦，见上
+    ok = {bare_name(n) for n in (proven or []) if n}
+    return [n for n in (models or [])
+            if n and bare_name(n) not in ok
+            # 四族之外名录管不着，见上；只有族认得出来才谈在册性
+            and family(n)
+            and _product_line(n) not in lines]

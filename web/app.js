@@ -52,13 +52,26 @@ function famOf(m) {
 // 不报错，但 CPA 路由过去必然失配 —— 它们走的不是对话协议路径。
 const NON_CHAT = /-image(?:$|[-.])|-tts(?:$|[-.])|^imagen|-oss-|-embedding|-whisper|-moderation|-batch-inference/;
 
-// 降级档：名字里带 mini / nano / lite 的一律不选（用户 2026-09-12 定，
+// 降级档：名字里带 mini / nano / lite / flash / fast 的一律不选
+// （用户 2026-09-12 定 mini，2026-09-16 补 flash 与 fast，
 // **不分类型、不看版本号**）。与后端 model_catalog.is_low_tier 逐条等价。
 //
 // 必须按 **token 边界** 匹配：`gemini` 与 `kimi` 的字面里就含 `mini`。
 // 裸 includes('mini') 会把整个 gemini 族和 kimi 族全挡掉 —— 静默的灾难
-// （gemini 段界面上一个模型都挑不出来）。
-const LOW_TIER = /(?:^|[^a-z0-9])(?:mini|nano|lite)(?![a-z0-9])/;
+// （gemini 段界面上一个模型都挑不出来）。`fast` 同理要防 `breakfast`。
+//
+// 为什么这一行漏了 flash/fast 会**真的写坏 config.yaml**（2026-09-16 实测）
+// ------------------------------------------------------------------
+// 后端 2026-09-16 已补上这两个词，而这里没跟上，于是两侧分叉：
+//   claude 段  后端拒 claude-opus-5-fast，这里放行并**默认预勾**
+//   compat 段  后端拒 gpt-6-fast / gpt-6-flash / kimi-k3-fast，这里全放行
+// 界面预勾之后，操作员一提交就进 `S.forced` —— 那是「手填」通道，
+// 后端手填只过 `section_protocol_ok`（协议层），**不查档次**。
+// 于是被界面勾上的降级档绕过后端那道闸，真的落进 config.yaml。
+// 现场快照里已有 4 处 `anthropic/claude-opus-5-fast` 处于勾选态。
+//
+// 这就是为什么两侧必须逐字等价，而不是「后端是权威，前端差一点无所谓」。
+const LOW_TIER = /(?:^|[^a-z0-9])(?:mini|nano|lite|flash|fast)(?![a-z0-9])/;
 
 function isLowTier(m) {
   return LOW_TIER.test(bareName(m));
@@ -1528,6 +1541,14 @@ function renderStream(events) {
     if (e.kind === 'shape-reuse-abort') {
       return `<div class="s4">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
         + `${esc(e.reason || '')}</div>`;
+    }
+    // 熔断开启（2026-09-16）：「临时 / 未知」类连续 N 次完整探测都是同一个
+    // 状态码，本轮剩余 Key 已设为零请求直接复用。与 shape-reuse-dead 的区别：
+    // 那个是一次就确定（门禁/WAF 等），这个是多次积累后触发的熔断。
+    if (e.kind === 'fail-streak-open') {
+      return `<div class="note">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `${esc(e.status)} 连续 ${e.streak} 次，触发熔断 —— 本轮后续 Key 零请求`
+        + `<span class="dim">（${esc(e.category || '')}）</span></div>`;
     }
     // 站方负载上限（503/502/504）会重试一次。要让这一步可见 —— 否则
     // 用户只看到同一个模型出现两次、不知道为什么，也不知道等了 2 秒。

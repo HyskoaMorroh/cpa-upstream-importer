@@ -478,6 +478,123 @@ def test_dead_section_shape_is_cached():
     print(f"[OK] Dead shape: 站+段级失败缓存（5 Key {gated} 次请求，"
           f"后 4 把零请求）、凭证级不缓存、复用结论说清来源")
 
+
+def test_temp_failure_circuit_breaker():
+    """「临时」类连续同码失败要熔断 —— 否则一个挂掉的站吃掉半轮预算。
+
+    2026-09-16 现场量化（173 站、1144 次请求那一轮）：
+      · gorouter.app 一个站吃掉 **420 次**请求（15 Key × 4 段 × 每段 7 次），
+        **全部 502，一次成功都没有**。全轮 568 次 502 里 418 次来自它。
+      · zzzcoding.org（站方维护中）84 次全 405，同一形状。
+    两个站合计约占全轮请求的 44%，贡献的信息量却等于 4 段各探一次。
+
+    为什么 `_dead_shape` 接不住：`_HOST_LEVEL_FAIL` 故意排除「临时/未知」，
+    理由是「那两类本该重试」。这对**第一把 Key** 成立，对第 2..N 把不成立
+    —— 重试的价值在「这次不行下次可能行」，不在「换把 Key 问同一个已经
+    连拒 N 次的站+段」。
+
+    代价不只是慢：那轮总耗时 1650 秒，而 `/api/plan` 要在同一个 HTTP 请求里
+    重建整份配置，跑过 Cloudflare 的 100 秒回源窗口就变成 524 —— 现场快照里
+    692 个 priority 框全停在占位符「待定」，正是这么来的。
+
+    判据是**状态码**而不是类别：502 与 429 同归「临时」，但那是两种处境。
+    按码算连续，才能让真在抖的站（502/429 交替）继续享有重试。
+    """
+    import socket as _socket          # noqa: F401  （与同文件其余用例同构）
+    import threading as _threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from cpa_probe.pipeline import Prober as _Prober
+
+    hits = []
+    mode = {"status": 502, "alternate": False}
+    flip = {"n": 0}
+
+    class _Fake(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _all(self):
+            hits.append(self.path)
+            if mode["alternate"]:
+                # 真在抖的站：502 与 429 交替 —— 不该熔断
+                flip["n"] += 1
+                code = 502 if flip["n"] % 2 else 429
+            else:
+                code = mode["status"]
+            b = b'{"error":{"message":"upstream failure"}}'
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        do_GET = do_POST = _all
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Fake)
+    port = srv.server_address[1]
+    _threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{port}"
+
+    try:
+        N = 8
+        rows = cp.parse_lines(
+            "\n".join(f"{base},sk-brk-{i:04d}" for i in range(N)),
+            allow_private=True).valid
+
+        # ── ① 稳定 502：达阈值后剩余 Key 不再重复探测 ──
+        mode["alternate"] = False
+        hits.clear()
+        pr = _Prober(gap=0.0, timeout=5, probe_context=False, swap_samples=0,
+                     probe_capabilities=False, workers=4)
+        results = [pr.probe(r) for r in rows]
+        per_key = [r.total_calls for r in results]
+
+        eq("稳定 502 全部判不可用",
+           all(not v.usable for r in results for v in r.sections.values()),
+           True)
+        # 契约是**收敛到零且不再回升**，不是「第 N 把起必须为零」。
+        #
+        # 为什么不能钉死下标（2026-09-16 写这条断言时先写错了一版）：
+        # 四个段各自独立计数，而 `000`（连接失败）既不计数也不重置
+        # （见 `_bump_fail_streak`）—— 于是某个段遇到一次抖动后要多等一把
+        # Key 才满阈值，四段不可能在同一把 Key 上同时熔断。
+        # 实测形状是 [10,10,10,4,4,0,0,0]：先是四段全探，再是少数段还在
+        # 攒计数，最后全部收敛。钉死 `per_key[LIMIT+1:] == 0` 会把这个
+        # 完全正确的形状判成失败。
+        zeros = [i for i, c in enumerate(per_key) if c == 0]
+        first_zero = zeros[0] if zeros else -1
+        truthy("最终收敛到零请求且不再回升",
+               first_zero >= 0 and all(c == 0 for c in per_key[first_zero:]),
+               f"各 Key 请求数 {per_key} —— 尾部应全为 0，熔断没生效")
+        truthy("总请求数显著低于线性增长",
+               sum(per_key) < per_key[0] * N / 2,
+               f"实测合计 {sum(per_key)} 次，首个 Key 自己 {per_key[0]} 次")
+        # 熔断结论要说清是熔断，不能看起来像站方对每把 Key 都回过
+        brk = [v.action or "" for r in results[-1:]
+               for v in r.sections.values()]
+        truthy("熔断说明写进 action",
+               any("不再重复探测" in a or "复用" in a for a in brk),
+               f"实得 {brk!r}")
+
+        # ── ② 502/429 交替：站方真在抖，**不该**熔断 ──
+        mode["alternate"] = True
+        flip["n"] = 0
+        hits.clear()
+        pr2 = _Prober(gap=0.0, timeout=5, probe_context=False, swap_samples=0,
+                      probe_capabilities=False, workers=4)
+        res2 = [pr2.probe(r) for r in rows]
+        per_key2 = [r.total_calls for r in res2]
+        truthy("交替状态码不熔断（每把 Key 各自探）",
+               all(c > 0 for c in per_key2),
+               f"各 Key 请求数 {per_key2} —— 有 0 说明把「在抖」误判成"
+               f"「稳定挂掉」，那会让恢复中的站再也探不到")
+    finally:
+        srv.shutdown()
+
+    print(f"[OK] Circuit breaker: 稳定同码 {_Prober._FAIL_STREAK_LIMIT} 次后熔断"
+          f"（8 Key 合计 {sum(per_key)} 次请求）、交替码不熔断、结论说清来源")
+
 def main() -> int:
     # 端口交给 ThreadingHTTPServer 自己 bind（2026-09-05 修竞态）——
     # 见 tests/test_server.py 的 free_port docstring。
@@ -855,6 +972,10 @@ def main() -> int:
     # 这一项自己起假上游（要控制返回体），所以放在主 srv 关掉之后
     section("站+段级失败的负缓存")
     test_dead_section_shape_is_cached()
+
+    # 同上：自己起假上游，且要按 Key 序号切换返回码
+    section("临时类连续同码失败的熔断")
+    test_temp_failure_circuit_breaker()
 
     print("\n" + "=" * 66)
     if _fail:

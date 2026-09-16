@@ -3051,20 +3051,31 @@ claude-api-key:
     p2 = plan_with(mixed)
     assert p2.sections["codex-api-key"].model_source == "catalog"
     # 同产品线旧版被剔除（5.5 让位给 5.6），再按用户 2026-09-11 的规则补到
-    # 该系列的**市面最高级**：codex 线当前最高是 gpt-6 世代，所以目录只报到
-    # gpt-5.6 的站会被填成 gpt-6-astra。
+    # 该系列的**市面最高级**：codex 线当前最高是 gpt-6 世代。
     #
-    # 这一条曾断言结果是 `["gpt-5.6"]`，那钉的是 2026-09-02 的旧规则
-    # 「不写目录之外的名字」。docx 第 4 条明确推翻它：
-    #   「如codex当前最高为gpt-6系列所有模型名称」
-    #   「为了排除有时候检测模型BUG实际上能够使用，如果检测出来没有高级模型
-    #     按该系列该类型模型的最高级进行填充勾选」
-    # 风险（填的名字站方没报过、CPA 可能 404）由用户明示承担；工具这边要守的
-    # 是「填了什么说得出来」—— 见下面的 model_provenance 断言。
-    assert p2.sections["codex-api-key"].models == ["gpt-6-astra"], (
-        f"没补到该系列市面最高级：{p2.sections['codex-api-key'].models}")
-    assert p2.sections["codex-api-key"].model_provenance == {
-        "gpt-6-astra": "inferred"}, "填进去的名字必须标成未验证"
+    # 这一条断言改过两次，记清楚每次的依据：
+    #
+    # 2026-09-02 旧规则「不写目录之外的名字」→ 断言 `["gpt-5.6"]`。
+    # 2026-09-11 docx 第 4 条推翻它 → 断言 `["gpt-6-astra"]`（只留顶代）。
+    # 2026-09-16 用户第 2 条再次修正 → **两代都留**：
+    #
+    #     「如果检测出来没有最高级模型，比如检测出来最新模型 gpt-6 系列
+    #       不通，直接按最新模型 gpt-6 填充。但是次高级模型如 gpt-5.6 通的，
+    #       这个时候将 gpt-5.6 系列与 gpt-6 系列都勾选保留。」
+    #
+    # 只留顶代的代价（mhtml 快照实测）：那一轮 45 次请求几乎 0 次 200，
+    # 站方报过的 `gpt-5.6-sol` 被换成站方**从没报过**的 `gpt-6-astra` ——
+    # 写进 config.yaml 后 CPA 每次轮到这个站都对着不存在的型号发请求。
+    # 判据见 `topup_to_market_top` 的 `_exempt_gen`：站方报过、且市面名录
+    # 里那一代还在售时豁免；名录里连同代的影子都没有（陈年目录）才顶掉。
+    got2 = p2.sections["codex-api-key"].models
+    assert "gpt-6-astra" in got2, f"没补到该系列市面最高级：{got2}"
+    assert "gpt-5.6" in got2, (
+        f"站方报过且市面仍在售的那一代被丢了（用户 2026-09-16 第 2 条）：{got2}")
+    # 降级档一个都不许有（用户 2026-09-16 第 1 条）
+    assert not any(model_catalog.is_low_tier(m) for m in got2), got2
+    assert p2.sections["codex-api-key"].model_provenance["gpt-6-astra"] == (
+        "inferred"), "填进去的名字必须标成未验证"
     assert "gpt-5.5" not in p2.sections["codex-api-key"].models
     assert p2.sections["claude-api-key"].models == ["claude-opus-5"]
     assert p2.sections["gemini-api-key"].models == [

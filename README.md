@@ -405,11 +405,42 @@ YAML 校验 → 备份落盘 → 推送重载 → 读回校验，并共用同一
 ```
 
 日志里只有一行 `段 X：CPA 运行时数据不可用，将基于检测结果预测健康分数`。
-**特征静默失效，而三份部署文件看起来都是齐全的。**
+**特性静默失效，而部署文件看起来都是齐全的。**
 
-已补进 `docker-compose.yml` / `docker-compose.local.yml` / `.env.example`。
+已补进本仓库的 `docker-compose.yml` / `docker-compose.local.yml` / `.env.example`。
+
+#### 改仓库模板还不够：真正生效的是你自己那份 compose
+
+本仓库的三份是**模板**。实际部署往往用一份独立维护的 `docker-compose.yml`
+（整栈的那份，含 CPA、CPAMP、sub2api、mihomo…），它不在本仓库里。
+**改了模板而没改那一份，镜像里带着修复的代码，变量却没注入，特性照样不生效。**
+
+2026-09-16 实测就踩了这一脚：仓库三份都补好、镜像也推上去了，而线上仍是
+「CPA 运行时数据不可用」——因为线上那份 compose 的 `environment:` 里根本没有
+这个键。
+
+在你自己那份 compose 的 `upstream-importer` 服务下加：
+
+```yaml
+    environment:
+      # …既有的 IMPORTER_* / CPA_UPSTREAM_URL …
+      CPA_MANAGEMENT_TOKEN: "${CPA_MANAGEMENT_PASSWORD:-}"
+```
+
+**值建议写成引用而不是再抄一遍明文**：CPA 容器那边用的是
+`MANAGEMENT_PASSWORD`，投喂台这边叫 `CPA_MANAGEMENT_TOKEN` ——
+**同一个管理密码、两个变量名**。写成引用后改密码只需动 `.env` 一处，
+两个服务同时跟上；抄明文迟早会分叉成两个值。
+
 取值就是 CPA 后台的管理密码（或 `config.yaml` 里 `remote-management.secret-key`
-对应的原始密码 —— CPA 自己会把哈希贴到那个字段）。
+对应的**原始密码** —— CPA 自己会把 bcrypt 哈希贴回那个字段，哈希本身不能当密码用）。
+
+**怎么确认变量真的进了容器：**
+
+```bash
+docker exec upstream-importer sh -c 'echo "长度: ${#CPA_MANAGEMENT_TOKEN}"'
+# 输出 0 就是没注入
+```
 
 **怎么确认它在工作：** 跑一次导入，看日志里有没有
 

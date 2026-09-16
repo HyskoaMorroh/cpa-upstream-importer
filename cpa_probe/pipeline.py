@@ -647,6 +647,38 @@ class Prober:
         # 错误地继承别人的欠费结论 —— 那正是原来「只在 usable 时缓存」
         # 想避免的事，但它把两类一起排除了。
         self._dead_shape: dict[tuple[str, str], SectionVerdict] = {}
+        # (host, section) -> (状态码, 连续失败次数)。「临时 / 未知」类的熔断计数。
+        #
+        # 为什么 _dead_shape 不够（2026-09-16 现场量化）
+        # ------------------------------------------
+        # `_HOST_LEVEL_FAIL` 故意把「临时」「未知」排除在外，理由写在那张表
+        # 旁边：「那两类本来就该重试，缓存等于放弃重试」。这个理由对**第一把
+        # Key** 完全成立，对第 2..N 把不成立 —— 重试的价值在于「这一次不行
+        # 下一次可能行」，而不在于「换一把 Key 问同一个已经连续拒了 N 次的
+        # 站+段」。
+        #
+        # 实测代价（173 站那一轮，1144 次请求）：
+        #   · gorouter.app 一个站吃掉 **420 次**请求，15 把 Key × 4 段 ×
+        #     每段 7 次（基线 + 临时重试 + 画像梯 + via-proxy-last）
+        #     **全部是 502，一次成功都没有**。全轮 568 次 502 里 418 次
+        #     来自这一个站。
+        #   · zzzcoding.org（站方维护中）84 次全 405，同一个形状。
+        # 这两个站合计约占全轮请求的 44%，而它们贡献的信息量等于 4 段各一次。
+        #
+        # 直接后果不只是慢：那一轮总耗时 1650 秒，而 /api/plan 要在同一个
+        # HTTP 请求里重建整份配置，跑过 Cloudflare 的 100 秒回源窗口就变成
+        # 524 —— 现场截图里 692 个 priority 框全停在占位符「待定」，正是
+        # 这么来的。烧掉的时间最终表现为「定档失败」。
+        #
+        # 阈值 3 的依据：单位是**一次完整 _full_probe**，不是一次请求。
+        # 每次 full probe 内部已经含临时重试 + 整梯画像 + 末次代理，
+        # 3 次 ≈ 21 次实际请求。用 21 次同码失败换「这个站+段这一轮不用再问」
+        # 的结论，比继续投 400 次划算得多；而真正间歇性的站在 3 次完整探测
+        # （每次都含内部重试）里几乎不可能次次同码全败。
+        #
+        # 只在**状态码相同**时累计：502 与 429 交替出现说明站方真的在抖，
+        # 那种情形继续重试是对的，计数会被重置。
+        self._fail_streak: dict[tuple[str, str], tuple[str, int]] = {}
         self._lock = threading.RLock()
         self._proxy_state: bool | None = None   # None=未检 True/False=预检结果
         # 代理预检专用锁。不复用 _lock —— 预检要占最多 4 秒，
@@ -2286,6 +2318,62 @@ class Prober:
 
     # ---------- 形态复用 ----------
 
+    def _bump_fail_streak(self, key: tuple[str, str],
+                          v: SectionVerdict) -> None:
+        """记一次「临时 / 未知」失败；连续同码达阈值就提升为站+段级结论。
+
+        **调用方必须已持有 `self._lock`** —— 它读改 `_fail_streak` 与
+        `_dead_shape` 两张表，而两者都在锁的保护范围内。唯一调用点在
+        `_probe_one_section` 的 `with self._lock:` 块里。
+
+        判据是**最后一次尝试的状态码**，不是类别：类别只有「临时」「未知」
+        两个值，粒度太粗 —— 502 与 429 都归「临时」，但那是两种处境
+        （站方挂了 vs 打太快）。按状态码算连续，才能让真正在抖的站
+        （502/429 交替）继续享有重试，而一个稳定挂掉的站（次次 502）
+        尽快收敛。
+
+        计数满了就写进 `_dead_shape`：那张表是「同站同段、换 Key 无用」的
+        既有通道，`_reuse_dead` 已经会在复用时把来源说明挂进 `action`，
+        界面与导出日志照实显示，不会让人以为这把 Key 也实测过。
+        """
+        att = v.attempts[-1] if v.attempts else None
+        status = att.status if att else ""
+        if not status:
+            return                      # 没有可比的状态码就不计数
+        prev_status, n = self._fail_streak.get(key, ("", 0))
+        # `000`（连接失败 / 超时）**既不计数也不重置**（2026-09-16 实测发现）
+        # -------------------------------------------------------------
+        # 它的含义是「根本没拿到回答」，不构成「站方行为变了」的证据。
+        # 按普通状态码处理会让它把已经攒起来的连续计数打回 1：
+        #
+        #   实测 8 把 Key 打同一个稳定回 502 的站，第 3 把的 compat 段偶发
+        #   一次 `000`，该段的计数从 2 归零重来，于是又多跑了 3 把 Key 的
+        #   完整探测 —— 请求数 [9,10,10,4,4,4,0,0] 而不是 [9,10,10,0,…]。
+        #
+        # 生产里这一脚更疼：gorouter 那种稳定 502 的站，中途任何一次网络
+        # 抖动都会让熔断从头再来，而熔断本来就是为它设计的。
+        #
+        # 也不能反过来让 `000` 参与累计（`prev_status` 记成 `000`）——
+        # 那会把「连不上」与「站方明确拒绝」混成一条链，下一次真的 502
+        # 又要重新开始。跳过是唯一不引入新错的做法。
+        if status == "000" and prev_status and prev_status != "000":
+            return
+        n = n + 1 if prev_status == status else 1
+        self._fail_streak[key] = (status, n)
+        if n < self._FAIL_STREAK_LIMIT:
+            return
+        # 达阈值：本轮剩下的 Key 不再重复问这个站+段。
+        # `action` 里写明是熔断而不是站方的原话 —— 否则看起来像站方
+        # 真的对每把 Key 都回了一次，而实际上后面的 Key 一个请求都没发。
+        v.action = (v.action or "") + (
+            f"（连续 {n} 次完整探测都是 {status}，本轮不再重复探测）")
+        self._dead_shape[key] = v
+        self.on_event("fail-streak-open", {
+            "host": key[0], "section": key[1],
+            "status": status, "streak": n,
+            "category": v.category,
+        })
+
     def _reuse_dead(
         self, row: ParsedRow, section: str, dead: SectionVerdict
     ) -> SectionVerdict:
@@ -2461,6 +2549,21 @@ class Prober:
         "反测活", "限频",
     })
 
+    # 熔断：同一个 (站, 段) 连续多少次**完整探测**都以同一个状态码失败，
+    # 就把这一轮剩下的 Key 短路掉。只作用于 `_HOST_LEVEL_FAIL` 之外的
+    # 「临时 / 未知」两类 —— 那两类原本一次都不缓存，见 `_fail_streak`。
+    #
+    # 单位是完整探测而不是单次请求：每次 `_full_probe` 内部已含临时重试、
+    # 整梯画像与末次代理，3 次约等于 21 次实际请求。
+    _FAIL_STREAK_LIMIT = 3
+
+    # 熔断只认这两类。其余类别各有归宿：
+    #   · `_HOST_LEVEL_FAIL` 里的九类已经一次就缓存，走不到这里
+    #   · 鉴权 / 余额是**凭据自己的属性**，必须逐 Key 各自探 —— 熔断它们
+    #     等于让同站其他 Key 继承别人的欠费结论，那正是 `_dead_shape`
+    #     当初刻意排除它们的理由
+    _FAIL_STREAK_CATEGORIES = frozenset({"临时", "未知"})
+
     def _probe_one_section(self, row: ParsedRow, section: str) -> SectionVerdict:
         """探一个段。probe() 的工作单元，串行与并行共用同一份逻辑。
 
@@ -2519,6 +2622,9 @@ class Prober:
                     with self._lock:
                         if v.usable:
                             self._shape[key] = v
+                            # 通了就清计数：这个站+段本轮已经证明能用，
+                            # 之前的连续失败不该再影响后面的 Key。
+                            self._fail_streak.pop(key, None)
                         elif v.category in self._HOST_LEVEL_FAIL:
                             # 站+段级的失败也缓存（2026-09-05）——
                             # 它与用哪把 Key 无关，后到的 Key 白跑一遍
@@ -2526,6 +2632,11 @@ class Prober:
                             # 凭证类（鉴权/余额）与该重试的（临时/未知）
                             # 不在这张表里，见 _HOST_LEVEL_FAIL。
                             self._dead_shape[key] = v
+                        elif v.category in self._FAIL_STREAK_CATEGORIES:
+                            # 「临时 / 未知」不一次就缓存 —— 那两类本该重试。
+                            # 但连续 N 次完整探测都以同一个状态码失败时，
+                            # 重试的前提已经不成立，见 _bump_fail_streak。
+                            self._bump_fail_streak(key, v)
                 finally:
                     # 无论成败都必须放闸，否则等待方永久卡死
                     with self._lock:
