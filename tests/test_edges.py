@@ -157,7 +157,8 @@ def _dead_section_params() -> None:
     if sp_seed:
         eq("标注来源是种子", sp_seed.model_source, "seed")
         eq("种子段可勾选", sp_seed.writable, True)
-        eq("种子段不建议写", sp_seed.recommended, False)
+        # 2026-09-17 反转（用户规则 ④）：种子填充的段也建议写
+        eq("种子段也建议写", sp_seed.recommended, True)
         eq("种子段 priority 是确定整数",
            bool(isinstance(sp_seed.priority, int)), True)
         eq("种子段 priority >= 1", sp_seed.priority >= 1, True)
@@ -457,14 +458,16 @@ def main() -> int:
                         for i in range(4)), compat_ok=False)
     eq("YAML 校验", r["yaml_ok"], True)
     eq("claude +4", r["d_claude"], 4)
-    eq("compat 不动", r["d_provider"], 0)
-    eq("compat 无 diff", r["per_section"]["openai-compatibility"], 0)
+    # 2026-09-17 反转（用户规则 ④）：不可用段用市面最高级填充并建议写，
+    # 于是新站的 compat 段也进 provider —— 4 把 Key 同站合并成 1 个 provider。
+    eq("compat +1（种子填充）", r["d_provider"], 1)
+    eq("compat 有 diff", r["per_section"]["openai-compatibility"] > 0, True)
 
     section("⑦ claude 段不可用")
     r = h.run("\n".join(f"https://ncl.example.com,sk-ncl{i:04d}aaaabbbbc"
                         for i in range(4)), claude_ok=False)
     eq("YAML 校验", r["yaml_ok"], True)
-    eq("claude 不动", r["d_claude"], 0)
+    eq("claude +4（种子填充）", r["d_claude"], 4)
     eq("compat +1", r["d_provider"], 1)
 
     # ---------------------------------------------------------------- ⑧

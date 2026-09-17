@@ -1953,11 +1953,26 @@ class SectionPlan:
           · 静默换模 —— 照常计费却返回另一个模型，比不可用更危险
           · 抢走顶层 —— 层级隔离下现有顶层站会完全不被尝试
           · 上限由截断反推 —— 那个数字是实测容量而非站方声明，可能偏保守
-          · 模型未经推理验证 —— 只有目录或手填，站方声称有不等于这把 Key 能用
+
+        **2026-09-17：不再按 model_source 卡**（用户第 ⑵④ 条）
+        ------------------------------------------------------
+        原来这里写 `if self.model_source != "probed": return False`，
+        于是 seed / catalog / prior 三类来源的段一律不建议、界面默认不勾。
+
+        现场后果（用户 2026-09-17 截图，agentrouter.org 四段 401）：
+        探测全灭 → model_source 落到 seed（市面最新填充）→ recommended=False
+        → 「只勾推荐项」一个都勾不到 → 模型列空白、priority 停在「待定」、
+        建议栏停在「勾选后计算」。用户要手工一个一个点，173 站就是几百次。
+
+        而用户的规则 ④ 恰恰相反：**检测不通时按该系列最高级填充并勾选**，
+        且「无论何种情况严禁出现不勾选模型」。清单是 `topup_to_market_top`
+        算出来的市面最高代，本来就是该写的那份 —— 探测没通过只说明这把 Key
+        当时不可用（401 常常是分组没开通，换个时间就好），不说明清单是错的。
+
+        依据强度仍然可见：`model_source` 照常带到界面上（「实测」「目录」
+        「猜测」三档徽标），只是不再因为「不是实测」就默认不勾。
         """
         if not self.writable:
-            return False
-        if self.model_source != "probed":
             return False
         if any("换模" in w for w in self.warnings):
             return False

@@ -584,9 +584,13 @@ console.log(JSON.stringify(out));
            '"market_top_gen_lines"' in srv,
            "只给全局最高世代时无法区分 o 系列与 gpt 系列")
     truthy("前端也按线比", "market_top_gen_lines" in js)
-    truthy("全部可比线都落后才返回空",
+    # 2026-09-17 反转：整份目录落后时**仍然预勾**（用户规则 ④ —— 检测不通
+    # 就按该系列最高级填充勾选；「严禁出现不勾选模型」）。后端
+    # topup_to_market_top 已把清单顶成市面最高级，前端只报「落后」不清空。
+    truthy("全部可比线都落后仍返回预勾清单",
            "behind.length === shared.length" in js
-           and "return { keep: []" in js)
+           and "return { keep, line: worst" in js
+           and "return { keep: []" not in js)
     truthy("没有可比线时不判落后", "if (shared.length)" in js,
            "目录里只有 o 系列而市面清单里没有 o 系列时无从比较，不该惩罚它")
     # 判落后的那句提示要说清**哪条线**落后到几 —— 逐线比之后「本段最新」不再是

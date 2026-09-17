@@ -104,6 +104,14 @@ _RULES: list[tuple[str, str, str, set[str] | None]] = [
      r"only allows? [\w\s-]*clients?"
      r"|restricted to [\w\s-]*clients?"
      r"|client[\s_-]?not[\s_-]?allowed"
+     # `unauthorized client detected` 也是客户端门禁（2026-09-17 从「鉴权」
+     # 挪过来）。判「鉴权」的处置是「换把 Key」，而这句正文说的是**客户端**
+     # 不被认可 —— 换十把 Key 结论都一样，要换的是请求形态。判错的代价
+     # （agentrouter.org 现场）：不进 identity 那一段 → 不写 cloak.mode /
+     # fingerprint-profile → CPA 用默认形态转发 → 站方按同一条规则拒 →
+     # 客户端拿 499/503，而直接用 Claude Code 调就通 —— 正是用户第 1 条
+     # 描述的「直连可用、经 CPA 不可用」。
+     r"|unauthorized client"
      r"|仅(?:支持|允许)[^，。]{0,20}客户端", None),
 
     # ---- 探测请求形态不合规：站是好的，错在探测没照着真实客户端发 ----
@@ -133,7 +141,6 @@ _RULES: list[tuple[str, str, str, set[str] | None]] = [
 
     # ---- 站方硬拒 ----
     ("死路", "敏感词拦截", r"sensitive_words", None),
-    ("鉴权", "需特定客户端标识", r"unauthorized client", None),
 
     # ---- 405 Method Not Allowed：站方维护或协议不支持 ----
     #
