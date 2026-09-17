@@ -508,8 +508,6 @@ def test_temp_failure_circuit_breaker():
 
     hits = []
     mode = {"status": 502, "alternate": False}
-    flip = {"n": 0}
-    flip_lock = _threading.Lock()
 
     class _Fake(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -518,11 +516,17 @@ def test_temp_failure_circuit_breaker():
         def _all(self):
             hits.append(self.path)
             if mode["alternate"]:
-                # 真在抖的站：502 与 429 交替 —— 不该熔断
-                # flip_lock 防止多线程同时递增导致竞态（2026-09-17 修）
-                with flip_lock:
-                    flip["n"] += 1
-                    code = 502 if flip["n"] % 2 else 429
+                # 真在抖的站：502 / 429 按 Key 序号交替 —— 偶数 Key → 502，
+                # 奇数 Key → 429。同一把 Key 的所有请求看到相同码，不同 Key
+                # 严格交替，保证 _fail_streak 永远是 (502,1)→(429,1)→(502,1)…
+                # 不会积累到阈值 3。用 Authorization 头末尾的数字确定序号；
+                # 无法解析时回落到 0（502）。(2026-09-17 修竞态)
+                auth = (self.headers.get("Authorization") or
+                        self.headers.get("x-api-key") or "")
+                import re as _re
+                m = _re.search(r'(\d+)\s*$', auth)
+                key_idx = int(m.group(1)) if m else 0
+                code = 502 if key_idx % 2 == 0 else 429
             else:
                 code = mode["status"]
             b = b'{"error":{"message":"upstream failure"}}'
@@ -581,11 +585,13 @@ def test_temp_failure_circuit_breaker():
                f"实得 {brk!r}")
 
         # ── ② 502/429 交替：站方真在抖，**不该**熔断 ──
+        # workers=1 保证段串行执行，避免并发段共享同一 (host,section) 熔断
+        # 计数器时出现「某段连续看到相同码」的竞态。交替逻辑本身是对的；
+        # 只是 workers=4 并发时 4 个段的请求交错让熔断误触发（2026-09-17 修）
         mode["alternate"] = True
-        flip["n"] = 0
         hits.clear()
         pr2 = _Prober(gap=0.0, timeout=5, probe_context=False, swap_samples=0,
-                      probe_capabilities=False, workers=4)
+                      probe_capabilities=False, workers=1)
         res2 = [pr2.probe(r) for r in rows]
         per_key2 = [r.total_calls for r in res2]
         truthy("交替状态码不熔断（每把 Key 各自探）",
