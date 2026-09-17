@@ -132,7 +132,7 @@ def test_classify() -> None:
         ("400", '{"error":"sensitive_words detected"}', "死路"),
         ("404", '{"error":{"code":"model_not_found"}}', "死路"),
         ("500", "当前分组无可用渠道", "死路"),
-        ("401", "unauthorized client", "鉴权"),
+        ("401", "unauthorized client", "客户端"),
         # CPA 自注入工具被拒
         ("403", "Image generation is not enabled for this group", "注入"),
         # 状态码兜底
@@ -161,7 +161,7 @@ def test_classify() -> None:
         eq(f"判余额：{body[:18]}", got, "余额")
     # 反向：这些不能被误判成余额
     for st, body, want in (("403", "<html>Attention Required!</html>", "IP封"),
-                           ("401", "unauthorized client", "鉴权"),
+                           ("401", "unauthorized client", "客户端"),
                            ("404", "model_not_found", "死路")):
         got, _ = cp.classify(st, body)
         eq(f"不误判成余额：{body[:24]}", got, want)
@@ -916,9 +916,11 @@ def test_real_config(path: str) -> None:
     # 判死的段不会在用户没勾的情况下落进 config.yaml。
     eq("不可用段进了方案", "gemini-api-key" in plan.sections, True)
     eq("不可用段可勾选", plan.sections["gemini-api-key"].writable, True)
-    eq("不可用段不建议写", plan.sections["gemini-api-key"].recommended, False)
-    eq("建议写的段 3 个",
-       len([1 for p in plan.sections.values() if p.recommended]), 3)
+    # 2026-09-17 反转（用户规则 ④）：判死段用市面最高级填充后**也建议写**，
+    # 「无论何种情况严禁出现不勾选模型」。依据强度仍由 model_source 徽标可见。
+    eq("不可用段也建议写", plan.sections["gemini-api-key"].recommended, True)
+    eq("建议写的段 4 个",
+       len([1 for p in plan.sections.values() if p.recommended]), 4)
     eq("无劫持顶层警告",
        [w for p in plan.sections.values() for w in p.warnings if "抢走" in w], [])
 
@@ -927,7 +929,7 @@ def test_real_config(path: str) -> None:
     only_rec = copy.copy(plan)
     only_rec.sections = {k: v for k, v in plan.sections.items() if v.recommended}
     diffs = build_diffs(raw, [only_rec])
-    eq("生成 3 处插入", len(diffs), 3)
+    eq("生成 4 处插入", len(diffs), 4)
     out = apply_diffs(raw, diffs)
     ok, msg = validate(out)
     eq("合并后 YAML 校验通过", ok, True)
@@ -935,7 +937,7 @@ def test_real_config(path: str) -> None:
 
     new = yaml.safe_load(out)
     for sec, delta in (("claude-api-key", 1), ("codex-api-key", 1),
-                       ("openai-compatibility", 1), ("gemini-api-key", 0)):
+                       ("openai-compatibility", 1), ("gemini-api-key", 1)):
         eq(f"{sec} 条目 +{delta}",
            len(new[sec]) - len(cfg[sec]), delta)
 

@@ -2910,7 +2910,9 @@ codex-api-key:
     assert not any(m.startswith("gpt-4") for m in sp.models), sp.models
     for m in sp.models:
         assert sp.model_provenance.get(m) == "inferred", (m, sp.model_provenance)
-    assert not sp.recommended, "补进去的名字未经实测，不该默认勾"
+    # 2026-09-17 反转（用户规则 ④）：补进去的市面最高级**也建议写**。
+    # 依据强度由 model_provenance=inferred 与徽标可见，不再靠「不勾」表达。
+    assert sp.recommended, "落后目录顶成市面最高级后该默认勾（规则 ④）"
 
     # ── 不落后：照常 ──
     fresh = plan(["gpt-4o", "gpt-5.1", "gpt-5.5", "gpt-5.6-luna",
@@ -4473,7 +4475,9 @@ openai-compatibility:
     #    「每种类型只选该类型最高级别模型」剔除。原清单里**这个站验过的
     #    最高一档**必须留下。
     assert sp.models == ["claude-opus-5"], sp.models
-    assert sp.recommended is False, "沿用原清单不等于本次验过，不许默认勾"
+    # 2026-09-17 反转（用户规则 ④）：沿用原清单的段也建议写 —— 原清单是
+    # 先前实测沉淀，比工具猜测硬；不勾等于让操作员逐条手点。
+    assert sp.recommended is True, "沿用原清单的段该默认勾（规则 ④）"
     assert sp.writable is True, "原清单是确定值，该让操作员能勾"
     assert any("沿用原" in w for w in sp.warnings), sp.warnings
 

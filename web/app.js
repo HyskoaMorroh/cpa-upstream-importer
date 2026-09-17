@@ -350,7 +350,23 @@ function staleCheck(sec, catalog) {
         behind.forEach((ln) => {
           if (genGreater(lines[ln], lines[worst])) worst = ln;
         });
-        return { keep: [], line: worst,
+        // **整份目录落后时仍然预勾**（2026-09-17，用户第 ⑵④ 条）
+        // ----------------------------------------------------
+        // 原来这里返回 `keep: []` —— 一个都不勾，界面提示「默认不勾，
+        // 确知该站只卖这些且够用，手工勾上即可」。
+        //
+        // 现场后果（用户截图）：codex 段目录只有 gpt-5.1、市面已到 gpt-6，
+        // 于是整格空白等人工点。173 站就是几百次点击。
+        //
+        // 用户规则 ④ 要的正相反：**最新代按目录最高级填充勾选，
+        // 同时保留实测通过的次新代**。后端 `topup_to_market_top` 已经
+        // 按这条算好了（catalog=[gpt-5.1] → ['gpt-6-astra']；
+        // proven=[gpt-5.1] → ['gpt-5.1','gpt-6-astra']），
+        // 前端只要照勾即可，不该再自作主张清空。
+        //
+        // `line/cat/mkt` 仍然返回 —— 界面照常提示「这份目录落后于市面」，
+        // 让操作员知道依据强度，但不再替他做「不勾」的决定。
+        return { keep, line: worst,
                  cat: catTop[worst].join('.'), mkt: lines[worst].join('.') };
       }
     }
@@ -1867,9 +1883,9 @@ function siteCard(r) {
             : ''}</td>
         <td class="prio">
           <div class="pedit"><input type="number" class="pi"
-            data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}" placeholder="待定"></div>
+            data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}" placeholder="计算中"></div>
         </td>
-        <td class="rsn"><span class="hint">勾选后计算</span></td>
+        <td class="rsn"><span class="hint">定档计算中…</span></td>
       </tr>
       <tr class="wrow" data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}">
         <td></td><td colspan="7" class="wbox"></td>
@@ -2451,14 +2467,29 @@ async function refreshPlan(silent) {
   if (taskId) {
     const stat = $('#pickstat');
     if (stat) stat.innerHTML = `<span class="hint">定档计算中…（后台运行，请稍候）</span>`;
-    for (let i = 0; i < 180; i++) {        // 最长等 360s
+    // 不设固定上限（2026-09-17）。原来 `i < 180`（360 秒）：173 站全量重探
+    // 的定档实测可能超过它，到点就报「定档超时，请重试」—— 而后台任务其实
+    // 还在正常跑，重试只会再起一个同样跑不完的任务。
+    // 现在只认后端的 state：done / error 才退出；连续 15 次轮询拿不到响应
+    // （30 秒没有任何可达性）才判断链路断了。任务本身在服务端有 TTL 兜底。
+    let misses = 0;
+    for (;;) {
       await new Promise((r) => setTimeout(r, 2000));
       let poll;
       try {
         poll = await api('/api/plan-status', {
           method: 'POST', body: { plan_task_id: taskId },
         });
-      } catch (_) { continue; }             // 网络抖动 → 继续等
+        misses = 0;
+      } catch (_) {
+        if (++misses >= 15) {
+          const meta = $('#planmeta');
+          if (meta) meta.innerHTML = `<div class="err">定档轮询 30 秒无响应，链路可能已断</div>`;
+          if (stat) stat.innerHTML = `<span class="err">定档轮询无响应 —— 刷新页面后重试</span>`;
+          return null;
+        }
+        continue;
+      }
       if (!poll) continue;
       if (poll.state === 'done') { d = poll.result; break; }
       if (poll.state === 'error') {

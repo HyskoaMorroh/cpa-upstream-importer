@@ -3119,25 +3119,40 @@ class Handler(BaseHTTPRequestHandler):
                          task: PlanTask) -> None:
         """在后台线程里跑 _plan_body，把结果存进 task.result。
 
-        不再 monkey-patch self._json（那会覆盖测试的 mock，导致 AttributeError）。
-        改用 _plan_cache_intercept 钩子：_plan_body 通过 _json 发结果时，
-        _json 里已有一段「当 _plan_cache_key 非空时写缓存」的逻辑，
-        这里复用同样的机制：设一个一次性 flag，_json 触发时把 payload
-        存进 task.result，然后清标志。
-        """
-        # 在 Handler 实例上挂一个一次性拦截器，让 _json 把结果写进 task
-        # 而 **不** 替换 _json 本身 —— 避免覆盖测试的 mock。
-        self._async_plan_task: "PlanTask | None" = task  # type: ignore[attr-defined]
-        try:
-            self._plan_body(body, job, raw, cfg)
-        finally:
-            self._async_plan_task = None  # type: ignore[attr-defined]
+        **必须在 Handler 的浅拷贝上跑**（2026-09-17 修死锁）
+        ----------------------------------------------------
+        上一版把 `_async_plan_task` 挂在 `self` 上。而 HTTP keep-alive 会让
+        **同一个 Handler 实例**接着服务后续请求 —— 前端轮询
+        `/api/plan-status` 正是走同一条连接：
 
-        # 如果 _json 没有通过正常路径把结果写入 task（比如 _plan_body 抛异常
-        # 在 finally 之前被上层 except 捕获），确保 task 标记为错误而不是永远 running。
+          1. `_api_plan_status` 调 `self._json(200, snap)`
+          2. `_json` 看到 `_async_plan_task` 还挂着
+          3. 于是把**轮询响应**当成定档结果写进 `task.result`，
+             并 `return` 不发 HTTP
+          4. 前端收不到响应 → 无限重试 → 界面永远停在
+             「定档计算中…（后台运行，请稍候）」
+
+        浅拷贝隔开实例状态：拷贝上的 `_async_plan_task` 与 `_plan_cache_key`
+        只影响后台那一次 `_json`，原 Handler 照常服务 HTTP。
+        `copy.copy` 不复制 socket 与缓冲区对象本身（那些是引用），
+        但后台路径在写进 task 后就 `return`，永远走不到 `send_response`，
+        所以不会与前台争用同一个 socket。
+        """
+        import copy as _copy
+
+        worker = _copy.copy(self)
+        worker._async_plan_task = task      # type: ignore[attr-defined]
+        worker._plan_cache_key = getattr(self, "_plan_cache_key", "")
+        try:
+            worker._plan_body(body, job, raw, cfg)
+        finally:
+            worker._async_plan_task = None  # type: ignore[attr-defined]
+
+        # _plan_body 没走 _json(200) 就结束时（抛异常被上层捕获、或走了
+        # 4xx 出口），确保 task 不会永远停在 running。
         with task.lock:
             if task.state == "running":
-                task.error = "定档未产生响应（_plan_body 未调用 _json）"
+                task.error = "定档未产生响应（_plan_body 未返回 200）"
                 task.state = "error"
                 task.finished = time.time()
 
