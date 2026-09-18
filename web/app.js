@@ -1207,7 +1207,8 @@ function renderDiag(d) {
           : (v.need_proxy ? '<span class="pill p-w">需代理</span>' : '直连')}</td>
         <td class="m">${esc(Object.keys(sp.headers || {}).join(', ')) || '—'}</td>
         <td class="m">${v.profile_name ? esc(v.profile_name)
-          : (v.min_body_kind ? 'fingerprint-profile' : '—')}</td>
+          : (v.min_body_kind ? 'fingerprint-profile' : '—')}
+          ${v.identity_proven ? '<div class="hint" title="画像梯某一档已推进到凭据类拒绝，说明站方接受这个身份；写回会带上 cloak 与 fingerprint-profile，Key 恢复后 CPA 直接可用">身份已验</div>' : ''}</td>
         <td class="num">${sp.max_context_length ? fmt(sp.max_context_length) : '—'}
           ${sp.context_model ? `<div class="hint">@${esc(sp.context_model)}</div>` : ''}</td>
         <td class="m">${toggleCell(sec, sp)}</td>
