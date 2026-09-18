@@ -2901,14 +2901,24 @@ class Handler(BaseHTTPRequestHandler):
                     model = order[0]
             rungs: list[dict] = []
             hit: dict | None = None
-
+            # 门票判定（2026-09-18）
+            # ---------------------
+            # 与 `Prober._try_profiles` 同一套判据：某一档把「门禁类拒绝」
+            # 推进成「非门禁类拒绝」，就说明该档带的头被站方认了。
+            # 诊断这条循环是独立写的（不经过 prober），所以判据要在这里
+            # 再实现一遍 —— 否则「单站诊断」看不到门票是否已过，而这正是
+            # 操作员拿诊断排查「直连能用、经 CPA 报错」时最需要的信息。
+            _GATE = ("客户端", "门禁", "反测活", "WAF", "边缘", "限频", "IP封")
+            _CRED = ("余额", "鉴权")
+            gate_hit: dict | None = None
+            base_gated = False
             for prof in cp.profiles.ladder(section, cfg):
                 hdrs, patch = cp.profiles.materialize(prof, row.api_key)
                 att = prober._call(section, base, row.api_key, model,
                                    combo=prof.name,
                                    extra_headers=hdrs or None,
                                    body_patch=patch or None)
-                rungs.append({
+                row_out = {
                     "profile": prof.name, "tier": prof.tier,
                     "family": prof.family, "alt": prof.alt,
                     "why": prof.why,
@@ -2918,7 +2928,14 @@ class Handler(BaseHTTPRequestHandler):
                     "resp_model": att.resp_model,
                     "headers": hdrs, "body_patch": bool(patch),
                     "ok": att.ok and not att.error_envelope,
-                })
+                }
+                rungs.append(row_out)
+                if prof.is_baseline and not att.ok:
+                    base_gated = att.category in _GATE
+                if (gate_hit is None and not att.ok and prof.name != "baseline"
+                        and (att.category in _CRED
+                             or (base_gated and att.category not in _GATE))):
+                    gate_hit = row_out
                 if att.ok and not att.error_envelope:
                     hit = rungs[-1]
                     break
@@ -2932,6 +2949,12 @@ class Handler(BaseHTTPRequestHandler):
                 "needed_headers": (hit["headers"] if hit and hit["profile"] != "baseline"
                                    else {}),
                 "needs_body": bool(hit and hit["body_patch"]),
+                # 门票已过、段仍不可用：给操作员明确结论与「照这个样子配」的
+                # 头集合。门禁解除后 CPA 用这套头转发即可，不必再探一次。
+                "gate_passed": bool(gate_hit),
+                "gate_profile": (gate_hit or {}).get("profile", ""),
+                "gate_headers": (gate_hit or {}).get("headers", {}) or {},
+                "gate_then": (gate_hit or {}).get("category", ""),
                 "calls": len(rungs),
             }
             with out_lock:

@@ -85,6 +85,30 @@ _CC_BETAS_STD = ",".join([
 # 「非 legacy 模型」与「无条件」两处分别追加它们（同文件 123-132）。
 _CC_BETAS_FULL = _CC_BETAS_STD + ",mid-conversation-system-2026-04-07,effort-2025-11-24"
 
+# 1m 上下文门票（2026-09-18 实测 anyrouter.top）
+# --------------------------------------------
+# 站方对**不带这个 beta** 的请求回 `400 "1m 上下文已经全量可用，请启用 1m
+# 上下文后重试"` —— 读起来像「你没开通」，实际是「你没带这个头」。实测
+# （本机直连 anyrouter.top，claude-opus-4-7）：
+#
+#   anthropic-beta 取值                          结果
+#   （不带）                                     400 仍被门禁
+#   claude-code-20250219                         400 仍被门禁
+#   context-1m-2025-08-07                        **503 门禁已过**
+#   claude-code-20250219,context-1m-2025-08-07   503 门禁已过
+#   context-1m（缺日期）                          400 仍被门禁
+#
+# 所以 token 必须逐字带上日期。过门禁后拿到 503 是站方上游此刻的负载问题，
+# 与客户端身份无关 —— 那正是「门票已过、凭据/上游不行」的形状。
+#
+# 为什么放进基线之后的**每一档**（而不是单独一档）：它是**叠加型**门票，
+# 与 UA/x-app/X-Stainless 那些形态正交。有的站可能既查 CLI 形态、又要求
+# 1m 头；分开成两档会让「形态对不对」与「1m 头要不要」纠缠在一起，梯子
+# 从 8 档变 16 档，而探测预算翻倍换来的只是同一类信息。
+# 加进所有档后，第一档（cc-min）就同时覆盖两种要求 —— 而 baseline 仍保持
+# 「什么都不带」，用来判断站方到底查不查。
+_CC_BETA_1M = "context-1m-2025-08-07"
+
 # codex：codex_executor_request.go:26-27
 _CODEX_UA_DEFAULT = "codex-tui/0.146.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.146.0)"
 _CODEX_ORIGINATOR_DEFAULT = "codex-tui"
@@ -159,6 +183,20 @@ def _cc_headers(defaults: dict, *, betas: str, std: bool = False,
     if defaults.get("claude_betas"):
         source_betas = defaults["claude_betas"]
         betas = source_betas[0] if betas == _CC_BETAS_MIN else ",".join(source_betas)
+    # 叠加 1m 门票（见 _CC_BETA_1M 的实测说明）。放在拼装之后而不是塞进
+    # _CC_BETAS_* 常量：那份常量要与 CPA 源码里的 beta 清单逐字比对
+    # （cpa_source_probe 的漂移检测），掺进一个站方要求的业务门票会让
+    # 漂移检测误报。
+    #
+    # 值的来源优先取 **CPA 源码里的 claudeContext1MBeta**（与 betas.wanted
+    # 同一口径，cpa_source_probe 解析 claude_executor_request.go 得到）——
+    # 硬编码那个只是源码不可达时的兜底。CPA 升级换了日期版本时，探测跟着换，
+    # 不会因为写死一个日期而发错头。
+    beta_1m = _CC_BETA_1M
+    if defaults.get("claude_context_1m_beta"):
+        beta_1m = str(defaults["claude_context_1m_beta"])
+    if _CC_BETA_1M not in betas and beta_1m not in betas:
+        betas = f"{betas},{beta_1m}" if betas else beta_1m
     h = {
         "user-agent": ua,
         "anthropic-beta": betas,
@@ -192,28 +230,39 @@ def _claude_ladder(d: dict) -> list[Profile]:
     """claude 段的画像梯。每档是前一档的超集（见模块 docstring）。"""
     return [
         Profile("baseline", 0, why="站方不查客户端身份"),
-        Profile("cc-min", 1,
+        # 只补 1m 门票、不带任何 CLI 形态（2026-09-18）
+        # -----------------------------------------
+        # 插在 baseline 与 cc-min 之间：有些站**只**要求 1m beta，UA 随便
+        # （anyrouter.top 实测如此 —— 裸 urllib + 该头就能过门禁，见
+        # `_CC_BETA_1M`）。单独一档的价值是让写回能给出**最小必需集**：
+        # 若这一档就通了，就不该给 config.yaml 塞整套 X-Stainless 伪装头，
+        # 那既没必要，又会让 CPA 的转发形态偏离站方的实际期望。
+        Profile("ctx-1m", 1,
+                headers={"anthropic-beta": str(d.get("claude_context_1m_beta")
+                                               or _CC_BETA_1M)},
+                why="站方要求 1m 上下文 beta，不查 CLI 形态"),
+        Profile("cc-min", 2,
                 headers=_cc_headers(d, betas=_CC_BETAS_MIN),
                 why="只查 UA 形态与 claude-code beta"),
-        Profile("cc-std", 2,
+        Profile("cc-std", 3,
                 headers=_cc_headers(d, betas=_CC_BETAS_STD, std=True),
                 why="另查 x-app / anthropic-version（实测 golf 属此档）"),
-        Profile("cc-full", 3,
+        Profile("cc-full", 4,
                 headers=_cc_headers(d, betas=_CC_BETAS_FULL, std=True, full=True),
                 why="另查 X-Stainless SDK 指纹族与会话头"),
         # ── body 档：headers 全套之上再加 metadata.user_id ──
         # 两种形态各一档：站方只认其中一种是实测过的（json 形态是 CPA 生成的，
         # plain 形态是 2026-08-31 手工试通的）。先 json —— 与 CPA 开
         # fingerprint-profile 后的真实行为一致，通了就能直接给出配置建议。
-        Profile("cc-body-json", 4,
+        Profile("cc-body-json", 5,
                 headers=_cc_headers(d, betas=_CC_BETAS_FULL, std=True, full=True),
                 body_patch={"metadata": {"user_id": _UID_JSON}},
                 why="另查 metadata.user_id（CPA 的 JSON 形态）"),
-        Profile("cc-body-plain", 4,
+        Profile("cc-body-plain", 5,
                 headers=_cc_headers(d, betas=_CC_BETAS_FULL, std=True, full=True),
                 body_patch={"metadata": {"user_id": _UID_PLAIN}},
                 why="另查 metadata.user_id（下划线拼接形态）"),
-        Profile("cc-body-system", 4,
+        Profile("cc-body-system", 5,
                 headers=_cc_headers(d, betas=_CC_BETAS_FULL, std=True, full=True),
                 body_patch={"metadata": {"user_id": _UID_JSON},
                             "system": [{"type": "text", "text": _CC_SYSTEM_TEXT,
@@ -388,6 +437,18 @@ def defaults_from_config(cfg: dict | None, *, source_identity=None) -> dict:
         out.update(codex_user_agent=source_identity.codex_user_agent,
                    codex_originator=source_identity.codex_originator,
                    claude_betas=list(source_identity.claude_betas_unconditional))
+        # 1m 上下文门票的**权威来源**（2026-09-18）
+        # --------------------------------------
+        # `claudeContext1MBeta` 是 CPA 源码里的常量
+        # （claude_executor_request.go，由 cpa_source_probe 解析）。
+        # `betas.wanted()` 早就用它覆盖硬编码值了，画像梯这里原先没有 ——
+        # 于是在「站方按 1m beta 放行」这一类站上，探测发的日期版本可能与
+        # CPA 实际转发的不一致，而 CPA 升级改日期时两边会一起错。
+        # 传下去让 `_cc_headers` 优先取它，取不到才落回内置常量。
+        _1m = (source_identity.claude_betas_conditional or {}).get(
+            "claudeContext1MBeta")
+        if _1m:
+            out["claude_context_1m_beta"] = str(_1m)
         cfg = dict(cfg)
         cfg["claude-header-defaults"] = {
             **source_identity.claude_header_defaults,

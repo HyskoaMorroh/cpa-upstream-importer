@@ -1504,10 +1504,26 @@ class Prober:
                 return False
 
         tried = 0
-        # 「门票已过」的第一档（2026-09-17）：某档把客户端拒绝推进成凭据类
-        # 拒绝，就说明这个身份被站方认了。记下最省的那一档；整梯全败时把它
-        # 当作「该站需要的身份」写进 verdict —— 段仍不可用，但写回带上门票。
+        # 「门票已过」的第一档（2026-09-17，2026-09-18 扩展判据）
+        # ------------------------------------------------------
+        # 判据是**拒绝性质的转变**，而不是命中某几个固定类别：
+        # 某一档把「门禁类拒绝」推进成了「非门禁类拒绝」，就说明这个档
+        # 带的东西被站方认了 —— 继续加形态也只会得到同一个回答。
+        #
+        # 原来是 `att.category in ("余额", "鉴权")`，只认凭据类。实测
+        # anyrouter.top（claude 段）时露了缺口：带上 1m 门票后站方不再回
+        # `400 "1m 上下文已经全量可用，请启用 1m 上下文后重试"`，而是回
+        # `503 Service Unavailable`（站方上游此刻不可用）。门票**确实过了**，
+        # 但 503 属「临时」，不在那份白名单里，于是一条证据都没有记下来 ——
+        # 写回不带门票，CPA 转发时又被同一道门禁拒。
+        #
+        # 新判据对**所有站**通用：只看「基线是不是被门禁拦住的」以及
+        # 「这一档是否不再被同一类门槛拦住」。_GATE_CATEGORIES 是门禁族
+        # （客户端 / 门禁 / 反测活 / WAF / 边缘 / 限频），它们表达的都是
+        # 「你这个请求的样子不对」；离开这一族就意味着形状已经被接受。
+        _GATE = ("客户端", "门禁", "反测活", "WAF", "边缘", "限频", "IP封")
         _CRED = ("余额", "鉴权")
+        base_gated = bool(v.attempts) and v.attempts[0].category in _GATE
         gate_hit: tuple | None = None       # (prof, hdrs, patch, att)
         for prof in profiles.ladder(section, self.cfg_snapshot):
             if prof.is_baseline:
@@ -1521,12 +1537,15 @@ class Prober:
             v.attempts.append(att)
             tried += 1
             if not att.ok:
-                if gate_hit is None and att.category in _CRED:
+                if gate_hit is None and (
+                        att.category in _CRED
+                        or (base_gated and att.category not in _GATE)):
                     gate_hit = (prof, hdrs, patch, att)
                     self.on_event("profile-gate-passed", {
                         "section": section, "host": host_of(base),
                         "profile": prof.name, "tier": prof.tier,
                         "then": att.category, "status": att.status,
+                        "was": (v.attempts[0].category if base_gated else ""),
                     })
                 continue
             # 200 也要过 _accept —— 「200 但正文是错误体」是实测过的假阳性
