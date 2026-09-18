@@ -1732,7 +1732,7 @@ class Prober:
                 page_url = f"{url}{sep}pageToken={urllib.parse.quote(token)}"
             resp = client.send(
                 page_url, headers=headers, body=b"", method="GET",
-                proxy=proxy, timeout=self.timeout,
+                proxy=proxy, timeout=min(self.timeout, 30),
             )
             if resp.status != "200":
                 if page == 0:
