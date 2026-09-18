@@ -387,6 +387,52 @@ CPA 照常轮询」。**这两个值不写死** —— `disable_semantics()` 每
 写回走与投喂流程**完全相同**的链路：预览 diff → 人工确认 → 基线比对 →
 YAML 校验 → 备份落盘 → 推送重载 → 读回校验，并共用同一把写盘锁。
 
+### 客户端门禁：1m 上下文 beta 通用破解（2026-09-19）
+
+**现象**："直连 Claude Code CLI 可以用，把同一个站填进 CPA 就报 403"。
+
+**根因**：站方要求请求头里带 `anthropic-beta: context-1m-2025-08-07`。报错文案是
+"1m 上下文已经全量可用，请启用 1m 上下文后重试"——读起来像"你没开通"，
+实际是"你的请求没带这个头"。实测：
+
+| 发送的 `anthropic-beta` | anyrouter.top 响应 |
+|---|---|
+| （不带）| 400 "1m 上下文已经全量可用…" |
+| `claude-code-20250219` | 400 仍被门禁 |
+| **`context-1m-2025-08-07`** | **门禁已过（503 是站方上游负载）** |
+| `context-1m`（缺日期） | 400 仍被门禁 |
+
+**机制**：画像梯（`cpa_probe/profiles.py`）新增 `ctx-1m` 档，插在 `baseline`
+与 `cc-min` 之间。门禁判定从「门禁 → 余额/鉴权」扩展为**「门禁类 → 任何非门禁类」**。
+1m beta 叠加进其余各档，beta 值优先取 CPA 源码的 `claudeContext1MBeta`，
+硬编码只作兜底（CPA 升级换日期时探测自动跟上）。
+
+单站诊断（`/api/diag`）输出 `gate_passed` / `gate_profile` / `gate_headers`，
+前端显示"身份已验"。写回时自动带门票头，CPA 转发即通。
+
+**适用范围**：对所有「直连 CLI 能用、经 CPA 报错」的站通用，不只限于 anyrouter.top。
+
+### 批量管理与全局调优写回修复（2026-09-18）
+
+**现象**："选好选项点执行根本不生效，没有任何反应"。
+
+根因是三层独立 bug 叠加：
+
+1. **复选框无事件绑定**：`.bmck` 复选框从不更新 `BM.sel`，五个操作按钮
+   永远 disabled。修：在 `#bmgrid` 补 `change` 事件委托（`web/app.js`）
+
+2. **脱敏器污染响应体**：config.yaml 里的短字段值（`"0"`, `"cli"`）被全局替换，
+   `section` 值、状态码、revision 哈希全被改坏。修：全局替换加 8 字符最短门槛
+   （`writeback.py`）
+
+3. **同站多 Key 只改一条**：同段同 host 多条 Key 改档时只写一条，
+   其余仍旧，触发段内不一致 → `_validate_final` 400 → 前端无反应。
+   修：`_resolve_op_collisions` 按 host 联动改（`server.py`）
+
+**额外修复**：`_submit_apply`（同时服务 bulk-apply 和 tuning-apply）写盘前
+的最终校验漏传 `cross_section=False`，导致调优落盘时被生产配置的 16 个跨段
+host 卡成 400（`server.py:4233`）。
+
 ### 全量重探的定档被 CF 切成 524（2026-09-13）
 
 现场（投喂台 mhtml 快照）：③ 判定与定档 顶上一条红框，内容是**一整页 CF 的
