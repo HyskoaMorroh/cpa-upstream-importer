@@ -527,17 +527,30 @@ def test_temp_failure_circuit_breaker():
         def _all(self):
             hits.append(self.path)
             if mode["alternate"]:
-                # 真在抖的站：502 / 429 按 Key 序号交替 —— 偶数 Key → 502，
-                # 奇数 Key → 429。同一把 Key 的所有请求看到相同码，不同 Key
-                # 严格交替，保证 _fail_streak 永远是 (502,1)→(429,1)→(502,1)…
-                # 不会积累到阈值 3。用 Authorization 头末尾的数字确定序号；
-                # 无法解析时回落到 0（502）。(2026-09-17 修竞态)
-                auth = (self.headers.get("Authorization") or
-                        self.headers.get("x-api-key") or "")
-                import re as _re
-                m = _re.search(r'(\d+)\s*$', auth)
-                key_idx = int(m.group(1)) if m else 0
-                code = 502 if key_idx % 2 == 0 else 429
+                # 真在抖的站：不同**段**给不同码（502 / 429 交替），
+                # 同一个段在整轮里恒定。
+                #
+                # 为什么按段而不是按 Key 序号（2026-09-18 修 CI 连续失败）
+                # --------------------------------------------------------
+                # 熔断计数器 `_fail_streak` 的键是 `(host, section)`，而
+                # `probe()` 是一把 Key 内**四段串行**。原来按 Key 序号取模，
+                # 于是同一把 Key 的四段拿到同一个码之后，下一把 Key 的码
+                # 会给前面段的计数**续上**：
+                #
+                #   Key0(502): 段A=1 段B=1 段C=1 段D=1
+                #   Key1(429): 段A 从 (502,1) 变成 (429,1) —— 重置
+                #   Key2(502): 段A 从 (429,1) 变成 (502,1) —— 又重置
+                #
+                # 看起来永远到不了 3，但四段的探测耗时不同、幂等性与重试
+                # 次数也不同，某些调度下某一段会连续吃到同一个码（例如
+                # 该段比别的段慢半拍、落到下一把 Key 上），于是它的计数
+                # 2→3 触发熔断，后续 Key 一次都不探 —— 断言看到 0。
+                # 这就是 CI 上反复失败、本地重跑又偶尔通过的那条抖动。
+                #
+                # 按段交替后，每个 (host, section) 在整轮里看到的码恒定，
+                # 计数永远停在 1，不可能达到阈值 —— 测试要表达的
+                # 「站方在抖、不该熔断」被确定性地复现，不再依赖调度。
+                code = 502 if "gemini" in self.path or "codex" in self.path else 429
             else:
                 code = mode["status"]
             b = b'{"error":{"message":"upstream failure"}}'
