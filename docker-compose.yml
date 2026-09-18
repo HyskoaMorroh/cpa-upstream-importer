@@ -45,6 +45,10 @@ services:
       # 写回后主动 PUT 让 CPA 立即重载 —— inotify 事件可能丢，而 CPA 没有
       # 轮询兜底。同栈填服务名，独立部署填宿主可达地址。
       CPA_UPSTREAM_URL: "${CPA_UPSTREAM_URL:-http://127.0.0.1:8317}"
+      # 日志级别（修改要求第 11 条）：DEBUG 输出每次上游请求详情，便于排查
+      # 探测失败、写回异常等问题；INFO（默认）只记关键里程碑；
+      # docker compose logs -f 实时跟踪。
+      IMPORTER_LOG_LEVEL: "${IMPORTER_LOG_LEVEL:-INFO}"
       # CPA 管理接口令牌。**不配就等于「按运行状态定优先级」静默失效** ——
       # `plan.py` 调 `fetch_cpa_runtime_health(base_url)` 时不传 token 参数，
       # 只读环境变量；拿不到授权头时 `/v0/management/api-key-usage` 返回
