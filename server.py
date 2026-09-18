@@ -735,7 +735,25 @@ def _public(value, field: str = ""):
 
 
 def _public_with_context(value, context):
-    """Let writeback remove known credentials even inside free-form messages."""
+    """Let writeback remove known credentials even inside free-form messages.
+
+    豁免完整性校验字段（2026-09-18）
+    ------------------------------
+    `revision`、`fingerprint`、`bulk_id`、`tuning_id` 是 SHA-256 哈希或
+    base64url token，用于完整性校验与去重。脱敏器在 writeback.py:1230 用
+    盲文本替换 `text.replace(secret, _short_mask(secret))` —— 任何在 config
+    里被判为凭据的短串（`"0"`、`"cli"`、`"5s"`、`"true"`）都会替换响应体
+    全文，把 SHA-256 哈希里所有相同字符改坏。
+
+    现场后果：生产配置 config.yaml 的 headers 里有值为 `"0"`、`"cli"`、
+    `"5s"`、`"true"`、`"600"` 的短字符串，mask_key("0")=="0***" →
+    `/api/routes` 响应的 `revision` / 每条 `fingerprint` 全部报废 →
+    `/api/bulk-preview` 必 409 `stale_selection` → 前端静默重载清空选中 →
+    「批量管理选好选项后点执行根本没反应」；`bulk_id` 同样被污染，apply 回 404。
+
+    修法：在扁平化时识别这四类字段，打上豁免标记，让脱敏器跳过它们。
+    这四类字段永远是哈希或 token，不可能是凭据。
+    """
     import yaml
     def strings_only(node):
         if isinstance(node, dict):
@@ -745,15 +763,21 @@ def _public_with_context(value, context):
             return [strings_only(item) for item in node
                     if isinstance(item, (str, dict, list))]
         return node
+    # 完整性校验字段豁免名单：这四个字段是哈希或 token，永远不可能是凭据
+    _INTEGRITY_FIELDS = {"revision", "fingerprint", "bulk_id", "tuning_id"}
     strings = []
-    def flatten(node):
+    exempt = set()      # 记下豁免索引
+    def flatten(node, path=()):
         if isinstance(node, dict):
-            for item in node.values():
-                flatten(item)
+            for key, item in node.items():
+                flatten(item, path + (key,))
         elif isinstance(node, list):
-            for item in node:
-                flatten(item)
+            for idx, item in enumerate(node):
+                flatten(item, path + (idx,))
         elif isinstance(node, str):
+            # path[-1] 是这个字符串的键名（或数组下标）
+            if path and path[-1] in _INTEGRITY_FIELDS:
+                exempt.add(len(strings))
             strings.append(node)
     flatten(value)
     # JSON is also YAML, and quotes every string. Non-string fields never
@@ -765,12 +789,17 @@ def _public_with_context(value, context):
             or len(redacted["payload_items"]) != len(strings)):
         raise ValueError("公开输出无法安全脱敏")
     cleaned = iter(redacted["payload_items"])
-    def typed(original):
+    def typed(original, idx_holder=[0]):
         if isinstance(original, dict):
             return {key: typed(item) for key, item in original.items()}
         if isinstance(original, list):
             return [typed(item) for item in original]
-        return next(cleaned) if isinstance(original, str) else original
+        if isinstance(original, str):
+            idx = idx_holder[0]
+            idx_holder[0] += 1
+            # 豁免字段直接用原值，不走脱敏器的输出
+            return original if idx in exempt else next(cleaned)
+        return original
     return _public(typed(value))
 
 def _validate_final(preview: str, plans=(), *, cross_section: bool = True) -> tuple[bool, str]:
