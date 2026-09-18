@@ -282,8 +282,18 @@ def test_source_defaults_updateable():
                                                     "package-version": "8.7.6"})
     items = profiles.ladder("claude-api-key", source_identity=ident)
     full = next(p for p in items if p.name == "cc-full")
-    assert full.headers["anthropic-beta"] == "claude-updated,thinking-updated"
+    # 源码里的两份清单都要出现，且**1m 门票也要在**（2026-09-18）：
+    # 门票由 claudeContext1MBeta 提供，硬编码那个只是源码不可达时的兜底。
+    # 断言写成「这三个都在、且顺序以源码清单打头」，而不是钉死整串 ——
+    # 钉死整串会让以后任何一档新增门票都要改这里，而这条测的是「源码值
+    # 能被吃进去」，不是「beta 串必须恰好是这两项」。
+    _betas = full.headers["anthropic-beta"]
+    assert _betas.startswith("claude-updated,thinking-updated"), _betas
+    assert "context-updated" in _betas, _betas
     assert full.headers["x-stainless-package-version"] == "8.7.6"
+    # ctx-1m 档同样必须取源码值，不能是硬编码日期
+    _ctx = next(p for p in items if p.name == "ctx-1m")
+    assert _ctx.headers["anthropic-beta"] == "context-updated", _ctx.headers
     assert betas.wanted("enable 1m context", source_identity=ident) == ["context-updated"]
     codex = profiles.ladder("codex-api-key", source_identity=ident)
     assert next(p for p in codex if p.name == "codex-tui").headers["originator"] == "updated"
