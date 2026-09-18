@@ -560,6 +560,13 @@ $('#themes').addEventListener('click', (e) => {
 })();
 
 // ── 鉴权 ──
+// 超时（2026-09-18）
+// ----------------
+// 原来 `fetch` 既无 AbortController 也无超时：反代切断或服务 hang 时请求
+// 一直悬着，而 `/api/plan` 的提交一旦悬住，单飞锁 `_planInFlight` 就永不
+// 释放 —— 之后所有勾选变化触发的重算被静默吞掉，界面看起来「点了没反应」。
+// 默认 30 秒；轮询这类短请求由调用方传更小的值。
+const API_TIMEOUT_MS = 30000;
 async function api(path, opts = {}) {
   const o = Object.assign({ headers: {} }, opts);
   o.headers['Authorization'] = 'Bearer ' + S.token;
@@ -567,7 +574,28 @@ async function api(path, opts = {}) {
     o.headers['Content-Type'] = 'application/json';
     o.body = JSON.stringify(o.body);
   }
-  const r = await fetch(path, o);
+  const ms = o.timeoutMs === undefined ? API_TIMEOUT_MS : o.timeoutMs;
+  delete o.timeoutMs;
+  let ctl = null, timer = null;
+  if (ms > 0 && typeof AbortController !== 'undefined' && !o.signal) {
+    ctl = new AbortController();
+    o.signal = ctl.signal;
+    timer = setTimeout(() => ctl.abort(), ms);
+  }
+  let r;
+  try {
+    r = await fetch(path, o);
+  } catch (e) {
+    // abort 的报错是 `AbortError`，原样抛出会显示成「signal is aborted」，
+    // 看不出是超时。换成能指导下一步的文案。
+    if (ctl && ctl.signal.aborted) {
+      throw Object.assign(new Error(`请求超时（${Math.round(ms / 1000)} 秒无响应）`),
+        { status: 0, timeout: true });
+    }
+    throw e;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
   const txt = await r.text();
   let data;
   try { data = JSON.parse(txt); }
@@ -1596,6 +1624,20 @@ function renderStream(events) {
       return `<div class="s4">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
         + `画像梯跑完仍不通（试 ${e.tried} 档）</div>`;
     }
+    // 门票已过、凭据不行：某一档把「客户端」拒绝推进成了凭据类拒绝（余额/
+    // 鉴权），说明站方认了这个身份。必须显示 —— 这是「直连可用、经 CPA 不
+    // 可用」那条问题的现场证据，也是写回 cloak / fingerprint-profile 的依据。
+    if (e.kind === 'profile-gate-passed') {
+      return `<div class="s2">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `画像 ${esc(e.profile)}（档 ${e.tier}）过了客户端门禁，`
+        + `改判 ${esc(e.then)}${e.status ? ' · ' + esc(e.status) : ''}</div>`;
+    }
+    // 整梯没有一档 200，但门票被证明过 —— 段仍不可用，写回照样带身份。
+    if (e.kind === 'profile-gate-only') {
+      return `<div class="warn">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `整梯不通，但身份 ${esc(e.profile)} 已被站方接受（${esc(e.then)}）`
+        + ` —— 写回带 headers 与 cloak/fingerprint，换把 Key 即可用</div>`;
+    }
     // 整梯全败后，正文点名要 beta 就补上重试。显示补了什么 —— 这一步会改
     // 落地的 anthropic-beta，操作员必须看得到凭什么改的。
     if (e.kind === 'beta-retry') {
@@ -2000,7 +2042,7 @@ function siteCard(r) {
         ${capBadge(sec, v)}</td>
       <td class="prio">
         <div class="pedit"><input type="number" class="pi"
-          data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}" placeholder="待定"></div>
+          data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}" placeholder="计算中"></div>
       </td>
       <td class="rsn"><span class="hint">计算中…</span></td>
     </tr>
@@ -2423,7 +2465,23 @@ function syncPickUI() {
 }
 
 // ── 方案 ──
+// 单飞（2026-09-17）：同一时刻只允许一个 refreshPlan 在跑。
+// 勾选变化每 180ms 防抖发一次，但轮询一次要几十秒 —— 期间再来的调用
+// 不能再起一个后台任务（那会把任务表挤满、让正在轮询的那条被淘汰，
+// 现场表现就是「定档轮询无响应」）。后到的调用只记一个「待重跑」标记，
+// 当前这轮结束后再跑一次即可 —— 最新的勾选状态那时才是准的。
+let _planInFlight = null;
+let _planRerun = false;
 async function refreshPlan(silent) {
+  if (_planInFlight) { _planRerun = true; return _planInFlight; }
+  _planInFlight = _refreshPlanOnce(silent).finally(() => {
+    _planInFlight = null;
+    if (_planRerun) { _planRerun = false; refreshPlan(true); }
+  });
+  return _planInFlight;
+}
+
+async function _refreshPlanOnce(silent) {
   let d;
   const body = {
     job_id: S.jobId,
@@ -2478,7 +2536,7 @@ async function refreshPlan(silent) {
       let poll;
       try {
         poll = await api('/api/plan-status', {
-          method: 'POST', body: { plan_task_id: taskId },
+          method: 'POST', body: { plan_task_id: taskId }, timeoutMs: 15000,
         });
         misses = 0;
       } catch (_) {
@@ -2513,19 +2571,41 @@ async function refreshPlan(silent) {
     }
   }
 
+  // 形状闸（2026-09-18）
+  // ------------------
+  // 下面整段都在裸取 `d.plan_id` / `d.plans` / `d.diffs.reduce` / `p.skipped`。
+  // 后端只要回一份形状不对的体（现场原因：keep-alive 让 `/api/plan-status`
+  // 的 `{state:"running"}` 快照被当成定档结果缓存，再被 `/api/plan` 重放），
+  // 这里就抛 TypeError 变成 unhandled rejection —— 界面没有任何错误提示，
+  // 整张表永久停在占位符。宁可显式报错，也不要静默空白。
+  if (!d || typeof d !== 'object' || !Array.isArray(d.plans)) {
+    const shape = d && typeof d === 'object'
+      ? Object.keys(d).slice(0, 6).join(',') : typeof d;
+    const meta = $('#planmeta');
+    if (meta) meta.innerHTML = `<div class="err">定档返回的数据形状不对（${esc(shape)}）</div>`;
+    const stat3 = $('#pickstat');
+    if (stat3) {
+      stat3.innerHTML = `<span class="err">定档结果异常 —— 请重试；`
+        + `若反复出现，把容器日志里的 error_ref 发出来</span>`;
+    }
+    return null;
+  }
+
   S.planId = d.plan_id; S.plans = d.plans;
 
   // 首次：按系统建议预勾选。
   //
-  // 必须先回填再递剷2026-09-13）：原来这里直接 `return refreshPlan(true)`,
-  // 于是首轮这一帧的 d.plans 被丢掉—— 而下面的回填循环在 return 之后，
+  // 必须先回填再重跑（2026-09-13）：原来这里直接 `return refreshPlan(true)`，
+  // 于是首轮这一帧的 d.plans 被丢掉 —— 而下面的回填循环在 return 之后，
   // 首轮永远到不了。递归的第二帧只要失败（且它传的就是 silent=true），
   // 整张表就永久停在「待定 / 计算中…」。
   const firstPass = S.picks === null;
   fillPlanIntoRows(d);
   if (firstPass) {
     applyPickPreset('rec');
-    return refreshPlan(true);
+    // 预勾选变了选择集，标记重跑；由单飞包装在本轮结束后执行
+    _planRerun = true;
+    return d;
   }
   syncPickUI();
   return d;

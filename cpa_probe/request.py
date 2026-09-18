@@ -313,6 +313,16 @@ def build_request(
         ident = source_identity
         codex_cfg = (cfg or {}).get("codex") or {}
         if codex_cfg.get("disable-codex-cloaking") is not True:
+            # 这里的覆盖是**刻意**的，别改成「只补没给过的」（2026-09-18 试过一次）
+            # ------------------------------------------------------------
+            # cloaking 开着时 CPA 自己就会把 UA 与 Originator 改写成它那一套
+            # （`codex_executor_execute.go` 一带）。探测要复现的是「经 CPA 之后
+            # 到达站方的形状」，所以这里必须同样覆盖 —— 否则测出来「某个画像档
+            # 能过」，而 CPA 实跑时那个 UA 根本发不出去，结论是假的。
+            # 契约锁在 tests/test_source_compliance.py:207。
+            # 代价：cloaking 开着时画像梯里只改 UA/Originator 的那几档与基线
+            # 等价，白烧请求。本部署 `codex.disable-codex-cloaking: true`
+            # （fsdownload/config.yaml:475），走的是下面的分支，梯子照常生效。
             headers = apply_custom_headers(headers, {
                 "User-Agent": ident.codex_user_agent or profiles._CODEX_UA_DEFAULT,
                 "Originator": ident.codex_originator or profiles._CODEX_ORIGINATOR_DEFAULT})

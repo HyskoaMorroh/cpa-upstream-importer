@@ -140,6 +140,18 @@ services:
     # -d 指定配置目录，mihomo 会读其中的 config.yaml。
     entrypoint: ["/usr/local/bin/mihomo", "-d", "/mihomo-config"]
     user: "0:0"
+    # 网络别名 `mihomo`（2026-09-17）
+    # ------------------------------
+    # 本模板的服务名是 mihomo-proxy，而线上整栈那份 compose 叫 mihomo。
+    # 代码里的回落地址（server.py proxy_candidates、cli.py --proxy 自动探测）
+    # 与 config.yaml 里已写好的 34 条 `proxy-url: http://mihomo:7890` 全用
+    # 短名。没有这个别名，用本模板部署时 CPA 和 importer 都解析不到代理：
+    # 探测判「需代理」的站全部走直连，写回的 proxy-url 也是死的。
+    # 加别名后两个名字都通，模板与整栈两种部署共用同一份 config.yaml。
+    networks:
+      default:
+        aliases:
+          - mihomo
     ports:
       # 只绑回环。7890 是 CPA 的 proxy-url 目标，9090 供探测脚本调用。
       # 容器间走服务名（http://mihomo-proxy:7890），不依赖这两个映射。
