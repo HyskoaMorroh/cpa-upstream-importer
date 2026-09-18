@@ -3470,6 +3470,19 @@ $('#bmgrid').addEventListener('click', (e) => {
   if (BM.sel.has(k)) BM.sel.delete(k); else BM.sel.add(k);
   bmRender();
 });
+// 复选框 change 事件（2026-09-18）
+// ---------------------------------
+// .bmck 渲染在卡片里，但卡片点击委托把 input 显式排除
+// （防止点输入框顺带改勾选状态），导致复选框无法触发 BM.sel 更新。
+// 用事件委托补一个 change 监听，单独处理复选框的选中/取消。
+$('#bmgrid').addEventListener('change', (e) => {
+  const ck = e.target.closest('.bmck');
+  if (!ck) return;
+  const k = ck.dataset.k;
+  if (!k) return;
+  if (ck.checked) BM.sel.add(k); else BM.sel.delete(k);
+  bmRender();
+});
 
 /* 卡片内的小按钮：整站启停 / 整站删除预览。
    走的是**就地草稿**那条路（启停）与既有的批量删除预览（删除），
