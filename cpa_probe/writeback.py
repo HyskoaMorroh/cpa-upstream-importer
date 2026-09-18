@@ -1226,7 +1226,25 @@ def _scrub_structural_secrets(text: str) -> str:
         # 残留清理：上面按节点改过的位置已经是脱敏形态，这一遍兜住
         # 「同一个凭据还出现在别处」（URL 里、自由文本里）的情形。
         # 替换成同一种脱敏形态而不是 `***`，理由见 _short_mask。
-        if secret and secret != "***" and secret != _short_mask(secret):
+        #
+        # 最短长度门槛（2026-09-18 加）
+        # ----------------------------
+        # 这是**无锚点的全局替换**：命中一处就把全文里所有相同子串都换掉。
+        # 短值因此会污染整份输出 —— 生产 config.yaml 的 `headers` 里有
+        # `"0"` / `"5s"` / `"true"` / `"cli"` 这类值，它们被判为凭据后，
+        # `text.replace("0", "0***")` 会把**错误提示文本**里的 0 也改掉：
+        #
+        #   实得 `同站优先级不一致：请将该站所有 Key（包括未勾选项与默认 0***）…`
+        # 用户照着这句话操作会以为要填 `0***`。而 revision 哈希、fingerprint、
+        # 以及任何含该数字/字母串的字段都会一起报废（那正是「批量管理点了
+        # 没反应」的第一层根因，当时只堵了四个字段，堵不住所有输出）。
+        #
+        # 真实凭据没有一个短于 16 字符（sk- 开头的 Key 通常 40+，订阅 token
+        # 更长），8 字符的门槛不会漏掉任何真凭据，却能让 `"0"`、`"5s"`、
+        # `"cli"`、`"true"`、`"600"` 这类配置值走**节点级**替换（那是带锚点的、
+        # 只改那一个值，不会污染别处），不参与全局盲替换。
+        if (secret and secret != "***" and secret != _short_mask(secret)
+                and len(secret) >= 8):
             text = text.replace(secret, _short_mask(secret))
     return text
 

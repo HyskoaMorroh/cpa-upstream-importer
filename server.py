@@ -763,8 +763,22 @@ def _public_with_context(value, context):
             return [strings_only(item) for item in node
                     if isinstance(item, (str, dict, list))]
         return node
-    # 完整性校验字段豁免名单：这四个字段是哈希或 token，永远不可能是凭据
-    _INTEGRITY_FIELDS = {"revision", "fingerprint", "bulk_id", "tuning_id"}
+    # 豁免名单：这些字段永远不可能是凭据，盲替换会破坏它们（2026-09-18）
+    # ------------------------------------------------------------------
+    # 为什么要豁免 `section`：它的值如 `claude-api-key` 含 "key" 子串，被
+    # `sensitive` 正则命中收进 secrets 集合，再经 `text.replace()` 盲替换，
+    # 把整个响应里所有出现该子串的地方（含 section 字段值本身）全部改烂 ——
+    # 实测 `/api/routes` 返回的 section 变成
+    # `0***351e6f2a5d926efa24c26b1fe2c80***e932...`，前端拿不到合法段名，
+    # 批量管理整个面板失效。`index`/`host`/`line_no` 等标识字段同理：
+    # 它们短、含数字、容易被误判。
+    #
+    # **不豁免 `base_url`**：URL 可能是 `https://user:password@relay/v1`，
+    # 豁免会把密码原样发出去。它必须照常走脱敏（writeback 的 URL 分支
+    # 只抹 password、保留 host 与 username，那才是正确口径）。
+    _INTEGRITY_FIELDS = {"revision", "fingerprint", "bulk_id", "tuning_id",
+                         "section", "index", "host", "line_no",
+                         "key_count", "key_masked", "api_key_masked"}
     strings = []
     exempt = set()      # 记下豁免索引
     def flatten(node, path=()):
@@ -789,16 +803,29 @@ def _public_with_context(value, context):
             or len(redacted["payload_items"]) != len(strings)):
         raise ValueError("公开输出无法安全脱敏")
     cleaned = iter(redacted["payload_items"])
-    def typed(original, idx_holder=[0]):
+    # 字符串在 flatten 与 typed 里的**遍历顺序必须完全一致**，否则 idx 对不上。
+    # 两边都用同一套「dict 按 items() 顺序、list 按索引、其余跳过」的规则，
+    # 所以这里只需要按序递增即可。编号用闭包变量，不用可变默认参数 ——
+    # 后者在函数被重新绑定时容易踩坑。
+    counter = [0]
+
+    def typed(original):
         if isinstance(original, dict):
             return {key: typed(item) for key, item in original.items()}
         if isinstance(original, list):
             return [typed(item) for item in original]
         if isinstance(original, str):
-            idx = idx_holder[0]
-            idx_holder[0] += 1
-            # 豁免字段直接用原值，不走脱敏器的输出
-            return original if idx in exempt else next(cleaned)
+            idx = counter[0]
+            counter[0] += 1
+            # 必须**先消费** cleaned 再决定用哪个值（2026-09-18 修）
+            # ------------------------------------------------
+            # 原来是 `return original if idx in exempt else next(cleaned)`
+            # —— 短路求值让豁免字段跳过 `next()`，迭代器与字符串序列从此
+            # 错位一个，之后每个字段都拿到别人的脱敏结果。实测症状：
+            # `/api/parse` 的 `bases["openai-compatibility"]` 变成空串
+            # （tests/test_server.py:1177 的「compat 补 /v1」断言）。
+            redacted_value = next(cleaned)
+            return original if idx in exempt else redacted_value
         return original
     return _public(typed(value))
 
@@ -3805,7 +3832,35 @@ class Handler(BaseHTTPRequestHandler):
         # 要改的主机集合，按段收 —— 用于从 taken 里挖掉它们自己的旧档位
         for section, sec_ops in pri_ops.items():
             arr = cfg.get(section) or []
-            moving = {(section, op["index"]) for op in sec_ops}
+
+            # 被点中的下标，先归到 host；**同一 host 的全部条目一起改**
+            # （2026-09-18 修）
+            # ------------------------------------------------------------
+            # 原来只改被点中的那一条，于是「同站多 Key 同档」这条硬约束被
+            # 自己打破：agentrouter.org 在 claude 段有 11 条 Key 共用 122，
+            # 点中其中一条改成别的值 → 该站档位分裂 → `_validate_final`
+            # 的段内检查判 False → bulk-preview 回 400
+            # `priority_invariant`，前端表现为「选好选项点执行根本没反应」。
+            #
+            # 这正是修改要求第 3⑶④ 说的「同一个类型相同域名的所有账号共享
+            # 同一个优先级」—— 界面上勾的是一个「(段, 域名) 组」，写回时
+            # 就必须整组一起动，不能只动组里的一条。
+            host_of_index: dict[int, str] = {}
+            for i, e in enumerate(arr):
+                if isinstance(e, dict):
+                    host_of_index[i] = _host(e.get("base-url"))
+
+            moving: set[tuple[str, int]] = set()
+            for op in sec_ops:
+                h = host_of_index.get(op["index"], "")
+                if not h:
+                    continue
+                # 该 host 在本段的**全部**条目都进入 moving 集合：
+                # taken 里不能留它们的旧值，否则新值会与同站邻居撞上。
+                for i, hh in host_of_index.items():
+                    if hh == h:
+                        moving.add((section, i))
+
             taken: set[int] = set()
             for i, e in enumerate(arr):
                 if not isinstance(e, dict) or (section, i) in moving:
@@ -3818,16 +3873,42 @@ class Handler(BaseHTTPRequestHandler):
             # host 的一个目标值，再回填给它的全部条目。
             by_host: dict[str, int] = {}
             for op in sec_ops:
-                h = _host(arr[op["index"]].get("base-url") if op["index"] < len(arr) else "")
+                h = host_of_index.get(op["index"], "")
                 if not h:
                     continue
                 by_host[h] = int(op["value"])
             final, notes = cp.bulk.resolve_priority_collisions(
                 by_host, taken=taken)
             adjusted += notes
+
+            # 回填：同 host 的**每一条**都要改，不只被点中的那条
+            # （2026-09-18）。已在前端选中态里的条目沿用它的值即可，
+            # 未选中的同站条目由这里补上 —— 否则写回后该站档位分裂。
+            #
+            # 注意补的条目要 append 到 **`ops`** 而不是 `sec_ops`：
+            # `sec_ops` 是 `pri_ops[section]`，一个本函数内部新建的列表，
+            # 往里加不影响调用方的 `ops`，而函数返回的是 `ops` ——
+            # 只加 sec_ops 等于白算（2026-09-18 实测踩到，entry_fingerprint
+            # 被调了 10 次却一条都没进返回值）。
+            covered = {op["index"] for op in sec_ops}
+            for i, h in host_of_index.items():
+                if h not in final or i in covered:
+                    continue
+                arr_i = arr[i]
+                if not isinstance(arr_i, dict):
+                    continue
+                extra = {
+                    "section": section, "index": i,
+                    "fingerprint": cp.bulk.entry_fingerprint(arr_i),
+                    "action": "priority", "value": final[h],
+                    # 标出来源：前端 diff 里能看出这条是「同站联动」补的
+                    "linked": True,
+                }
+                sec_ops.append(extra)
+                ops.append(extra)
             for op in sec_ops:
                 i = op["index"]
-                h = _host(arr[i].get("base-url") if i < len(arr) else "")
+                h = host_of_index.get(i, "")
                 if h in final:
                     op["value"] = final[h]
         return ops, adjusted
