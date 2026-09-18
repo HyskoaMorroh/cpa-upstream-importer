@@ -1401,7 +1401,7 @@ def run_job(job: Job, cfg_path: str) -> None:
         prober = Prober(
             cfg_snapshot=cfg,
             proxy=_resolve_proxy(str(job.opts.get("proxy") or "")),
-            gap=_clamp(job.opts, "gap", 3.0),
+            gap=_clamp(job.opts, "gap", 1.5),
             timeout=_clamp(job.opts, "timeout", 120),
             probe_context=bool(job.opts.get("probe_context", True)),
             # 能力开关探测（codex 的 websockets、compat 的
@@ -1761,7 +1761,7 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
         prober = Prober(
             cfg_snapshot=cfg,
             proxy=_resolve_proxy(str(job.opts.get("proxy") or "")),
-            gap=_clamp(job.opts, "gap", 3.0),
+            gap=_clamp(job.opts, "gap", 1.5),
             timeout=_clamp(job.opts, "timeout", 120),
             probe_context=bool(job.opts.get("probe_context", True)),
             # 能力开关探测（codex 的 websockets、compat 的
@@ -4364,6 +4364,13 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--token", default=os.environ.get("IMPORTER_TOKEN", ""),
                     help="Bearer token。日志不显示；也可使用 CPA 管理密码登录")
+    ap.add_argument("--log-level",
+                    default=os.environ.get("IMPORTER_LOG_LEVEL", "INFO"),
+                    choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+                    help="日志级别。DEBUG 输出每条请求的探测细节与耗时；"
+                         "也可用环境变量 IMPORTER_LOG_LEVEL 设置。"
+                         "容器里日志直接写到 stdout/stderr，"
+                         "docker compose logs -f 可实时跟踪。")
     ap.add_argument("--trusted-proxy-peer", action="append",
                     default=[x.strip() for x in os.environ.get("IMPORTER_TRUSTED_PROXY_PEERS", "").split(",") if x.strip()],
                     help="明确可信的反代 IP/CIDR，可重复；默认仅回环")
@@ -4393,6 +4400,30 @@ def main() -> None:
     ap.add_argument("--no-cpa-key", action="store_true",
                     help="不接受 CPA 管理密钥登录，只认本服务的 token")
     args = ap.parse_args()
+
+    # 详细日志初始化（修改要求第 11 条，2026-09-18）
+    # -----------------------------------------
+    # 容器里日志直接写到 stdout/stderr，`docker compose logs -f` 实时跟踪。
+    # 级别由 --log-level 参数或 IMPORTER_LOG_LEVEL 环境变量控制：
+    #   INFO（默认）：每条 API 请求与关键里程碑（探测开始/结束、写回成功/失败）
+    #   DEBUG：每次上游请求的状态码、耗时、画像档位，便于定位具体站点问题
+    #   WARNING/ERROR：只有警告与错误，适合生产安静运行
+    #
+    # 格式：时间戳 + 级别 + 模块名 + 消息，时间精确到毫秒。
+    # 敏感信息（token、api-key）不进日志：Handler 类的请求日志已过滤，
+    # probe/plan 流程里的 key 均以 mask_key() 脱敏后才传给 logger。
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+        force=True,   # 覆盖 Python 默认的 WARNING 级别（容器里往往已有 basicConfig）
+    )
+    # 第三方库（urllib3、PyYAML）的 DEBUG 日志极为冗长，单独压到 WARNING
+    for noisy in ("urllib3", "yaml", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    logger.info("日志级别 %s，服务即将启动", args.log_level.upper())
     try:
         Handler.trusted_proxy_peers = tuple(str(ipaddress.ip_network(x, strict=False))
                                             for x in args.trusted_proxy_peer)
