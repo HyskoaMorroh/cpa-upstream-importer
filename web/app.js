@@ -3452,7 +3452,10 @@ $('#bmdelete').onclick = () => {
   $('#bmdel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 };
 $('#bmdelok').oninput = () => {
-  $('#bmdelgo').disabled = $('#bmdelok').value.trim() !== 'DELETE';
+  const ok = $('#bmdelok').value.trim() === 'DELETE';
+  $('#bmdelgo').disabled = !ok;
+  // 输入正确时移除提示（避免红色边框干扰）
+  $('#bmdelok').classList.toggle('input-ok', ok);
 };
 $('#bmdelno').onclick = () => { $('#bmdel').hidden = true; };
 $('#bmdelgo').onclick = () => {

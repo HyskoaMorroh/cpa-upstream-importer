@@ -1018,9 +1018,11 @@ https://其他站.com,sk-yyyyyyyyyyyyyyyy
        <b>CPA 侧没有回滚</b>。每条删除都会校验 <code>base-url</code> 指纹，
        不符即整批拒绝。</p>
     <div id="bmdellist" class="bm-dellist"></div>
-    <div class="row">
-      <label>输入 <code>DELETE</code> 以确认
-        <input id="bmdelok" placeholder="DELETE" autocomplete="off"></label>
+    <div class="row" style="gap:.5rem;flex-wrap:wrap;align-items:center">
+      <label style="display:flex;flex-direction:column;gap:.25rem">
+        <span style="font-size:.8rem;color:var(--c-warn,#e07b00)">⚠ 手动输入大写 DELETE 才能解锁按钮</span>
+        <input id="bmdelok" placeholder="在此输入 DELETE" autocomplete="off" style="min-width:14rem">
+      </label>
       <button class="go sm act-del" id="bmdelgo" disabled>确认删除</button>
       <button class="go ghost sm" id="bmdelno">取消</button>
     </div>
