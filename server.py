@@ -1040,6 +1040,15 @@ def verdict_json(v) -> dict:
         # 于是界面上「请求指纹」这一列永远是空的。
         "profile_name": v.profile_name,
         "min_body_kind": v.min_body_kind,
+        # 门票已过、凭据不行（2026-09-18 补进 JSON）
+        # -----------------------------------------
+        # `identity_proven` 在 `_try_profiles` 里置位，含义是「画像梯某一档把
+        # 客户端拒绝推进成了凭据类拒绝」—— 站方已经认了这个身份，只是这把
+        # Key 没钱或无效。写回侧（plan.py）一直读它并据此带上
+        # cloak/fingerprint-profile，但**它从没进过 JSON**，于是界面上看不出
+        # 「这个站要什么身份」已经实测出来，操作员只看到一片「不可用」，
+        # 正是「直连能用、经 CPA 报错」最难排查的那种表现。
+        "identity_proven": bool(getattr(v, "identity_proven", False)),
         "time_window": list(v.time_window) if v.time_window else None,
         "swap": v.swap,
         "swap_detected": v.swap_detected,
