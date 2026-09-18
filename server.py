@@ -4230,7 +4230,13 @@ def _commit_apply(task, entry, body, cfg_path, cpa_url, mgmt, client_key,
                 task.result["error_code"] = "stale_config"
                 raise ValueError("配置已变化，队列中的旧方案已拒绝；请重新预览")
             preview = entry.get("preview", entry.get("text", ""))
-            ok, msg = _validate_final(preview, entry.get("plans", []))
+            # `_start_apply_task` 同时服务 bulk-apply 与 tuning-apply 两条路。
+            # 两条路的预览 YAML 都来自用户已确认的 ops/调优方案，不涉及新写的
+            # 跨段 priority 分配 —— 写盘那一刻与 bulk-preview 的语义相同，
+            # 所以传 cross_section=False：允许生产配置里既有的 16 个跨段分裂
+            # 通过，不要在最后一步 validate 时把已经通过预览的方案拦住。
+            ok, msg = _validate_final(preview, entry.get("plans", []),
+                                      cross_section=False)
             if not ok:
                 task.result["error_code"] = "invalid_plan"
                 raise ValueError(msg)
