@@ -1271,6 +1271,12 @@ def topup_to_market_top(section: str, models: list[str], *,
     # 会让 CPA 路由到死模型，比不写更糟。
     #
     # 这个判据不需要任何阈值常数，也不受主版本号是否连续影响。
+    #
+    # 2026-09-18 试着撤掉过这道闸（以为它会把站方报过的名字整批顶掉），
+    # 被四条既有断言挡回来，实测也证明想错了：真实名录（models.router-for.me
+    # 的 models.json）**同时列着好几代**，站方报的上一代通常在册，这道闸不会
+    # 命中。只有在人为构造的「名录里只有一代」的输入下才会整批顶掉。
+    # 真正要挡的是 gpt-4 / gpt-4-32k 这种名录里连影子都没有的陈年目录。
     _market_gens: dict[str, set[tuple[int, int]]] = {}
     for n in market_pool:
         g = _cmp_gen(n)
@@ -1296,6 +1302,13 @@ def topup_to_market_top(section: str, models: list[str], *,
 
         站方那一层还要过「市面名录认不认识这一代」那道闸 —— 名录里连同代
         的影子都没有，说明它已经下线，照常顶成市面最高级。见上面的说明。
+
+        2026-09-18 复核：曾怀疑这道闸会把站方报过的名字整批顶掉（构造
+        `have=['gpt-5.6-sol'], remote=['gpt-6','gpt-6-astra']` 确实会），
+        但真实名录同时列着多代，站方报的上一代在册，闸不会命中；
+        撤掉它会让 `gpt-4 / gpt-4-32k / gpt-4o` 这种陈年目录留下来，
+        `tests/test_full_redetect.py` 与 `tests/test_planning_compliance.py`
+        共四条断言锁着这个行为。结论：**保持原样**，不要再改。
         """
         hit = _proven_gen.get(fam)
         if hit is not None:

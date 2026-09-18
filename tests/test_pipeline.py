@@ -194,7 +194,7 @@ class FakeUpstream(BaseHTTPRequestHandler):
         if "models" not in path:
             self._send(404, {"error": {"message": "not found"}})
             return
-        if profile in ("quota", "cfguard", "identity"):
+        if profile in ("quota", "cfguard", "identity", "gatebroke"):
             # 目录也不给 —— 真实站点在鉴权失败时通常连目录都不返回
             self._send(403, {"error": {"message": "forbidden"}})
             return
@@ -237,6 +237,17 @@ class FakeUpstream(BaseHTTPRequestHandler):
                 self._send(200, self._ok_payload(model, max(sent, 20)))
             else:
                 self._send(500, {"error": {"message": "internal error"}})
+            return
+
+        if profile == "gatebroke":
+            # 「门票已过、凭据不行」（2026-09-17 golf.example 现场形态）：
+            # 不带 Claude Code 身份 → 401 客户端；带了身份 → 402 余额。
+            # 站方认了身份，只是 Key 没钱。工具必须把身份写进 verdict。
+            ua = self.headers.get("User-Agent", "")
+            if ua.startswith("claude-cli/") or self.headers.get("anthropic-beta"):
+                self._send(402, {"error": {"message": "insufficient balance, 剩余 $0.00"}})
+            else:
+                self._send(401, {"error": {"message": "unauthorized client detected"}})
             return
 
         if profile == "identity":
@@ -483,9 +494,9 @@ def test_temp_failure_circuit_breaker():
     """「临时」类连续同码失败要熔断 —— 否则一个挂掉的站吃掉半轮预算。
 
     2026-09-16 现场量化（173 站、1144 次请求那一轮）：
-      · gorouter.app 一个站吃掉 **420 次**请求（15 Key × 4 段 × 每段 7 次），
+      · gorou.example 一个站吃掉 **420 次**请求（15 Key × 4 段 × 每段 7 次），
         **全部 502，一次成功都没有**。全轮 568 次 502 里 418 次来自它。
-      · zzzcoding.org（站方维护中）84 次全 405，同一形状。
+      · zulu.example（站方维护中）84 次全 405，同一形状。
     两个站合计约占全轮请求的 44%，贡献的信息量却等于 4 段各探一次。
 
     为什么 `_dead_shape` 接不住：`_HOST_LEVEL_FAIL` 故意排除「临时/未知」，
@@ -574,9 +585,20 @@ def test_temp_failure_circuit_breaker():
         truthy("最终收敛到零请求且不再回升",
                first_zero >= 0 and all(c == 0 for c in per_key[first_zero:]),
                f"各 Key 请求数 {per_key} —— 尾部应全为 0，熔断没生效")
+        # 阈值为什么是 0.6 而不是 0.5（2026-09-18 订正）
+        # --------------------------------------------------
+        # 原式 `sum < per_key[0]*N/2` 把基准钉在**首把 Key 的实测次数**上，
+        # 而 per_key[0] 本身随线程调度浮动（四段并发，`000` 不计数也不重置，
+        # 见上面那段注释）。实测 per_key[0] 在 9 与 10 之间摆动：取 10 时
+        # 门限 40、实测 36 通过；取 9 时门限 36、实测 36 —— 同一份正确行为
+        # 被判成失败。四个段不可能在同一把 Key 上同时熔断，50% 在部分调度
+        # 下本就不可达。
+        # 真正要锁的是「熔断确实省掉了大头」：无熔断时是 per_key[0]*N，
+        # 现在必须显著低于它。0.6 仍然能抓住「熔断没生效」（那会是 1.0）。
         truthy("总请求数显著低于线性增长",
-               sum(per_key) < per_key[0] * N / 2,
-               f"实测合计 {sum(per_key)} 次，首个 Key 自己 {per_key[0]} 次")
+               sum(per_key) < per_key[0] * N * 0.6,
+               f"实测合计 {sum(per_key)} 次，首个 Key 自己 {per_key[0]} 次，"
+               f"各 Key {per_key}")
         # 熔断结论要说清是熔断，不能看起来像站方对每把 Key 都回过
         brk = [v.action or "" for r in results[-1:]
                for v in r.sections.values()]
@@ -706,6 +728,22 @@ def main() -> int:
         eq("救回后有模型", bool(v.models), True)
         eq("发了 proxy-rescued 事件",
            any(k == "proxy-rescued" for k, _ in seen_events), True)
+
+        # ------------------------------------------------------------------
+        section("gatebroke：401 客户端 → 带身份后 402 余额（门票已过、凭据不行）")
+        r = probe("gatebroke")
+        v = r.sections["claude-api-key"]
+        eq("段仍不可用（Key 没钱）", v.usable, False)
+        eq("最终类别是凭据类，不是客户端", v.category, "余额")
+        eq("identity_proven 置位", v.identity_proven, True)
+        eq("记下了被接受的画像档", bool(v.profile_name), True)
+        truthy("最省档：cc-min（第一档就把 401 推成了 402）",
+               v.profile_name == "cc-min", f"实得 {v.profile_name!r}")
+        eq("门票头写进 min_headers", bool(v.min_headers), True)
+        truthy("action 说清「身份已被接受、凭据不行」",
+               "已被站方接受" in (v.action or ""), f"实得 {v.action!r}")
+        truthy("发出 profile-gate-passed 事件",
+               any(k == "profile-gate-passed" for k, _ in seen_events), True)
 
         # ------------------------------------------------------------------
         section("identity：401 → 补标识头救回")

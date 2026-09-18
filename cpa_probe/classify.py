@@ -107,7 +107,7 @@ _RULES: list[tuple[str, str, str, set[str] | None]] = [
      # `unauthorized client detected` 也是客户端门禁（2026-09-17 从「鉴权」
      # 挪过来）。判「鉴权」的处置是「换把 Key」，而这句正文说的是**客户端**
      # 不被认可 —— 换十把 Key 结论都一样，要换的是请求形态。判错的代价
-     # （agentrouter.org 现场）：不进 identity 那一段 → 不写 cloak.mode /
+     # （golf.example 现场）：不进 identity 那一段 → 不写 cloak.mode /
      # fingerprint-profile → CPA 用默认形态转发 → 站方按同一条规则拒 →
      # 客户端拿 499/503，而直接用 Claude Code 调就通 —— 正是用户第 1 条
      # 描述的「直连可用、经 CPA 不可用」。

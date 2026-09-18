@@ -1959,7 +1959,7 @@ class SectionPlan:
         原来这里写 `if self.model_source != "probed": return False`，
         于是 seed / catalog / prior 三类来源的段一律不建议、界面默认不勾。
 
-        现场后果（用户 2026-09-17 截图，agentrouter.org 四段 401）：
+        现场后果（用户 2026-09-17 截图，golf.example 四段 401）：
         探测全灭 → model_source 落到 seed（市面最新填充）→ recommended=False
         → 「只勾推荐项」一个都勾不到 → 模型列空白、priority 停在「待定」、
         建议栏停在「勾选后计算」。用户要手工一个一个点，173 站就是几百次。
@@ -2339,8 +2339,13 @@ def build_plan(
         #
         # 注意不要退回「注入 proxy-url」那条路 —— 见 :2544 那段的三条论证。
         _client_gate = getattr(v, "category", "") == "客户端"
+        # 「门票已过、凭据不行」也要写身份（2026-09-17）：画像梯某档把
+        # 401「客户端」推进成 402「余额」，站方已经认了这个身份，只是 Key
+        # 没钱。探测的类别是「余额」，但写回必须带上门票，否则这把 Key 充值
+        # 恢复后 CPA 仍用默认形态转发、仍被拒。
+        _gate_proven = bool(getattr(v, "identity_proven", False))
         if section == "claude-api-key" and (getattr(v, "min_body_kind", "")
-                                            or _client_gate):
+                                            or _client_gate or _gate_proven):
             try:
                 from .cpa_source_probe import cached_identity
                 ident = cached_identity()
@@ -2358,7 +2363,8 @@ def build_plan(
             #
             # 「客户端」类同样要：sub2api 的四项校验里 anthropic-beta 与
             # system prompt 分属两半，只开 cloak 不带 CLI 指纹仍会缺 beta 头。
-            if (("+system" in getattr(v, "min_body_kind", "") or _client_gate)
+            if (("+system" in getattr(v, "min_body_kind", "") or _client_gate
+                    or _gate_proven)
                     and "claude-code-cli" in profs):
                 fp_profile = "claude-code-cli"
             if cloak_mode or fp_profile:

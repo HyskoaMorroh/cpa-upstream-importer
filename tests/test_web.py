@@ -986,12 +986,22 @@ console.log(JSON.stringify(out));
     truthy("回填抽成独立函数（首轮与后续轮共用）",
            "function fillPlanIntoRows(" in js,
            "内联在 refreshPlan 里会重现「首轮跳过回填」")
-    # 顺序：先回填、再递归。反过来就是原缺陷。
+    # 顺序：先回填、再排重跑。反过来就是原缺陷。
+    #
+    # 2026-09-18：递归 `return refreshPlan(true)` 已被单飞包装取代 —— 首轮
+    # 不再自己递归，而是先回填、再置 `_planRerun`，由单飞在本轮结束后重跑。
+    # 契约不变（回填必须发生在"再来一轮"之前），锚点改成重跑标记。
+    # 用 rfind：`_planRerun = true;` 有两处，前一处在单飞包装的早退分支
+    # （「已有一轮在飞，记个待重跑」），它本来就在函数前面。要锁的是首轮
+    # 那一处 —— 必须排在回填之后。
     _fill_at = js.find("fillPlanIntoRows(d);")
-    _rec_at = js.find("return refreshPlan(true);")
-    truthy("首轮先回填再递归",
+    _rec_at = js.rfind("_planRerun = true;")
+    truthy("首轮先回填再排重跑",
            _fill_at != -1 and _rec_at != -1 and _fill_at < _rec_at,
-           f"fillPlanIntoRows@{_fill_at} 必须早于 return refreshPlan@{_rec_at}")
+           f"fillPlanIntoRows@{_fill_at} 必须早于 _planRerun@{_rec_at}")
+    truthy("重跑走单飞包装，不再直接递归 refreshPlan",
+           "return refreshPlan(true);" not in js,
+           "首轮直接递归会再起一个后台定档任务，把任务表挤满")
     truthy("定档失败一律显示（不再受 silent 抑制）",
            "定档失败" in js and "if (!silent) $('#planmeta')" not in js,
            "silent 只该压成功态提示，不该压错误")

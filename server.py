@@ -577,10 +577,26 @@ class Store:
 
     def add_plan_task(self, task: "PlanTask") -> None:
         with self.lock:
-            self._evict("plan_tasks", self.plan_tasks, 8,
-                        lambda t: t.state == "running")
+            # 上限从 8 提到 32、且 done 的任务 5 分钟内不淘汰（2026-09-17）
+            # ------------------------------------------------------------
+            # 现场两份快照都停在「定档轮询无响应 —— 刷新页面后重试」。
+            # 成因：前端每次勾选变化都防抖 180ms 发一次 /api/plan，一轮操作
+            # 几十次；每次缓存未命中都新建一个任务，8 条上限很快被挤满，
+            # 正在被轮询的那条 done 任务被 LRU 淘汰 → /api/plan-status 404
+            # → 前端连续 15 次 miss → 报「无响应」。任务本身没有问题。
+            # busy 判据加上「刚完成不到 300 秒」，给轮询方取结果的窗口。
+            self._evict("plan_tasks", self.plan_tasks, 32, self._plan_task_busy)
             self.plan_tasks[task.id] = task
             self._touch("plan_tasks", task.id)
+
+    @staticmethod
+    def _plan_task_busy(task) -> bool:
+        if task is None:
+            return False
+        if getattr(task, "state", "") == "running":
+            return True
+        fin = getattr(task, "finished", 0.0) or 0.0
+        return bool(fin) and (time.time() - fin) < 300.0
 
     def get_plan_task(self, tid: str) -> "PlanTask | None":
         with self.lock:
@@ -757,10 +773,42 @@ def _public_with_context(value, context):
         return next(cleaned) if isinstance(original, str) else original
     return _public(typed(value))
 
-def _validate_final(preview: str, plans=()) -> tuple[bool, str]:
+def _validate_final(preview: str, plans=(), *, cross_section: bool = True) -> tuple[bool, str]:
+    """写盘前的最后一道闸。
+
+    `cross_section` 控制「同一网址跨协议段也必须同档」这条 2026-09-11 批准的
+    规则是否**阻断**（2026-09-18 加这个开关）：
+      · 走方案写回（`/api/apply`）时保持 True —— 本工具自己产出的方案不该
+        制造新的跨段分裂；
+      · 走批量管理与全局调优（`/api/bulk-preview`、`/api/bulk-apply`、
+        `/api/tuning-apply`）时传 False。理由见下面那段注释：那条路径没有
+        `plans`，这道闸只能去扫**整份 config.yaml**，而生产配置里 18 个 host
+        有 16 个跨段档位不同（同段内 0 个分裂），于是每次预览都被判失败、
+        返回 400，前端把错误写进折叠着的 `#bmmsg` —— 用户看到的就是
+        「选好选项点执行，根本没反应」。分裂照常作为提示回传，不再阻断。
+    """
     ok, msg = validate(preview)
     if not ok:
         return ok, msg
+    # 空 models 闸（2026-09-18）
+    # ------------------------
+    # 在此之前这道闸只查三件事：YAML 合法、priority 是整数、同站档位一致。
+    # **不查 models 是否为空** —— 于是「探测全灭 → 目录读不到 → 清单为空」
+    # 的段只要被勾上（前端 `selected` 自报，落盘侧无质量判据），就照样写进
+    # config.yaml。CPA 拿到 models 为空的条目，每次轮到它必失败，
+    # 而界面上看不出任何异常。这就是用户说的「低次品写进 config.yaml」。
+    #
+    # 端到端验证里早有同样的判据（`if not sp.writable or not sp.models`），
+    # 但那是**写盘之后**的抽验，拦不住写入本身。
+    empty = [sp for sp in plans
+             if getattr(sp, "writable", False) and not getattr(sp, "models", None)]
+    if empty:
+        names = "、".join(
+            f"{cp.host_of(str(getattr(sp, 'base_url', '')))}/{getattr(sp, 'section', '?')}"
+            for sp in empty[:3])
+        more = f" 等 {len(empty)} 条" if len(empty) > 3 else ""
+        return False, (f"这些段没有任何模型，写进去 CPA 每次轮到都会失败：{names}{more}"
+                       f" —— 请先取消勾选，或在「模型」列手工填入站方支持的模型名")
     issues = cp.priority_split_within_host(list(plans))
     import yaml
     cfg = yaml.safe_load(preview) or {}
@@ -781,9 +829,23 @@ def _validate_final(preview: str, plans=()) -> tuple[bool, str]:
                            if isinstance(k, dict)]
             if any(type(value) is not int for value in values):
                 return False, "priority 必须是整数"
-            groups.setdefault(host, set()).update(values)
-    if issues or any(len(values) > 1 for values in groups.values()):
-        return False, "同站优先级不一致：请将该站所有 Key（包括未勾选项与默认 0）统一后重新预览"
+            # 归集键 =（段, host）而不是单 host（2026-09-18）
+            # ----------------------------------------------
+            # 段内同站同档是硬约束（修改要求 3⑶④：同一类型相同域名共享同一
+            # 优先级）。跨段是否也必须同档由 `cross_section` 决定 —— 见函数
+            # docstring：批量管理那条路只能扫整份文件，用它阻断等于让 16/18
+            # 个 host 的既有分裂把所有批量操作全卡死。
+            groups.setdefault((section, host), set()).update(values)
+            if cross_section:
+                groups.setdefault(("*", host), set()).update(values)
+    if any(len(values) > 1 for values in groups.values()):
+        return False, ("同站优先级不一致：请将该站所有 Key"
+                       "（包括未勾选项与默认 0）统一后重新预览")
+    if issues:
+        # 跨段分裂：阻断与否由 cross_section 决定，但无论如何都要让操作员看见。
+        if cross_section:
+            return False, "；".join(issues)
+        msg = (msg + " · " if msg else "") + "；".join(issues)
     return True, msg
 
 
@@ -2126,7 +2188,19 @@ class Handler(BaseHTTPRequestHandler):
         # 脱敏结果二次脱敏。
         if code == 200:
             _ck = getattr(self, "_plan_cache_key", "")
-            if _ck:
+            # 只缓存**真正的定档结果**（2026-09-18）
+            # ------------------------------------
+            # 现场：两份快照都停在「定档轮询无响应 —— 刷新页面后重试」。
+            # 成因是 keep-alive —— 同一个 Handler 实例先服务 `POST /api/plan`
+            # （设了 `_plan_cache_key`、回 202），接着服务
+            # `POST /api/plan-status`，而后者的 `_json(200, snap)` 又落到这里，
+            # 于是 `{state:"running", elapsed:…}` 被当成定档结果写进缓存。
+            # 下一次同参 `/api/plan` 命中缓存原样重放这份快照 —— 前端拿到的
+            # 体里没有 `plans` / `plan_id` / `diffs`，裸取字段抛 TypeError，
+            # 整张表永久停在占位符。
+            # `_plan_cache_key` 的生命周期已经改成不跨请求（见 `_api_plan`），
+            # 这里的 `"plans" in payload` 是第二道闸：形状不对就不进缓存。
+            if _ck and isinstance(payload, dict) and "plans" in payload:
                 with Handler._plan_cache_lock:
                     if len(Handler._plan_cache) >= Handler._PLAN_CACHE_MAX:
                         oldest = min(Handler._plan_cache.items(),
@@ -2258,6 +2332,16 @@ class Handler(BaseHTTPRequestHandler):
         elif route == "/api/routes":
             # 既有上游路由清单（只读），批量管理面板的数据源
             self._api_routes()
+        elif route == "/api/plan-status":
+            # 异步定档轮询也挂 GET（2026-09-18）
+            # ------------------------------
+            # `PlanTask` 的 docstring 一直写的是
+            # `GET /api/plan-status?plan_task_id=…`，而路由只挂了 POST ——
+            # 按文档接的客户端、健康检查、curl 排障全部落 404「未知路由」，
+            # 看起来像「任务不存在」。轮询是纯读操作，GET 更符合语义。
+            ptid = (urllib.parse.parse_qs(p.query).get("plan_task_id")
+                    or [""])[0]
+            self._api_plan_status(ptid)
         elif route.startswith("/api/apply-status/"):
             self._api_apply_status(route[len("/api/apply-status/"):])
         elif route.startswith("/api/export/"):
@@ -2732,7 +2816,24 @@ class Handler(BaseHTTPRequestHandler):
 
         def _diag_one(section: str) -> None:
             base = cp.base_for_section(row.bare, section)
+            # 先问站方目录，再挑模型（2026-09-18）
+            # --------------------------------
+            # 原来这里写死 `SEED_MODELS[section][0]` —— 种子是本工具**猜**的
+            # 名字。站方没有这个模型时每一档都回 404/「分组无该模型渠道」，
+            # 诊断报「所有画像都不通」，而站点其实活着：与主流程 2026-09-01
+            # 复盘修掉的是同一个根因（那次把 `_stage0_catalog` 提到了所有推理
+            # 请求之前，见 `pipeline.py:1654` 的说明），只是诊断这条路没跟上。
+            # 目录读不到（401/404/关闭）时照常回落种子，行为与原来一致。
             model = SEED_MODELS[section][0]
+            catalog: list[str] = []
+            try:
+                catalog = prober._stage0_catalog(row, section, base) or []
+            except Exception:           # 目录端点不可用不该让诊断整段失败
+                catalog = []
+            if catalog:
+                order = prober._probe_order(section, catalog)
+                if order:
+                    model = order[0]
             rungs: list[dict] = []
             hit: dict | None = None
 
@@ -3082,13 +3183,19 @@ class Handler(BaseHTTPRequestHandler):
         # 生产环境：启动异步任务，立即返回 task_id
         task = PlanTask(secrets.token_hex(10), body)
         STORE.add_plan_task(task)
-        self._plan_cache_key = _ck
+        # 缓存键**不挂在 self 上**（2026-09-18）
+        # ------------------------------------
+        # 挂在 self 上就会随 keep-alive 活到后续请求里 —— 下一条
+        # `POST /api/plan-status` 的 200 响应会被 `_json` 当成定档结果写进
+        # `_plan_cache`，再下一次同参 `/api/plan` 就重放一份没有 `plans` 的
+        # 体，界面永久停在占位符（现场：「定档轮询无响应」两份快照）。
+        # 键只交给后台 worker 那一份浅拷贝，前台 handler 全程保持空。
 
         def _run():
             try:
                 _t0 = time.time()
-                # _plan_body 写到 self._plan_result 而非直接发送
-                self._plan_async_body(body, job, raw, cfg, task)
+                # _plan_body 写到 task.result 而非直接发送
+                self._plan_async_body(body, job, raw, cfg, task, cache_key=_ck)
                 logger.info("异步定档完成：%.1f 秒 · 全量重探=%s · %d 个候选",
                             time.time() - _t0,
                             bool(job.opts.get("full_redetect")),
@@ -3099,8 +3206,6 @@ class Handler(BaseHTTPRequestHandler):
                     task.error = str(exc)
                     task.finished = time.time()
                 logger.exception("异步定档异常")
-            finally:
-                self._plan_cache_key = ""
 
         threading.Thread(target=_run, daemon=True).start()
         self._json(202, {"plan_task_id": task.id, "state": "running"})
@@ -3116,7 +3221,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, snap)
 
     def _plan_async_body(self, body: dict, job, raw: str, cfg: dict,
-                         task: PlanTask) -> None:
+                         task: PlanTask, *, cache_key: str = "") -> None:
         """在后台线程里跑 _plan_body，把结果存进 task.result。
 
         **必须在 Handler 的浅拷贝上跑**（2026-09-17 修死锁）
@@ -3142,7 +3247,9 @@ class Handler(BaseHTTPRequestHandler):
 
         worker = _copy.copy(self)
         worker._async_plan_task = task      # type: ignore[attr-defined]
-        worker._plan_cache_key = getattr(self, "_plan_cache_key", "")
+        # 缓存键只在这份拷贝上存在（2026-09-18）：前台 handler 不再持有它，
+        # 所以 keep-alive 上的后续请求不可能被误当成定档结果缓存。
+        worker._plan_cache_key = cache_key
         try:
             worker._plan_body(body, job, raw, cfg)
         finally:
@@ -3774,7 +3881,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "批量操作未通过校验", "problems": problems,
                              "error_code": "invalid_operation", "bulk_id": ""})
             return
-        ok, msg = _validate_final(new_text)
+        # cross_section=False：批量路径没有 plans，这道闸只能扫整份文件。
+        # 生产配置 18 个 host 有 16 个跨段档位不同（同段内 0 个分裂），
+        # 用它阻断等于让所有批量操作永远失败 —— 现场表现就是「点了没反应」。
+        # 段内同站同档仍然阻断；跨段分裂作为提示随 `msg` 回传。
+        ok, msg = _validate_final(new_text, cross_section=False)
         if not ok:
             self._json(400, {"error": msg, "error_code": "priority_invariant",
                              "bulk_id": ""})

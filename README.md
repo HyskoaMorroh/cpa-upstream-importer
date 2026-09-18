@@ -31,20 +31,49 @@
 
 ## 快速上手
 
-### Docker（推荐，支持 amd64 / arm64）
+### 第 0 步：填 `.env`（唯一需要动手的配置文件）
 
 ```bash
 git clone <你的仓库地址> && cd cpa-upstream-importer
-
 cp .env.example .env
-$EDITOR .env          # 至少要设 CONFIG_PATH，指向你的 CPA config.yaml
+$EDITOR .env
+```
 
+逐行说明 —— 只有第一行是硬性必填，其余按需：
+
+| 变量 | 必填 | 填什么 | 不填的后果 |
+|---|---|---|---|
+| `CONFIG_PATH` | **是** | CPA 的 `config.yaml` 在宿主机上的**绝对路径**，例如 `/opt/deploy/config.yaml` | `docker compose up` 直接报错退出（compose 用 `${CONFIG_PATH:?}`） |
+| `IMPORTER_TOKEN` | 建议 | 投喂台登录口令，随便一串 | 每次启动随机生成并打印到日志，**重启就变**，得去日志里翻 |
+| `CPA_MANAGEMENT_TOKEN` | 建议 | CPA 后台的**管理密码**（原始密码，不是 config.yaml 里的 bcrypt 哈希） | 「按 CPA 运行状态定优先级」静默退回静态检测分，日志只有一行提示 |
+| `CPA_UPSTREAM_URL` | 否 | 默认 `http://cli-proxy-api:8317`；与 CPA 不在同一 compose 项目时改成可达地址 | 写回后不触发 CPA 重载，也拿不到运行时健康分 |
+| `IMPORTER_UID` / `IMPORTER_GID` | 视情况 | `stat -c '%u:%g' /opt/deploy/config.yaml` 的输出 | 属主不一致时写回 `PermissionError` |
+| `MIHOMO_SUB_WOG` / `MIHOMO_SUB_WOGB` | 用代理才填 | 机场订阅链接（含 token） | 不用代理可留模板值；用了 `--profile mihomo` 而没填，init 容器会报错退出 |
+| `MIHOMO_SECRET` | 用代理才填 | mihomo 9090 API 的鉴权串 | 留空则同网段任意容器都能改出口节点 |
+
+其余变量（`IMAGE`、`PULL_POLICY`、`BIND_ADDR`、`HOST_PORT`、`MEMORY_LIMIT`、
+`MIHOMO_BIND` 等）在 `.env.example` 里都有注释与默认值，一般不用动。
+
+### 第 1 步：起服务
+
+```bash
+# 不用代理
 docker compose up -d
+
+# 站方按出口 IP 拦截（CF 人机验证等）时，连代理一起起
+docker compose --profile mihomo up -d
+
 docker compose logs cpa-upstream-importer | head -20    # 拿访问地址与 token
 ```
 
-浏览器开 `http://127.0.0.1:8765/`，用 **CPA 后台的管理密码**登录
-（或 `.env` 里的 `IMPORTER_TOKEN`）。
+浏览器开 `http://127.0.0.1:8765/`，用 `IMPORTER_TOKEN`（或 CPA 后台管理密码）登录。
+服务只绑回环；远程访问走 SSH 隧道 `ssh -L 8765:127.0.0.1:8765 root@<VPS>` 或 nginx。
+
+### 第 2 步：用完关掉
+
+```bash
+docker compose stop cpa-upstream-importer   # 它持有明文上游 Key，别长开
+```
 
 用现成镜像而不是本地构建：
 
@@ -435,7 +464,7 @@ id="p4" 在快照里出现 0 次           ← 第 4 步写回面板根本没渲
 
 - 692 个 priority 格全停在「待定」占位符，根本没写进去
 - 1772 个 mini / flash / fast 低档模型被勾上（应当全部滤掉）
-- gorouter.app 一个站吃掉 **420 次**请求；zzzcoding 84 次；两个站占全轮 44%
+- gorou.example 一个站吃掉 **420 次**请求；zulu 84 次；两个站占全轮 44%
 - 前端 LOW_TIER 正则比后端少 `flash|fast`，导致低档模型在界面里看起来已勾选
   但写回时被后端悄悄删掉 —— 界面与 config.yaml 不一致
 - 订阅 URL 含百分号编码（`%2F` / `%3D`）时 bootstrap 脚本的 init 容器
@@ -451,7 +480,16 @@ id="p4" 在快照里出现 0 次           ← 第 4 步写回面板根本没渲
 | `000` 打断熔断计数 | 网络抖动产生 `000`（连接失败）会清零已积累的连续 502 计数 | `000` 既不计数也不重置，不把「没拿到回答」当成「站方行为变了」 |
 | 代理永不启动 | `hc_block(url) % name` 二段式 `%` 格式化遇 `%2F` 崩溃 | 一次填完，`json.dumps` 处理 URL 保证 YAML 安全 |
 
-**2026-09-17 第二轮（用户新截图：401 段模型空白、priority「待定」、建议「勾选后计算」）**
+**2026-09-17 第三轮（镜像拉取后两份快照：「定档轮询无响应」+ 客户端门禁未解决）**
+
+| 现象 | 根因 | 修复 |
+|---|---|---|
+| 「定档轮询无响应 —— 刷新页面后重试」 | 每次勾选变化防抖 180ms 发一次 `/api/plan`，缓存未命中就新建任务；任务表上限 8，正在被轮询的 done 任务被 LRU 淘汰 → `/api/plan-status` 404 → 前端连续 15 次 miss | 前端单飞：同一时刻只跑一个 refreshPlan，后到的只记「待重跑」；后端上限 32，done 后 300 秒内不淘汰 |
+| golf.example 探测判「客户端」，写回不带身份 | 画像梯 `cc-min` 把 401「客户端」推成 402「余额」—— **站方已认了 Claude Code 身份**，只是 Key 没钱；但最终类别按「最严重」评选，把这条证据盖回「客户端」 | 新增 `identity_proven`：整梯无 200 但有一档推进成凭据类拒绝时，记下那一档为门票，类别改凭据类；写回带 `headers` + `fingerprint-profile: claude-code-cli` |
+
+第二条就是「直连可用、经 CPA 499/503」的完整解释：直连时 Claude Code 自带身份，
+站方放行后再按余额拒；经 CPA 时没带身份，站方在门口就拒。写回身份后，
+这把 Key 充值恢复即可直接用，不必再探。
 
 | 现象 | 根因 | 修复 |
 |---|---|---|
@@ -473,7 +511,7 @@ id="p4" 在快照里出现 0 次           ← 第 4 步写回面板根本没渲
 2. **待定不会发生** —— `topup_to_market_top()` 强制填充：检测到任何已通模型就
    自动补全同 generation 全系列；若最新代全不通，也会填充最高档并保留次新代，
    不会让任何条目停在空值。
-3. **熔断防超时** —— gorouter / zzzcoding 类稳定故障站在第 3 次完整探测后短路，
+3. **熔断防超时** —— gorou / zulu 类稳定故障站在第 3 次完整探测后短路，
    后续 Key 零请求复用，总请求量大幅下降，触发 524 的概率降低。
 
 **还需要你手动操作的一件事**：compose 里加 `CPA_MANAGEMENT_TOKEN`，

@@ -448,6 +448,15 @@ class SectionVerdict:
     # 随机 UUID，落进报告会让每次输出都不同）。非空表示 headers 表达不了，
     # claude 段要 fingerprint-profile，其余三段配置层无解。
     min_body_kind: str = ""
+    # 「门票已过、凭据不行」（2026-09-17）
+    # ---------------------------------
+    # 画像梯某一档把「客户端」拒绝推进成了**凭据类**拒绝（余额 / 鉴权）：
+    # 站方已经认了这个身份，只是这把 Key 没钱或无效。段仍不可用，但
+    # 「这个站要什么身份」已经实测出来 —— 写回必须带上，否则 CPA 用默认
+    # 形态转发，站方按同一条规则拒，客户端拿 401/503/499。
+    # 现场：golf.example claude 段 baseline 401「客户端」，cc-min 起全部
+    # 402「余额」；原逻辑取最严重类别报「客户端」，把这条证据丢了。
+    identity_proven: bool = False
     # 分组的可调用时段（("09:00","18:00")）。「时段」类才有。
     time_window: tuple[str, str] | None = None
     swap: dict = field(default_factory=dict)
@@ -658,11 +667,11 @@ class Prober:
         # 站+段」。
         #
         # 实测代价（173 站那一轮，1144 次请求）：
-        #   · gorouter.app 一个站吃掉 **420 次**请求，15 把 Key × 4 段 ×
+        #   · gorou.example 一个站吃掉 **420 次**请求，15 把 Key × 4 段 ×
         #     每段 7 次（基线 + 临时重试 + 画像梯 + via-proxy-last）
         #     **全部是 502，一次成功都没有**。全轮 568 次 502 里 418 次
         #     来自这一个站。
-        #   · zzzcoding.org（站方维护中）84 次全 405，同一个形状。
+        #   · zulu.example（站方维护中）84 次全 405，同一个形状。
         # 这两个站合计约占全轮请求的 44%，而它们贡献的信息量等于 4 段各一次。
         #
         # 直接后果不只是慢：那一轮总耗时 1650 秒，而 /api/plan 要在同一个
@@ -1342,7 +1351,32 @@ class Prober:
         pool = seen or seen_weak
         if pool:
             best = min(pool, key=lambda ca: self._severity_rank(ca[0]))
-            v.category, v.action = best
+            # 画像梯已证明门票（identity_proven）时不再按「最严重」评选：
+            # 那会把 cc-min 拿到的「余额」重新盖成 baseline 的「客户端」，
+            # 正是现场丢证据的那一步。类别由 _try_profiles 定，这里不覆盖。
+            if not getattr(v, "identity_proven", False):
+                v.category, v.action = best
+
+        # 全程只见 429：终判「限流」而不是「临时」（2026-09-18）
+        # ----------------------------------------------------
+        # `classify` 在 2026-09-13 把 429 从「限流」改判「临时」，为的是让它
+        # 参与重试 —— 那一步是对的。代价是「限流」这个类别在 `_RULES` 里
+        # 再也没有任何规则命中，成了**不可达**类别，而 `DISPOSITION` 里它写着
+        # 「凭据有效，CPA 自带冷却与轮换」。于是一把只是被限频的**有效** Key
+        # 被报成「临时 — 上游错误」，操作员据此当成坏站处理。
+        # 修法不是把 classify 改回去（那会丢掉重试），而是在**段级终判**这里
+        # 分开：重试用尽后若这一段见过的失败状态码只有 429，说明站方一直在
+        # 限频而不是出错，类别据实写「限流」。
+        # 注意不动 `v.usable` —— 全程没有一次 200，没有证据说这段现在能用；
+        # 写回仍走「不可用段也建议写」那条路（7227cea）。
+        if (v.category == "临时" and v.attempts
+                and not getattr(v, "identity_proven", False)):
+            bad = {getattr(a, "status", "") for a in v.attempts
+                   if getattr(a, "status", "") and not str(a.status).startswith("2")}
+            if bad == {"429"}:
+                v.category = "限流"
+                v.action = "站方持续限频，凭据本身有效 —— CPA 自带冷却与轮换；" \
+                           "如需现在验证，加大探测间隔或换出口 IP 重试"
 
         # 第二级代理：原因不明（未知）或疑似链路问题（临时）的段，在**所有**
         # 其余处置都用尽之后补一次换 IP。
@@ -1448,7 +1482,17 @@ class Prober:
         body 形态，不看模型名），所以第一个种子试完整梯全败之后，同段的后续
         种子直接跳过，不重问同一个问题。省的量见 _profiles_failed 的说明。
         """
-        pkey = (host_of(base), section)
+        # 归集键与形态缓存对齐（2026-09-18）
+        # ------------------------------
+        # 原来这里用 `(host_of(base), section)`，而 `_shape` / `_dead_shape`
+        # 用的是 `(entry_scope(section, row.bare), section)` —— 前三段两者
+        # 等价，**compat 段不等价**：`entry_scope` 带路径（同一台主机上
+        # `/v1` 与 `/api/v1` 是两个不同的 provider）。于是 `host/a` 整梯失败
+        # 会让 `host/b` 在下面直接 return False 跳过整梯，一次请求都不发，
+        # 结论却按「整梯已试过全败」写。`_shape` / `_dead_shape` 在
+        # 2026-09-12 修过同一个坑，`_profiles_failed` 当时漏改。
+        from .batch import entry_scope
+        pkey = (entry_scope(section, row.bare), section)
         if self.reuse_profile_verdict:
             with self._lock:
                 already_failed = pkey in self._profiles_failed
@@ -1460,6 +1504,11 @@ class Prober:
                 return False
 
         tried = 0
+        # 「门票已过」的第一档（2026-09-17）：某档把客户端拒绝推进成凭据类
+        # 拒绝，就说明这个身份被站方认了。记下最省的那一档；整梯全败时把它
+        # 当作「该站需要的身份」写进 verdict —— 段仍不可用，但写回带上门票。
+        _CRED = ("余额", "鉴权")
+        gate_hit: tuple | None = None       # (prof, hdrs, patch, att)
         for prof in profiles.ladder(section, self.cfg_snapshot):
             if prof.is_baseline:
                 continue                    # 基线已在调用方试过
@@ -1472,6 +1521,13 @@ class Prober:
             v.attempts.append(att)
             tried += 1
             if not att.ok:
+                if gate_hit is None and att.category in _CRED:
+                    gate_hit = (prof, hdrs, patch, att)
+                    self.on_event("profile-gate-passed", {
+                        "section": section, "host": host_of(base),
+                        "profile": prof.name, "tier": prof.tier,
+                        "then": att.category, "status": att.status,
+                    })
                 continue
             # 200 也要过 _accept —— 「200 但正文是错误体」是实测过的假阳性
             # 来源（某站对所有请求都回 200，把真实错误放正文里）。
@@ -1496,6 +1552,25 @@ class Prober:
         # 「请启用 1m 上下文」，说明站方没查客户端身份，只是缺一个 beta）。
         if self._retry_with_betas(row, section, base, model, v, tried):
             return True
+
+        # 整梯没有一档 200，但有一档把「客户端」推成了「余额 / 鉴权」——
+        # 门票已经实测出来，只是凭据不行。把身份写进 verdict，并把最终类别
+        # 改成凭据类：处置是「换把 Key / 充值」，不再是「换请求形态」。
+        # 段仍 usable=False；写回带 headers + cloak/fingerprint-profile，
+        # 这把 Key 恢复后 CPA 直接能用，不必再探一次。
+        if gate_hit is not None:
+            prof, hdrs, patch, att = gate_hit
+            v.min_headers = dict(hdrs)
+            v.profile_name = prof.name
+            v.min_body_kind = _body_kind(prof)
+            v.identity_proven = True
+            v.category, v.action = att.category, (
+                f"{att.action}（身份 {prof.name} 已被站方接受，凭据不行）")
+            self.on_event("profile-gate-only", {
+                "section": section, "host": host_of(base),
+                "profile": prof.name, "then": att.category,
+            })
+            return False
 
         with self._lock:
             self._profiles_failed.add(pkey)
@@ -2350,7 +2425,7 @@ class Prober:
         #   一次 `000`，该段的计数从 2 归零重来，于是又多跑了 3 把 Key 的
         #   完整探测 —— 请求数 [9,10,10,4,4,4,0,0] 而不是 [9,10,10,0,…]。
         #
-        # 生产里这一脚更疼：gorouter 那种稳定 502 的站，中途任何一次网络
+        # 生产里这一脚更疼：gorou 那种稳定 502 的站，中途任何一次网络
         # 抖动都会让熔断从头再来，而熔断本来就是为它设计的。
         #
         # 也不能反过来让 `000` 参与累计（`prev_status` 记成 `000`）——
