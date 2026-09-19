@@ -2298,13 +2298,68 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # 请求体上限。chunked 路径也要用它，所以在方法外用常量。
+    _MAX_BODY = 8 * 1024 * 1024
+
+    def _read_chunked(self) -> bytes:
+        """解 `Transfer-Encoding: chunked` 的请求体。
+
+        为什么必须支持（2026-09-19 实测发现）
+        ------------------------------------
+        原来 `_body` 只读 `Content-Length`，chunked 请求直接当空体返回 ——
+        而**这是相当常见的发送方式**：
+          · Node 的 `fetch` / `http.request` 在未显式设 Content-Length 时
+            自动用 chunked（实测：同一份账号文本，Node 发出去解析出 0 行，
+            Python 发出去 3 行，差异只在这里）
+          · 部分 HTTP 客户端库与反向代理转发时也会改写成 chunked
+
+        现场表现：**粘贴账号后点「解析」，界面回「没有有效行」，
+        而同样的文本换个客户端发就正常** —— 用户看不出任何线索。
+
+        实现按 RFC 7230 §4.1：`<十六进制长度>\r\n<数据>\r\n`，最后是
+        `0\r\n` + trailer + `\r\n`。长度上限复用 `_MAX_BODY`，超了抛错 ——
+        不能因为走了 chunked 就绕过大小限制。
+        """
+        buf = bytearray()
+        while True:
+            line = self.rfile.readline(65536)
+            if not line:
+                raise ValueError("chunked 请求体意外结束")
+            # chunk-size 后可跟 `;ext`，取分号前那一段
+            size_txt = line.split(b";", 1)[0].strip()
+            try:
+                size = int(size_txt, 16)
+            except ValueError as e:
+                raise ValueError("chunked 长度字段非法") from e
+            if size == 0:
+                # 读掉 trailer（可能若干行，直到空行）
+                while True:
+                    t = self.rfile.readline(65536)
+                    if not t or t in (b"\r\n", b"\n"):
+                        break
+                break
+            if len(buf) + size > self._MAX_BODY:
+                raise ValueError("请求体过大（上限 8MB）")
+            chunk = self.rfile.read(size)
+            if len(chunk) < size:
+                raise ValueError("chunked 请求体被截断")
+            buf += chunk
+            self.rfile.read(2)      # 尾随 CRLF
+        return bytes(buf)
+
     def _body(self) -> dict:
-        n = int(self.headers.get("Content-Length") or 0)
-        if n <= 0:
-            return {}
-        if n > 8 * 1024 * 1024:
-            raise ValueError("请求体过大（上限 8MB）")
-        raw = self.rfile.read(n)
+        # chunked 优先判 —— 这类请求**没有** Content-Length，若先看后者会
+        # 直接当成空体（这正是修之前的行为）。
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te:
+            raw = self._read_chunked()
+        else:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n <= 0:
+                return {}
+            if n > self._MAX_BODY:
+                raise ValueError("请求体过大（上限 8MB）")
+            raw = self.rfile.read(n)
         try:
             body = json.loads(raw.decode("utf-8"))
         except Exception as e:

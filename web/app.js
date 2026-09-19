@@ -438,6 +438,25 @@ const SECTION_LABEL = {
   'openai-compatibility': 'compat',
 };
 
+// 段序兜底（2026-09-19）
+// --------------------
+// 页面里多处裸取 `S.ctx.section_order`，而 `S.ctx` 由启动时那次
+// `/api/context` 赋值。那个请求一旦失败（网络抖动、反代超时、服务刚重启），
+// `S.ctx` 保持 null，随后**任何**渲染都抛
+// `TypeError: Cannot read properties of null (reading 'section_order')`
+// 并中断整条流程 —— 用户看到的是「点了没反应 / 黑屏 / 参数全缺失」，
+// 而控制台里只有一条抛在深处的 TypeError。
+//
+// 后端 `SECTIONS` 是常量（cp.SECTIONS），顺序固定，这里据实抄一份即可。
+// 用它兜底之后，拿不到 ctx 时页面降级成「段名列不全但能操作」，
+// 而不是整页崩掉。真正的失败原因由 boot 里的显式提示说出来。
+const SECTION_ORDER = ['gemini-api-key', 'codex-api-key',
+                       'claude-api-key', 'openai-compatibility'];
+function sectionOrder() {
+  return (S.ctx && Array.isArray(S.ctx.section_order) && S.ctx.section_order.length)
+    ? S.ctx.section_order : SECTION_ORDER;
+}
+
 // 判定类别 → 徽标样式。与后端 classify 的类别名一一对应。
 const CAT_PILL = {
   '可用': 'p-ok', '余额': 'p-w', '限流': 'p-w', '边缘': 'p-w', '反测活': 'p-w',
@@ -889,7 +908,15 @@ function hostState(b, host) {
 
 function renderBands() {
   const box = $('#bands');
-  box.innerHTML = S.ctx.section_order.map((sec) => {
+  // S.ctx 缺失时不能用空对象假装有数据 —— 那样会把档位谱渲染成一堆 0，
+  // 比报错更误导。这里直接说明「拿不到 ctx」，其余部分照常可用。
+  if (!S.ctx || !S.ctx.sections) {
+    box.innerHTML = `<div class="err">拿不到后端上下文（/api/context 未成功），`
+      + `段信息与档位谱暂不可用。<span class="hint">刷新页面重试；`
+      + `持续如此请看容器日志。</span></div>`;
+    return;
+  }
+  box.innerHTML = sectionOrder().map((sec) => {
     const b = S.ctx.sections[sec];
     const gapSet = new Map(b.gaps.map(([lo, hi]) => [hi, [lo, hi]]));
     const rows = [];
@@ -997,7 +1024,7 @@ async function doParse() {
       <td class="m"><b>${esc(r.host)}</b>${n > 1
         ? ` <span class="pill p-i">${first ? '首个 · 全量探测' : '复用形态'}</span>` : ''}</td>
       <td class="m">${esc(r.key_masked)}</td>
-      <td class="m" style="color:var(--ink-3)">${S.ctx.section_order
+      <td class="m" style="color:var(--ink-3)">${sectionOrder()
         .map((s) => `${SECTION_LABEL[s]}: ${esc(r.bases[s].replace(/^https?:\/\//, ''))}`)
         .join('<br>')}</td>
     </tr>`;
@@ -1809,7 +1836,7 @@ function siteCard(r) {
   // 候选身份 = 输入行号。一个站常有 15 把 Key，用 host 当身份会让同站
   // 多 Key 的勾选状态、priority 输入、模型清单全部串到第一行上。
   const rid = String(r.row.line_no);
-  const rows = S.ctx.section_order.map((sec) => {
+  const rows = sectionOrder().map((sec) => {
     const v = r.sections[sec];
     if (!v) return '';
     const label = SECTION_LABEL[sec] || sec;
@@ -2055,7 +2082,7 @@ function siteCard(r) {
   // 尝试明细：每段一张表，放在站卡最下面。
   // 12 个字段后端一直在返回，而结果表只显示了 status 与 excerpt ——
   // 排障时真正要看的「哪一档通的、别的档报什么、哪个慢」都在这里。
-  const detail = S.ctx.section_order.map((sec) => {
+  const detail = sectionOrder().map((sec) => {
     const v = r.sections[sec];
     if (!v || !(v.attempts || []).length) return '';
     return attemptTable(SECTION_LABEL[sec] || sec, v);
@@ -2687,6 +2714,139 @@ $('#btnreplan').onclick = () => {
 //
 // 与步骤②的探测轮询同一套思路：断连要重试，不能因为一次网络抖动就让用户
 // 以为写回失败（写盘早就成了）。
+// ── headers 就地编辑器 ──
+// 2026-09-19 恢复：与 impactTable 一样，本函数在提交 470d04a 里被**误删**，
+// 而调用点（fillPlanIntoRows 结尾的 `bindHeaderEditor(wb, ...)`）留着。
+// 影响面比 impactTable 稍轻（impactTable 先抛，所以这个从来没被执行到），
+// 但两个都必须补回来 —— 只补一个的话，下一个抛的就是它。
+function bindHeaderEditor(wb, rid, sec) {
+  const det = wb.querySelector('.hedit');
+  if (!det) return;
+  const rowsBox = det.querySelector('.hrows');
+  const msg = det.querySelector('.hmsg');
+
+  const collect = () => {
+    const out = {};
+    [].slice.call(rowsBox.querySelectorAll('.hrow')).forEach((r) => {
+      const k = r.querySelector('.hk').value.trim();
+      const v = r.querySelector('.hv').value.trim();
+      // 空 key 或空 value 一律丢弃 —— 与 CPAMP 的 buildHeaderObject 同口径，
+      // 两边行为不同会让人在一处试通、另一处失败时找不到原因。
+      if (k && v) out[k] = v;
+    });
+    return out;
+  };
+
+  const check = (h) => {
+    const bad = Object.keys(h).filter(
+      (k) => !KNOWN_HEADERS.includes(k.toLowerCase()));
+    const under = Object.keys(h).filter((k) => k.includes('_'));
+    const bits = [];
+    if (under.length) {
+      bits.push(`${under.join('、')} 含下划线 —— HTTP 头一般用连字符，`
+        + `确认不是 anthropic_beta 这类手滑`);
+    }
+    if (bad.length) bits.push(`未见过的头名：${bad.join('、')}`);
+    msg.textContent = bits.length ? `⚠ ${bits.join('；')}` : '';
+    msg.style.color = bits.length ? 'var(--warn)' : '';
+  };
+
+  // 写进 S.overrides 但**不**立刻 refreshPlan —— 那会重渲染整个 .wbox，
+  // 把正在输入的框连焦点带光标一起换掉。边打字边跳焦点是不能用的。
+  const stash = () => {
+    const h = collect();
+    check(h);
+    S.overrides[rid] = S.overrides[rid] || {};
+    S.overrides[rid][sec] = S.overrides[rid][sec] || {};
+    S.overrides[rid][sec].headers = h;
+    det.querySelector('.hreset').disabled = false;
+  };
+
+  let timer = null;
+  det.addEventListener('input', (e) => {
+    if (!e.target.classList.contains('hk')
+        && !e.target.classList.contains('hv')) return;
+    stash();
+    // 停手 700ms 才重算方案。数字是权衡：太短仍会在连续输入中打断，
+    // 太长会让「改了头之后 priority 建议随之变化」这件事显得没反应。
+    clearTimeout(timer);
+    timer = setTimeout(() => { S.keepOpen = pk(rid, sec); refreshPlan(); }, 700);
+  });
+  // 失焦立即结算 —— 用户已经改完了，不该再等那 700ms
+  det.addEventListener('focusout', () => {
+    if (!timer) return;
+    clearTimeout(timer); timer = null;
+    S.keepOpen = pk(rid, sec);
+    refreshPlan();
+  });
+  det.addEventListener('click', (e) => {
+    const add = e.target.closest('.hadd');
+    const del = e.target.closest('.hdel');
+    const rst = e.target.closest('.hreset');
+    if (add) {
+      e.preventDefault();
+      rowsBox.insertAdjacentHTML('beforeend',
+        hdrRow('', '', rowsBox.children.length));
+      rowsBox.lastElementChild.querySelector('.hk').focus();
+      return;
+    }
+    if (del) {
+      e.preventDefault();
+      del.closest('.hrow').remove();
+      // 这里原本写的是 commit() —— 那个函数不存在（闭包里只有 collect /
+      // check / stash），于是抛 ReferenceError：行从 DOM 上消失了，
+      // 但 S.overrides 里还留着被删的那个头，看起来删掉了实际没有。
+      stash();
+      S.keepOpen = pk(rid, sec);
+      refreshPlan();
+      return;
+    }
+    if (rst) {
+      e.preventDefault();
+      // 删掉这个键而不是置空 —— 「没改过」与「改成空」是两件事，
+      // 后者应当真的写出一个空 headers。
+      if (S.overrides[rid] && S.overrides[rid][sec]) {
+        delete S.overrides[rid][sec].headers;
+      }
+      refreshPlan();
+    }
+  });
+}
+
+// ── 影响面表格 ──
+// `sp.impacts` 是每个模型相对**现有顶层**的判定（抢走 / 同层 / 低于），
+// 以及被挡在其后的站列表。这张表回答「把这一段写成这个档位，会动到谁」——
+// 是操作员决定勾不勾这个段的唯一依据。
+//
+// 2026-09-19 恢复：本函数在提交 470d04a（异步定档改造）里被**误删**，
+// 而它的调用点（fillPlanIntoRows 里的 `+ impactTable(sp)`）留着。
+// 后果是定档结果一回来就抛
+// `ReferenceError: impactTable is not defined`，整条 fillPlanIntoRows
+// 中断 —— 界面停在「定档计算中…」，推荐勾选一个都不勾，用户完全看不出
+// 原因（控制台里才有那一行红字）。恢复时保持原实现不变。
+function impactTable(sp) {
+  const imps = sp.impacts || [];
+  if (!imps.length) return '';
+  const rows = imps.map((i) => {
+    const hosts = i.shadowed_hosts || [];
+    let verdict, cls;
+    if (i.hijacks) { verdict = `抢走顶层（原 ${i.current_top}）`; cls = 'p-b'; }
+    else if (i.shares) { verdict = `与顶层同层（${i.current_top}）`; cls = 'p-w'; }
+    else { verdict = `低于顶层 ${i.current_top}`; cls = 'p-ok'; }
+    return `<tr>
+      <td class="m">${esc(i.model)}</td>
+      <td><span class="pill ${cls}">${esc(verdict)}</span></td>
+      <td class="hint">${hosts.length
+        ? `挡住 ${hosts.length} 站：${esc(hosts.slice(0, 6).join(' '))}${hosts.length > 6 ? ' …' : ''}`
+        : '不挡任何站'}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="tw" style="margin-top:9px"><table>
+    <thead><tr><th>模型</th><th style="width:190px">相对现有顶层</th>
+      <th>被挡在其后</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
 function fillPlanIntoRows(d) {
   if (!d || !Array.isArray(d.plans)) return;
   d.plans.forEach((p) => {
@@ -3761,4 +3921,22 @@ $('#tnapply').onclick = async () => {
   }
 };
 
-boot();
+// 顶层启动加 catch（2026-09-19）
+// ----------------------------
+// 原来是裸 `boot();`。boot 是 async，内部任何未捕获异常都变成
+// unhandled rejection —— 页面停在骨架屏，控制台里一条红字，用户看到的是
+// 「黑屏 / 一直转圈」，没有任何可操作的提示。
+// 这里把失败显式画到启动区，并给出下一步。
+boot().catch((e) => {
+  try {
+    hideSkel();
+    const box = $('#bootmsg');
+    if (box) {
+      box.innerHTML = `<div class="err">启动失败：${esc(e && e.message || e)}</div>`
+        + `<div class="hint">刷新页面重试；持续如此请把容器日志里的 `
+        + `error_ref 发出来排查。</div>`;
+    }
+    const gate = $('#gate');
+    if (gate) gate.hidden = false;
+  } catch (_) { /* 兜底本身不能再抛 */ }
+});
