@@ -1721,6 +1721,45 @@ def _cpa_runtime_commit(base: str, mgmt: str = "") -> str:
     return commit
 
 
+def _norm_site(base_url: str) -> str:
+    """全量重探的去重键：归一化后的「主机 + 路径」。
+
+    各段的 base-url 形态不统一，同一个站在不同段会被写成不同字符串：
+
+        claude/gemini   https://gorouter.app
+        codex           https://gorouter.app/v1
+        compat          gorouter.app / https://gorouter.app / .../v1 都可能
+
+    直接用原文当去重键，同一个凭据会被判成 2~4 个 —— 探测白跑几遍，
+    重建时还会写出多条（同一把 Key 在 CPA 轮询池里占多个位）。
+
+    归一化：剥 scheme、host 小写、去尾斜杠、去尾 `/v1`。
+    **保留路径**：compat 段同一主机可按路径挂多个互不相干的上游
+    （本项目假上游的 `/good` 与 `/gate`），把路径也剥掉会把一个站的 Key
+    灌进另一个站。
+
+    为什么不用 `entry_scope` / `_source_identity`：那两个函数的 compat
+    口径保留 scheme，而前三段口径不带 —— 同一个站跨这两类段时被判成
+    `gorouter.app` 与 `https://gorouter.app` 两个键，去重失效（实测只省下
+    54 个而不是应有的 140 个）。这里统一一套口径。
+    """
+    import re as _re
+    from urllib.parse import urlsplit as _urlsplit
+    b = str(base_url or "").strip().rstrip("/")
+    if not b:
+        return ""
+    if "://" not in b:
+        b = "//" + b                # urlsplit 需要一个 scheme 或 // 前缀
+    try:
+        sp = _urlsplit(b)
+        host = (sp.netloc or "").lower()
+        path = sp.path or ""
+    except ValueError:
+        return b.lower()
+    path = _re.sub(r"/v1$", "", path).rstrip("/")
+    return host + path
+
+
 def run_job_full_redetect(job: Job, cfg_path: str) -> None:
     """全量重探模式：重新探测所有既有站 + 新站
 
@@ -1760,7 +1799,30 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
         lines: list[str] = []
         dup = 0
         for _sec, base_url, api_key, _orig in existing_entries:
-            ck = (base_url.rstrip("/"), api_key)
+            # 去重键 = 归一化后的「站身份 + 路径」（2026-09-19 实测修）
+            # ------------------------------------------------------
+            # 同一个凭据会被写进多个段（中转站常拿同一把 Key 同时提供
+            # claude / codex / gemini / compat），而各段的 base-url 形态不同：
+            #   claude/gemini：`https://host`（不带 /v1）
+            #   codex：      `https://host/v1`
+            #   compat：    写法最杂 —— 可能 `host`、`https://host`、
+            #                `https://host/v1` 都有
+            # 直接用原始 base_url 当键，同一个凭据会被判成 2~4 个：
+            #   · 探测白跑 2~4 遍（实测 231 个条目 → 177 行，只省下 54）
+            #   · 重建时写出 2~4 条条目 —— 同一把 Key 在 CPA 轮询池里占多个位，
+            #     冷却与模型能力按 name 索引、几套状态各走各的
+            #
+            # 归一化规则（**保留路径**，因为 compat 段同一主机可按路径挂多个
+            # 互不相干的上游，假上游 /good 与 /gate 就是；合并会把一个站的
+            # Key 灌进另一个站）：
+            #   剥 scheme、host 转小写、去尾斜杠、去尾 `/v1`
+            #
+            # 为什么不用 `entry_scope`：它前三段返回 host（不带 scheme），
+            # compat 段返回 `_source_identity(base_url)`（**保留 scheme**）——
+            # 同一个站跨这两类段时被判成 `gorouter.app` 与
+            # `https://gorouter.app` 两个键，去重照样失效（实测只省下 54 个
+            # 而不是应有的 140 个）。这里统一归一化，各段同口径。
+            ck = (_norm_site(base_url), api_key)
             if ck in seen_cred:
                 dup += 1
                 continue
@@ -1769,7 +1831,9 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
 
         # 新站：原始文本，同样参与去重（用户可能粘贴了已在配置里的站）
         for row in job.rows:
-            ck = (row.bare.rstrip("/"), row.api_key)
+            # 与上面同一口径（_norm_site），否则用户粘贴 `https://host`
+            # 而配置里是 `host` 时会被当成新站重复探测。
+            ck = (_norm_site(row.bare), row.api_key)
             if ck in seen_cred:
                 dup += 1
                 continue
