@@ -5,8 +5,56 @@
 ## 文件说明
 
 - **mihomo-subscriptions.conf**: 订阅配置文件（唯一需要编辑的）
+- **bootstrap-mihomo.sh**: 由 mihomo-init 容器执行，把模板物化进共享卷
+- **mihomo/config.template.yaml**: 配置模板，全 `${ENV}` 占位符，无凭据
+- **mihomo/healthcheck.sh**: 给 **mihomo 容器**用的健康检查（纯 busybox）
+- **mihomo/healthcheck.py**: 给 **本镜像自己**用的健康检查（python3）
 - **update-mihomo-subscriptions.sh**: 自动更新脚本
 - **README.md**: 本文档
+
+### 为什么有两份 healthcheck
+
+两个容器的可用解释器不同，2026-09-19 实测：
+
+| 容器 | 有 | 没有 |
+|---|---|---|
+| `metacubex/mihomo:latest`（busybox） | `wget` `nc` `sed` `awk` `grep` `wc` `head` `tr` | `curl` `python` `python3` `bash` `jq` |
+| `cpa-upstream-importer`（python:3.12-slim） | `python3`（标准库 urllib） | `curl` `wget` |
+
+所以 `healthcheck.sh` 只用 busybox 自带件（HTTP 请求靠 `nc` 手写），
+`healthcheck.py` 用 urllib。**不要**把两者混用：在 mihomo 容器里跑 `.py` 是
+`python3: not found`，在本镜像里跑 `.sh` 会因为缺 `curl` 失败 —— 两者都表现为
+「容器永远 unhealthy」，而不是明显的报错。
+
+`bootstrap-mihomo.sh` 每次启动都把两份一起同步到共享卷（`healthcheck.sh`
+`healthcheck.py`），各自被自己的容器按文件名调用。
+
+### healthcheck.sh 做什么
+
+不只是判活，还会**改选路**：
+
+1. 9090 API 有没有响应（没响应 = 进程坏了，退出 1 让 docker 重启）
+2. AUTO 组里有多少节点（节点数不是判据，只用于日志）
+3. 经 7890 真出一次网。通 → 若状态是 `DIRECT` 就切回 `AUTO`，退出 0
+4. 不通 → 调 `PUT /proxies/PROXY {"name":"DIRECT"}` 降级，再探直连；
+   直连通就退出 0（降级不算失败），直连也不通才退出 1
+
+第 4 步是关键：机场节点全挂时 mihomo **进程本身活得好好的**（端口在听、
+API 有响应、AUTO 组里还列着 59 个节点名），而 CPA 的 `proxy-url` 指着 7890，
+于是所有上游请求走进一个没有可用出口的代理里排队到超时 —— 表面现象是上游
+502/524，真因在这里。光把容器标成 `unhealthy` 解决不了，因为
+`restart: unless-stopped` 对 unhealthy **不重启**，选路也不会变。
+
+可调环境变量：`MIHOMO_API_HOST/PORT`、`MIHOMO_PROXY_HOST/PORT`、
+`MIHOMO_SECRET`、`MIHOMO_PROBE_URL`、`MIHOMO_STATE_FILE`、`MIHOMO_GROUP`。
+`MIHOMO_SECRET` 不设时脚本不带 `Authorization` 头 —— 只有 mihomo 侧也没设
+鉴权才切得动组，否则切换会拿到 401（脚本会在日志里报"切换 DIRECT 失败"）。
+
+手动跑一次（排查用，会真的切组）：
+
+```bash
+docker compose exec mihomo sh /root/.config/mihomo/healthcheck.sh; echo rc=$?
+```
 
 ## 快速开始
 

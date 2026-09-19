@@ -106,7 +106,35 @@ COPY --from=builder /deps /usr/local
 # 放到 /usr/local/bin 让 PATH 直接能找到。
 COPY --from=mihomo /mihomo /usr/local/bin/mihomo
 
+# 地理数据。GEOIP/GEOSITE 规则要靠这两份，缺了 mihomo 会报
+# "geoip.dat not found" 并把每条 GEOIP 规则静默当成不匹配 ——
+# 表现是"规则看起来在，实际全走 MATCH 兜底"，很难查。
+#
+# 放在 /usr/local/share/mihomo 而不是官方镜像的默认目录
+# /root/.config/mihomo：bootstrap-mihomo.sh 会用 -d 指向的**挂载卷**，
+# 卷一挂上去就把镜像里那份遮掉了，所以放在一个不会被遮的位置，
+# 每次启动由 bootstrap 复制进卷。
+COPY --from=mihomo /root/.config/mihomo/geoip.dat \
+     /root/.config/mihomo/geosite.dat \
+     /root/.config/mihomo/geoip.metadb \
+     /usr/local/share/mihomo/
+
 WORKDIR /app
+
+# busybox 与 wget：只有**一个**用途 —— mihomo-proxy 容器用本镜像跑，
+# 而它调的健康检查脚本 healthcheck.sh 需要这两个工具。
+#
+# 为什么不能用 python3 那份代替：那份是本镜像自己的容器用的（探自己的
+# server.py 端口），跑在 mihomo-proxy 里探不到任何东西。
+#
+# 为什么必须显式装 busybox：Debian 装了 busybox **不会**自动生成
+# /usr/bin/nc 这个软链（实测 2026-09-19：have busybox，MISS nc），
+# 而切换出口是 PUT，busybox 的 wget 只能发 GET/POST —— 必须有 nc。
+# healthcheck.sh 对 nc/wget 各做一次"命令探测 + 回退到 busybox <applet>"，
+# 所以两个包都在就行，不需要额外建软链。合计约 1.3 MB。
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends busybox wget && \
+    rm -rf /var/lib/apt/lists/*
 
 # 只拷运行需要的。legacy/ 与 docs/ 是本机排障用，不进容器。
 # tests/ 也不进 —— 镜像里跑不了它们（要 config.yaml），CI 里已经跑过。
@@ -120,22 +148,27 @@ COPY server.py cli.py /app/
 # 为什么必须进镜像：部署方式是"VPS 只拉镜像"，宿主上不预置任何文件，
 # 所以 config.yaml 必须由容器自己从模板物化（bootstrap-mihomo.sh 干这件事）。
 #
-# healthcheck 用 Python 而不是 shell：两个镜像里**都没有 curl**
-# （实测 2026-09-13：metacubex/mihomo 有 wget/sed/awk/nc 但无 curl；
-# python:3.12-slim 连 wget 都没有）。urllib 是标准库，一定在。
+# 两份 healthcheck 都要进镜像，它们服务的容器不同（实测 2026-09-19 复核）：
+#   · healthcheck.py —— 给**本镜像**用（python:3.12-slim，有 python3 无 wget）
+#   · healthcheck.sh —— 给 **mihomo 容器**用（metacubex/mihomo 是 busybox：
+#     有 wget/nc/sed/awk，但没有 curl、也没有 python3）
+# 两个都拷进来，由 bootstrap-mihomo.sh 按可用解释器挑一份物化到共享卷，
+# 这样 compose 侧不需要挂任何脚本文件 —— 部署只要 4 个文件。
 #
-# 只拷这几样：模板（全 ${ENV} 占位符）、healthcheck、两个脚本、清单示例。
 # 真实的 mihomo-subscriptions.conf 与 providers/ 含凭据，被 .dockerignore
 # 排除，运行时由 compose 从环境变量提供。
 COPY mihomo-manager/mihomo/config.template.yaml \
      mihomo-manager/mihomo/healthcheck.py \
+     mihomo-manager/mihomo/healthcheck.sh \
      /app/mihomo-manager/mihomo/
 COPY mihomo-manager/update-mihomo-subscriptions.sh \
      mihomo-manager/bootstrap-mihomo.sh \
      mihomo-manager/mihomo-subscriptions.conf.example \
      mihomo-manager/README.md \
      /app/mihomo-manager/
-RUN chmod +x /app/mihomo-manager/*.sh /app/mihomo-manager/mihomo/healthcheck.py
+RUN chmod +x /app/mihomo-manager/*.sh \
+             /app/mihomo-manager/mihomo/healthcheck.py \
+             /app/mihomo-manager/mihomo/healthcheck.sh
 
 # 非 root 用户作为镜像默认。**实际生效的 uid 由 compose 的 user: 决定** ——
 # 它必须与宿主 config.yaml 的属主一致，否则写回时 PermissionError。
