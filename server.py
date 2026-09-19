@@ -3522,7 +3522,6 @@ class Handler(BaseHTTPRequestHandler):
             # 可用新站压到一堆死站后面（claude 段实测 500 → 175）。
             prio_warns = cp.assign_priorities(
                 list(all_plans.values()), cfg, probation=probation, raw=raw)
-
             # 第二批覆盖：priority。放在定档之后，手工值不会被冲掉。
             for (base_url, api_key), p in all_plans.items():
                 ov_host = _by_row(overrides, p)
@@ -3599,7 +3598,24 @@ class Handler(BaseHTTPRequestHandler):
 
             # 生成完整 diff（整个文件）
             diffs = []
-            ok, msg = _validate_final(preview, list(write_plans.values()))
+            # cross_section=False（2026-09-19 实测修正）
+            # -----------------------------------------
+            # 用户第 3-⑴ 条原文：「同一**类型**相同网址上游优先级也要保持
+            # 相同（**不同类型**相同网址可以不同，优先级主要在同一类型进行
+            # 综合比较）」—— 这是**段内**约束。跨段用同一档既不是要求，
+            # 也不该阻断写回。
+            #
+            # 原来这里用默认 True，于是生产配置（16/18 个 host 跨段档位不同）
+            # 在**写回那一刻**被判 False、回
+            # `同站优先级不一致：请将该站所有 Key…统一后重新预览`，
+            # 而预览阶段（bulk-preview 走 False）是过的 —— 用户看到 diff
+            # 都正常、点写回才失败，报错还指向一个他没改过的东西。
+            # 现场：MHTML2（2026-09-19 05:26）「插入 11 处 / 新增 399 行」
+            # 下面紧跟这条红字。
+            #
+            # 段内同站同档仍然是硬约束（下面那道 groups 检查照常跑）。
+            ok, msg = _validate_final(preview, list(write_plans.values()),
+                                      cross_section=False)
 
             pid = secrets.token_hex(8)
             # 存 write_plans 而不是 all_plans：写后验证按 entry["plans"] 挑目标，
@@ -3743,13 +3759,63 @@ class Handler(BaseHTTPRequestHandler):
             shallow.sections = keep
             for_write.append(shallow)
 
+        # 同段同站锚定（2026-09-19 实测修）
+        # ---------------------------------
+        # 增量导入一条**新 Key**（站已存在、Key 是新的）时，`build_plan` 里
+        # 的 `suggest_priority` 只看档位谱的空档，**看不到同段同站既有条目的
+        # 档位** —— 于是新 Key 拿到一个空档值，而原有那一批还留在旧档，
+        # 写回时被 `_validate_final` 的段内检查判 False、回
+        # `同站优先级不一致：请将该站所有 Key…统一后重新预览`。
+        #
+        # 实测（MHTML2 2026-09-19 05:26，容器内 TRACE 确证）：
+        #   agentrouter.org 的 claude 段原本 11 条 Key 都在 122，
+        #   新导入的 sk-PRv… 拿了 10 → [10, 122] 分裂 → 写回 400。
+        #
+        # 全量重探那条路不会出这个问题 —— 它调 `assign_priorities`，那里有
+        # 「已在本段占着档位的站留在原档」的锚定逻辑。增量路缺这一步，
+        # 这里补上同一套判据（用同一个函数，不另写一套）。
+        #
+        # 为什么不干脆也在增量路调 `assign_priorities`：那个函数的职责是
+        # 「把**一批新站**互相分开」，它会对整批站重排序 —— 而增量导入只
+        # 关心新增的那几把 Key 该跟谁同档，重排既有站间次序不是这条路的
+        # 目标（同 `assign_priorities` 里 1b 段的论证）。
+        try:
+            from cpa_probe.plan import existing_host_tiers as _host_tiers
+            _anchored = 0
+            for _p in for_write:
+                for _sec, _sp in _p.sections.items():
+                    _band = bands.get(_sec)
+                    if _band is None:
+                        _band = cp.build_band(cfg, _sec, raw=raw)
+                        bands[_sec] = _band
+                    _anchor, _ = _host_tiers(_band)
+                    _keep = _anchor.get((cp.host_of(_sp.base_url) or "").lower())
+                    if _keep is None or _sp.priority == _keep:
+                        continue
+                    # 既有的原档就是同站其他 Key 用的那一档 —— 新 Key 跟随它。
+                    # 影响面要按新值重算（旧值算出的遮挡关系会误导）。
+                    _sp.priority = _keep
+                    _sp.priority_reason = (
+                        f"沿用该站在本段的原档 {_keep}"
+                        f"（同段同网址的多把 Key 必须同档，"
+                        f"否则高档那批会被优先抽中并先烧完）")
+                    _sp.impacts = cp.compute_impact(_band, _sp.models, _keep)
+                    _sp.warnings = [w for w in _sp.warnings
+                                    if "抢走" not in w and "挡在其后" not in w]
+                    _anchored += 1
+            if _anchored:
+                logger.info("增量导入：%d 个段按同段同站原档对齐", _anchored)
+        except Exception:
+            # 锚定失败不该让整个定档失败 —— 它只是「让新 Key 跟随旧档」，
+            # 做不到时 `_validate_final` 仍会照实报出来，不会静默写坏。
+            logger.exception("同段同站原档对齐失败（不影响其余流程）")
+
         diffs = build_diffs(raw, for_write)
         preview = apply_diffs(raw, diffs)
-        ok, msg = _validate_final(preview, for_write)
+        # 与上面的全量重探同一条理由：跨段档位不同不是错误，见那段注释。
+        ok, msg = _validate_final(preview, for_write, cross_section=False)
 
         pid = secrets.token_hex(8)
-        # 存 for_write 而不是 plans：apply 后的写后验证按 entry["plans"]
-        # 挑目标，存全量就会去验根本没写进去的段（判死段现在也 writable）。
         STORE.add_plan(pid, {"plans": for_write, "diffs": diffs,
                              "preview": preview, "base_raw": raw,
                              "valid": ok, "validate_msg": msg,

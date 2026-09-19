@@ -3251,7 +3251,7 @@ const BM = { groups: [], sel: new Set(), bulkId: '', revision: '' };
    `enabled` 与 `priority` 分开存：两者可以叠加（改成 350 同时启用），
    而分开存让「只改了优先级」与「只改了启停」在计数与放弃时都分得清。 */
 const BMD = new Map();          // `${section}\u0000${host}` -> {section, host, priority, enabled}
-const bmdKey = (sec, host) => sec + '\u0000' + host;
+const bmdKey = (sec, host) => sec + '␟' + host;
 
 /* 档位 → 颜色。用黄金角轮转而不是固定色表：档位数由配置决定，
    写死八色表到第 9 档就没颜色了，而「同色 = 同档」正是这里要的可读性。
@@ -3295,7 +3295,22 @@ const BM_SEC_CLS = {
   'claude-api-key': 'sec-claude', 'openai-compatibility': 'sec-compat',
 };
 
-const bmKey = (g) => g.section + '\u0000' + g.host;
+// 批量管理的卡片键。分隔符**必须是 HTML 安全的字符**（2026-09-19 实测修）。
+//
+// 原来是 `'\u0000'`（NUL）。它用于纯 JS 的 Map/Set 没问题，但这个 key 会
+// 被写进 `data-k` 属性（bmCard 的 `<div class="bm-card" data-k="...">`），
+// 而 **HTML 属性里的裸 NUL 会被解析器替换成 U+FFFD**（替换字符）。
+// 于是读回来的是 `claude-api-key�agentrouter.org`，与 `bmKey(g)` 生成的
+// `claude-api-key\u0000agentrouter.org` **永不相等**：
+//
+//   · 点复选框/卡片 → `BM.sel.add(k)` 确实执行了
+//   · `bmSelected()` 用 `BM.groups.filter(g => BM.sel.has(bmKey(g)))` 过滤
+//     → 一条都匹配不上 → 计数恒为 0、五个操作按钮恒灰
+//
+// 现场就是「路由批量管理点了没反应」（MHTML 两份快照 + 本机容器实测复现）。
+// 换成 U+241F（符号「␟」，UNIT SEPARATOR）—— 它是可见的普通字符，
+// HTML 安全，且不会出现在段名或域名里。
+const bmKey = (g) => g.section + '␟' + g.host;
 
 function bmStat() {
   const t = BM.groups;
