@@ -4717,11 +4717,24 @@ def main() -> None:
     # 敏感信息（token、api-key）不进日志：Handler 类的请求日志已过滤，
     # probe/plan 流程里的 key 均以 mask_key() 脱敏后才传给 logger。
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    # 落盘日志（IMPORTER_LOG_TO_FILE=1 时开启）
+    # 每次启动写 logs/importer-<时间戳>.log，方便 VPS 事后排查。
+    # 容器里用 docker compose logs -f 看实时，落盘文件用 docker cp 取出。
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    log_to_file = os.environ.get("IMPORTER_LOG_TO_FILE", "0").strip() in ("1", "true", "yes")
+    if log_to_file:
+        import time as _time
+        _log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(_log_dir, exist_ok=True)
+        _log_path = os.path.join(_log_dir, "importer-%s.log" % _time.strftime("%Y%m%d-%H%M%S"))
+        _fh = logging.FileHandler(_log_path, encoding="utf-8")
+        _fh.setLevel(logging.DEBUG)  # 文件永远记最详细级别
+        handlers.append(_fh)
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
+        handlers=handlers,
         force=True,   # 覆盖 Python 默认的 WARNING 级别（容器里往往已有 basicConfig）
     )
     # 第三方库（urllib3、PyYAML）的 DEBUG 日志极为冗长，单独压到 WARNING
