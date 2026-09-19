@@ -2477,7 +2477,20 @@ async function refreshPlan(silent) {
   if (_planInFlight) { _planRerun = true; return _planInFlight; }
   _planInFlight = _refreshPlanOnce(silent).finally(() => {
     _planInFlight = null;
-    if (_planRerun) { _planRerun = false; refreshPlan(true); }
+    if (_planRerun) {
+      _planRerun = false;
+      // 清掉「定档计算中」占位文字再触发重算（2026-09-19）
+      // -----------------------------------------------
+      // 首轮定档完成后 applyPickPreset('rec') 把 _planRerun 设为 true，
+      // 这里触发第二轮 refreshPlan(true)（silent）。但 _planInFlight 已被
+      // 清零，后续的 syncPickUI 由第二轮完成后才调 —— 期间 #pickstat
+      // 停在「定档计算中… Xs」占位文字不消。
+      // MHTML1（09-19 23:50）的「定档计算中… 6s 长期停住」正是这么来的。
+      // 在启动第二轮之前先把 pickstat 刷成当前已选数量，让用户知道
+      // 第一轮已有结果、第二轮是补算而不是一直在算第一轮。
+      syncPickUI();
+      refreshPlan(true);
+    }
   });
   return _planInFlight;
 }

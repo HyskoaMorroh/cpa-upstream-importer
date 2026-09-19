@@ -3030,7 +3030,17 @@ def compat_key_blocks(lines: list[str]) -> dict[str, dict[str, list[str]]]:
 #   · 前端                —— 决定默认勾不勾
 # 上一版只有第一个有闸，另两个按「没有闸」渲染，于是界面显示建议写入并默认
 # 勾上，勾了写不进，只在 warnings 里留一句话。
-_NEW_SECTION_SOURCES = frozenset({"probed", "manual", "catalog"})
+_NEW_SECTION_SOURCES = frozenset({"probed", "manual", "catalog", "topup"})
+# 为什么加 "topup"（2026-09-19）
+# --------------------------------
+# 探测通了但模型清单来自 `topup_to_market_top`（市面最新填充）时，
+# `model_source` 会落到 "topup"。这不在集合里 → `write_blocked` 被设上 →
+# 界面上「推荐勾选」全部跳过，看起来一个都没勾。
+# 现场：windhub.cc codex+compat 可用段，探测通过但模型走 topup，结果被
+# `write_blocked` 挡住，用户看到推荐勾选空白（MHTML1 09-19 23:50 截图）。
+# "topup" 的语义是「探测通了、清单用市面最新代填充」，这是 3-⑵④ 的要求
+# 正是如此——探测通后按该系列最高级填充并勾选，而不是因为清单来源不是
+# "probed" 就拒绝写入。seed（纯猜测）不在集合里、行为不变。
 
 
 def new_section_admitted(model_source: str) -> bool:
