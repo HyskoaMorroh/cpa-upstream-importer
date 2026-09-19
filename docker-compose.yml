@@ -166,14 +166,27 @@ services:
     healthcheck:
       # 不只判活，还会在节点全挂时把 PROXY 组切到 DIRECT ——
       # docker 的 healthcheck 本身改不了 mihomo 选路，那件事得脚本自己做。
-      # 详见 mihomo-manager/mihomo/healthcheck.py 的开头说明。
-      test: ["CMD", "python3", "/mihomo-config/healthcheck.py"]
+      # 详见 mihomo-manager/mihomo/healthcheck.sh 的开头说明。
+      #
+      # 用 .sh 而不是 .py（2026-09-19 改）：本镜像是 Debian slim，
+      # healthcheck.sh 对 nc/wget 会做"命令探测 + 回退到 busybox <applet>"，
+      # 所以同一份脚本在 busybox 基座（metacubex/mihomo）和这里都能跑，
+      # 不用为两个基座维护两份逻辑。Dockerfile 里装了 busybox 与 wget。
+      test: ["CMD", "sh", "/mihomo-config/healthcheck.sh"]
       interval: 60s
-      timeout: 20s
+      timeout: 40s
       retries: 2
       start_period: 30s
     environment:
-      MIHOMO_SECRET: "${MIHOMO_SECRET:-}"
+      # healthcheck.sh 的探测参数（默认值就是这几个，写出来便于改）
+      - MIHOMO_API_HOST=127.0.0.1
+      - MIHOMO_API_PORT=9090
+      - MIHOMO_PROXY_HOST=127.0.0.1
+      - MIHOMO_PROXY_PORT=7890
+      - MIHOMO_SECRET=${MIHOMO_SECRET:-}
+      - MIHOMO_PROBE_URL=${MIHOMO_PROBE_URL:-https://www.gstatic.com/generate_204}
+      - MIHOMO_STATE_FILE=${MIHOMO_STATE_FILE:-/tmp/mihomo-egress-state}
+      - MIHOMO_GROUP=${MIHOMO_GROUP:-PROXY}
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
