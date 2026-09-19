@@ -4725,11 +4725,17 @@ def main() -> None:
     if log_to_file:
         import time as _time
         _log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-        os.makedirs(_log_dir, exist_ok=True)
-        _log_path = os.path.join(_log_dir, "importer-%s.log" % _time.strftime("%Y%m%d-%H%M%S"))
-        _fh = logging.FileHandler(_log_path, encoding="utf-8")
-        _fh.setLevel(logging.DEBUG)  # 文件永远记最详细级别
-        handlers.append(_fh)
+        try:
+            os.makedirs(_log_dir, exist_ok=True)
+            _log_path = os.path.join(_log_dir, "importer-%s.log" % _time.strftime("%Y%m%d-%H%M%S"))
+            _fh = logging.FileHandler(_log_path, encoding="utf-8")
+            _fh.setLevel(logging.DEBUG)  # 文件永远记最详细级别
+            handlers.append(_fh)
+        except (PermissionError, OSError) as _e:
+            # 容器以非 root 用户运行时 /app/logs 可能无写权限，退回只输出到控制台。
+            # 不能在这里用 logger（还没初始化），直接打到 stderr。
+            print(f"[importer] WARNING: 无法创建日志目录 {_log_dir}：{_e}，回退到仅控制台输出。",
+                  file=sys.stderr)
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s.%(msecs)03d [%(levelname)s] %(name)s: %(message)s",
