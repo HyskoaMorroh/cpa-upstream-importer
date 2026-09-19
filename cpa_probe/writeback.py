@@ -1865,11 +1865,24 @@ def build_diffs(raw: str, plans: list[ImportPlan]) -> list[Diff]:
     diffs: list[Diff] = list(head_diffs)
 
     # compat 段先按 (host, base_url) 归并同站的多个 Key
-    compat_groups: dict[tuple[str, str, str], list] = {}
+    #
+    # 为什么不再把 capability 纳入分组键（2026-09-20 修复）：
+    # _compat_capability 序列化了 headers / models / request-scoped-errors 等字段。
+    # 同一个 base-url 下，不同 Key 被探测到携带不同数量的 headers（有的只有
+    # user-agent / x-stainless-lang 两个，有的有完整的 16 个 stainless 头），
+    # 导致同一个站被拆成了多个带哈希后缀的 provider 块（如
+    # sub.100xlabs.space-e61f676530、sub.100xlabs.space-0104b8b5bc 等），
+    # 而实际模型能力完全相同。
+    #
+    # 修复：分组键只用 (host, base_url)，让同一站所有 Key 落进同一个 bucket。
+    # 「能力确实不同时另起 provider」的逻辑由下面的 find_compat_provider +
+    # 哈希后缀分支承担——只在「该 base-url 完全没有现成 provider」且同 host
+    # 有多个能力分组时才生成新 provider，而不是在 bucket 分组阶段就拆散。
+    compat_groups: dict[tuple[str, str], list] = {}
     for plan in plans:
         sp = plan.sections.get("openai-compatibility")
         if sp is not None and sp.writable:
-            compat_groups.setdefault((plan.host, sp.base_url, _compat_capability(sp)), []).append(sp)
+            compat_groups.setdefault((plan.host, sp.base_url), []).append(sp)
 
     for plan in plans:
         for section, sp in plan.sections.items():
@@ -1896,9 +1909,9 @@ def build_diffs(raw: str, plans: list[ImportPlan]) -> list[Diff]:
     if span is not None and compat_groups:
         start, end = span
         dash, field = _detect_indent(lines, start, end)
-        for (host, base, capability), group in compat_groups.items():
+        for (host, base), group in compat_groups.items():
             head = copy.deepcopy(group[0])
-            head.priority = max(g.priority for (h, b, c), members in compat_groups.items()
+            head.priority = max(g.priority for (h, b), members in compat_groups.items()
                                 if h == host for g in members)
             keys = [g.api_key for g in group]
 
