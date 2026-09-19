@@ -78,32 +78,56 @@ def test_collision_check_reports_same_value() -> None:
     print("[PASS] collision reported")
 
 
-def test_split_within_host_is_blocking() -> None:
-    """同域名被拆成两档是阻断级错误，必须报出来。"""
+def test_split_within_same_section_is_blocking() -> None:
+    """**同一段内**同域名的多把 Key 被拆成两档是阻断级错误，必须报出来。
+
+    2026-09-19 重写：原断言要求「同域名跨**段**分档」也报阻断级警告，
+    那与用户第 3-⑴ 条原文相反 —— 原文是
+
+        同一**类型**相同网址上游优先级也要保持相同
+        （**不同类型**相同网址可以不同，优先级主要在同一类型进行综合比较）
+
+    跨段各排各的（各段档位谱独立）。旧判据把生产配置里 16/18 个 host 的
+    正常跨段差异全报成「违反同网址同优先级」，写回被它阻断（现场：
+    MHTML2 2026-09-19 05:26 的 `同站优先级不一致：…统一后重新预览`）。
+    真实要抓的是**同段内**分裂：那样高档几把会先烧完、低档沦为冷备。
+    """
+    # 同一段（claude）同域名的**两把 Key**（两个 plan）给了不同档 —— 真违规
     plans = [
         _plan(1, "api.example.com", "https://api.example.com", "sk-a", 100),
+        _plan(2, "api.example.com", "https://api.example.com", "sk-b", 50),
     ]
+    warns = cp.priority_split_within_host(plans)
+    assert warns, "同一段内同域名分档必须给出阻断级警告"
+    assert "api.example.com" in warns[0], f"警告要点明域名，实得 {warns[0]}"
+    assert "claude-api-key" in warns[0], f"警告要点明段名，实得 {warns[0]}"
+    print("[PASS] split within same section reported")
+
+
+def test_cross_section_split_is_not_an_error() -> None:
+    """跨段档位不同**不是**错误 —— 需求明确允许（不同类型可以不同）。"""
+    plans = [_plan(1, "api.example.com", "https://api.example.com", "sk-a", 100)]
     plans[0].sections["codex-api-key"] = SectionPlan(
         section="codex-api-key",
         base_url="https://api.example.com/v1",
         api_key="sk-a",
         models=["gpt-5.6"],
-        priority=50,          # 与同域名的 claude 段不同 —— 违规
+        priority=50,          # 与 claude 段不同 —— 允许
         model_source="probed",
         score=100,
     )
     warns = cp.priority_split_within_host(plans)
-    assert warns, "同域名跨段分档必须给出阻断级警告"
-    assert "api.example.com" in warns[0], f"警告要点明域名，实得 {warns[0]}"
-    print("[PASS] split within host reported")
+    assert not warns, f"跨段不同档不该报警，实得 {warns}"
+    print("[PASS] cross-section split allowed")
 
 
 def main() -> int:
     test_same_host_same_priority()
     test_different_host_different_priority()
     test_collision_check_reports_same_value()
-    test_split_within_host_is_blocking()
-    print("\n全部通过 · 4 项")
+    test_split_within_same_section_is_blocking()
+    test_cross_section_split_is_not_an_error()
+    print("\n全部通过 · 5 项")
     return 0
 
 

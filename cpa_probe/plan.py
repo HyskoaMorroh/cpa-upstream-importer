@@ -3664,35 +3664,32 @@ def priority_collisions(plans: list[ImportPlan]) -> list[str]:
 
 
 def priority_split_within_host(plans: list[ImportPlan]) -> list[str]:
-    """同一网址跨协议、跨 Key 的条目拿到不同 priority：阻断级警告。
+    """同一网址**在同一段内**的条目拿到不同 priority：阻断级警告。
 
-    与 `priority_collisions` 正好相反的方向，而这个方向是**硬错误**，不是
-    「可能是预期结果」（2026-09-10 加）。
+    2026-09-19 重写判据 —— 原来只按 host 归集、**忽略了段**，于是把
+    「不同的段给了不同档位」也报成「违反同网址同优先级」。那与用户要求相反：
 
-    用户的硬要求：同一网址的上游，即使 Key 不同，priority 也必须相同。
-    `assign_priorities` 本身守住了这条（按 `host_of(sp.base_url)` 分组，
-    同 host 的所有 SectionPlan 复制同一个值，见 :2658-2668 / :2825-2826），
-    但它之后还有两道会破坏它：
-      · 用户覆盖按 `rid = row.line_no`（**每把 Key 一行**）应用
-        （server.py:2401-2403 / 2246-2248 / web/app.js:1592），
-        同站第 2 把 Key 一改就与第 1 把分层；
-      · 全量重探沿用既有档位时，若原文件本来就分裂，会照样沿用。
+        用户第 3-⑴ 条原文：「同一**类型**相同网址上游优先级也要保持相同
+        （**不同类型**相同网址可以不同，优先级主要在同一类型进行综合比较）」
 
-    实测证据（2026-09-10 逐条对账两份生产配置）：
-    桌面份（**本项目注入前**）40 组里 0 组分裂；fsdownload 份（**注入后**）
-    3 组分裂 —— 也就是这些分裂是本项目自己写进去的：
-      · codex  @romeo.example/v1  4 条 {350, 147}
-        —— models / headers / proxy-url 三项**逐字相同**，唯 idx9 是 350。
-           后果：350 那条被永远优先抽中并先烧完，另 3 把 Key 沦为冷备
-           （147 档要等 155/154/153/150/149/148 全部冷却后才轮到）。
-      · codex  @golf.example/v1    7 条 {348, 149}
-      · gemini @romeo.example     3 条 {218, 215}
+    所以正确的判据是 `(段, host)`：同段同网址的多把 Key 必须同档；
+    跨段本来就各排各的（各段档位谱独立，`priority_collisions` 的注释里
+    早就写死了这一条）。
 
-    2026-09-11：批准的同站规则覆盖所有协议段。这里只检查并报告，
-    不合并路径、凭据、模型或请求参数；档位修改仍须调用方确认。
+    现场后果（MHTML2 2026-09-19 05:26）：生产配置 16/18 个 host 跨段档位
+    不同（**同段内 0 处分裂**），这条按旧判据给每个站都报一条
+    「跨协议检查：…违反同网址同优先级」，把界面上真正的提示淹掉了，
+    同时 `_validate_final` 拿它当阻断级，写回直接被拒。
+
+    仍然要抓的真问题：**同段同 host 多把 Key 档位不一致**。那样高档那几把
+    会被永远优先抽中并先烧完，低档的沦为冷备 —— 本该并行轮询的多把 Key
+    变成主备切换。`assign_priorities` 本身守住了这条（按 host 分组同值），
+    但它之后还有两道会破坏：用户覆盖按 `rid = row.line_no`（每把 Key 一行）
+    应用；全量重探沿用既有档位时若原文件本就分裂会照样沿用。
     """
     out: list[str] = []
-    by_host: dict[str, dict[int, list[str]]] = {}
+    # 归集键含段 —— 这是本次重写的全部要点
+    by_sec_host: dict[tuple[str, str], dict[int, int]] = {}
     for plan in plans:
         for section, sp in plan.sections.items():
             if sp is None or not sp.writable:
@@ -3700,18 +3697,18 @@ def priority_split_within_host(plans: list[ImportPlan]) -> list[str]:
             host = host_of(sp.base_url)
             if not host:
                 continue
-            by_host.setdefault(host, {}).setdefault(
-                sp.priority, []).append(section)
-    for host, at in sorted(by_host.items()):
+            at = by_sec_host.setdefault((section, host), {})
+            at[sp.priority] = at.get(sp.priority, 0) + 1
+    for (section, host), at in sorted(by_sec_host.items()):
         if len(at) <= 1:
             continue
         detail = "；".join(
-            f"priority {pri} × {len(sections)} 条"
-            for pri, sections in sorted(at.items(), reverse=True))
+            f"priority {pri} × {n} 条"
+            for pri, n in sorted(at.items(), reverse=True))
         out.append(
-            f"跨协议检查：同一网址 {host} 的条目拿到了不同 priority"
-            f"（{detail}）—— 违反「同网址同优先级」。"
-            f"同协议内高档优先、低档作冷备；跨协议仍须满足同站约束。"
+            f"段 {section}：同一网址 {host} 的多把 Key 拿到了不同 priority"
+            f"（{detail}）—— 违反「同一类型相同网址同优先级」。"
+            f"高档那几把会被优先抽中并先烧完，低档的沦为冷备。"
             f"请统一到同一档再写回")
     return out
 

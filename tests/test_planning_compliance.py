@@ -502,7 +502,15 @@ def test_implicit_priority_zero_participates_in_impact():
     assert pp.compute_impact(band, ["gpt-6"], 100)[0].hijacks
 
 
-def test_cross_section_site_priority_check_keeps_evidence_distinct():
+def test_cross_section_site_priority_difference_is_allowed():
+    """跨段的档位差异**不报** —— 需求 3-⑴ 明文允许（不同类型可以不同）。
+
+    2026-09-19 重写：原断言要求这里产出 1 条警告，那与用户原文相反。
+    跨段各排各的档（各段档位谱独立），把它当错误会让生产配置里
+    16/18 个 host 的正常差异阻断写回（现场 MHTML2 的写回 400）。
+
+    这里同时锁住「只读不写」：检查函数不得改 plans。
+    """
     plans = []
     for i, (section, priority) in enumerate(((C, 0), (L, 100), (O, 200))):
         p = pp.ImportPlan(host="site.example", masked_key="fixture", line_no=i)
@@ -512,9 +520,28 @@ def test_cross_section_site_priority_check_keeps_evidence_distinct():
         plans.append(p)
     before = copy.deepcopy(plans)
     warnings = pp.priority_split_within_host(plans)
-    assert len(warnings) == 1
-    assert all(f"priority {p}" in warnings[0] for p in (0, 100, 200))
-    assert all(f"fixture-{i}" not in warnings[0] for i in range(3))
+    assert warnings == [], f"跨段差异不该报警，实得 {warnings}"
+    assert plans == before, "检查函数不得改 plans"
+
+
+def test_same_section_site_priority_split_still_reported():
+    """**同一段内**同域名分档仍必须报 —— 那才是真违规。
+
+    同段同域名的多把 Key 分档，会让高档那几把被优先抽中并先烧完，
+    低档的沦为冷备（本该并行轮询变成主备切换）。
+    """
+    plans = []
+    for i, priority in enumerate((100, 50)):        # 同段、同 host、不同档
+        p = pp.ImportPlan(host="site.example", masked_key="fixture", line_no=i)
+        p.sections[L] = pp.SectionPlan(
+            L, "https://site.example", f"fixture-{i}",
+            models=["fixture-model"], priority=priority)
+        plans.append(p)
+    before = copy.deepcopy(plans)
+    warnings = pp.priority_split_within_host(plans)
+    assert len(warnings) == 1, f"同段分档必须报 1 条，实得 {warnings}"
+    assert "site.example" in warnings[0] and L in warnings[0], warnings[0]
+    assert all(f"fixture-{i}" not in warnings[0] for i in range(2))
     assert plans == before
 
 
