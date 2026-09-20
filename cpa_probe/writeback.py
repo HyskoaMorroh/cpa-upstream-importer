@@ -1941,6 +1941,17 @@ def build_diffs(raw: str, plans: list[ImportPlan]) -> list[Diff]:
             # 的分组键之一（不同能力的 Key 本来就落在不同 group），
             # 下面 `not found` 时的哈希后缀只用于**确实没有**现成 provider
             # 可并、且同 host 有多个能力分组的情形。
+            #
+            # 2026-09-20 修正：上面这段已不再成立 —— capability 不再进分组键
+            # （见 compat_groups 处的说明），同一 base-url 的 Key 一律同组；
+            # 哈希后缀只剩「同 host 下按路径挂了多个上游、且都没有现成 provider」
+            # 这一种用途，标签只由 base 决定，重跑幂等。
+            # 同组各 Key 探到的模型清单取并集：compat 的 models 是 provider 级、
+            # 全组共用，只写 head 那份会让别的 Key 实测能用的模型消失。
+            for g in group:
+                for m in (g.models or []):
+                    if m not in head.models:
+                        head.models.append(m)
             if found:
                 head.priority = max(
                     1,
@@ -1949,11 +1960,11 @@ def build_diffs(raw: str, plans: list[ImportPlan]) -> list[Diff]:
                       if r.get("name") == found["name"]),
                 )
             # New incompatible credentials get their own provider identity.
-            if not found and (providers or sum(1 for h, b, c in compat_groups
+            if not found and (providers or sum(1 for h, b in compat_groups
                                                if h == host) > 1):
                 name = head.provider_name or host
                 head.provider_name = name + "-" + hashlib.sha256(
-                    (base + "\0" + capability).encode()).hexdigest()[:10]
+                    base.encode()).hexdigest()[:10]
             if found and found["keys_line"] >= 0:
                 fresh = [k for k in keys if k not in set(found["existing_keys"])]
                 if not fresh:
@@ -3324,10 +3335,21 @@ def rebuild_config_full(
     #    分组会裂成两条，渲染出两个同站 provider —— CPA 按 name 索引冷却、
     #    模型能力与执行路由，重名会让这三处对同一个 Key 命中两套配置，同一把
     #    Key 还在轮询池里占两个位）。
-    compat_groups: dict[tuple[str, str, str], list[SectionPlan]] = {}
+    #
+    #    2026-09-20：分组键里**不再**含 _compat_capability。那个函数把 headers /
+    #    models / request-scoped-errors 等序列化进去比较，而全量重探时同一站
+    #    的各把 Key 探到的 headers 数量不同（有的只有 user-agent 与
+    #    x-stainless-lang 两个，有的带完整 16 个 stainless 头），models 却完全
+    #    一样 —— 于是一个站被写成 sub.100xlabs.space-e61f676530 /
+    #    -0104b8b5bc / -3fbb883f42 三条 provider，每条一把 Key。这与本段开头
+    #    「一个条目 = 一个上游站」的约定相反，也违反用户第 4 条（同网址 Key
+    #    同一 provider 同一档）。现在同一 provider 身份的 Key 一律同组，
+    #    模型清单取组内并集（见下面 render 处），headers 等 provider 级字段
+    #    取组内 priority 最高那把（head）的。
+    compat_groups: dict[tuple[str, str], list[SectionPlan]] = {}
     for sp in sections_data["openai-compatibility"]:
         old = _original_entry(cfg, sp)
-        group_key = (compat_provider_key(sp.base_url), _compat_capability(sp, old),
+        group_key = (compat_provider_key(sp.base_url),
                      old.get("name", sp.provider_name))
         compat_groups.setdefault(group_key, []).append(sp)
     for pkey, group in compat_groups.items():
@@ -3367,7 +3389,7 @@ def rebuild_config_full(
             # 原样贴一遍 —— 否则同一个站出现两条 provider、同一把 Key 在
             # CPA 的轮询池里占两个位（2026-09-12 实测形态）。
             absorbed: set[tuple[str, str]] = set()
-            for (pkey, capability, source_name), group in compat_ordered:
+            for (pkey, source_name), group in compat_ordered:
                 # head 取组内 priority 最高的那个，不是插入顺序的第一个 ——
                 # 组的其余成员只贡献 api-key，所以 head 的选择决定了整组用
                 # 哪一套 headers/priority/models。
@@ -3378,6 +3400,14 @@ def rebuild_config_full(
                     *(x.priority for x in sections_data[section]
                       if _host_of(x.base_url) == _host_of(head.base_url))
                 )
+                # 模型清单取组内并集（2026-09-20，配合分组键去掉 capability）：
+                # compat 的 models 块是 provider 级、全组共用。只写 head 的那份，
+                # 其余 Key 实测能用、head 没探到的模型就从清单里消失了。
+                # 顺序：head 的在前，其余按方案顺序追加，去重。
+                for g in group:
+                    for m in (g.models or []):
+                        if m not in head.models:
+                            head.models.append(m)
                 old = _original_entry(cfg, head)
                 own_keys = {k["api-key"]: _dump_fields(
                     {f: v for f, v in k.items() if f != "api-key"}, field + "    ")
@@ -3409,15 +3439,20 @@ def rebuild_config_full(
                 #     （compat_groups 的键第二维不同），那时同名会让两套
                 #     参数互相覆盖
                 #   · 全新 provider（old 为空）而同 host 下已经有别的组
+                #
+                # 2026-09-20：第一种已不存在 —— capability 不再进分组键，同一
+                # pkey 只会有一组（能力差异改为取模型并集）。`other_capabilities`
+                # 这里数的是同一 pkey 下不同 source_name 的组数，保留是为了
+                # 原文件里同站两个不同 name 的 provider 各自维持身份。
+                # 第二种照旧。哈希标签只由 pkey 决定，重建幂等。
                 other_capabilities = sum(
-                    1 for p, c, n in compat_groups if p == pkey)
+                    1 for p, n in compat_groups if p == pkey)
                 split = (other_capabilities > 1 or
-                         not old and sum(1 for p, c, n in compat_groups
+                         not old and sum(1 for p, n in compat_groups
                                          if _host_of(p) == _host_of(pkey)) > 1)
                 if split:
                     name = head.provider_name or _host_of(head.base_url)
-                    tag = hashlib.sha256(
-                        (pkey + "\0" + capability).encode()).hexdigest()[:10]
+                    tag = hashlib.sha256(pkey.encode()).hexdigest()[:10]
                     # 已经带着**同一个**后缀时不再追加（2026-09-12）
                     # ------------------------------------------------
                     # 重建必须语义幂等：同一份方案跑两遍要得到同一份配置。
