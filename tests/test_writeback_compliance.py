@@ -244,18 +244,24 @@ claude-api-key: [{api-key: fixture-key-a, base-url: 'https://unit.example/A'}, {
                  headers={"X-Channel": "b"})
         b.models = ["other-model"]
         rows = rebuild(raw, a, b)["openai-compatibility"]
-        self.assertEqual(len(rows), 3)
-        by_key = {k["api-key"]: (row, k) for row in rows for k in row["api-key-entries"]}
-        self.assertEqual(by_key[a.api_key][0]["models"][0]["name"], "fixture-model")
-        self.assertEqual(by_key[b.api_key][0]["models"][0]["name"], "other-model")
-        self.assertIs(by_key[a.api_key][0]["disable-cooling"], False)
-        self.assertEqual(by_key[a.api_key][1]["weight"], 0)
-        self.assertEqual(by_key[a.api_key][1]["proxy-url"], "http://proxy.example:8080")
-        self.assertEqual(by_key["fixture-key-unselected"][0]["models"][0]["name"], "old-model")
-        self.assertEqual(by_key["fixture-key-unselected"][0]["priority"], 1)
-        self.assertEqual(by_key[a.api_key][0]["priority"], by_key[b.api_key][0]["priority"])
-        self.assertTrue(all("custom" in r for r in rows))
-        self.assertEqual(len({r["name"] for r in rows}), 3)
+        # 2026-09-20 改契约：同一个 base-url 只写**一条** provider，不再按
+        # headers 差异拆成多条带哈希后缀的 provider（那会把同一个站在 CPA 里
+        # 注册成 N 个独立 provider，冷却 / 模型能力 / 执行路由各走各的）。
+        # 组内各 Key 探到的模型取并集，provider 级字段取 head（priority 最高
+        # 那把）的；没进方案的 Key 原样留在同一条 provider 下。
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["name"], "fixture-provider")
+        by_key = {k["api-key"]: k for k in row["api-key-entries"]}
+        self.assertEqual(set(by_key), {a.api_key, b.api_key, "fixture-key-unselected"})
+        self.assertEqual({m["name"] for m in row["models"]}, {"fixture-model", "other-model"})
+        self.assertIs(row["disable-cooling"], False)
+        self.assertEqual(by_key[a.api_key]["weight"], 0)
+        self.assertEqual(by_key[a.api_key]["proxy-url"], "http://proxy.example:8080")
+        self.assertEqual(by_key[b.api_key]["weight"], 2)
+        self.assertEqual(by_key["fixture-key-unselected"]["weight"], 3)
+        self.assertEqual(row["priority"], 100)
+        self.assertIn("custom", row)
 
     def test_compat_incremental_split_and_weight_zero(self):
         a = plan("openai-compatibility", weight=0, disable_cooling=False)
@@ -265,10 +271,16 @@ claude-api-key: [{api-key: fixture-key-a, base-url: 'https://unit.example/A'}, {
         raw = "openai-compatibility: []\n"
         cfg = yaml.safe_load(wb.apply_diffs(raw, wb.build_diffs(raw, plans)))
         rows = cfg["openai-compatibility"]
-        self.assertEqual(len(rows), 2)
-        row = next(r for r in rows if r["api-key-entries"][0]["api-key"] == a.api_key)
-        self.assertEqual(row["api-key-entries"][0]["weight"], 0)
+        # 2026-09-20 改契约：同 base-url 的 Key 合进同一条 provider（见上一个
+        # 用例的说明）。per-key 的 weight 仍逐把保留，模型取并集。
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        by_key = {k["api-key"]: k for k in row["api-key-entries"]}
+        self.assertEqual(set(by_key), {a.api_key, b.api_key})
+        self.assertEqual(by_key[a.api_key]["weight"], 0)
+        self.assertNotIn("weight", by_key[b.api_key])
         self.assertIs(row["disable-cooling"], False)
+        self.assertEqual({m["name"] for m in row["models"]}, {"fixture-model", "other-model"})
 
     def test_multiple_model_aliases_survive(self):
         raw = """claude-api-key:
