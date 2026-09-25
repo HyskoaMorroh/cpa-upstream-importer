@@ -50,6 +50,7 @@ import shutil
 import textwrap
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
@@ -2305,6 +2306,43 @@ def write_local(path: str, text: str, *, backup_dir: str | None = None,
         return bak
 
 
+def normalize_push_base(base: str) -> str:
+    """补全缺失的 scheme，供白名单判定与实际发请求共用同一个结果。
+
+    2026-09-25 现场根因：用户把管理地址填成 `cli-proxy-api:8317`（少了
+    `http://`），urlsplit 解不出 scheme，白名单判「格式无效」，而调用方把
+    这个拒绝当成「不许写盘」—— 少打七个字符，整次写回作废。
+
+    判定与发请求必须用同一个归一化结果，否则会出现「白名单放行了，urllib
+    却因为没有 scheme 打不出去」这种更难查的形态。
+    """
+    b = (base or "").strip()
+    if b and "://" not in b:
+        b = "http://" + b.lstrip("/")
+    return b
+
+
+def restart_hint(base: str) -> str:
+    """「去哪台容器重启 CPA」这句提示，从实际使用的管理地址推服务名。
+
+    compose 的惯例是服务名即容器名，而管理地址的 host 就是服务名 ——
+    所以 `http://cli-proxy-api:8317` 推得出 `docker restart cli-proxy-api`。
+    推不出（IP、回环、带点的 FQDN）时给通用说法，不猜一个可能不存在的名字。
+
+    为什么不写死：服务名与端口由部署方在 docker-compose.yml 的
+    `CPA_UPSTREAM_URL`（或 `--cpa-url` / `--push`）里自己定。写死的字面量
+    在改过端口或服务名的部署上就是一句错误指引，而这句提示恰恰是给
+    「已经出问题的人」看的，再错一次代价更大。
+    """
+    try:
+        host = urllib.parse.urlsplit(normalize_push_base(base)).hostname or ""
+    except ValueError:
+        host = ""
+    if host and re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_-]*", host) and host != "localhost":
+        return f"docker restart {host}"
+    return "docker restart <CPA 容器名>"
+
+
 def reload_cpa(base: str, mgmt_password: str, text: str, *,
                timeout: int = 60) -> tuple[bool, str]:
     """让 CPA 立刻用上新的 config.yaml。返回 (成功, 说明)。
@@ -2422,8 +2460,9 @@ def push_to_cpa(base: str, mgmt_key: str, text: str, *, timeout: int = 120) -> t
                     f"403 被 Cloudflare 拦下（{body[:120]}）—— **请求根本没到 CPA**，"
                     "config.yaml 一个字节都没动。\n"
                     "原因：管理端点走了公网域名，而公网入口在 CF 后面。\n"
-                    "修法：CPA 地址留空，走容器内服务名直连 "
-                    "http://cli-proxy-api:8317 —— 既绕开 CF 也不出公网。")
+                    "修法：把 CPA 地址留空，走服务端配置的容器内服务名直连"
+                    "（docker-compose.yml 的 CPA_UPSTREAM_URL / --cpa-url，"
+                    "具体值以界面 ④ 面板的提示为准）—— 既绕开 CF 也不出公网。")
             return False, (
                 f"403 被拒（{body[:160]}）。请求可能没到 CPA（前置网关拦下），"
                 "也可能是 CPA 的 remote-management 拒绝了这个来源 —— "
@@ -2499,7 +2538,7 @@ def _readback_check(base: str, mgmt_key: str, want: str, *,
         return False, (f"CPA 读回的条目数不符（{detail}）。"
                        "最可能的原因是 config.yaml 的 inode 被换过 —— "
                        "单文件 bind mount 在容器启动时把 inode 定死了，"
-                       "容器仍在读旧文件。需要 docker restart cli-proxy-api")
+                       f"容器仍在读旧文件。需要 {restart_hint(base)}")
     if not same:
         return False, "CPA 读回配置语义不符；请核对配置版本与挂载状态"
     total = sum(len(expected.get(section) or []) for section in _SECTION_KEYS)

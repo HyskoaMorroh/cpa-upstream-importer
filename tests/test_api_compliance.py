@@ -353,6 +353,69 @@ claude-api-key:
             self.assertEqual(task.state, "error")
             self.assertEqual(task.result["error_code"], "reload_failed")
 
+    def test_refused_push_target_still_writes_config(self):
+        """推送目标被拒 ≠ 不许写盘（2026-09-25 现场根因回归）。
+
+        现场：用户在 ④ 面板把「CPA 地址」填成公网域名/缺 scheme 的地址，
+        `_commit_apply` 在写盘**之前**就 `raise ValueError("管理目标被拒，
+        未写盘")`，整次写回作废；而前端拿着这个 error 仍旧渲染「✓ 已写回」
+        + 一排空的 written/backup/diffs。用户看到的是「写回成功但全是空白」，
+        真相是一个字节都没写。
+
+        白名单要防的是「整份配置被 PUT 给错误目标」—— 本地写盘不出网、
+        不外发凭据，不该被这道闸连坐。所以本例断言三件事：
+          · config.yaml **真的被改了**
+          · reload_cpa **一次都没发**（凭据没出去）
+          · 失败原因带得回来，且带上被拒地址
+        """
+        raw = "codex-api-key: []\n"
+        new = raw + "request-retry: 2\n"
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "fixture.yaml"
+            path.write_text(raw, encoding="utf-8")
+            task = server.ApplyTask("fixture-task", {"local_written": False})
+            entry = {"text": new, "base_raw": raw, "notes": ["fixture"]}
+            body = {"push": {"base": "https://evil.example.com"}}
+            with patch.object(server, "STORE", server.Store()), \
+                    patch.object(server, "reload_cpa") as reload:
+                server._commit_apply(task, entry, body, str(path),
+                                     "http://cli-proxy-api:8317",
+                                     "fixture-management", "", folder)
+            self.assertEqual(path.read_text(encoding="utf-8"), new)
+            self.assertIs(task.result["local_written"], True)
+            self.assertTrue(task.result["written"])
+            self.assertTrue(task.result["backup"])
+            reload.assert_not_called()
+            self.assertIs(task.result["reload_ok"], False)
+            self.assertIn("evil.example.com", task.result["reload_msg"])
+            self.assertIn("未触发 CPA 重载", task.result["reload_msg"])
+
+    def test_scheme_less_push_base_reaches_reload(self):
+        """`cli-proxy-api:8317` 少个 http:// 不能让整条重载链断掉。
+
+        旧代码对缺 scheme 的地址回「配置推送地址格式无效」，配合上面那条
+        「被拒就不写盘」，等于少打七个字符就让写回全废。补全 scheme 后，
+        它应当与 `http://cli-proxy-api:8317` 完全等价 —— reload 真的发出去。
+        """
+        raw = "codex-api-key: []\n"
+        new = raw + "request-retry: 3\n"
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "fixture.yaml"
+            path.write_text(raw, encoding="utf-8")
+            task = server.ApplyTask("fixture-task", {"local_written": False})
+            entry = {"text": new, "base_raw": raw, "notes": ["fixture"]}
+            body = {"push": {"base": "cli-proxy-api:8317"}}
+            with patch.object(server, "STORE", server.Store()), \
+                    patch.object(server, "reload_cpa",
+                                 return_value=(False, "fixture reload failed")) as reload, \
+                    patch.object(server.time, "sleep"):
+                server._commit_apply(task, entry, body, str(path),
+                                     "http://cli-proxy-api:8317",
+                                     "fixture-management", "", folder)
+            reload.assert_called_once()
+            self.assertEqual(reload.call_args.args[0], "http://cli-proxy-api:8317")
+            self.assertEqual(path.read_text(encoding="utf-8"), new)
+
     def test_stale_queued_work_never_writes_or_pushes(self):
         store = server.Store()
         first = {"preview": "request-retry: 1\n", "base_raw": "{}\n"}

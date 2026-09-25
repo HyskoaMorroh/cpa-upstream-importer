@@ -814,20 +814,25 @@ console.log(JSON.stringify(out));
                      html) is not None,
            ".spin{display:inline-block} 会压过 UA 的 [hidden] —— 实测踩过")
 
-    # ── ⑤ CPA 地址不能硬编码公网域名 ───────────────────────────────
-    section("⑤ CPA 地址：不硬编码公网域名")
-    # 实测踩过：#o_base 的 value 写死 https://cpa.example.com，于是管理端点的
-    # PUT 走公网被 Cloudflare 拦成 403 error code 1010 —— 请求根本没到 CPA，
-    # 而页面报的是「注意 PUT 落盘用 O_TRUNC…核对文件完整性」，把人引错方向。
-    m = re.search(r'id="o_base"[^>]*', html)
-    truthy("#o_base 存在", bool(m))
-    if m:
-        tag = m.group(0)
-        truthy("#o_base 没有硬编码的 value",
-               'value=' not in tag,
-               f"实际：{tag} —— 填了 value 就会覆盖服务端的 CPA_UPSTREAM_URL")
-        truthy("#o_base 有 placeholder 说明留空的含义",
-               "placeholder=" in tag)
+    # ── ⑤ CPA 地址：界面不给人填，只回显服务端配置 ─────────────────
+    section("⑤ CPA 地址：只读回显，界面无输入口")
+    # 这个框两次造成现场故障，两次都是「让人填」本身的错：
+    #   · 早期 #o_base 的 value 写死 https://cpa.example.com → PUT 走公网被
+    #     Cloudflare 拦成 403 error code 1010（请求根本没到 CPA），而页面报的是
+    #     「注意 PUT 落盘用 O_TRUNC…核对文件完整性」，把人引错方向；
+    #   · 2026-09-24 用户手填 `cli-proxy-api:8317`（少了 http://）→ 白名单判
+    #     「格式无效」，整次写回作废。
+    # 这个值唯一的正确来源是部署方配的 CPA_UPSTREAM_URL，服务端自己就有 ——
+    # 所以输入框整个删掉，改成只读回显。
+    truthy("④ 面板不再有 CPA 地址输入框",
+           re.search(r'id="o_base"[^>]*', html) is None,
+           "只要还是 input，就还有人能填错 —— 值只能来自服务端配置")
+    truthy("前端不再从输入框读地址",
+           "'#o_base'" not in js and '"#o_base"' not in js,
+           "请求体不许带前端决定的 push.base")
+    truthy("请求体不再带 push.base",
+           not re.search(r"push\.base\s*=", js),
+           "地址由服务端用自己配的值，前端无权覆盖")
     # 整个前端不该在**代码**里出现写死的公网 CPA 域名。
     # 注释里提它是好的（记录踩坑历史），所以先剥掉注释再查。
     js_code = re.sub(r"//[^\n]*", "", js)
@@ -837,17 +842,64 @@ console.log(JSON.stringify(out));
            "cpa.example.com" not in html_code
            and "cpa.example.com" not in js_code,
            "公网入口在 CF 后面，管理端点必须走容器内服务名")
-    # 地址只在用户填了才传 —— 传空串也会让服务端优先用它（若判据写反）
-    truthy("地址只在非空时才放进请求体",
-           "if (baseIn)" in js or "baseIn &&" in js,
-           "无条件传 base 会让服务端配置永远用不上")
+    # 服务名与端口同样不能写死（2026-09-25）。
+    # ------------------------------------------------
+    # 它们是部署方在 docker-compose.yml 的 CPA_UPSTREAM_URL 里定的。
+    # 界面上「当前地址是什么」「去哪台容器重启」这些提示恰恰是给
+    # **已经出问题的人** 看的 —— 写死的字面量在改过端口/服务名的部署上
+    # 就是再教错一次。正确做法：从 /api/context 的 cpa_url 回显。
+    truthy("前端代码里不写死 CPA 服务名与端口",
+           "cli-proxy-api:8317" not in html_code
+           and "cli-proxy-api:8317" not in js_code,
+           "改成从 /api/context 的 cpa_url 回显（renderCpaHint / cpaRestartHint）")
+    truthy("有从服务端回显 CPA 地址的渲染函数",
+           "function renderCpaHint" in js and "function cpaRestartHint" in js)
+    truthy("启动时真的调了 renderCpaHint",
+           re.search(r"^\s*renderCpaHint\(\);", js, re.M) is not None,
+           "定义了不调用等于没有 —— 提示会永远停在占位文案")
+    truthy("④ 面板留了回显 CPA 地址的挂点",
+           'id="o_base_configured"' in html and 'id="o_base_hint"' in html)
+    truthy("回显位是 output 而不是 input",
+           re.search(r'<output[^>]*id="o_base_configured"', html) is not None,
+           "input 会让人以为可以改；output 语义上就是「算出来的值」")
+    _srv = io.open(os.path.join(ROOT, "server.py"), encoding="utf-8").read()
+    truthy("/api/context 回传服务端实配的 cpa_url",
+           '"cpa_url": type(self).cpa_url' in _srv,
+           "前端的地址回显靠它；缺了就只能退回写死字面量")
+    # 服务端那道白名单**不能**因为前端不再传地址就删掉 —— 它现在防的是
+    # 绕过界面直接打 /api/apply 的调用方。
+    truthy("服务端仍保留推送地址白名单",
+           "_push_target_ok" in _srv and "_push_result" in _srv,
+           "前端不传 base 只是少了一个误配入口，API 仍对外开放")
+
+    # ── ⑤ 写回失败不许渲染成「已写回」（2026-09-25 现场根因）─────────
+    section("⑤ 没写盘就不许出「已写回」面板")
+    # 现场：推送目标被拒 → 后端在写盘前抛错 → pollApply 仍返回对象 →
+    # 调用方 `if (!d)` 判不住 → 渲染「✓ 已写回」+ 一排空的 written/backup。
+    truthy("pollApply 出错时按 local_written 区分写没写盘",
+           "local_written === true" in js,
+           "前端不能自己假设「收尾出错 = 已写盘」")
+    truthy("未写盘时 pollApply 返回 null 让调用方停住",
+           re.search(r"return\s+wrote\s*\?\s*\{\s*\.\.\.first", js) is not None,
+           "返回对象会被 `if (!d)` 漏过去，继续渲染成功面板")
+    truthy("渲染成功面板前校验 local_written",
+           re.search(r"d\.local_written\s*!==\s*true", js) is not None,
+           "「✓ 已写回」是静态标题，显示出来就等于向用户断言盘上已改")
+    truthy("出错时不清空 #applymsg",
+           re.search(r"d\.state\s*!==\s*'error'\s*\)\s*\$\('#applymsg'\)", js) is not None,
+           "无条件清空会把唯一一条真实失败信息擦掉")
 
     section("⑤ 403 的两种来源要分开说")
     wb = io.open(os.path.join(ROOT, "cpa_probe", "writeback.py"),
                  encoding="utf-8").read()
     truthy("识别 Cloudflare 的 1010", "error code: 1010" in wb)
     truthy("CF 情形明说请求没到 CPA", "根本没到 CPA" in wb)
-    truthy("CF 情形给出容器内直连的修法", "cli-proxy-api:8317" in wb)
+    truthy("CF 情形给出容器内直连的修法",
+           "CPA_UPSTREAM_URL" in wb and "留空" in wb,
+           "修法要指向部署方配的那个值，不能写死 cli-proxy-api:8317 —— "
+           "改过端口的部署会被教一个错地址")
+    # 「不写死容器名」这条按 AST 只查非 docstring 的字面量，在 test_server 里
+    # （docstring 里举真实服务名反而更好读，全文检索会把它一起误杀）。
 
     section("⑤ 后端加的诊断字段，前端必须真的用上")
     # 实测踩到（2026-08-30）：加了 4 个诊断字段（unmatched_notes / dead_hosts /

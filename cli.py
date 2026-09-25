@@ -56,6 +56,7 @@ from cpa_probe.writeback import (  # noqa: E402
     apply_diffs,
     build_diffs,
     reload_cpa,
+    restart_hint,
     validate,
     verify_upstream,
     write_local,
@@ -224,9 +225,8 @@ def main() -> None:
                          "否则 http://127.0.0.1:8317）——**写回后默认就会推**，"
                          "因为只写盘不推有丢事件的风险。给了值就用你给的")
     ap.add_argument("--no-reload", action="store_true",
-                    help="写回后不触发 CPA 重载。只在你打算自己 "
-                         "docker restart cli-proxy-api 时用 —— "
-                         "不加这个开关也不给密码时会明确告警，不会静默跳过")
+                    help="写回后不触发 CPA 重载。只在你打算自己重启 CPA 容器时用 "
+                         "—— 不加这个开关也不给密码时会明确告警，不会静默跳过")
     ap.add_argument("--mgmt-key", default=os.environ.get("MGMT", ""),
                     help="CPA management key（默认取环境变量 MGMT）")
     ap.add_argument("--client-key", default=os.environ.get("CPA_CLIENT_KEY", ""),
@@ -454,15 +454,18 @@ def main() -> None:
     # write_local 已保证 inode 不变（单文件 bind mount 的硬要求），
     # 所以容器能看到新字节；PUT 的作用是把「事件可能丢」换成
     # 「事件必然有」，并且给出一个可判断的 HTTP 回执 + 读回校验。
+    # 地址先算出来 —— 下面每一条「去哪台容器重启」的提示都从它推服务名，
+    # 不写死 `cli-proxy-api`（服务名与端口由部署方在 docker-compose.yml 的
+    # CPA_UPSTREAM_URL 里自己定，写死的在改过名字的部署上就是错指引）。
+    cpa_base = args.push or os.environ.get("CPA_UPSTREAM_URL") or "http://127.0.0.1:8317"
+
     if args.no_reload:
         print()
         print(f"  {C_WARN}⚠ --no-reload：未触发 CPA 重载。{C_END}")
         print(f"  {C_DIM}磁盘已改。CPA 大概率会自己收到 inotify 事件并重载，"
               f"但**没有保证** —— 事件丢了它不会自愈。{C_END}")
-        print(f"  {C_DIM}确认生效：docker restart cli-proxy-api{C_END}")
+        print(f"  {C_DIM}确认生效：{restart_hint(cpa_base)}{C_END}")
         return
-
-    cpa_base = args.push or os.environ.get("CPA_UPSTREAM_URL") or "http://127.0.0.1:8317"
 
     if not args.mgmt_key:
         print()
@@ -472,7 +475,7 @@ def main() -> None:
         print()
         print("  让它确定生效，选一条：")
         print(f"    {C_OK}A{C_END} 重启容器（最直接，约 8 秒）")
-        print("        docker restart cli-proxy-api")
+        print(f"        {restart_hint(cpa_base)}")
         print(f"    {C_OK}B{C_END} 本命令补上密码重跑（不重启）")
         print("        --mgmt-key '<你在 CPA 后台输的原始密码>'")
         print(f"       {C_DIM}或 export MGMT='<原始密码>' 后重跑{C_END}")
@@ -502,7 +505,7 @@ def main() -> None:
         print(f"  {C_BAD}✗{C_END} {rmsg}")
         print()
         print(f"  {C_WARN}配置已写入磁盘，但 CPA 未确认用上。"
-              f"执行 docker restart cli-proxy-api{C_END}")
+              f"执行 {restart_hint(cpa_base)}{C_END}")
         sys.exit(1)
 
     # 第二级验证。少了它就只知道「CPA 接受了这份 YAML」，

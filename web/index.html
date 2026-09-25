@@ -274,6 +274,15 @@ button.mini:hover{border-color:var(--accent-2);color:var(--ink)}
 }
 .opt input:focus{outline:0;border-color:var(--accent-2);box-shadow:var(--glow)}
 .opt input[type=number]{width:74px}
+/* 只读回显（CPA 地址）。看得出「这是配置读出来的值，不是让你填的框」：
+   虚线边、无焦点态、字体与输入框一致好对照。 */
+.opt .ro{
+  border:1px dashed var(--line);border-radius:8px;padding:6px 10px;
+  background:var(--bg-2);color:var(--ink-2);
+  font-family:ui-monospace,monospace;font-size:13px;
+  max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.opt .ro.bad{border-style:solid;border-color:var(--bad);color:var(--bad)}
 .hint{color:var(--ink-3);font-size:12.5px}
 .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:20px}
 button.go{
@@ -911,10 +920,18 @@ https://其他站.com,sk-yyyyyyyyyyyyyyyy
      <code>O_TRUNC</code> 且失败不回滚，备份是唯一保险。</p>
   <div id="planmeta"></div>
   <div id="diffs"></div>
+  <!-- CPA 地址是**只读回显**，不是输入框（2026-09-25）。
+       ------------------------------------------------
+       它原来是个可填的 text input。现场故障：用户往里填了 `cli-proxy-api:8317`
+       （少了 http://），整次写回被判「推送地址格式无效」而作废。这个值本来就
+       只有一个正确来源 —— 部署方在 docker-compose.yml 的 CPA_UPSTREAM_URL /
+       --cpa-url 里配的那个，服务端自己就有，没有任何理由让人再抄一遍。
+       现在由 renderCpaHint() 从 /api/context 的 cpa_url 回显；服务端
+       仍保留地址白名单，防的是绕过界面直接打 API 的调用方。 -->
   <div class="opts" style="margin-top:20px">
-    <label class="opt">CPA 地址 <input type="text" id="o_base"
-      placeholder="留空 = 容器内直连（推荐）" style="width:250px">
-      <span class="hint">留空走服务端配好的 CPA_UPSTREAM_URL</span></label>
+    <label class="opt">CPA 地址
+      <output class="ro" id="o_base_configured">读取中…</output>
+      <span class="hint" id="o_base_hint">取自服务端配置，无需填写</span></label>
     <label class="opt">管理密码 <input type="password" id="o_mgmt"
       placeholder="留空 = 复用登录凭据" style="width:200px">
       <span class="hint">用 CPA 密码登录的就不用填</span></label>
@@ -923,10 +940,10 @@ https://其他站.com,sk-yyyyyyyyyyyyyyyy
       <span class="hint">端到端验证用；留空自动取，一般不用填</span></label>
   </div>
   <div class="note w">
-    <b>CPA 地址不要填公网域名。</b>公网入口在 Cloudflare 后面，管理端点的
+    <b>管理端点只走容器内直连。</b>公网入口在 Cloudflare 后面，管理端点的
     <code>PUT</code> 会被挡成 <code>403 error code 1010</code> —— 那是 CF 的拦截码，
-    不是 CPA 拒绝了配置。留空即走容器内服务名直连
-    （<code>http://cli-proxy-api:8317</code>），既绕开 CF 也不出公网。</div>
+    不是 CPA 拒绝了配置。上面那个地址由服务端配置决定（<code>CPA_UPSTREAM_URL</code>），
+    界面不提供改写入口：既绕开 CF 也不出公网。要换地址就改 compose 里的那一行。</div>
   <div class="note b">
     <b>这一步真正落盘。</b>确认前核对每一处插入 —— <code>priority</code> 定错在分层隔离下
     不是「略微靠后」，而是<b>永远轮不到</b>或<b>完全取代现有顶层站</b>。
