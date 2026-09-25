@@ -59,7 +59,9 @@ from cpa_probe.writeback import (  # noqa: E402
     redact_yaml_secrets,
     apply_diffs,
     build_diffs,
+    normalize_push_base as _normalize_push_base,
     reload_cpa,
+    restart_hint as _restart_hint,
     validate,
     verify_upstream,
     write_local,
@@ -2933,6 +2935,17 @@ class Handler(BaseHTTPRequestHandler):
             # 这里露出来是为了让运维看得见有没有堆积 —— 那三张表里
             # plans 每份持有两份整份配置，是 OOM 的主要来源。
             "store": STORE.sizes(),
+            # 服务端实配的 CPA 管理地址（CPA_UPSTREAM_URL / --cpa-url）。
+            #
+            # 前端拿它来渲染 ④ 面板「留空会走到哪里」那句提示，以及重载失败
+            # 时的「去哪台容器重启」。以前那串 `http://cli-proxy-api:8317`
+            # 是写死在 index.html 里的字面量 —— 部署方在 docker-compose.yml
+            # 改了服务名或端口，界面就在教用户一个错地址，而这条提示恰恰是
+            # 给「已经填错地址的人」看的。
+            #
+            # 不是秘密：凭据在请求体与 Authorization 头里，URL 里没有。
+            # 能看到这个接口的人本来就持有本服务的写配置权限。
+            "cpa_url": type(self).cpa_url,
         })
 
     def _api_parse(self, body: dict) -> None:
@@ -4337,6 +4350,19 @@ def _push_target_ok(base: str, configured: str) -> str:
     b = (base or "").strip()
     if not b:
         return ""                       # 空地址由调用方另行处理（跳过重载）
+    # scheme 缺省时补 `http://`（2026-09-25 现场根因）
+    # ------------------------------------------------
+    # `cli-proxy-api:8317`、`10.0.0.5:8317`、`agi.example.com` 这些写法
+    # urlsplit 解不出 scheme，旧代码一律判「格式无效」，而 `_commit_apply`
+    # 把这个拒绝当成「不许写盘」——少打七个字符，整次写回就作废，界面还
+    # 显示「✓ 已写回」。补完 scheme 后仍要过下面的白名单，放行范围没变大：
+    # 公网域名补成 http:// 之后照样走到下面那条「拒绝公网目标」。
+    #
+    # 判据与实际发请求用的地址必须是**同一个归一化结果**，否则会出现
+    # 「白名单放行了，urllib 却因为没有 scheme 打不出去」。所以两边都走
+    # `_normalize_push_base`。
+    b = _normalize_push_base(b)
+    shown = _push_addr_label(base)
     try:
         url = urllib.parse.urlsplit(b)
         configured_url = urllib.parse.urlsplit(configured or "")
@@ -4360,16 +4386,54 @@ def _push_target_ok(base: str, configured: str) -> str:
                                   and not ip.is_multicast and not ip.is_reserved):
                 return ""
     except ValueError:
-        return "配置推送地址格式无效"
+        # 必须带上被拒的原文：不带的话用户只看到「格式无效」，既不知道是哪
+        # 一个地址被拒（服务端配的？还是自己填的？），也不知道怎么改。
+        #
+        # 修法提示里回显**服务端实配的那个地址**，不要写死
+        # `http://cli-proxy-api:8317` —— 端口和服务名都是部署方在
+        # docker-compose.yml / CPA_UPSTREAM_URL 里自己定的，写死的字面量
+        # 在改过端口的部署上就是错误指引。
+        return (f"配置推送地址格式无效：{shown} —— "
+                f"把 ④ 面板的「CPA 地址」清空即可，{_configured_hint(configured)}")
     # 理由要说清**后果**，不能只说「被拒了」（2026-09-12 退回原措辞）
     # ----------------------------------------------------------------
     # 推送走的是 `PUT /v0/management/config.yaml` —— 发出去的是**整份配置**，
     # 里面含 `remote-management.secret-key`（管理密码）与全部上游 Key。
     # 发错目标就是一次全量凭据泄露，所以这句话必须让人看懂代价，
     # 而不是只留一句「请使用明确配置的管理地址」。
-    return ("拒绝向未配置的公网目标发送配置：推送会把**整份配置**"
+    return (f"拒绝向未配置的公网目标发送配置（被拒地址：{shown}）："
+            "推送会把**整份配置**"
             "（含管理密码与全部上游 Key）发给该地址。"
-            "请改用回环、私网、docker 服务名，或服务端 --cpa-url 明确配置过的地址")
+            f"请把 ④ 面板的「CPA 地址」清空（{_configured_hint(configured)}），"
+            "或改用回环、私网、docker 服务名，或服务端 --cpa-url 明确配置过的地址")
+
+
+
+def _configured_hint(configured: str) -> str:
+    """「留空会走到哪里」这句提示，回显服务端实配地址而不是写死字面量。
+
+    端口与服务名由部署方在 docker-compose.yml 的 `CPA_UPSTREAM_URL`
+    （或 `--cpa-url`）里自己定。写死 `http://cli-proxy-api:8317` 的话，
+    改过端口的部署会拿到一句错误指引，而这条提示恰恰是给「已经填错地址
+    的人」看的 —— 再给错一次代价更大。
+    """
+    c = (configured or "").strip()
+    if not c:
+        return ("留空走服务端配置的 CPA 地址；服务端当前也没配"
+                "（CPA_UPSTREAM_URL / --cpa-url 为空），"
+                "请先在 docker-compose.yml 里配好")
+    return f"留空走服务端配置的 {_push_addr_label(c)}"
+
+
+def _push_addr_label(base: str) -> str:
+    """把用户填的地址整理成一句可以原样显示的短文本。
+
+    只做长度截断与控制字符清理 —— 地址本身不是秘密（凭据在请求体和
+    Authorization 头里，不在 URL 里），但它会被拼进 HTML 前的 JSON，
+    所以不能带换行与控制字符。
+    """
+    s = re.sub(r"[\x00-\x1f\x7f]", "", (base or "").strip())
+    return (s[:80] + "…") if len(s) > 80 else (s or "(空)")
 
 
 def _push_result(base: str, configured: str) -> dict | None:
@@ -4425,11 +4489,18 @@ def _commit_apply(task, entry, body, cfg_path, cpa_url, mgmt, client_key,
             if not ok:
                 task.result["error_code"] = "invalid_plan"
                 raise ValueError(msg)
-            push = body.get("push") or {}
-            refused = _push_result(push.get("base") or cpa_url, cpa_url)
-            if refused:
-                task.result.update(refused, error_code="push_target_refused")
-                raise ValueError("管理目标被拒，未写盘")
+            # 推送目标被拒**不再阻断写盘**（2026-09-25 现场根因）
+            # ----------------------------------------------------
+            # 这里原来是「_push_result 有拒绝 → raise ValueError("管理目标被
+            # 拒，未写盘")」。后果：用户在 ④ 面板把「CPA 地址」填成
+            # `cli-proxy-api:8317`（少个 http://），整次写回就被丢掉，而
+            # 前端仍渲染「✓ 已写回」+ 一排空字段。真实故障是「重载地址不合
+            # 规」，被放大成「配置写不进去」。
+            #
+            # 白名单要防的是「整份配置被 PUT 给错误目标」——那道闸在
+            # `_run_apply_tail` 里，写盘之后照样生效（它会再算一次
+            # `_push_result`，被拒就跳过 reload 与验证）。本地写盘不出网、
+            # 不带凭据外发，没有理由被这道闸连坐。
             task.set_stage("local_write")
             bak = write_local(cfg_path, preview, backup_dir=backup_dir or None,
                               expected_version=version)
@@ -4492,8 +4563,10 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
         #
         # 顺序反过来后：留空走服务名直连（既绕开 CF、也不出公网），
         # 只有用户明确填了别的地址才用他填的。
-        cpa_base = ((push.get("base") or "").strip()
-                    or (cfg_cpa_url or "").strip())
+        # 归一化与白名单判定用同一个结果（2026-09-25）：否则会出现
+        # 「白名单放行了，urllib 却因为地址没有 scheme 打不出去」。
+        cpa_base = _normalize_push_base((push.get("base") or "").strip()
+                                        or (cfg_cpa_url or "").strip())
         # 地址白名单（2026-09-05 加）。上面那个「服务端配置优先」的顺序降低了
         # 误配概率，但没关掉出口 —— 用户明确填一个公网地址仍然会把整份配置
         # 与管理密码发出去。见 _push_target_ok。
@@ -4517,13 +4590,23 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
                 "已写盘，但**未触发 CPA 重载** —— 没有可用的管理密码。\n"
                 "CPA 不会自己发现这次改动（单文件挂载 + 无轮询兜底）。\n"
                 "两条路：① 用 CPA 后台管理密码重新登录本页，再写回一次；"
-                "② 在 VPS 上执行 docker restart cli-proxy-api")
+                f"② 在 VPS 上执行 {_restart_hint(cpa_base)}")
             result["push_ok"] = False
             result["push_msg"] = result["reload_msg"]
         else:
-            result["reload_ok"] = False
-            result["reload_msg"] = ("已写盘。未配置 CPA 地址（CPA_UPSTREAM_URL），"
-                                    "无法自动重载 —— 请 docker restart cli-proxy-api")
+            # 只有「真的没配地址」才说没配地址。目标被拒时 result 里已经有
+            # `_push_result` 写好的拒绝理由（含被拒地址与改法），这里若无条件
+            # 覆盖，用户看到的就会是「未配置 CPA 地址」这种误导性结论
+            # ——2026-09-25：写盘不再被拒绝连坐后，这条分支第一次真的会走到。
+            if not refused:
+                result["reload_ok"] = False
+                result["reload_msg"] = ("已写盘。未配置 CPA 地址（CPA_UPSTREAM_URL），"
+                                        "无法自动重载 —— 请手工重启 CPA 容器"
+                                        "（docker restart <CPA 容器名>）")
+            else:
+                result["reload_msg"] = (
+                    "已写盘，但**未触发 CPA 重载** —— " + result["reload_msg"])
+                result["push_msg"] = result["reload_msg"]
 
         if result.get("reload_ok"):
             # 等 fsnotify 的 debounce 落地再验。

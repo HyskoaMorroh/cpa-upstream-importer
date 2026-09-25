@@ -717,25 +717,88 @@ def test_push_target_is_whitelisted():
            bool(F("https://evil.example.com", "https://cielo-cpa.example")))
 
     # 形态错的一律拒
-    for base in ("ftp://x", "not-a-url", "//no-scheme.example.com",
-                 "http://"):
+    for base in ("ftp://x", "http://", "http://user:pw@cli-proxy-api:8317",
+                 "http://cli-proxy-api:8317?x=1"):
         truthy(f"形态错拒绝：{base!r}", bool(F(base, "")))
+
+    # 缺 scheme 要**补全**而不是判死（2026-09-25 现场根因）
+    # ------------------------------------------------------
+    # 用户在 ④ 面板把「CPA 地址」填成 `cli-proxy-api:8317`（少了 http://），
+    # 旧代码回「配置推送地址格式无效」，而调用方把这个拒绝当成「不许写盘」
+    # —— 少打七个字符，整次写回作废，界面还显示「✓ 已写回」+ 一排空字段。
+    # 补全后判据不变：单标签主机名/回环/私网照样放行，公网域名照样拒。
+    for base in ("cli-proxy-api:8317", "127.0.0.1:8317", "10.0.0.9:8317",
+                 "localhost:8317"):
+        eq(f"缺 scheme 补全后放行 {base}", F(base, ""), "")
+    for base in ("evil.example.com", "//no-scheme.example.com",
+                 "api.openai.com:443"):
+        why = F(base, "")
+        truthy(f"缺 scheme 的公网目标仍然拒：{base}", bool(why))
+        truthy(f"{base} 的拒绝理由说清了后果",
+               "管理密码" in why or "整份配置" in why, f"实得 {why!r}")
+
+    # 拒绝理由必须带上被拒地址原文 —— 只说「格式无效」用户不知道改哪个
+    why = F("ftp://cielo-cpa.example", "")
+    truthy("格式无效的理由带被拒地址", "cielo-cpa.example" in why, f"实得 {why!r}")
+    truthy("格式无效的理由给了修法", "留空" in why or "清空" in why, f"实得 {why!r}")
 
     # 空地址不算错 —— 调用方另行处理（跳过重载并给告警）
     eq("空地址交给调用方", F("", ""), "")
 
-    # 被拒时必须**真的跳过**重载，而不只是记个消息
+    # 「去哪台容器重启」必须从地址推，不能写死（2026-09-25）
+    # ------------------------------------------------------
+    # 服务名与端口由部署方在 docker-compose.yml 的 CPA_UPSTREAM_URL 里定。
+    # 写死 `docker restart cli-proxy-api` 的话，改过服务名的部署会被教一个
+    # 不存在的容器名 —— 而这句提示只在「已经出问题」时才显示。
+    from cpa_probe.writeback import restart_hint, normalize_push_base
+    eq("服务名推得出容器名",
+       restart_hint("http://cli-proxy-api:8317"), "docker restart cli-proxy-api")
+    eq("改过服务名也跟着变",
+       restart_hint("http://cpa-main:19000"), "docker restart cpa-main")
+    eq("缺 scheme 也推得出",
+       restart_hint("cpa-main:19000"), "docker restart cpa-main")
+    for base in ("http://127.0.0.1:8317", "http://localhost:8317",
+                 "http://cpa.internal.example:8317", ""):
+        eq(f"推不出服务名就给通用说法：{base!r}",
+           restart_hint(base), "docker restart <CPA 容器名>")
+    eq("归一化只补 scheme，不改其余部分",
+       normalize_push_base("cli-proxy-api:8317/"), "http://cli-proxy-api:8317/")
+    eq("已有 scheme 不动", normalize_push_base("https://x.example"), "https://x.example")
+    eq("空串仍是空串", normalize_push_base("  "), "")
+
+    # 后端发给界面的短文案里不许再出现写死的容器名。
+    # docstring 除外 —— 那是给读代码的人看的说明，举例用真实服务名反而更清楚。
+    import ast as _ast
     import io as _io
+    for rel in ("server.py", "cli.py", os.path.join("cpa_probe", "writeback.py")):
+        _src = _io.open(os.path.join(ROOT, rel), encoding="utf-8").read()
+        _tree = _ast.parse(_src)
+        _docs = set()
+        for _p in _ast.walk(_tree):
+            if isinstance(_p, (_ast.Module, _ast.ClassDef,
+                               _ast.FunctionDef, _ast.AsyncFunctionDef)):
+                _first = (_p.body or [None])[0]
+                if (isinstance(_first, _ast.Expr)
+                        and isinstance(_first.value, _ast.Constant)
+                        and isinstance(_first.value.value, str)):
+                    _docs.add(id(_first.value))
+        for _n in _ast.walk(_tree):
+            if (isinstance(_n, _ast.Constant) and isinstance(_n.value, str)
+                    and id(_n) not in _docs):
+                truthy(f"{rel}:{_n.lineno} 不写死容器名",
+                       "docker restart cli-proxy-api" not in _n.value,
+                       "改用 writeback.restart_hint(base) 从实配地址推")
+
+    # 被拒时必须**真的跳过**重载，而不只是记个消息
     src = _io.open(os.path.join(ROOT, "server.py"), encoding="utf-8").read()
     idx = src.find("refused = _push_result(")
     truthy("apply 收尾里调了白名单", idx > 0)
-    # 现在有**两处**调用点（2026-09-12）：
-    #   ① 写盘前那处 —— 被拒直接 `raise`，连 config.yaml 都不写；
-    #   ② 收尾验证那处 —— 被拒清空 cpa_base，后面的 reload 被
-    #      `if cpa_base and mgmt` 挡住。
-    # 原来只取第一处之后 700 字符的窗口，扫不到 ② 的 `cpa_base = ""`。
-    # 改成在**全部**调用点之后合起来找：任一处兑现「被拒就不发」即可，
-    # 而 ① 的 raise 比清空更强。
+    # 调用点只剩**一处**了（2026-09-25）：`_run_apply_tail` 里写盘之后那处，
+    # 被拒清空 cpa_base，后面的 reload 被 `if cpa_base and mgmt` 挡住。
+    #
+    # 写盘前那处已经删掉 —— 它当年 `raise ValueError("管理目标被拒，未写盘")`，
+    # 把「重载目标不合规」放大成「配置写不进去」。本地写盘不出网、不外发凭据，
+    # 没有理由被这道闸连坐；要防的「整份配置发给错误目标」由剩下这处兑现。
     windows = []
     scan = idx
     while scan >= 0:

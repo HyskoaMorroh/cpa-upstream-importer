@@ -247,7 +247,11 @@ def main() -> int:
             eq("403 + CF 正文判为失败", ok, False)
             contains("点明是 Cloudflare 拦下", msg, "Cloudflare")
             contains("明确说请求没到 CPA", msg, "根本没到 CPA")
-            contains("给出容器内直连的修法", msg, "cli-proxy-api:8317")
+            # 修法要指向「部署方配的那个地址」，不能写死服务名与端口
+            # （2026-09-25）：端口在 docker-compose.yml 里改过的部署，
+            # 写死的字面量就是再教错一次。
+            contains("给出容器内直连的修法", msg, "CPA_UPSTREAM_URL")
+            contains("修法明说把地址留空", msg, "留空")
             truthy("不误导去核对文件完整性", "完整性" not in msg,
                    "文件没被碰过，让人去核对完整性是错的方向")
 

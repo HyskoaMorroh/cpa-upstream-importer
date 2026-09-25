@@ -675,6 +675,7 @@ async function boot() {
   $('#cfgmeta').textContent =
     `${S.ctx.lines.toLocaleString()} 行 · ${entries} 条目`;
   renderBands();
+  renderCpaHint();
   applyResources();
   renderDrift();
   updateBudget();
@@ -904,6 +905,45 @@ function hostState(b, host) {
   if ((b.dead_hosts || []).some((x) => String(x).toLowerCase() === h)) return 'dead';
   if ((b.unhealthy_hosts || []).some((x) => String(x).toLowerCase() === h)) return 'unwell';
   return 'live';
+}
+
+/* ── 服务端实配的 CPA 地址 ──────────────────────────────────────────
+   界面上任何「留空会走到哪里」「去哪台容器重启」的提示都从这里取，
+   不写死字面量。服务名与端口由部署方在 docker-compose.yml 的
+   CPA_UPSTREAM_URL（或 --cpa-url）里自己定；写死 `http://cli-proxy-api:8317`
+   的话，改过端口或服务名的部署会被界面教一个错地址 —— 而这些提示恰恰是
+   给「已经填错地址的人」看的，再错一次代价更大。 */
+function cpaTarget() {
+  return (S.ctx && typeof S.ctx.cpa_url === 'string' ? S.ctx.cpa_url : '').trim();
+}
+
+// 「在 VPS 上重启哪个容器」——容器名后端不知道，但 compose 的惯例是
+// 服务名即容器名，而管理地址的 host 就是服务名。取不到就退回通用说法，
+// 不猜一个可能不存在的名字。
+function cpaRestartHint() {
+  const url = cpaTarget();
+  let host = '';
+  try { host = new URL(url).hostname; } catch { host = ''; }
+  return host && !/^[0-9.]+$|^\[|^localhost$/.test(host)
+    ? `在 VPS 上 <code>docker restart ${esc(host)}</code>`
+    : '在 VPS 上重启 CPA 容器（<code>docker restart &lt;CPA 容器名&gt;</code>）';
+}
+
+function renderCpaHint() {
+  const url = cpaTarget();
+  const hint = $('#o_base_hint');
+  const inline = $('#o_base_configured');
+  if (hint) {
+    hint.textContent = url
+      ? '取自服务端配置（CPA_UPSTREAM_URL），无需填写'
+      : '服务端未配 CPA 地址（CPA_UPSTREAM_URL / --cpa-url 为空）—— 写回后不会自动重载';
+  }
+  if (inline) {
+    // 只读回显，不是输入框：这个值唯一的正确来源是服务端配置，
+    // 让人再抄一遍只会多一次抄错的机会（2026-09-25 现场就是抄漏了 http://）。
+    inline.textContent = url || '未配置';
+    inline.classList.toggle('bad', !url);
+  }
 }
 
 function renderBands() {
@@ -3084,7 +3124,7 @@ async function pollApply(taskId, first) {
       if (fails >= 20) {
         box.innerHTML = `<span style="color:var(--bad)">轮询中断（${esc(e.message)}）
           —— <b>配置已写盘</b>，但重载与验证结果拿不到了。
-          可在 VPS 上 <code>docker restart cli-proxy-api</code> 确认生效。</span>`;
+          可${cpaRestartHint()} 确认生效。</span>`;
         return null;
       }
       continue;
@@ -3100,9 +3140,20 @@ async function pollApply(taskId, first) {
             (${pct}%)</span>` : '')
       + ` <span class="hint">· ${st.elapsed}s</span>`;
     if (st.state === 'error') {
-      box.innerHTML = `<span style="color:var(--bad)">收尾出错 —— <b>配置已写盘</b>，
-        是重载或验证那一步失败：<pre>${esc(st.error || '')}</pre></span>`;
-      return { ...first, ...st };
+      // 「写没写盘」只认后端的 local_written，不要在前端猜（2026-09-25）。
+      //
+      // 现场故障：④ 面板的「CPA 地址」填成 `cli-proxy-api:8317`（少了
+      // http://），后端在**写盘之前**就因推送目标被拒而抛错，这里却写死
+      // 「配置已写盘」，并且把 st 合并后返回；调用方只判 `if (!d)`，判不住，
+      // 于是继续渲染「✓ 已写回」+ 一排空的 written/backup/diffs。
+      // 用户看到的是「写回成功但全是空白」，真相是一个字节都没写。
+      const wrote = st.local_written === true;
+      box.innerHTML = `<span style="color:var(--bad)">${wrote
+        ? '收尾出错 —— <b>配置已写盘</b>，是重载或验证那一步失败：'
+        : '<b>写回失败 —— 配置未写盘</b>，config.yaml 未被改动：'}
+        <pre>${esc(st.error || '')}</pre></span>`;
+      // 没写盘就没有任何结果可展示，返回 null 让调用方停在错误态。
+      return wrote ? { ...first, ...st } : null;
     }
     if (st.state !== 'running') return { ...first, ...st };
   }
@@ -3119,14 +3170,19 @@ $('#btnapply').onclick = async () => {
     mgmt_key: $('#o_mgmt').value,          // 留空则服务端复用 _cred
     client_key: $('#o_client').value.trim(),
   };
-  // 地址**只在用户显式填了才传**。不填就不带这个键，让服务端用它自己配的
-  // CPA_UPSTREAM_URL（容器内 http://cli-proxy-api:8317）。
+  // 地址**永远不由前端决定**（2026-09-25）。
+  // ------------------------------------------
+  // 这里原来读 `#o_base` 输入框，填了就作为 push.base 覆盖服务端配置。
+  // 两次现场故障都出在这个框上：
+  //   · 早期它硬编码 https://cpa.example.com → PUT 走公网被 Cloudflare 拦成
+  //     403 error code 1010（CF 的码，不是 CPA 拒绝配置），看着像「写回失败」；
+  //   · 2026-09-24 用户手填 `cli-proxy-api:8317`（少了 http://）→ 整次写回作废。
+  // 这个值唯一的正确来源是部署方在 docker-compose.yml 的 CPA_UPSTREAM_URL
+  // 里配的那个，服务端自己就有。界面改成只读回显（renderCpaHint），请求体
+  // 不再带 base —— 服务端用自己配的地址。
   //
-  // 为什么这么小心：这个输入框曾硬编码 https://cpa.example.com，
-  // 于是 PUT 走公网被 Cloudflare 拦成 403 error code 1010 —— 那是 CF 的码，
-  // 不是 CPA 拒绝了配置。看着像「写回失败」，其实是根本没打到 CPA。
-  const baseIn = $('#o_base').value.trim();
-  if (baseIn) body.push.base = baseIn;
+  // 服务端的地址白名单（_push_target_ok）**保留**：它现在防的是绕过界面
+  // 直接打 /api/apply 的调用方，而不是本页面。
   let d;
   try { d = await api('/api/apply', { method: 'POST', body }); }
   catch (e) {
@@ -3144,7 +3200,9 @@ $('#btnapply').onclick = async () => {
     d = await pollApply(d.task_id, d);
     if (!d) { btn.disabled = false; return; }
   }
-  $('#applymsg').textContent = '';
+  // 出错但已写盘时，pollApply 刚写进 #applymsg 的错误原文必须留着 ——
+  // 无条件清空会把唯一一条真实失败信息擦掉，只剩下面那个绿色成功面板。
+  if (d.state !== 'error') $('#applymsg').textContent = '';
 
   let verifyHtml = '';
   if (Array.isArray(d.verified) && d.verified.length) {
@@ -3191,7 +3249,20 @@ $('#btnapply').onclick = async () => {
       ${esc(d.reload_msg).split('\n').join('<br>')}<br>
       <span class="hint">磁盘已改，但不确定 CPA 用上了没有。它靠 inotify 发现
       改动，而 inotify 事件可能丢且**没有轮询兜底** —— 丢了就不会自愈。
-      最直接的确认办法：在 VPS 上 <code>docker restart cli-proxy-api</code>。</span></div>`;
+      最直接的确认办法：${cpaRestartHint()}。</span></div>`;
+  }
+
+  // 最后一道诚实闸（2026-09-25）：没写盘就不许出「✓ 已写回」面板。
+  // 这个面板的标题是静态的「✓ 已写回」，只要显示出来就等于向用户断言
+  // 「盘上已经改了」。后端在 written/backup/diffs 之外专门给了
+  // `local_written`，这里必须认它 —— 用 d.written 判是不够的：将来任何一条
+  // 早退路径只要漏填这三个字段，界面就又会变成「成功 + 一排空白」。
+  if (d.local_written !== true) {
+    $('#applymsg').innerHTML = `<span style="color:var(--bad)">
+      <b>写回未完成 —— config.yaml 未被改动。</b>
+      ${esc(d.error || d.reload_msg || d.push_msg || '后端未返回写盘回执')}</span>`;
+    btn.disabled = false;
+    return;
   }
 
   $('#donebody').innerHTML = reloadHtml + `
