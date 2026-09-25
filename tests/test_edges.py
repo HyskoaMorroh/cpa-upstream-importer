@@ -139,7 +139,7 @@ def _dead_section_params() -> None:
     sp = plan.sections.get("claude-api-key")
     eq("目录来源的判死段进得了方案", bool(sp is not None), True)
     if sp:
-        eq("模型取自目录", sp.models, ["claude-opus-5", "claude-sonnet-5"])
+        eq("模型取自目录", sp.models, ["claude-sonnet-5", "claude-opus-5-5"])
         eq("标注来源是目录", sp.model_source, "catalog")
         eq("priority 是确定的整数", bool(isinstance(sp.priority, int)), True)
         eq("priority >= 1", sp.priority >= 1, True)

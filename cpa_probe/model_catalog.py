@@ -1420,6 +1420,75 @@ def topup_to_market_top(section: str, models: list[str], *,
     # 只有站方没报过的才算「补齐」。站方已报的名字留在 `kept` 里，不是补齐。
     added = [n for n in added if n not in have]
 
+    # ── 阶段 C：同产品线、同主版本内，次版本只留最高（2026-09-25 现场根因）─
+    #
+    # 阶段 A 只比**主版本**，阶段 B 只决定「补什么」，两者都管不到
+    # 「同一条线、同一主版本里已保留的旧次版本」。于是这种形态会漏出去：
+    #
+    #     站方目录报 claude-opus-5        → station_top[claude-opus] = (5, 0)
+    #     市面名录有 claude-opus-5-5      → market_top[claude-opus]  = (5, 5)
+    #     阶段 A：同族主版本都是 5，claude-opus-5 不作废 → 进 kept
+    #     阶段 B：claude-opus-5-5 == lines[claude-opus] → 进 added
+    #     落盘   ['claude-opus-5', 'claude-opus-5-5']   ← 同版本高低两档并存
+    #
+    # 后果与 docx 第 3⑵ 条「每种类型只能选择该类型对应的最高级别模型」直接
+    # 冲突：两个都注册进 config.yaml，CPA 会把请求分给 5.0 那一档（旧档），
+    # 用户报的「模型勾选高低模型混乱错误」就是这个形状。
+    #
+    # 作用域**严格限定在同主版本内**，跨主版本归阶段 A —— 两者的用户裁定
+    # 不同，越界就会违反其中一条。详见 `_stale_minor` 的说明。
+    #
+    # 同代变体不受影响：`claude-opus-5-max` / `-thinking` / `-xhigh` 的世代
+    # 都是 (5, 0)，与 `claude-opus-5` 相等而非更低，`_stale_minor` 不命中。
+    # 那正是 docx 第 3⑵ 条「所有相同等级系列的模型全部都要勾选上」。
+    _line_top: dict[str, tuple[int, int]] = {}
+    for n in merged:
+        g = _cmp_gen(n)
+        if g is None:
+            continue                    # 认不出世代的（站方特供名）不参与
+        line = _product_line(n)
+        if line not in _line_top or g > _line_top[line]:
+            _line_top[line] = g
+
+    def _stale_minor(n: str) -> bool:
+        """同一产品线、**同一主版本**内，次版本更低的那些。
+
+        必须限定「同主版本」——跨主版本是阶段 A 的辖区，两者规则不同，
+        而用户对这两件事的裁定也不同，混在一起必然违反其中一条：
+
+            gpt-5.6   vs gpt-6-astra   主版本 5≠6 → 阶段 C **不管**
+              用户 2026-09-16 第 2 条：「检测出来最新模型 gpt-6 系列不通，
+              直接按最新模型 gpt-6 填充。但是次高级模型如 gpt-5.6 通的，
+              这个时候将 gpt-5.6 系列与 gpt-6 系列都勾选保留。」
+              → 两代都留，由阶段 A 的 proven / 站方报过豁免兑现。
+
+            claude-opus-5 vs claude-opus-5-5   主版本同为 5 → 阶段 C **管**
+              用户 2026-09-25：「claude-opus-5 与 claude-opus-5-5
+              后者为同一个版本较高版本」。
+              → 同一个版本的高低两档，只留高的；两个都注册会让 CPA
+                把请求分给旧档，即用户报的「高低模型混乱」。
+
+        不加这个限定时 `tests/test_full_redetect.py::
+        test_model_rules_no_dead_end` 会挂在 `gpt-5.6` 被丢掉上 —— 那条
+        断言从 924330f 起就锁着「两代都留」。
+        """
+        g = _cmp_gen(n)
+        if g is None:
+            return False
+        top = _line_top.get(_product_line(n))
+        return top is not None and g[0] == top[0] and g[1] < top[1]
+
+    _converged = [n for n in merged if not _stale_minor(n)]
+    _minor_drop: list[str] = []
+    if len(_converged) != len(merged):
+        _dropped_minor = [n for n in merged if _stale_minor(n)]
+        # 站方报过的名字被这一步裁掉时要进 `drop`，理由才会挂到界面警告上
+        # （「少了 claude-opus-5」必须追得到原因，不能悄悄消失）。
+        _minor_drop = [n for n in _dropped_minor if n in have]
+        drop = list(drop) + _minor_drop
+        added = [n for n in added if n in _converged]
+        merged = _converged
+
     if not added and not drop:
         # 站方清单已是市面最新：原样返回，**不做任何删改**。
         return list(models or []), [], ""
@@ -1428,10 +1497,20 @@ def topup_to_market_top(section: str, models: list[str], *,
     # plan.py 取走后写进该段的 model_warns，界面上能看见（「少了 gpt-5.6」
     # 这种事必须能追到原因，不能悄悄消失）。
     # 本模块刻意不引 logging —— 它是纯选型库，只依赖标准库与 urllib。
+    #
+    # 两种淘汰的措辞要分开：阶段 A 是**跨主版本换代**（gpt-5.6 → gpt-6），
+    # 阶段 C 是**同线次版本收敛**（claude-opus-5 → claude-opus-5-5）。
+    # 混用一句「按更高主版本淘汰」会让人去查一个不存在的主版本变化。
     if drop:
-        _LAST_MERGE_NOTES[section] = (
-            f"按市面更高主版本淘汰同族低代：{'、'.join(drop[:6])}"
-            + ("…" if len(drop) > 6 else ""))
+        _major_drop = [n for n in drop if n not in _minor_drop]
+        parts = []
+        if _major_drop:
+            parts.append(f"按市面更高主版本淘汰同族低代：{'、'.join(_major_drop[:6])}"
+                         + ("…" if len(_major_drop) > 6 else ""))
+        if _minor_drop:
+            parts.append(f"同一产品线只留最高世代，淘汰低次版本：{'、'.join(_minor_drop[:6])}"
+                         + ("…" if len(_minor_drop) > 6 else ""))
+        _LAST_MERGE_NOTES[section] = "；".join(parts)
 
     return merged, added, src
 
