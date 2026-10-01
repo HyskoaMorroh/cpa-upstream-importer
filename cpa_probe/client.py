@@ -224,22 +224,10 @@ def send(
     status = ""
     content_encoding = ""
     http_error = False
-    # 连接被中途掐断时重发一次（2026-10-01 加）。
-    # --------------------------------------
-    # 本机实测（Windows 回环、300 次连发）：约 3% 的请求拿到 WinError 10053
-    # 「An established connection was aborted by the software in your host
-    # machine」。真实上游上同一形态来自负载均衡回收空闲连接。
-    #
-    # 为什么必须在这一层重发：连接层失败回的是 `000`，而 `000` 按设计既不
-    # 计熔断也不重置状态码连击（见 `pipeline._bump_fail_streak`）—— 它的
-    # 含义是「没拿到回答」，确实不该当作站方的行为证据。代价是那把凭据会
-    # 重跑一次**完整探测**（单段约 7 次请求）。在这里补发 1 次，把代价从
-    # 「一次完整探测」降到「一次请求」，而且语义更准：连接被掐断本来就不是
-    # 一个答案。
-    #
-    # 只重发一次：真正不可达的站由 `ConnectionRefusedError` 走原路径立即
-    # 返回 `000`，不进重试；连发两次都被掐断，那就是真的有问题，交给上层。
-    attempts_left = 2
+    # 只对安全读取补发一次。连接中断不代表请求尚未被服务端执行：
+    # 自动重发 POST 可能重复生成、计费或写入；保持执行结果未知交给调用方。
+    # 已收到响应头后也不重新请求，避免把正文中断伪装成一次完整响应。
+    attempts_left = 2 if method.upper() in ("GET", "HEAD", "OPTIONS") else 1
     while True:
         attempts_left -= 1
         try:
@@ -264,8 +252,8 @@ def send(
             break
         except urllib.error.URLError as e:
             # URLError 把真正的原因包在 .reason 里，掐断类要看那一层。
-            if (attempts_left > 0 and _is_transient_conn_error(e.reason)
-                    and _time_left(deadline) > 0):
+            if (attempts_left > 0 and not status and _is_transient_conn_error(e.reason)
+                    and time.monotonic() < deadline):
                 continue
             return Response("000", "", int((time.monotonic() - t0) * 1000),
                             str(e.reason))
@@ -273,8 +261,8 @@ def send(
             return Response("000", "", int((time.monotonic() - t0) * 1000),
                             "timeout")
         except Exception as e:  # 兜底：SSL 错误等
-            if (attempts_left > 0 and _is_transient_conn_error(e)
-                    and _time_left(deadline) > 0):
+            if (attempts_left > 0 and not status and _is_transient_conn_error(e)
+                    and time.monotonic() < deadline):
                 continue
             return Response("000", "", int((time.monotonic() - t0) * 1000),
                             repr(e))

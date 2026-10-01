@@ -1338,7 +1338,8 @@ def remote_names(*, timeout: int = 8, proxy: str | None = None,
     否则模拟的目录会污染共享落盘缓存，断网测试也会误读先前的真实目录。
     """
     now = time.time()
-    if use_cache and _cache["names"] is not None:
+    key = (tuple(_CATALOG_URLS), proxy, timeout)
+    if use_cache and _cache.get("key") == key and _cache["names"] is not None:
         ttl = _TTL_OK if _cache["ok"] else _TTL_BAD
         if now - _cache["at"] < ttl:
             return list(_cache["names"]), _cache["why"]
@@ -1397,7 +1398,7 @@ def remote_names(*, timeout: int = 8, proxy: str | None = None,
 
     if best:
         if use_cache:
-            _cache.update(at=time.time(), names=best, ok=True, why="")
+            _cache.update(key=key, at=time.time(), names=best, ok=True, why="")
             _disk_cache_save(best)
         return list(best), ""
 
@@ -1412,75 +1413,75 @@ def remote_names(*, timeout: int = 8, proxy: str | None = None,
             why += "；该名录已超过 7 天，请尽快恢复出网或配置代理"
         if use_cache:
             # 标 ok=False：它不是实时数据，10 分钟后应该再试一次远程。
-            _cache.update(at=now, names=disk, ok=False, why=why)
+            _cache.update(key=key, at=now, names=disk, ok=False, why=why)
         return list(disk), why
 
     why = "；".join(errors) or "未知原因"
     if use_cache:
-        _cache.update(at=now, names=[], ok=False, why=why)
+        _cache.update(key=key, at=now, names=[], ok=False, why=why)
     return [], why
 
 
-# ---------------- 请求路径专用：只读缓存，过期后台刷新 ----------------
-#
-# 2026-10-01 加。`remote_names()` 在缓存冷时最坏等 `timeout + 4` 秒
-# （两个镜像并发 + as_completed 的余量），而 `server._market_top_gen` 在
-# `/api/context` 这条**首屏**路径上同步调它。国内 VPS 出网不通时：
-#   · 容器刚起那次首屏等满约 12 秒；
-#   · 失败缓存只有 10 分钟，所以每 10 分钟就再付一次；
-#   · 失败后 `_market_top_gen` 返回空 dict 且**不带任何原因**，
-#     前端只看到「市面世代」整块没有，表现为「参数缺失 / 字段全空」。
-#
-# 与 `cpa_source_probe.identity_nonblocking` 同一套解法：首次立刻返回
-# 空清单与一句自述原因，后台线程把真值填进 `_cache` 与落盘快照。
-# 判「目录是否落后」只是个增强信号，拿不到就不判，照常预勾 ——
-# 这正是 `_market_top_gen` 原来写在 docstring 里的降级语义。
+# 首屏只读缓存；实际探测仍等待完整结果。每个来源配置独立 single-flight，
+# 缓存有界，失败或旧磁盘快照沿用失败 TTL，不能冒充六小时内的实时数据。
 _NB_LOCK = threading.Lock()
-_NB_STATE: dict = {"at": 0.0, "names": None, "why": "", "inflight": False}
-_NB_TTL_OK = _TTL_OK
-_NB_TTL_BAD = _TTL_BAD
+_NB_STATE: dict = {}
+_NB_MAX_ENTRIES = 16
 
 
-def _nb_refresh(kwargs: dict) -> None:
+def _nb_refresh(key, entry, kwargs: dict) -> None:
     try:
         names, why = remote_names(**kwargs)
-    except Exception as e:                              # noqa: BLE001
-        names, why = [], f"名录刷新失败（{type(e).__name__}）"
+    except Exception as exc:                            # noqa: BLE001
+        names, why = [], f"名录刷新失败（{type(exc).__name__}）"
+    ttl = _TTL_OK if names and not why else _TTL_BAD
     with _NB_LOCK:
-        _NB_STATE.update(at=time.time(), names=names, why=why, inflight=False)
+        if _NB_STATE.get(key) is entry:
+            entry.update(at=time.time(), names=list(names), why=why,
+                         expires=time.time() + ttl, inflight=False)
 
 
 def remote_names_nonblocking(**kwargs) -> tuple[list[str], str]:
-    """请求路径上取 CPA 权威名录：**永不等待网络**。
-
-    回 (名字列表, 原因)。首次调用回 ([], "正在后台拉取…")，后台线程拉完
-    之后的调用就拿到真清单。原因字段永远非空当且仅当清单为空 ——
-    调用方必须把它展示出来，不能静默留白。
-    """
+    """首屏不等待网络；旧快照与失败结果必须携带来源说明。"""
+    if kwargs.get("use_cache", True) is False:
+        return [], "已禁用缓存；需要即时结果时请使用同步名录查询"
+    options = {"timeout": kwargs.get("timeout", 8), "proxy": kwargs.get("proxy")}
+    key = (tuple(_CATALOG_URLS), options["proxy"], options["timeout"])
     now = time.time()
     with _NB_LOCK:
-        names = _NB_STATE["names"]
-        ttl = _NB_TTL_OK if names else _NB_TTL_BAD
-        if names is not None and now - _NB_STATE["at"] < ttl:
-            return list(names), _NB_STATE["why"]
-        need = not _NB_STATE["inflight"]
+        entry = _NB_STATE.get(key)
+        if entry is None:
+            if len(_NB_STATE) >= _NB_MAX_ENTRIES:
+                completed = [k for k, value in _NB_STATE.items() if not value["inflight"]]
+                if not completed:
+                    return [], "名录刷新队列繁忙，请稍后重试"
+                del _NB_STATE[min(completed, key=lambda k: _NB_STATE[k]["at"])]
+            entry = {"at": 0., "names": [], "why": "", "expires": 0., "inflight": False}
+            _NB_STATE[key] = entry
+        names, why = list(entry["names"]), entry["why"]
+        if now < entry["expires"]:
+            return names, why
+        need = not entry["inflight"]
         if need:
-            _NB_STATE["inflight"] = True
-
+            entry["inflight"] = True
     if need:
-        threading.Thread(target=_nb_refresh, args=(kwargs,), daemon=True,
-                         name="model-catalog-refresh").start()
-
-    if names:
-        return list(names), _NB_STATE["why"]
-    return [], (_NB_STATE["why"]
-                or "权威名录正在后台拉取，本次不判断目录是否落后")
+        try:
+            threading.Thread(target=_nb_refresh, args=(key, entry, options),
+                             daemon=True, name="model-catalog-refresh").start()
+        except Exception as exc:                        # noqa: BLE001
+            why = f"名录刷新未启动（{type(exc).__name__}），可稍后重试"
+            with _NB_LOCK:
+                if _NB_STATE.get(key) is entry:
+                    entry.update(inflight=False, why=why)
+            return names, why
+    return names, why or ("正在后台刷新，暂用上次名录" if names
+                           else "权威名录正在后台拉取，本次不判断目录是否落后")
 
 
 def reset_remote_nonblocking() -> None:
-    """清空非阻塞缓存。供测试隔离用，产品代码不调。"""
+    """清空缓存；旧 worker 只能更新自己的条目，不能污染新一代状态。"""
     with _NB_LOCK:
-        _NB_STATE.update(at=0.0, names=None, why="", inflight=False)
+        _NB_STATE.clear()
 
 
 # ---------------- 第 3 层：内置兜底 ----------------

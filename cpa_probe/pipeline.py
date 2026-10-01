@@ -587,22 +587,10 @@ class Prober:
         # （profiles.defaults_from_config）。给 None 时回落内置常量 ——
         # 那些常量是从 CPA 源码抄录的，不是猜的，所以缺配置也能工作。
         self.cfg_snapshot = copy.deepcopy(cfg_snapshot or {})
-        # 身份快照走**非阻塞**入口（2026-10-01）。
-        #
-        # 原来这里调 `cached_identity(proxy=proxy)`，而那个函数在缓存冷时
-        # 要付满 `extract_remote` 的 60 秒预算 —— 三个仓库 17 次 GitHub
-        # 请求，国内 VPS 直连不通是常态。本机实测（Python 3.14，直连）：
-        #     Prober(...) 冷 26.5 秒 / 热 0.00 秒
-        # 而 `Prober` 是**每个探测任务开工时**构造的，于是单站检测、添加
-        # 账号、全量重探三条路都在真正发第一个请求之前先空等 26–60 秒。
-        # 前端那边的表现正是「定档轮询无响应」与「全量检测半天不动」。
-        #
-        # `identity_nonblocking` 首次回空快照（自述不完整）并在后台把真值
-        # 填进缓存，秒级后所有调用就跟上了。画像梯与 codex 形态在拿不到
-        # 身份时本来就按内置默认走（那些常量从 CPA 源码抄录，不是猜的），
-        # 所以首个任务最多少一次源码级校正，不会误判。
-        from .cpa_source_probe import identity_nonblocking
-        self.source_identity = copy.deepcopy(identity_nonblocking(proxy=proxy))
+        # 后台探测任务先取得完整身份，再固定本轮快照；不把“仍在加载”
+        # 的空身份复制成整轮依据。HTTP 任务创建接口仍以 202 立即返回。
+        from .cpa_source_probe import cached_identity
+        self.source_identity = copy.deepcopy(cached_identity(proxy=proxy))
         self.session_id = uuid.uuid4().hex
         self.client_headers = dict(self.cfg_snapshot.get("probe-client-headers") or {})
         self._cancelled = threading.Event()

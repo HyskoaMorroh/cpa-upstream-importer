@@ -823,21 +823,29 @@ codex-api-key:
         scrub_py = root / "tools" / "scrub.py"
         self.assertTrue(scrub_py.is_file(), "提交前脱敏工具不在了")
 
-        namespace: dict = {}
-        exec(compile(scrub_py.read_text(encoding="utf-8"),
-                     str(scrub_py), "exec"), namespace)
-        # 映射表非空，且每一项都是「真实值 → 占位符」
-        domain_map = namespace.get("DOMAIN_MAP") or []
-        self.assertTrue(domain_map, "DOMAIN_MAP 空 —— 提交脱敏等于没做")
-        for real, code in domain_map:
-            self.assertTrue(real and code and real != code, (real, code))
+        # 公开测试只用合成映射；CI 不得依赖本机真实域名对照表。
+        namespace: dict = {"__file__": str(scrub_py)}
+        with patch("os.path.isfile", return_value=False):
+            exec(compile(scrub_py.read_text(encoding="utf-8"),
+                         str(scrub_py), "exec"), namespace)
+        self.assertEqual([], namespace["DOMAIN_MAP"])
+        namespace["DOMAIN_MAP"] = [("private-fixture.invalid", "fixture.example")]
+        namespace["LABEL_MAP"] = []
+        out, count = namespace["scrub"]("base-url: https://private-fixture.invalid/v1")
+        self.assertEqual("base-url: https://fixture.example/v1", out)
+        self.assertEqual(1, count)
 
-        # 脱敏函数真的替换，而不是原样返回
-        scrub = namespace["scrub"]
-        sample_real = domain_map[0][0]
-        out, count = scrub(f"base-url: https://{sample_real}/v1")
-        self.assertNotIn(sample_real, out)
-        self.assertGreaterEqual(count, 1)
+    def test_missing_private_map_never_applies_changes(self):
+        root = Path(__file__).resolve().parents[1]
+        scrub_py = root / "tools" / "scrub.py"
+        namespace = {"__file__": str(scrub_py)}
+        with patch("os.path.isfile", return_value=False):
+            exec(compile(scrub_py.read_text(encoding="utf-8"),
+                         str(scrub_py), "exec"), namespace)
+        def must_not_scan():
+            raise AssertionError("missing-map apply must stop before scanning or editing")
+        namespace["targets"] = must_not_scan
+        self.assertNotEqual(0, namespace["main"](["--apply"]))
 
     def test_inconsistent_final_preview_is_invalid_and_cannot_be_applied(self):
         row = server.cp.parse_lines("https://fixture.invalid/v1,fixture-plan-key").valid[0]

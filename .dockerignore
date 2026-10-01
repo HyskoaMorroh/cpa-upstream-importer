@@ -90,3 +90,15 @@ Thumbs.db
 desktop.ini
 .git/
 .gitignore
+
+# Local audit material must not enter the build context.
+.claude/
+.graphify/
+.planning/
+MEMORY.md
+**/*handoff*.md
+docs/tutorial.html
+*.mhtml
+*.docx
+*.pdf
+Dockerfile.wt

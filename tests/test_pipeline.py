@@ -426,6 +426,7 @@ def test_dead_section_shape_is_cached():
             pass
 
         def _all(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
             hits.append(self.path)
             b = mode["body"].encode()
             self.send_response(403)
@@ -441,23 +442,9 @@ def test_dead_section_shape_is_cached():
     # 那两步之间有窗口 —— 全套跑 11 个套件、4 个起真 HTTP 服务，同一台机器短时间
     # 反复分配端口，窗口里被抢到就 OSError（Windows 上是 WinError 10048）。
     # 实测吻合：只在 run.py 全链跑时出现、两次分别落在起服务的两个套件、不可复现。
-    # 监听队列放到 128（2026-10-01）。默认 5 在**全链跑**时不够：11 个套件
-    # 里有 4 个起真 HTTP 服务，负载一高，内核就把排不进队列的连接直接拒掉，
-    # 探测侧记成 `000`。而 `000` 按设计既不计熔断也不重置连击（见
-    # `_bump_fail_streak`），于是那把 Key 会**正确地**重探一次 —— 断言
-    # 「后 4 把零请求」便偶发失败。单跑与并发 6 份都稳定通过，只有全链跑
-    # 偶发，正是这个形状。
-    #
-    # 这是**夹具**的容量问题，不是被测逻辑的问题：真实上游不会在 5 个
-    # 连接时拒服务。所以修夹具，不放宽断言 —— 放宽等于把「负缓存失效」
-    # 这条真缺陷的探针一起钝化掉。
-    #
-    # 必须在 bind 之前设：`request_queue_size` 是 `server_activate()` 里
-    # listen() 的实参，而默认构造函数已经把 bind+activate 都做完了。
-    class _Deep(ThreadingHTTPServer):
-        request_queue_size = 128
-
-    srv = _Deep(("127.0.0.1", 0), _Fake)
+    # 先读完请求正文再回响应；带未读正文关闭连接会让客户端看到 RST。
+    # 不能用生产 POST 自动重试来掩盖夹具的问题。
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Fake)
     port = srv.server_address[1]
     _threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{port}"
@@ -522,7 +509,7 @@ def test_dead_section_shape_is_cached():
                f"实测 {gated} 次，首个 Key 自己就 {first_key_calls} 次；"
                f"状态码分布 {_codes}，逐 Key 请求数 "
                f"{[r.total_calls for r in results]} —— 若分布里有 000，"
-               f"是本地假上游在高负载下拒连（夹具容量），不是负缓存失效")
+               f"需结合连接错误与服务端日志判断原因，不能仅凭 000 归因")
         # 结论要传下去，且说清是复用的
         #
         # 同理放宽（2026-09-18）：偶发 `000` 的那把 Key 会真探一次，它拿到的
@@ -598,6 +585,7 @@ def test_temp_failure_circuit_breaker():
             pass
 
         def _all(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
             hits.append(self.path)
             if mode["alternate"]:
                 # 真在抖的站：不同**段**给不同码（502 / 429 交替），
@@ -635,23 +623,9 @@ def test_temp_failure_circuit_breaker():
 
         do_GET = do_POST = _all
 
-    # 监听队列放到 128（2026-10-01）。默认 5 在**全链跑**时不够：11 个套件
-    # 里有 4 个起真 HTTP 服务，负载一高，内核就把排不进队列的连接直接拒掉，
-    # 探测侧记成 `000`。而 `000` 按设计既不计熔断也不重置连击（见
-    # `_bump_fail_streak`），于是那把 Key 会**正确地**重探一次 —— 断言
-    # 「后 4 把零请求」便偶发失败。单跑与并发 6 份都稳定通过，只有全链跑
-    # 偶发，正是这个形状。
-    #
-    # 这是**夹具**的容量问题，不是被测逻辑的问题：真实上游不会在 5 个
-    # 连接时拒服务。所以修夹具，不放宽断言 —— 放宽等于把「负缓存失效」
-    # 这条真缺陷的探针一起钝化掉。
-    #
-    # 必须在 bind 之前设：`request_queue_size` 是 `server_activate()` 里
-    # listen() 的实参，而默认构造函数已经把 bind+activate 都做完了。
-    class _Deep(ThreadingHTTPServer):
-        request_queue_size = 128
-
-    srv = _Deep(("127.0.0.1", 0), _Fake)
+    # 先读完请求正文再回响应；带未读正文关闭连接会让客户端看到 RST。
+    # 不能用生产 POST 自动重试来掩盖夹具的问题。
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Fake)
     port = srv.server_address[1]
     _threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{port}"

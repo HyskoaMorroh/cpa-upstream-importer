@@ -42,41 +42,39 @@ SUITES = ["test_probe.py", "test_server.py", "test_pipeline.py",
           "test_effort_tier_gate.py", "test_generation_siblings.py",
           "test_plan_capacity.py", "test_priority_invariants.py",
           "test_public_redaction.py", "test_recovery_catalog.py",
-          "test_request_path_latency.py", "test_transient_connection.py"]
+          "test_request_path_latency.py", "test_transient_connection.py",
+          "test_release_gate.py"]
 
 # 前端用例跑在 Node 上，`web/app.js` 的真实函数由 vm 直接取源码执行。
 # 它们原来只能手跑，于是「python tests/run.py 全绿」从来不包含前端 ——
 # 而现场报的「定档失败 Failed to fetch」「轮询无响应」「黑屏」全在这一层。
-# Node 缺失时标记为跳过而不是静默通过：跳过会出现在汇总里。
+# Node 缺失、超时或没有执行用例均为失败，发布闸不能部分验证却报全绿。
 NODE_SUITES = ["test_web_runtime.test.js", "test_recovery_web.test.js"]
 
 
 def _run_node_suites() -> tuple[int, list[str], str]:
-    """回 (通过项数, 失败套件, 跳过原因)。"""
+    """回 (通过项数, 失败套件, 失败说明)。缺少运行时不放行。"""
+    label = "+".join(NODE_SUITES)
     try:
         probe = subprocess.run(["node", "--version"], capture_output=True,
                                text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError) as e:
-        return 0, [], f"没跑前端用例：node 不可用（{type(e).__name__}）"
-    if probe.returncode:
-        return 0, [], "没跑前端用例：node --version 返回非 0"
-
-    paths = [os.path.join(HERE, s) for s in NODE_SUITES]
-    print(f"\n{'#' * 66}\n# {' '.join(NODE_SUITES)}（Node）\n{'#' * 66}")
-    r = subprocess.run(["node", "--test", *paths], capture_output=True,
-                       text=True, encoding="utf-8", errors="replace",
-                       timeout=600)
-    out = (r.stdout or "") + "\n" + (r.stderr or "")
-    passed = 0
-    for line in out.splitlines():
-        m = re.match(r"^.\s*pass (\d+)$", line.strip())
-        if m:
-            passed = int(m.group(1))
-    if r.returncode:
+        if probe.returncode:
+            return 0, [label], "前端验证失败：node --version 返回非 0"
+        paths = [os.path.join(HERE, name) for name in NODE_SUITES]
+        r = subprocess.run(["node", "--test", "--test-reporter=tap", *paths],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=600)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 0, [label], f"前端验证未完成（{type(exc).__name__}）"
+    out = (r.stdout or "") + chr(10) + (r.stderr or "")
+    match = re.search(r"(?m)^# pass (\d+)$", out)
+    passed = int(match.group(1)) if match else 0
+    if r.returncode or not passed:
         for line in out.splitlines():
-            if line.startswith("✖") or "AssertionError" in line:
+            if line.lstrip().startswith("not ok") or "AssertionError" in line:
                 print(line[:300])
-        return passed, ["+".join(NODE_SUITES)], ""
+        return passed, [label], "前端运行时测试失败或没有执行任何用例"
+    print(f"前端运行时测试通过 · {passed} 项")
     return passed, [], ""
 
 

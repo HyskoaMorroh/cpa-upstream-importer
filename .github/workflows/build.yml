@@ -107,6 +107,10 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: 装依赖
         run: pip install "PyYAML==6.0.2" "bcrypt==4.2.1"
 
