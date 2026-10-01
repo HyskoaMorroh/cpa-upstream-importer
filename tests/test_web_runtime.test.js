@@ -135,7 +135,7 @@ function applyContext(first, states = []) {
     },
   };
   vm.createContext(context);
-  for (const name of ['pollApply', 'tnPoll', 'awaitApplyReceipt', 'applyReceiptHtml']) {
+  for (const name of ['classifyPollError', 'pollApply', 'tnPoll', 'awaitApplyReceipt', 'applyReceiptHtml']) {
     if (source.includes(`function ${name}(`)) vm.runInContext(sourceFunction(name), context);
   }
   return {context, nodes, calls};

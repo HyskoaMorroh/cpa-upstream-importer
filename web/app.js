@@ -2644,22 +2644,33 @@ function bindResultEvents() {
         // 导出端点要序列化整个任务日志（全量重探可达数 MB），网关慢一点
         // 就永久挂着，而 `alert(e.message)` 会把 `Failed to fetch` 原样弹出，
         // api() 为此专门做的文案改写在这条路上完全无效。
+        // 截止时间要盖住**整次导出**，包括读 body 那一段。
+        // 2026-10-01 二次修：上一版把 clearTimeout 放在只包 fetch() 的
+        // finally 里 —— 响应头一到就把定时器清了，而导出端点正是「头很快
+        // 回、body 慢慢流」的形状（服务端边序列化边写）。于是 `r.blob()`
+        // 在网关半死时永久挂着，按钮停在「导出中…」且 disabled，和没有
+        // 超时完全一样。api() 为同一个坑做过同样的修（见 tests/
+        // test_web_runtime.test.js 第一项），这条路当时漏了。
         const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
         const tm = ac ? setTimeout(() => ac.abort(), 120000) : null;
         let r;
+        let blob;
         try {
           r = await fetch(`/api/export/${encodeURIComponent(S.jobId)}`,
             { headers: { Authorization: 'Bearer ' + S.token },
               signal: ac ? ac.signal : undefined });
+          if (!r.ok) throw new Error(`导出失败 ${r.status}`);
+          blob = await r.blob();
         } catch (err) {
-          throw new Error(err && err.name === 'AbortError'
-            ? '导出超时（120 秒）—— 日志太大或网关慢。任务仍在服务端，可稍后重试。'
-            : '导出请求没能发出去（网络或网关中断）—— 页面没坏，重试即可。');
+          if (err && err.name === 'AbortError') {
+            throw new Error('导出超时（120 秒）—— 日志太大或网关慢。任务仍在服务端，可稍后重试。');
+          }
+          // `导出失败 NNN` 是上面自己抛的，原样传出去，别被套成网络错误。
+          if (err && /^导出失败 /.test(err.message || '')) throw err;
+          throw new Error('导出请求没能发出去（网络或网关中断）—— 页面没坏，重试即可。');
         } finally {
           if (tm) clearTimeout(tm);
         }
-        if (!r.ok) throw new Error(`导出失败 ${r.status}`);
-        const blob = await r.blob();
         const cd = r.headers.get('Content-Disposition') || '';
         const m = /filename="([^"]+)"/.exec(cd);
         const url = URL.createObjectURL(blob);
@@ -2686,7 +2697,19 @@ function bindResultEvents() {
 }
 
 function applyPickPreset(mode) {
-  if (!S.plans) return;
+  if (!S.plans) {
+    // 静默 return 等于「点了没反应」（2026-10-01 修）。
+    // --------------------------------------------------
+    // 首轮定档还没回、或定档失败时 `S.plans` 是 null，三个预设按钮照样
+    // 可点，点下去这里直接 return —— 界面上毫无变化。这正是本函数末尾
+    // 那段注释要修的「点下去界面没有任何回应」，只是当时只处理了成功
+    // 路径，这条早退分支漏了。
+    _pickWhy = S.jobId
+      ? '方案还没算出来 —— 等③的定档完成后再用预设勾选；若③报了错，先按它的提示处理。'
+      : '还没有探测结果 —— 先完成②的探测，③出方案后预设勾选才有东西可勾。';
+    syncPickUI();
+    return;
+  }
   // 「全勾」就是全勾 —— 不看判定状态。很多站不给测活却能用，按判定筛
   // 等于把可用站扔掉。唯一不勾的是 duplicate（撞已有 Key，写进去是重复条目）。
   // 「只勾推荐项」保持按 recommended 筛，那才是让工具替你判断的入口。
@@ -3508,22 +3531,57 @@ function confirmWeakEvidence(payload) {
 async function pollApply(taskId, first, box = $('#applymsg')) {
   let last = first || {};
   let fails = 0;
+  let attempt = 0;
   for (;;) {
     await new Promise((r) => setTimeout(r, 900));
     let st;
     try {
       st = await api(`/api/apply-status/${encodeURIComponent(taskId)}`);
       fails = 0;
+      attempt = 0;
     } catch (e) {
+      // 与定档轮询用同一个分类器（2026-10-01）。
+      // ------------------------------------
+      // 原来这里只有一个 `fails` 计数器：404/410/401 与网络抖动走同一条
+      // 路，白重试 20 次 × 900ms ≈ 18 秒才报「结果未知」。而这三种的处置
+      // 完全不同 —— 任务已不在服务端（重启/淘汰）时重试一万次也没用，
+      // 该立刻告诉操作员「服务重启过，这次写回的结果要去配置里核对」。
+      // 定档那条轮询 2026-09 就改用 classifyPollError 了，这条漏了。
+      const cls = classifyPollError(e, attempt);
+      const wrote = last.local_written === true;
+      const head = wrote
+        ? '已确认本地写盘，但后续结果未知'
+        : '写回结果未知，无法确认配置是否写入';
+      if (cls.kind === 'expired') {
+        box.innerHTML = `<span style="color:var(--${wrote ? 'warn' : 'bad'})">
+          <b>${head}</b> —— 任务 ${esc(taskId)} 已不在服务端
+          （服务重启或任务仓淘汰）。请刷新页面，并到「参考 · 当前档位谱」
+          核对这次写回是否已生效，不要直接重复提交。</span>`;
+        return null;
+      }
+      if (cls.kind === 'auth') {
+        box.innerHTML = `<span style="color:var(--bad)"><b>${head}</b>
+          —— 登录已失效，请重新进入后再核对任务 ${esc(taskId)} 的结果。</span>`;
+        return null;
+      }
+      attempt += 1;
+      if (cls.kind === 'throttled') {
+        // 限流不是「无响应」，不该计进失败数 —— 否则一次网关限流就能
+        // 把一次正常的写回判成结果未知。
+        box.innerHTML = `<span class="spin"></span> 网关限流，
+          <span class="hint">${Math.round(cls.wait / 1000)} 秒后重试</span>`;
+        await new Promise((r) => setTimeout(r, cls.wait));
+        continue;
+      }
       fails += 1;
       if (fails >= 20) {
-        const wrote = last.local_written === true;
         box.innerHTML = `<span style="color:var(--${wrote ? 'warn' : 'bad'})">
-          <b>${wrote ? '已确认本地写盘，但后续结果未知' : '写回结果未知，无法确认配置是否写入'}</b>
+          <b>${head}</b>
           —— 轮询中断（${esc(e.message)}）。任务 ${esc(taskId)} 的状态尚未确认，
           请恢复状态查询后再操作，不要重复提交。</span>`;
         return null;
       }
+      if (cls.wait) await new Promise((r) => setTimeout(r, cls.wait));
       continue;
     }
     if (!st || !['running', 'done', 'error'].includes(st.state)) {

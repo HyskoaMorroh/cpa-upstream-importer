@@ -1688,8 +1688,8 @@ def _clean_override_models(section: str, raw_models: list) -> list[str]:
     return kept
 
 
-def _market_top_gen(cfg: dict) -> tuple[dict, dict]:
-    """各段「当前市面最新」的最高世代。返回 (全局, 逐产品线)。
+def _market_top_gen(cfg: dict) -> tuple[dict, dict, str]:
+    """各段「当前市面最新」的最高世代。返回 (全局, 逐产品线, 缺失原因)。
 
     全局形如 `{"codex-api-key": [5, 6]}`，逐产品线形如
     `{"codex-api-key": {"gpt": [5, 6], "o": [4, 0]}}`。
@@ -1707,13 +1707,21 @@ def _market_top_gen(cfg: dict) -> tuple[dict, dict]:
     后端在 build_plan 里判同一件事（catalog_is_stale），但结果表在勾选**之前**
     就渲染了，那时还没有 /api/plan 的响应 —— 所以两边都要能判。
 
-    走 model_catalog 自己的缓存（成功 6 小时 / 失败 10 分钟），不会拖慢
-    /api/context；拉不到时返回空 dict，前端退化成「不判落后、照常预勾」。
+    走 model_catalog 的**非阻塞**入口（2026-10-01 改）：这条路在
+    `/api/context` 的首屏请求里，而 `remote_names()` 冷缓存时最坏等
+    `timeout + 4` ≈ 12 秒。国内 VPS 出网不通时那 12 秒每 10 分钟重付
+    一次（失败缓存 TTL），表现就是「打开页面半天空白、参数全缺」。
+
+    第三个返回值是**缺失原因**：拿不到名录时绝不静默回空 dict ——
+    空 dict 在前端看来与「市面没有更新的世代」无法区分，而两者的含义
+    相反（一个是没数据，一个是数据说不落后）。
     """
     out: dict[str, list[int]] = {}
     by_line: dict[str, dict[str, list[int]]] = {}
     try:
-        remote, _why = cp.model_catalog.remote_names()
+        remote, why = cp.model_catalog.remote_names_nonblocking()
+        if not remote:
+            return {}, {}, (why or "权威名录暂不可用")
         for sec in cp.SECTIONS:
             names, _src = cp.model_catalog.latest_models(
                 sec, cfg=cfg, remote=remote, limit=12)
@@ -1723,11 +1731,12 @@ def _market_top_gen(cfg: dict) -> tuple[dict, dict]:
             per = cp.model_catalog.top_generation_per_line(names)
             if per:
                 by_line[sec] = {ln: [g[0], g[1]] for ln, g in per.items()}
-    except Exception:                                    # noqa: BLE001
+    except Exception as e:                               # noqa: BLE001
         # 这只是个增强信号，绝不能让它影响 /api/context 的可用性 ——
         # 与漂移检测同一条原则（那次它把首屏卡成了白屏）。
-        return {}, {}
-    return out, by_line
+        # 但要把原因带出去，否则前端分不清「没数据」与「数据说不落后」。
+        return {}, {}, f"世代信号计算失败（{type(e).__name__}）"
+    return out, by_line, ""
 
 
 def _cpa_runtime_commit(base: str, mgmt: str = "") -> str:
@@ -3046,7 +3055,7 @@ class Handler(BaseHTTPRequestHandler):
         existing_count = len(existing_entries)
 
         # 「市面最新世代」的两份：全局与逐产品线。见 _market_top_gen。
-        mkt_top, mkt_top_lines = _market_top_gen(cfg)
+        mkt_top, mkt_top_lines, mkt_why = _market_top_gen(cfg)
 
         # 运行环境与推荐并发数。前端要显示「为什么是这个数」，所以连
         # 依据（cpus/memory/来源/reason）一起给，不只给一个数字。
@@ -3100,6 +3109,9 @@ class Handler(BaseHTTPRequestHandler):
             # o 系列与 gpt 系列的编号互不相干（`o3` 不比 `gpt-5.6` 老一代）。
             # 见 _market_top_gen 与 catalog_is_stale。
             "market_top_gen_lines": mkt_top_lines,
+            # 空信号必须自述原因：空 dict 在前端看来与「市面没有更新的
+            # 世代」无法区分，而两者含义相反（没数据 vs 数据说不落后）。
+            "market_top_gen_why": mkt_why,
             # 三张内存表的条数。有上限与 TTL（见 Store 的 docstring），
             # 这里露出来是为了让运维看得见有没有堆积 —— 那三张表里
             # plans 每份持有两份整份配置，是 OOM 的主要来源。

@@ -38,7 +38,46 @@ SUITES = ["test_probe.py", "test_server.py", "test_pipeline.py",
           "test_priority_consistency.py", "test_sub2api_source.py",
           "test_source_compliance.py", "test_transport_compliance.py",
           "test_writeback_compliance.py", "test_planning_compliance.py",
-          "test_probe_compliance.py", "test_api_compliance.py"]
+          "test_probe_compliance.py", "test_api_compliance.py",
+          "test_effort_tier_gate.py", "test_generation_siblings.py",
+          "test_plan_capacity.py", "test_priority_invariants.py",
+          "test_public_redaction.py", "test_recovery_catalog.py",
+          "test_request_path_latency.py", "test_transient_connection.py"]
+
+# 前端用例跑在 Node 上，`web/app.js` 的真实函数由 vm 直接取源码执行。
+# 它们原来只能手跑，于是「python tests/run.py 全绿」从来不包含前端 ——
+# 而现场报的「定档失败 Failed to fetch」「轮询无响应」「黑屏」全在这一层。
+# Node 缺失时标记为跳过而不是静默通过：跳过会出现在汇总里。
+NODE_SUITES = ["test_web_runtime.test.js", "test_recovery_web.test.js"]
+
+
+def _run_node_suites() -> tuple[int, list[str], str]:
+    """回 (通过项数, 失败套件, 跳过原因)。"""
+    try:
+        probe = subprocess.run(["node", "--version"], capture_output=True,
+                               text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        return 0, [], f"没跑前端用例：node 不可用（{type(e).__name__}）"
+    if probe.returncode:
+        return 0, [], "没跑前端用例：node --version 返回非 0"
+
+    paths = [os.path.join(HERE, s) for s in NODE_SUITES]
+    print(f"\n{'#' * 66}\n# {' '.join(NODE_SUITES)}（Node）\n{'#' * 66}")
+    r = subprocess.run(["node", "--test", *paths], capture_output=True,
+                       text=True, encoding="utf-8", errors="replace",
+                       timeout=600)
+    out = (r.stdout or "") + "\n" + (r.stderr or "")
+    passed = 0
+    for line in out.splitlines():
+        m = re.match(r"^.\s*pass (\d+)$", line.strip())
+        if m:
+            passed = int(m.group(1))
+    if r.returncode:
+        for line in out.splitlines():
+            if line.startswith("✖") or "AssertionError" in line:
+                print(line[:300])
+        return passed, ["+".join(NODE_SUITES)], ""
+    return passed, [], ""
 
 
 def _force_utf8_stdout() -> None:
@@ -152,7 +191,13 @@ def main() -> None:
             # 让半数套件的项数静默消失。
             total_ok += _count_cases(out) or _count_cases(r.stderr or "")
 
+    node_ok, node_failed, node_skip = _run_node_suites()
+    total_ok += node_ok
+    failed.extend(node_failed)
+
     print(f"\n{'=' * 66}")
+    if node_skip:
+        print(node_skip)
     if failed:
         print(f"失败套件：{', '.join(failed)}")
         sys.exit(1)

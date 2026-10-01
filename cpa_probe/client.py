@@ -167,6 +167,25 @@ def _read_body(resp) -> bytes:
     return raw
 
 
+def _is_transient_conn_error(exc: BaseException) -> bool:
+    """这次失败是「连接被中途掐断」而不是「对方不在」或「对方很慢」吗？
+
+    只认三类 —— 它们的共同点是**连接已经建立、随后被对端或本机网络栈
+    中断**，重发一次通常就过：
+        · ConnectionAbortedError  Windows WinError 10053
+        · ConnectionResetError    对端 RST（负载均衡回收空闲连接最常见）
+        · BrokenPipeError         写请求时对端已关
+
+    刻意**不**包含这两类：
+        · ConnectionRefusedError —— 对方根本没在听，重试只是把失败乘以二。
+        · TimeoutError / socket.timeout —— 已经花掉调用方的全部预算，
+          再来一次等于把最慢的那批站的墙钟时间翻倍。超时该由上层的
+          `_FAIL_STREAK_LIMIT` 熔断处理，不在这一层重发。
+    """
+    return isinstance(exc, (ConnectionAbortedError, ConnectionResetError,
+                            BrokenPipeError))
+
+
 def send(
     url: str,
     *,
@@ -205,33 +224,60 @@ def send(
     status = ""
     content_encoding = ""
     http_error = False
-    try:
-        with _opener(proxy, deadline=deadline).open(
-            req, timeout=_time_left(deadline)
-        ) as resp:
-            status = str(resp.status)
-            content_encoding = resp.headers.get("Content-Encoding", "")
-            raw = _read_body(resp)
-    except urllib.error.HTTPError as e:
-        # 状态码先记下 —— 它已经到手且有价值（403 就是 403，正文读不全
-        # 不改变这个事实）。正文单独一段读，失败也不丢状态码。
-        status = str(e.code)
-        http_error = True
+    # 连接被中途掐断时重发一次（2026-10-01 加）。
+    # --------------------------------------
+    # 本机实测（Windows 回环、300 次连发）：约 3% 的请求拿到 WinError 10053
+    # 「An established connection was aborted by the software in your host
+    # machine」。真实上游上同一形态来自负载均衡回收空闲连接。
+    #
+    # 为什么必须在这一层重发：连接层失败回的是 `000`，而 `000` 按设计既不
+    # 计熔断也不重置状态码连击（见 `pipeline._bump_fail_streak`）—— 它的
+    # 含义是「没拿到回答」，确实不该当作站方的行为证据。代价是那把凭据会
+    # 重跑一次**完整探测**（单段约 7 次请求）。在这里补发 1 次，把代价从
+    # 「一次完整探测」降到「一次请求」，而且语义更准：连接被掐断本来就不是
+    # 一个答案。
+    #
+    # 只重发一次：真正不可达的站由 `ConnectionRefusedError` 走原路径立即
+    # 返回 `000`，不进重试；连发两次都被掐断，那就是真的有问题，交给上层。
+    attempts_left = 2
+    while True:
+        attempts_left -= 1
         try:
-            with e:
-                content_encoding = e.headers.get("Content-Encoding", "")
-                raw = _read_body(e)
-        except Exception as read_err:      # noqa: BLE001
-            err = f"正文读取失败：{read_err!r}"
-    except urllib.error.URLError as e:
-        return Response("000", "", int((time.monotonic() - t0) * 1000),
-                        str(e.reason))
-    except (socket.timeout, TimeoutError):
-        return Response("000", "", int((time.monotonic() - t0) * 1000),
-                        "timeout")
-    except Exception as e:  # 兜底：SSL 错误等
-        return Response("000", "", int((time.monotonic() - t0) * 1000),
-                        repr(e))
+            with _opener(proxy, deadline=deadline).open(
+                req, timeout=_time_left(deadline)
+            ) as resp:
+                status = str(resp.status)
+                content_encoding = resp.headers.get("Content-Encoding", "")
+                raw = _read_body(resp)
+            break
+        except urllib.error.HTTPError as e:
+            # 状态码先记下 —— 它已经到手且有价值（403 就是 403，正文读不全
+            # 不改变这个事实）。正文单独一段读，失败也不丢状态码。
+            status = str(e.code)
+            http_error = True
+            try:
+                with e:
+                    content_encoding = e.headers.get("Content-Encoding", "")
+                    raw = _read_body(e)
+            except Exception as read_err:      # noqa: BLE001
+                err = f"正文读取失败：{read_err!r}"
+            break
+        except urllib.error.URLError as e:
+            # URLError 把真正的原因包在 .reason 里，掐断类要看那一层。
+            if (attempts_left > 0 and _is_transient_conn_error(e.reason)
+                    and _time_left(deadline) > 0):
+                continue
+            return Response("000", "", int((time.monotonic() - t0) * 1000),
+                            str(e.reason))
+        except (socket.timeout, TimeoutError):
+            return Response("000", "", int((time.monotonic() - t0) * 1000),
+                            "timeout")
+        except Exception as e:  # 兜底：SSL 错误等
+            if (attempts_left > 0 and _is_transient_conn_error(e)
+                    and _time_left(deadline) > 0):
+                continue
+            return Response("000", "", int((time.monotonic() - t0) * 1000),
+                            repr(e))
 
     text = ""
     if not err:

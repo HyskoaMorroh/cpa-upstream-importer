@@ -2582,15 +2582,20 @@ gemini-api-key:
     fams = {mc.family(m) for m in got}
     assert len(fams) >= 3, f"compat 前 4 个只覆盖 {fams}：{got}"
 
-    # ── ⑦ 失败也缓存 ——「拉不通的环境每次都慢」那个坑不许回来 ──
+    # ── ⑦ 没有历史快照时，失败也缓存；测试不依赖公网或共享磁盘 ──
+    # 落盘兜底加入后，其他用例留下的成功快照使旧断言在 CI 三个平台全失败。
+    # 保留「确实没有快照则返回空、下次不重发」的契约；有快照路径独立测试。
+    from unittest.mock import patch
     mc._cache.update(at=0.0, names=None, ok=False, why="")
-    names, why = mc.remote_names(timeout=1, proxy="http://10.255.255.1:9")
-    assert names == [] and why, (names, why)
-    assert mc._cache["names"] is not None, "失败必须写缓存"
-    assert mc._cache["ok"] is False
-    t0 = time.time()
-    again, _why2 = mc.remote_names(timeout=1, proxy="http://10.255.255.1:9")
-    assert again == [] and time.time() - t0 < 0.5, "命中负缓存该是瞬时的"
+    with patch.object(mc, "_disk_cache_load", return_value=([], 0.0)), \
+            patch.object(mc, "_http_json", side_effect=OSError("offline")) as fetch:
+        names, why = mc.remote_names(timeout=1)
+        assert names == [] and why, (names, why)
+        assert mc._cache["names"] is not None, "失败必须写缓存"
+        assert mc._cache["ok"] is False
+        calls = fetch.call_count
+        again, _why2 = mc.remote_names(timeout=1)
+        assert again == [] and fetch.call_count == calls, "命中负缓存不能重新请求"
     assert mc._TTL_BAD < mc._TTL_OK
     mc._cache.update(at=0.0, names=None, ok=False, why="")
 
@@ -4190,7 +4195,9 @@ codex-api-key:
     # 提醒重新评估要不要探。
     import os as _os
 
-    prod = "~/OneDrive/Desktop/fsdownload/config.yaml"
+    # 真实 config.yaml 的位置由环境给，不写死个人路径（它会进公开仓库）。
+    # 没给就跳过这一条 —— 它是「拿真文件复核」型断言，不是必跑项。
+    prod = _os.environ.get("IMPORTER_PROD_CONFIG", "")
     if _os.path.isfile(prod):
         pcfg = _yaml.safe_load(_io.open(prod, encoding="utf-8").read()) or {}
         codex_cfg = pcfg.get("codex") or {}
@@ -5428,8 +5435,9 @@ def test_profile_matches_real_cpa_source():
     """
     from cpa_probe import cpa_source_probe as csp
 
+    # 同理：CPA 源码树的位置走环境变量或仓库同级目录，不写死个人路径。
     candidates = [
-        os.path.expanduser("~/OneDrive/Desktop/CLIProxyAPI-main"),
+        os.environ.get("CPA_SOURCE_ROOT", ""),
         os.path.join(os.path.dirname(ROOT), "CLIProxyAPI-main"),
         os.path.join(os.path.dirname(ROOT), "CLIProxyAPI"),
     ]

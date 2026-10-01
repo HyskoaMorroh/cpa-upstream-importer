@@ -33,6 +33,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -226,6 +227,77 @@ def _slice_items(src: str, var: str, consts: dict[str, str]) -> list[str]:
 
 _IDENT_TTL = 6 * 3600
 _ident_cache: dict = {"at": 0.0, "ident": None}
+
+# ---------------- 请求路径专用：只读缓存，过期后台刷新 ----------------
+#
+# 2026-10-01 加。`cached_identity()` 在缓存冷时要付满 `extract_remote` 的
+# 60 秒预算（三仓 17 次 GitHub 请求），而国内 VPS 直连 GitHub 不通是常态。
+# 它原来被 `Prober.__init__` 同步调用 —— 于是**每次探测任务开工前**先卡
+# 26–60 秒，前端那边表现为「定档轮询无响应」「全量检测半天不动」，
+# 而后端日志里一切正常（它确实在等网络）。
+#
+# 这不是新机制：`bulk.disable_semantics()` 2026-09-26 为同一个坑定过同一
+# 套解法（见那里的实测数字：冷 37.97 秒 / 热 0.00 秒）。这里只是把它提到
+# 本模块，让所有请求路径消费者共用一个入口，而不是各自再踩一次。
+#
+# 语义约定：首次调用立刻返回一个**空的、自述不完整的** CpaIdentity，
+# 后台线程把真值填进 `_ident_cache`；之后的调用拿到的就是解析结果。
+# 调用方一律按「拿不到就用内置默认」处理 —— 这与 `cached_identity` 的
+# 既有契约完全一致（见它的 docstring），所以不需要新的失败分支。
+_NB_LOCK = threading.Lock()
+_NB_STATE: dict = {"at": 0.0, "ident": None, "inflight": False}
+_NB_TTL = _IDENT_TTL
+
+
+def _nb_refresh(kwargs: dict) -> None:
+    """后台把真身份填进缓存。失败也要落一个自述不完整的快照。"""
+    try:
+        ident = cached_identity(**kwargs)
+    except Exception:                                   # noqa: BLE001
+        # 这一层是可选增强，不是运行前提：后台线程绝不能把进程带走。
+        ident = CpaIdentity()
+        ident.uncertainty.append(
+            "Source manifest refresh failed; built-in defaults remain in use.")
+    with _NB_LOCK:
+        _NB_STATE.update(at=time.time(), ident=ident, inflight=False)
+
+
+def identity_nonblocking(**kwargs) -> CpaIdentity:
+    """请求路径上取上游常量快照：**永不等待网络**。
+
+    回一个 `CpaIdentity`。首次调用（或缓存过期且刷新尚未落地）回的是空
+    快照，`ok` 为假且 `uncertainty` 里写明原因 —— 调用方据此走内置默认，
+    不要把它当权威值写进 config.yaml。
+
+    需要权威值的写回路径仍应调 `cached_identity()`：那里允许阻塞，
+    因为写回不是交互路径，且 `apply_*` 之前缓存通常已被后台填好。
+    """
+    now = time.time()
+    with _NB_LOCK:
+        ident = _NB_STATE["ident"]
+        fresh = ident is not None and now - _NB_STATE["at"] < _NB_TTL
+        if fresh:
+            return ident
+        need = not _NB_STATE["inflight"]
+        if need:
+            _NB_STATE["inflight"] = True
+
+    if need:
+        threading.Thread(target=_nb_refresh, args=(kwargs,), daemon=True,
+                         name="cpa-source-identity").start()
+
+    if ident is not None:
+        return ident            # 过期旧值也比阻塞强，且它自己带着时间戳
+    stale = CpaIdentity()
+    stale.uncertainty.append(
+        "Source manifest is still being fetched; built-in defaults are in use.")
+    return stale
+
+
+def reset_identity_nonblocking() -> None:
+    """清空非阻塞缓存。供测试隔离用，产品代码不调。"""
+    with _NB_LOCK:
+        _NB_STATE.update(at=0.0, ident=None, inflight=False)
 
 
 def cached_identity(*, source_root: str = "", ttl: int = _IDENT_TTL,

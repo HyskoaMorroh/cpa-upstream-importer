@@ -43,6 +43,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.request
 
@@ -1229,6 +1230,7 @@ _cache: dict = {"at": 0.0, "names": None, "ok": False, "why": ""}
 # 这是加速层，不是功能依赖，不能让它把探测搞崩（2026-09-27 落盘日志
 # 那次 PermissionError 崩溃就是这么来的，见提交 3ceae78）。
 _DISK_CACHE_NAME = "model-catalog-last-good.json"
+_DISK_CACHE_LOCK = threading.Lock()
 # 落盘名录的保鲜期。超过它仍然用（比硬编码新），但在 why 里标出年龄，
 # 让界面能说清「这是 N 天前的名录」而不是假装是实时数据。
 _DISK_STALE_AFTER = 7 * 86400
@@ -1254,28 +1256,52 @@ def _disk_cache_save(names: list[str]) -> None:
     path = _disk_cache_path()
     if not path or not names:
         return
+    import tempfile
+    tmp = None
     try:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
+        # 每个写者有独立临时文件；固定 .tmp 会在并发刷新时互相覆盖。
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                dir=os.path.dirname(path), prefix=_DISK_CACHE_NAME + ".",
+                suffix=".tmp", delete=False) as fh:
+            tmp = fh.name
             json.dump({"at": time.time(), "names": names}, fh)
-        os.replace(tmp, path)          # 原子替换，避免读到半截文件
+            fh.flush()
+            os.fsync(fh.fileno())
+        # Windows 上并发替换同一个目标也会产生 sharing violation。
+        with _DISK_CACHE_LOCK:
+            os.replace(tmp, path)
     except OSError:
-        pass                            # 加速层，失败不影响功能
+        pass                            # 缓存失败不能破坏已取得的名录
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _disk_cache_load() -> tuple[list[str], float]:
-    """回 (名字列表, 落盘时间戳)。读不到回 ([], 0.0)。"""
+    """回 (名字列表, 落盘时间戳)。缺失或损坏均视为缓存未命中。"""
     path = _disk_cache_path()
     if not path:
         return [], 0.0
     try:
         with open(path, encoding="utf-8") as fh:
-            got = json.load(fh)
+            raw = fh.read(4 * 1024 * 1024 + 1)
+        if len(raw) > 4 * 1024 * 1024:
+            return [], 0.0
+        got = json.loads(raw)
+        if not isinstance(got, dict):
+            return [], 0.0
         names = got.get("names")
         if isinstance(names, list):
-            clean = [n for n in names if isinstance(n, str) and n.strip()]
+            clean = list(dict.fromkeys(n.strip() for n in names
+                if isinstance(n, str) and n.strip() and len(n) <= 512))
             if clean:
-                return clean, float(got.get("at") or 0.0)
+                at = float(got.get("at") or 0.0)
+                if not (0 < at <= time.time() + 300):
+                    return [], 0.0
+                return clean, at
     except (OSError, ValueError, TypeError):
         pass
     return [], 0.0
@@ -1307,11 +1333,9 @@ def remote_names(*, timeout: int = 8, proxy: str | None = None,
     超时 8 秒与 cpa_source_probe 对齐：这个调用可能出现在探测路径上，
     而国内 VPS 直连 GitHub 常不通 —— 长超时只会让整批探测变慢。
 
-    2026-10-01 改并发：原来两个地址**依次**试，各 8 秒，全不通的最坏
-    用时是 16 秒。而 `server._api_context` 在请求路径上同步调它，于是
-    容器刚起、缓存冷的那一次 `/api/context` 要等 16 秒才回 —— 首屏白屏
-    / 黑屏，刷新一次就好了（第二次吃失败缓存）。并发后最坏 8 秒，
-    且两个地址里只要有一个通就按它的真实耗时返回。
+    并发只消除两个镜像串行等待；socket timeout 不是严格墙钟死线。
+    use_cache=False 同时关闭内存与磁盘缓存读写，供强制刷新和隔离测试使用。
+    否则模拟的目录会污染共享落盘缓存，断网测试也会误读先前的真实目录。
     """
     now = time.time()
     if use_cache and _cache["names"] is not None:
@@ -1346,37 +1370,39 @@ def remote_names(*, timeout: int = 8, proxy: str | None = None,
 
     errors: list[str] = []
     best: list[str] = []
+    import concurrent.futures as _cf
+    ex = None
+    futs = []
     try:
-        import concurrent.futures as _cf
-        with _cf.ThreadPoolExecutor(max_workers=len(_CATALOG_URLS),
-                                    thread_name_prefix="catalog") as ex:
-            futs = {ex.submit(_one, u): u for u in _CATALOG_URLS}
-            for fut in _cf.as_completed(futs, timeout=timeout + 4):
-                _url, names, err = fut.result()
-                if names:
-                    best = names
-                    break                  # 先到先用，其余 future 自行结束
-                if err:
-                    errors.append(err)
-    except Exception as e:                              # noqa: BLE001
-        # 线程起不来（容器线程数吃紧）就退回串行，功能不能因此丢。
-        errors.append(f"并发拉取失败（{type(e).__name__}），已退回串行")
-        for url in _CATALOG_URLS:
-            _url, names, err = _one(url)
+        ex = _cf.ThreadPoolExecutor(max_workers=len(_CATALOG_URLS),
+                                   thread_name_prefix="catalog")
+        futs = [ex.submit(_one, u) for u in _CATALOG_URLS]
+        for fut in _cf.as_completed(futs, timeout=timeout + 4):
+            _url, names, err = fut.result()
             if names:
                 best = names
                 break
             if err:
                 errors.append(err)
+    except Exception as e:                              # noqa: BLE001
+        # 不再串行重发整批；异常或预算耗尽均交给已知目录缓存兜底。
+        errors.append(f"名录并发拉取未完成（{type(e).__name__}）")
+    finally:
+        for fut in futs:
+            fut.cancel()
+        if ex is not None:
+            # with 块的隐式 wait=True 会把先返回的结果拖到最慢镜像结束。
+            # 已开始的请求自行在网络超时后回收，不延迟当前调用方。
+            ex.shutdown(wait=False, cancel_futures=True)
 
     if best:
         if use_cache:
-            _cache.update(at=now, names=best, ok=True, why="")
-        _disk_cache_save(best)
+            _cache.update(at=time.time(), names=best, ok=True, why="")
+            _disk_cache_save(best)
         return list(best), ""
 
-    # 第 1.5 层：上次拉通的落盘名录。比写死的第 3 层新，优先用它。
-    disk, disk_at = _disk_cache_load()
+    # 第 1.5 层：仅缓存模式使用落盘名录；显式禁用不能偷读旧数据。
+    disk, disk_at = _disk_cache_load() if use_cache else ([], 0.0)
     if disk:
         age_d = max(0, int((now - disk_at) // 86400)) if disk_at else -1
         age = f"{age_d} 天前" if age_d >= 0 else "时间未知"
@@ -1393,6 +1419,68 @@ def remote_names(*, timeout: int = 8, proxy: str | None = None,
     if use_cache:
         _cache.update(at=now, names=[], ok=False, why=why)
     return [], why
+
+
+# ---------------- 请求路径专用：只读缓存，过期后台刷新 ----------------
+#
+# 2026-10-01 加。`remote_names()` 在缓存冷时最坏等 `timeout + 4` 秒
+# （两个镜像并发 + as_completed 的余量），而 `server._market_top_gen` 在
+# `/api/context` 这条**首屏**路径上同步调它。国内 VPS 出网不通时：
+#   · 容器刚起那次首屏等满约 12 秒；
+#   · 失败缓存只有 10 分钟，所以每 10 分钟就再付一次；
+#   · 失败后 `_market_top_gen` 返回空 dict 且**不带任何原因**，
+#     前端只看到「市面世代」整块没有，表现为「参数缺失 / 字段全空」。
+#
+# 与 `cpa_source_probe.identity_nonblocking` 同一套解法：首次立刻返回
+# 空清单与一句自述原因，后台线程把真值填进 `_cache` 与落盘快照。
+# 判「目录是否落后」只是个增强信号，拿不到就不判，照常预勾 ——
+# 这正是 `_market_top_gen` 原来写在 docstring 里的降级语义。
+_NB_LOCK = threading.Lock()
+_NB_STATE: dict = {"at": 0.0, "names": None, "why": "", "inflight": False}
+_NB_TTL_OK = _TTL_OK
+_NB_TTL_BAD = _TTL_BAD
+
+
+def _nb_refresh(kwargs: dict) -> None:
+    try:
+        names, why = remote_names(**kwargs)
+    except Exception as e:                              # noqa: BLE001
+        names, why = [], f"名录刷新失败（{type(e).__name__}）"
+    with _NB_LOCK:
+        _NB_STATE.update(at=time.time(), names=names, why=why, inflight=False)
+
+
+def remote_names_nonblocking(**kwargs) -> tuple[list[str], str]:
+    """请求路径上取 CPA 权威名录：**永不等待网络**。
+
+    回 (名字列表, 原因)。首次调用回 ([], "正在后台拉取…")，后台线程拉完
+    之后的调用就拿到真清单。原因字段永远非空当且仅当清单为空 ——
+    调用方必须把它展示出来，不能静默留白。
+    """
+    now = time.time()
+    with _NB_LOCK:
+        names = _NB_STATE["names"]
+        ttl = _NB_TTL_OK if names else _NB_TTL_BAD
+        if names is not None and now - _NB_STATE["at"] < ttl:
+            return list(names), _NB_STATE["why"]
+        need = not _NB_STATE["inflight"]
+        if need:
+            _NB_STATE["inflight"] = True
+
+    if need:
+        threading.Thread(target=_nb_refresh, args=(kwargs,), daemon=True,
+                         name="model-catalog-refresh").start()
+
+    if names:
+        return list(names), _NB_STATE["why"]
+    return [], (_NB_STATE["why"]
+                or "权威名录正在后台拉取，本次不判断目录是否落后")
+
+
+def reset_remote_nonblocking() -> None:
+    """清空非阻塞缓存。供测试隔离用，产品代码不调。"""
+    with _NB_LOCK:
+        _NB_STATE.update(at=0.0, names=None, why="", inflight=False)
 
 
 # ---------------- 第 3 层：内置兜底 ----------------
