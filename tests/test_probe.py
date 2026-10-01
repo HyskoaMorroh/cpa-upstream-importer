@@ -703,10 +703,27 @@ def test_request() -> None:
     from cpa_probe import model_catalog as _mc
 
     # codex 只收 gpt 系
-    for m in ("gpt-5.6-sol", "gpt-5.6", "gpt-4o", "o3"):
+    for m in ("gpt-5.6-sol", "gpt-5.6", "gpt-4o"):
         eq(f"codex 收 {m}", _mc.section_allows("codex-api-key", m), True)
     for m in ("claude-opus-5", "gemini-3.1-pro", "kimi-k3", "deepseek-v4f"):
         eq(f"codex 拒 {m}", _mc.section_allows("codex-api-key", m), False)
+
+    # o 系列不进 codex 段（2026-09-27 用户在三选一里改判，见 CODEX_GPT_ONLY）。
+    # 这一条原来断言 `codex 收 o3`：`family("o3")` 是 `gpt`，段族比对放行它。
+    # 改判后 `section_allows` 在 codex 段显式拒 o 系列，所以断言要跟着翻。
+    #
+    # 注意它拒的理由是**段**不是档次：`o3` 不带 mini，`is_low_tier` 放行它，
+    # compat 段照收（下面那条断言）。两层判据不能混 —— 与 `o3-mini` 那组
+    # 「族放行、档次拒」正好是对称的另一面。
+    for m in ("o3", "o1", "o3-pro"):
+        eq(f"codex 拒 o 系列 {m}", _mc.section_allows("codex-api-key", m), False)
+        eq(f"但 compat 仍收 {m}",
+           _mc.section_allows("openai-compatibility", m), True)
+        # 手填不受段族偏好约束 —— 与放行四族之外的 grok-4.6 同一条原则。
+        eq(f"手填放行 {m}", _mc.section_protocol_ok("codex-api-key", m), True)
+        # 写回前终检与 section_allows 同口径，理由文字点明是段不是档次。
+        truthy(f"{m} 的写回终检给出段级理由",
+               "o 系列" in _mc.section_model_violation("codex-api-key", m))
 
     # mini / nano / lite 一律不挑（用户 2026-09-12：「本项目无论什么类型，
     # 凡是模型名称中带 mini 的就算版本很高也不应该勾选应该排除」）。
@@ -776,9 +793,55 @@ def test_request() -> None:
        ngl(["claude-opus-5", "claude-sonnet-5", "claude-fable-5"]),
        ["claude-opus-5", "claude-sonnet-5", "claude-fable-5"])
     # 日期戳只是同一世代的另一种写法，不该让它挤掉不带戳的那个
+    #
+    # 样本 2026-09-27 从 `claude-haiku-4-5` 换成 `claude-opus-5`：haiku 当天
+    # 进了降级档（`_LOW_TIER`），拿它当样本会让整组被剔成 `[]`，测不到本条
+    # 想测的「日期戳」。换样本当场暴露了一个**真 bug**（见下）。
     eq("日期戳不构成更高世代",
-       ngl(["claude-haiku-4-5", "claude-haiku-4-5-20251001"]),
-       ["claude-haiku-4-5", "claude-haiku-4-5-20251001"])
+       ngl(["claude-opus-5", "claude-opus-5-20251001"]),
+       ["claude-opus-5", "claude-opus-5-20251001"])
+    # 单段版本号 + 日期戳（2026-09-27 换样本时发现并修）
+    # -------------------------------------------------
+    # `generation` 取版本号前两位本来是给日期戳兜底的，但它只在版本号**已经
+    # 有两位**时够用：
+    #   claude-haiku-4-5 (4,5) vs (4,5,20251001) → 前两位都 (4,5)，相等 ✓
+    #   claude-opus-5    (5,)  vs (5,20251001)   → (5,0) vs (5,20251001) ✗
+    # 后者把日期戳当成次版本号，带戳的写法把不带戳的淘汰掉 —— 而站方两种写法
+    # 常常同时出现在目录里。修法：`series_and_version` 在取版本号之前先剥掉
+    # 纯八位日期戳（`_DATE_STAMP`），不再靠下游截断兜底。
+    eq("单段版本号的日期戳不算次版本",
+       _mc.series_and_version("claude-opus-5-20251001"), ("claude-opus-*", (5,)))
+    eq("戳后面的后缀原样保留",
+       _mc.series_and_version("claude-opus-5-20251001-preview"),
+       ("claude-opus-*-preview", (5,)))
+    eq("戳在中间时两种写法同线同代",
+       ngl(["claude-opus-5-20251001-preview", "claude-opus-5"]),
+       ["claude-opus-5-20251001-preview", "claude-opus-5"])
+    # 反面：八位以外的数字段不许当戳剥掉，那可能是真版本号的一部分
+    eq("32k 不是日期戳",
+       _mc.series_and_version("gpt-4-32k"), ("gpt-*-32k", (4,)))
+    eq("剥戳不影响真实世代淘汰",
+       ngl(["claude-opus-4-8", "claude-opus-5"]), ["claude-opus-5"])
+    # haiku 进降级档（2026-09-27 用户拍板，规则①「低档次模型没有存在的价值」）
+    # ---------------------------------------------------------------------
+    # 改前实测的两条错误行为：① 站上只有 haiku 时它被写进 config.yaml；
+    # ② 同世代时它因 `_product_line` 自成一线，在 `_round_robin` 里**保证**
+    # 占一个注册位，挤掉的反而是 `claude-opus-5-thinking`。
+    truthy("haiku 算降级档", _mc.is_low_tier("claude-haiku-4-5"))
+    truthy("带日期戳的 haiku 也算", _mc.is_low_tier("claude-haiku-4-5-20251001"))
+    truthy("haiku 进不了 claude 段",
+           bool(_mc.section_model_violation("claude-api-key", "claude-haiku-4-5")))
+    truthy("haiku 进不了 compat 段",
+           bool(_mc.section_model_violation("openai-compatibility", "claude-haiku-4-5")))
+    eq("同段有主力款时 haiku 不占位",
+       ngl(["claude-opus-5", "claude-haiku-5"]), ["claude-opus-5"])
+    # 反面：token 边界必须守住，别把含 haiku 字样之外的名字连坐
+    eq("不误伤同族主力款",
+       ngl(["claude-opus-5", "claude-sonnet-5"]),
+       ["claude-opus-5", "claude-sonnet-5"])
+    # `-high` / `-low` 仍**不**进降级档（2026-09-26 用户拍板，与 haiku 相反）
+    truthy("-low 不算降级档", not _mc.is_low_tier("gemini-3.1-pro-low"))
+    truthy("-high 不算降级档", not _mc.is_low_tier("gemini-3.1-pro-high"))
     # 规格后缀（32k / nano / codex）不该自成产品线从而躲过世代过滤
     eq("规格后缀不自成产品线",
        ngl(["gpt-4-32k", "gpt-5.4-nano", "gpt-5.6"]), ["gpt-5.6"])
@@ -916,10 +979,29 @@ def test_real_config(path: str) -> None:
     # 判死的段不会在用户没勾的情况下落进 config.yaml。
     eq("不可用段进了方案", "gemini-api-key" in plan.sections, True)
     eq("不可用段可勾选", plan.sections["gemini-api-key"].writable, True)
-    # 2026-09-17 反转（用户规则 ④）：判死段用市面最高级填充后**也建议写**，
-    # 「无论何种情况严禁出现不勾选模型」。依据强度仍由 model_source 徽标可见。
-    eq("不可用段也建议写", plan.sections["gemini-api-key"].recommended, True)
-    eq("建议写的段 4 个",
+    # 2026-09-29：断言跟上 09-28 裁定 —— 勾选与写入拆成两道独立的闸。
+    #
+    # 这条断言在 09-26 写成「默认不写」，09-28 用户裁定后代码改成「默认全勾 +
+    # 写回前对 weak 段强制确认」，断言没跟上，于是 test_probe / test_edges 共
+    # 8 项红着。而 CI 是 `build: needs: test`（.github/workflows/build.yml:105），
+    # 测试红 = 不出镜像：最后一个成功构建停在 09-20（9a3117d），此后 c225b22
+    # 与 8beff88 两次全红，8beff88 修的「写回被推送地址连坐、界面谎报 ✓ 已写回」
+    # 因此从未进过镜像 —— 用户 mhtml 里「✓ 已写回」与「推送 CPA：配置推送
+    # 地址格式无效」同屏出现，正是这个。所以断言必须与当日裁定对齐。
+    #
+    # 为什么是「默认勾 + 写回时确认」而不是「默认不写」：规则 ③⑵④ 末句
+    # 明令「严禁出现不勾选模型比如出现待定……让用户去手工选择」。09-27 的
+    # 收紧版实跑 accounts.txt 得到 16/16 段全不勾、写回按钮 disabled ——
+    # 正是那句话禁止的形态。低次品不落盘这条要求由另一道闸保：
+    # server.py 的 `confirm_weak`（weak 段写回前逐条列出请操作员确认）。
+    sp_dead = plan.sections["gemini-api-key"]
+    eq("不可用且无依据的段仍默认勾选（规则③⑵④：严禁不勾选）",
+       sp_dead.recommended, True)
+    eq("但它的依据被标成最弱一档 —— 写回时由 confirm_weak 闸单独确认",
+       sp_dead.evidence_tier, "weak")
+    truthy("勾选理由说清这是猜测",
+           "猜" in sp_dead.recommend_reason, sp_dead.recommend_reason)
+    eq("四段全部建议写（判死段靠 weak 闸把关，不靠不勾）",
        len([1 for p in plan.sections.values() if p.recommended]), 4)
     eq("无劫持顶层警告",
        [w for p in plan.sections.values() for w in p.warnings if "抢走" in w], [])
@@ -936,6 +1018,8 @@ def test_real_config(path: str) -> None:
     print(f"      {msg}")
 
     new = yaml.safe_load(out)
+    # gemini 段也 +1：判死 + 无依据的段现在默认勾选（规则 ③⑵④），
+    # 低次品不落盘由 server.py 的 confirm_weak 闸把关，不靠这里少写一条。
     for sec, delta in (("claude-api-key", 1), ("codex-api-key", 1),
                        ("openai-compatibility", 1), ("gemini-api-key", 1)):
         eq(f"{sec} 条目 +{delta}",
@@ -1064,7 +1148,11 @@ def test_real_config(path: str) -> None:
     # 这条才是「就高选择」的真正判据，且对自带样本与真实配置都成立。
     from cpa_probe import model_catalog as _mcg
     _gens = {_mcg.generation(_mcg.series_and_version(n)[1]) for n in _mn}
-    eq("清单里只有一个世代", len(_gens), 1)
+    # 2026-09-26 规则 ④：claude-opus 线的最高次版本 claude-opus-5-5（市面名录）
+    # 这次没有实测通过，而 claude-opus-5 实测通过 —— 两代并存，更低的
+    # claude-opus-4-8 照常淘汰。所以不变式是「只剩线顶 + 实测最高」，不是「只剩一代」。
+    truthy("线顶 claude-opus-5-5 在清单里", "claude-opus-5-5" in _mn, _mn)
+    eq("清单里最多两个世代（线顶 + 实测最高）", len(_gens) <= 2, True)
     eq("headers 只写一次", kk[0].get("headers"),
        {"User-Agent": "cli-proxy-openai-compat"})
 

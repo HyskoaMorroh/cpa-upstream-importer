@@ -37,8 +37,13 @@ from __future__ import annotations
 import re
 import json
 import hashlib
+import logging
+import threading
+import time
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 from .parse import SECTIONS, host_of
 from .writeback import (_detect_indent, _realign_priority, _section_span,
@@ -51,19 +56,70 @@ from .writeback import (_detect_indent, _realign_priority, _section_span,
 DISABLE_ALL = "*"
 DISABLED_FIELD = "disabled"
 
+# 停用语义的只读缓存。`disable_semantics()` 永不在请求路径里发网络请求，
+# 详见那个函数的 docstring（2026-09-26 实测 37.97 秒的那一条）。
+# 成功与失败同一个 TTL：失败也要缓存，否则拉不通的环境每次调用都起线程。
+_SEM_LOCK = threading.Lock()
+_SEM_CACHE: dict = {"value": None, "at": 0.0, "inflight": False}
+_SEM_TTL = 6 * 3600
+
 
 def disable_semantics() -> tuple[str, str, str]:
     """当前应当使用的停用写法。返回 (通配符, 布尔字段名, 来源说明)。
 
     优先级：CPAMP 源码解析 > 内置默认。
-    解析走 `cpa_source_probe`，那里有 6 小时缓存与「失败也缓存」，
-    所以这里可以每次调用都问，不会反复付网络代价。
 
-    为什么必须跟着上游走：key 类段与 compat 段的停用是**两套完全不同的字段**
-    （`excluded-models` 里的通配符 / 布尔 `disabled`）。CPAMP 哪天改了写法而
-    本项目还按旧的写，后果是「界面显示已停用、CPA 照常轮询」—— 静默失效，
-    比报错更难发现。
+    **永不阻塞调用方**（2026-09-26 本机按 VPS 拓扑实测后改）
+    ------------------------------------------------------
+    原来这里直接调 `cpa_source_probe.cached_identity()`，注释里写的是
+    「那里有 6 小时缓存与失败也缓存，所以可以每次调用都问」。那句话对
+    **第二次以后**的调用成立，对**第一次**不成立：进程刚起来时缓存是空的，
+    `cached_identity` 会去 GitHub 拉 CPA / CPAMP / sub2api 源码，而国内 VPS
+    与本机容器都拉不通，只能等满 `extract_remote` 的 60 秒预算。
+
+    实测（Docker Desktop，按 VPS 方式挂真实 295KB config.yaml）：
+        cp.bulk.disable_semantics()   冷 37.97 s / 热 0.00 s
+        GET /api/routes               冷 30.9  s / 热 0.57 s
+
+    `server._api_routes` 在请求路径里同步调本函数，于是路由批量管理面板
+    打开后有 30 秒白窗。那 30 秒里 `BM.groups` 是空数组，而前端的筛选与
+    五个批量按钮都是可点的 —— 点「只选分裂组」在空数组上过滤，面板显示
+    「筛选出 0 组」，选中集为空又让五个操作按钮恒灰。用户看到的就是
+    「路由批量管理点了根本不会生效」，而后端数据完全正常（同一份配置
+    实测 50 组 / 133 条目 / 50 组档位分裂）。
+
+    改法与 `server._drift_snapshot` 同一套：**只读缓存，过期则后台刷新**。
+    首次调用拿内置默认立即返回，后台线程把真值填进缓存，之后的调用拿到
+    的就是从 CPAMP 源码解析出来的值。跟随上游自动同步这条要求不变 ——
+    变的只是「同步发生在后台，不在用户的请求路径里」。
+
+    为什么用内置默认兜首次调用是安全的：`DISABLE_ALL` / `DISABLED_FIELD`
+    与 CPAMP 现行常量一致，解析成功也是同样的值；真出现上游改写法的那天，
+    后台刷新完成后（秒级）所有调用就跟上了，而**写回前还有一道闸**——
+    `apply_bulk` 自己会再取一次语义（:317），那时缓存早已填好。
     """
+    now = time.time()
+    with _SEM_LOCK:
+        cached = _SEM_CACHE["value"]
+        fresh = cached is not None and now - _SEM_CACHE["at"] < _SEM_TTL
+        if fresh:
+            return cached
+        need = not _SEM_CACHE["inflight"]
+        if need:
+            _SEM_CACHE["inflight"] = True
+
+    if need:
+        threading.Thread(target=_refresh_semantics, daemon=True,
+                         name="bulk-disable-semantics").start()
+
+    # 缓存里有旧值就用旧值（过期也比阻塞强），否则用内置默认。
+    if cached is not None:
+        return cached
+    return DISABLE_ALL, DISABLED_FIELD, "内置默认（CPAMP 源码解析进行中）"
+
+
+def _semantics_uncached() -> tuple[str, str, str]:
+    """真正去解析 CPAMP 源码的那一步。只在后台线程里跑。"""
     try:
         from . import cpa_source_probe as _csp
         ident = _csp.cached_identity()
@@ -77,6 +133,36 @@ def disable_semantics() -> tuple[str, str, str]:
     except Exception:
         pass
     return DISABLE_ALL, DISABLED_FIELD, "内置默认（未能解析 CPAMP 源码）"
+
+
+def _refresh_semantics() -> None:
+    """后台刷新停用语义。失败也写缓存 —— 否则每次调用都会再起一个线程。"""
+    try:
+        value = _semantics_uncached()
+    except Exception:                                    # pragma: no cover
+        logger.debug("停用语义后台刷新失败，沿用内置默认", exc_info=True)
+        value = (DISABLE_ALL, DISABLED_FIELD, "内置默认（后台刷新异常）")
+    with _SEM_LOCK:
+        _SEM_CACHE["value"] = value
+        _SEM_CACHE["at"] = time.time()
+        _SEM_CACHE["inflight"] = False
+
+
+def prime_disable_semantics() -> None:
+    """进程启动时预热停用语义（非阻塞）。server 的 main() 调它。
+
+    不调也不影响正确性 —— 第一次 `disable_semantics()` 会自己起后台线程。
+    预热只是让「用户打开面板时缓存已经是真值」的概率更高。
+    """
+    disable_semantics()
+
+
+def reset_disable_semantics() -> None:
+    """测试用：清空停用语义缓存。"""
+    with _SEM_LOCK:
+        _SEM_CACHE["value"] = None
+        _SEM_CACHE["at"] = 0.0
+        _SEM_CACHE["inflight"] = False
 
 
 # `excluded-models` 的键名是 **CPA config.yaml 的 schema**（config_types.go），

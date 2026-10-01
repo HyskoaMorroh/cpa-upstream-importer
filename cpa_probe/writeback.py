@@ -44,6 +44,7 @@ import copy
 import datetime
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -56,6 +57,8 @@ from dataclasses import dataclass
 
 from . import betas
 from .plan import ImportPlan, SectionPlan
+
+logger = logging.getLogger(__name__)
 
 
 def _load_yaml(text: str):
@@ -1512,44 +1515,20 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
     note = f"# {stamp} 批量导入 · 得分 {sp.score} · {sp.priority_reason}"
 
     def model_lines(indent: str) -> list[str]:
-        # P0 修复：空模型验证与应急处理（2026-09-12）
-        # ---------------------------------------------------
-        # 背景：95% 检测失败 → 空段 → sp.models=[] → 生成空 models 块
-        #
-        # 三层检查：
-        # 1. sp.models 非空：正常渲染
-        # 2. sp.highest_models 非空：应急回退（元数据字段，但好过空白）
-        # 3. 两者都空：记录严重错误，返回空列表（由调用方决定是否写入）
+        # 渲染层不再替任何人「补」模型名（2026-09-27 删掉 09-12 的两层兜底）
+        # ------------------------------------------------------------------
+        # 09-12 那版在 sp.models 为空时先拿 highest_models、再拿写死的
+        # FALLBACK_MODELS 顶上 —— 于是一个探测全灭、没有任何证据的段会带着一批
+        # 本工具猜的名字落进 config.yaml（用户：「这样的低次品如何能写入
+        # config.yaml 去破坏系统」）。空清单的段在方案层已经 writable=False，
+        # 走不到这里；真走到了说明上游有 bug，此时返回空由 `_validate_final`
+        # 与写回闸门拦下，而不是用猜测把 bug 盖住。
         if not sp.models:
             logger.error(
-                f"CRITICAL: 空模型渲染被阻止 - "
-                f"section={sp.section}, base_url={sp.base_url}, "
-                f"model_source={sp.model_source}, score={sp.score}")
-
-            # 尝试使用 highest_models 作为应急回退
-            if sp.highest_models:
-                logger.warning(
-                    f"  → 使用 highest_models 作为应急回退："
-                    f"{len(sp.highest_models)} 个模型")
-                models_to_render = sp.highest_models
-            else:
-                # 最后防线：使用硬编码回退
-                from .model_catalog import FALLBACK_MODELS
-                emergency_fallback = FALLBACK_MODELS.get(sp.section, [])
-
-                if emergency_fallback:
-                    logger.error(
-                        f"  → highest_models 也空，使用硬编码回退："
-                        f"{len(emergency_fallback)} 个模型")
-                    models_to_render = list(emergency_fallback)
-                else:
-                    # 无任何回退可用，记录严重错误并返回空
-                    logger.critical(
-                        f"  → 所有回退均失败！将生成空 models 块。"
-                        f"该条目可能无法在 CPA 中正常工作。")
-                    return []  # 返回空列表，让调用方决定如何处理
-        else:
-            models_to_render = sp.models
+                f"空模型条目不渲染 - section={sp.section}, "
+                f"base_url={sp.base_url}, model_source={sp.model_source}")
+            return []
+        models_to_render = sp.models
 
         rows: list[str] = []
         for m in models_to_render:
@@ -2179,7 +2158,42 @@ def validate(text: str) -> tuple[bool, str]:
         return False, "提供商段必须是列表"
     n = sum(len(cfg.get(s) or []) for s in
             ("gemini-api-key", "codex-api-key", "claude-api-key", "openai-compatibility"))
-    return True, f"YAML OK · {len(cfg)} 个顶层键 · 四段共 {n} 条目"
+    return True, f"YAML OK · {len(cfg)} 个顶层键 · 四段共 {n} 条目（{section_key_total(cfg)} 把 Key）"
+
+
+def section_key_total(cfg: dict) -> int:
+    """四段一共挂了多少把 Key —— 与 `existing_count` 同口径。
+
+    为什么必须单独给这个数（2026-09-27 本机按 VPS 拓扑实跑复现）
+    ----------------------------------------------------------
+    `validate` 原来只报「四段共 N 条目」，数的是**列表元素**；而投喂台面板
+    上方那句「config.yaml 中有 N 个既有条目」来自 server 的 `existing_count`，
+    数的是**每把 Key 一条**（compat 段一个 provider 挂 `api-key-entries`
+    多把 Key，在前者算 1、在后者算 N）。
+
+    两个数并排出现在同一次写回的结果里，就成了：
+
+        ⚠ 全量重探将重新探测所有既有站。config.yaml 中有 173 个既有条目
+        ...
+        YAML OK · 42 个顶层键 · 四段共 136 条目
+
+    看起来像「173 条被写成了 136 条，删了 37 条」。实跑核对过同一次写回的
+    前后两份 config.yaml：条目零丢失，净增 3 条（romeo.example 的 codex
+    段），compat 那两条只是同站同 base-url 的 Key 数变化。也就是说这纯粹是
+    两个口径并排显示造成的误读 —— 但它让人以为工具在删自己的上游，
+    所以必须在同一句话里把两个口径都写出来。
+    """
+    total = 0
+    for section in ("gemini-api-key", "codex-api-key",
+                    "claude-api-key", "openai-compatibility"):
+        for entry in (cfg.get(section) or []):
+            if not isinstance(entry, dict):
+                continue
+            nested = entry.get("api-key-entries")
+            # 空列表与缺失都算「这个 provider 自己带一把 Key」——
+            # `api-key-entries: []` 在 CPA 侧等价于没有这个字段。
+            total += len(nested) if isinstance(nested, list) and nested else 1
+    return total
 
 
 _LOCAL_WRITE_LOCK = threading.RLock()
@@ -2542,7 +2556,11 @@ def _readback_check(base: str, mgmt_key: str, want: str, *,
     if not same:
         return False, "CPA 读回配置语义不符；请核对配置版本与挂载状态"
     total = sum(len(expected.get(section) or []) for section in _SECTION_KEYS)
-    return True, f"配置语义一致；四段共 {total} 条目；非运行时路由证明"
+    # 与 `validate` 同口径同措辞：两个数字（列表元素 / Key 把数）必须成对出现，
+    # 否则与面板上方那句「config.yaml 中有 N 个既有条目」并排读成「删了一批」。
+    # 见 `section_key_total` 的说明。
+    return True, (f"配置语义一致；四段共 {total} 条目"
+                  f"（{section_key_total(expected)} 把 Key）；非运行时路由证明")
 
 
 def _valid_verification_body(body: str, section: str = "") -> bool:
@@ -3093,22 +3111,81 @@ def compat_key_blocks(lines: list[str]) -> dict[str, dict[str, list[str]]]:
 #   · 前端                —— 决定默认勾不勾
 # 上一版只有第一个有闸，另两个按「没有闸」渲染，于是界面显示建议写入并默认
 # 勾上，勾了写不进，只在 warnings 里留一句话。
-_NEW_SECTION_SOURCES = frozenset({"probed", "manual", "catalog", "topup"})
-# 为什么加 "topup"（2026-09-19）
-# --------------------------------
-# 探测通了但模型清单来自 `topup_to_market_top`（市面最新填充）时，
-# `model_source` 会落到 "topup"。这不在集合里 → `write_blocked` 被设上 →
-# 界面上「推荐勾选」全部跳过，看起来一个都没勾。
-# 现场：private-upstream-41.example codex+compat 可用段，探测通过但模型走 topup，结果被
-# `write_blocked` 挡住，用户看到推荐勾选空白（MHTML1 09-19 23:50 截图）。
-# "topup" 的语义是「探测通了、清单用市面最新代填充」，这是 3-⑵④ 的要求
-# 正是如此——探测通后按该系列最高级填充并勾选，而不是因为清单来源不是
-# "probed" 就拒绝写入。seed（纯猜测）不在集合里、行为不变。
+_NEW_SECTION_SOURCES = frozenset({"probed", "manual", "catalog"})
+# 为什么 "topup" 不在这里了，以及为什么 "seed" 仍然不放行（2026-09-27）
+# --------------------------------------------------------------------
+# 上一版写的是 {"probed","manual","catalog","topup"}，注释说「探测通了但清单
+# 来自 topup_to_market_top 时 model_source 会落到 'topup'」。**这句话是错的，
+# 那个值从来不存在**：plan.py 里 `model_source` 的全部 7 个赋值点
+# （:2563 / :2597 / :2635 / :2677 / :2714 / :2734 / :2887）取值只有
+# probed / manual / catalog / seed / prior 五种；topup 路径写的是**另一个变量**
+# `model_src`（plan.py:2820 / :2847 / :2856），而它只被 :3217 的警告文案读一次，
+# 不参与任何判定。全仓库（含测试）搜字面量 "topup" 只命中本段注释自己。
+#
+# 所以 2026-09-19 那次「修 whisky 推荐勾选空白」的修复从未生效：走到
+# topup 时 `model_source` 通常已经是 probed / catalog，本来就在集合里、本来
+# 就放行。删掉这个死值不改变任何行为，只是让集合不再骗人。
+#
+# 那为什么不顺手放行 "seed"（2026-09-27 一度改过又撤回）
+# ----------------------------------------------------
+# 被这道闸挡住的确实是 `model_source == "seed"` 的段（:2714 / :2887），也确实
+# 是现场「推荐勾选空白」的来源。但放行它会重启一次**已实测过的事故**：
+# 2026-09-02 那次条目从 121 变成 246，成因正是「四段都生成了方案、四段都写
+# 进去」，而那些新增段的清单只是工具猜测。README 与 MEMORY 两处独立记载都
+# 点名了这条路径。
+#
+# 边界是**原文件里有没有这一段**，不是「要不要勾选」：
+#   · 凭据在原文件里本来就有的段 —— seed 照常更新，不受这道闸约束
+#     （见 `is_new_section`：只有真·新增段才问 `new_section_admitted`）
+#   · 原文件里没有的段 —— seed 不凭空增加条目
+#
+# 「严禁出现待定」那条要求由另外两层满足，都不需要放行这道闸：
+#   · 默认勾选：2026-09-17 起四类来源全部默认勾选，seed 在内
+#   · 清单不空：`topup_to_market_top` 与 `latest_models` 保证任何段都不以
+#     零模型结束（plan.py:2830-2890 的三层兜底）
+# 真正要改的是**界面把「不写入」的理由说清楚**，而不是偷偷放宽写入闸 ——
+# 现在那句话是「原本没配这一段且清单只是猜测 —— 手填真实模型即可放行」，
+# 本机实跑确认它已经显示出来了（76 段标为「不写入」各自带这句）。
+_LEGACY_NEW_SECTION_SOURCES = frozenset({"topup"})
+# 留个名字记住这个死值，免得下次有人看到旧注释又把它加回来。
 
 
-def new_section_admitted(model_source: str) -> bool:
-    """这个 model_source 够不够格新增一个原本不存在的 (凭据, 段) 条目。"""
-    return model_source in _NEW_SECTION_SOURCES
+def new_section_admitted(model_source: str, *,
+                         family_attested: bool = False) -> bool:
+    """这个来源够不够格新增一个原本不存在的 (凭据, 段) 条目。
+
+    **2026-09-28：改按依据强度分档，不再只看 model_source**
+    ------------------------------------------------------
+    旧判据是「model_source in {probed, manual, catalog}」，于是 seed 与 prior
+    一律挡死。本机按 VPS 拓扑实跑 accounts.txt 复现出的后果：4 个新站 ×4 段
+    全部 `write_blocked` → `writable=False` → `recommended=False` →
+    界面「未勾选任何项」、「生成写回方案」按钮 disabled、priority 列停在
+    「定档计算中…」。那正是规则 ③⑵④ 最后一句明令禁止的形态。
+
+    与 `SectionPlan.evidence_tier` 对齐后的判据：
+      · strong（probed / manual）—— 放行，与旧版一致
+      · medium（catalog / prior，或 seed 但这一族在本站有据可查）—— 放行
+      · weak  （seed 且目录没报过、原配置也没有）—— 仍然挡
+
+    `prior` 从挡改为放行：那是原 config.yaml 里**已经写着**的清单，是先前一轮
+    的实测沉淀，比工具猜测硬得多。挡住它等于「重探一个既有站反而写不进去」。
+
+    seed 分两档是这次修改的要点：同样是「按市面最新代填充」，站方目录报过
+    这一族（只是本轮没探通）与「这一族在本站毫无痕迹」是两种风险，旧判据把
+    它们混成一档，为了挡住后者连前者一起挡，才逼出了「16/16 全不勾」。
+
+    真正的 weak 段仍然挡在这里，另外还有 server.py `_api_apply` 的
+    `confirm_weak` 二次确认闸 —— 两道闸都在，2026-09-02 那次「条目 121→246」
+    的事故面没有被放宽。
+    """
+    if model_source in _NEW_SECTION_SOURCES:
+        return True
+    # prior 与「有据可查的 seed」属于 medium 档，放行。
+    if model_source == "prior":
+        return True
+    if model_source == "seed":
+        return bool(family_attested)
+    return False
 
 
 def is_new_section(cfg: dict, sp: SectionPlan,
@@ -3146,12 +3223,15 @@ def mark_new_sections(cfg: dict, plans: list[ImportPlan]) -> int:
             # 让复用同一批对象的调用方（测试、脚本）也拿到干净结果。
             sp.new_section = is_new_section(cfg, sp, owned)
             sp.write_blocked = ""
-            if sp.new_section and not new_section_admitted(sp.model_source):
+            if sp.new_section and not new_section_admitted(
+                    sp.model_source,
+                    family_attested=getattr(sp, "family_attested", False)):
                 sp.write_blocked = (
                     f"原本没配这一段，而本次模型清单是"
                     f"{_SRC_LABEL.get(sp.model_source, sp.model_source)}"
-                    f"（没有实测依据）—— 不新增。确知该站这一段可用的话，"
-                    f"在模型格里手填真实清单，它就会作为新条目写入")
+                    f"（站方目录没报过这一族、原配置里也没有）—— 不新增。"
+                    f"确知该站这一段可用的话，在模型格里手填真实清单，"
+                    f"它就会作为新条目写入")
                 blocked += 1
     return blocked
 
@@ -3340,7 +3420,10 @@ def rebuild_config_full(
                 # have 为 None = 这是个新凭据（增量导入混进重探），照写。
                 # have 非空但不含本段 = 原来没配这一段 —— 按证据强弱决定。
                 if have is not None and sp.section not in have:
-                    if not new_section_admitted(sp.model_source):
+                    if not new_section_admitted(
+                            sp.model_source,
+                            family_attested=getattr(
+                                sp, "family_attested", False)):
                         skipped_unowned += 1
                         continue
                     # 身份用 base_url 而不是 plan.host —— 同一台主机可以按

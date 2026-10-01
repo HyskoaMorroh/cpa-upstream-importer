@@ -12,13 +12,21 @@
 #     ├─ mihomo-subscriptions.conf      订阅清单（含 token，手工编辑，不进版本库）
 #     ├─ update-mihomo-subscriptions.sh 本脚本
 #     └─ mihomo/                        mihomo 的配置目录，被容器挂载
-#         ├─ config.mihomo.yaml         模板（进版本库/镜像，私密值一律 ${VAR}）
+#         ├─ config.template.yaml       模板（进版本库/镜像，私密值一律 ${VAR}）
 #         ├─ config.yaml                实际配置（由模板生成，不进版本库）
-#         ├─ healthcheck.py             容器健康检查 + 出口降级
+#         ├─ healthcheck.sh / .py       容器健康检查 + 出口降级（mihomo 容器用 .sh）
 #         └─ providers/                 订阅缓存，mihomo 自己写
 #
-# 模板名叫 config.mihomo.yaml 而不是 config.template.yaml：上游
-# .dockerignore 有一条 `config.*.yaml`，会把后者从镜像构建上下文里排除。
+# 适用范围（2026-09-27 更正）：本脚本只用于「宿主机目录挂载」式的老部署 ——
+# 它读写宿主上的 mihomo/config.yaml。按本仓库 compose 部署时，mihomo 配置在
+# 命名卷里，由 mihomo-init 容器执行 bootstrap-mihomo.sh 生成；那种部署下改订阅
+# 只需改 .env 里的 MIHOMO_SUB_* / MIHOMO_SUBSCRIPTIONS 再
+# `docker compose up -d mihomo-init mihomo`，bootstrap 会按订阅指纹自动重建，
+# 不需要这个脚本（见 README.md「VPS 更换订阅」）。
+#
+# 模板名：旧注释说「.dockerignore 的 `config.*.yaml` 会排除 config.template.yaml」，
+# 不成立 —— 那条规则只匹配构建上下文根目录，mihomo-manager/mihomo/ 下的模板
+# 照常进镜像（bootstrap-mihomo.sh 就靠它）。旧名 config.mihomo.yaml 仅作兼容。
 
 set -euo pipefail
 

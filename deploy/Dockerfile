@@ -177,12 +177,23 @@ RUN chmod +x /app/mihomo-manager/*.sh \
 # 让构建方能对齐，省掉 compose 里再覆盖一次。
 ARG APP_UID=10001
 ARG APP_GID=10001
+# `/data` 也要 chown（2026-10-01 补）。
+# -------------------------------------
+# 这里原来只 chown 了 `/app` 与 `/backups`，漏了 `/data` —— 而 `/data/config.yaml`
+# 正是写回的目标。两个 compose 的 `user` 默认都是 `0:0`，root 无视属主，
+# 恰好把这个漏洞盖住了；一旦有人按 `.env.example` 的注释把 `IMPORTER_UID`
+# 设成非 0（文档里就是推荐这么做的），写回会 PermissionError，而界面上
+# 表现为「✓ 已写回」之后配置没变 —— 静默失效，最难排查的那一类。
+#
+# 注意这只解决**镜像内目录**的属主。`/data/config.yaml` 是宿主单文件挂载，
+# 它的属主由宿主决定，容器改不了；所以 `.env.example` 里关于
+# `IMPORTER_UID` 必须与宿主 config.yaml 属主对齐的说明仍然必要。
 RUN set -eux; \
     groupadd -g "${APP_GID}" -r importer 2>/dev/null || true; \
     useradd -r -u "${APP_UID}" -g "${APP_GID}" -m importer 2>/dev/null || \
       useradd -r -u "${APP_UID}" -m importer; \
     mkdir -p /data /backups; \
-    chown -R "${APP_UID}:${APP_GID}" /app /backups
+    chown -R "${APP_UID}:${APP_GID}" /app /data /backups
 USER ${APP_UID}
 
 # 容器内绑 0.0.0.0 是对的 —— 只监听 127.0.0.1 的话 compose 的端口映射

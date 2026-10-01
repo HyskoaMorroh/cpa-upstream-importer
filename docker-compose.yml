@@ -12,8 +12,12 @@ name: cpa-upstream-importer
 services:
   cpa-upstream-importer:
     image: ${IMAGE:-swhesong/cpa-upstream-importer:latest}
-    # 升级：docker compose pull && docker compose up -d
-    pull_policy: ${PULL_POLICY:-missing}
+    # 升级：docker compose pull && docker compose up -d --force-recreate
+    #
+    # 默认 always（2026-09-27，原 missing）：VPS 上已有 :latest 时 missing
+    # 不会去拉新镜像，`up -d` 继续跑旧版 —— 「本机全绿、VPS 一跑一堆错」的
+    # 成因之一。本地构建时 .env 设 PULL_POLICY=build。
+    pull_policy: ${PULL_POLICY:-always}
 
     # 本地构建：.env 里设 PULL_POLICY=build，镜像就取本地 tag 而不去 registry。
     build:
@@ -24,7 +28,9 @@ services:
         APP_GID: ${IMPORTER_GID:-10001}
 
     container_name: ${CONTAINER_NAME:-cpa-upstream-importer}
-    restart: "no"           # 按需启的运维工具，崩了要人看日志
+    # 2026-09-27 与线上整栈对齐为 unless-stopped（原 "no"）：OOM 或崩溃后
+    # 不自动拉起，前端只剩 Failed to fetch。崩了看 docker compose logs。
+    restart: ${IMPORTER_RESTART:-unless-stopped}
 
     # 只绑回环。写成 "8765:8765" 会暴露到公网 —— 这界面持有明文上游 Key
     # 且能改写 config.yaml。外网访问经 nginx 加 TLS，见 deploy/nginx-snippet.conf。
@@ -64,6 +70,20 @@ services:
       # claude_executor_request.go 里的 beta 常量表与 codex 的 UA/originator。
       # 不给则退回读 config.yaml 的 claude-header-defaults，覆盖面小得多。
       CPA_SOURCE_ROOT: "${CPA_SOURCE_ROOT:-}"
+      # CPA 源码漂移检测拉 GitHub 用的代理，以及它比对的分支/标签。
+      # 国内 VPS 直连 GitHub 常超时，填 mihomo：http://mihomo:7890。
+      DRIFT_PROXY: "${DRIFT_PROXY:-}"
+      CPA_SOURCE_REF: "${CPA_SOURCE_REF:-main}"
+      CPAMP_SOURCE_REF: "${CPAMP_SOURCE_REF:-main}"
+      # 探测「直连不通 → 改走代理重试」用的代理地址，逗号分隔可给多个。
+      # 留空时代码回落到内置的 http://mihomo:7890 与 http://127.0.0.1:7890
+      # （启用 mihomo profile 时前者经网络别名可达）。
+      PROBE_PROXY: "${PROBE_PROXY:-}"
+      # 落盘日志：1 则同时写 /app/logs/importer-*.log（挂载见下方 volumes）
+      IMPORTER_LOG_TO_FILE: "${IMPORTER_LOG_TO_FILE:-0}"
+      # 探测超时（秒）。单请求上限与单段总时限；留空用代码默认值。
+      PROBE_REQUEST_TIMEOUT: "${PROBE_REQUEST_TIMEOUT:-}"
+      PROBE_SECTION_DEADLINE: "${PROBE_SECTION_DEADLINE:-}"
 
     volumes:
       # 只挂这一个文件：挂整个目录等于把 .env、secrets/、auths/ 一起递给它。
@@ -76,6 +96,9 @@ services:
       # CPA_SOURCE_ROOT=/cpa-source 同时生效。留空则整条挂载不生效
       # （`${VAR:-/dev/null}:/x:ro` 这种写法在留空时会挂个空设备，比报错好）。
       - "${CPA_SOURCE:-/dev/null}:/cpa-source:ro"
+      # 落盘日志目录（IMPORTER_LOG_TO_FILE=1 时写入）。宿主目录不存在时由
+      # Docker 以 root 建出；IMPORTER_UID 非 0 时先 chown，否则回退为只打控制台。
+      - "${IMPORTER_LOG_DIR:-./logs}:/app/logs"
 
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -83,7 +106,25 @@ services:
     deploy:
       resources:
         limits:
-          memory: ${MEMORY_LIMIT:-512M}
+          # 1G（2026-09-27，原 512M）：实测一次全量重探 cgroup memory.peak 476MB，
+          # OOM 被杀后内存里的任务全丢，前端「定档轮询无响应」。
+          memory: ${IMPORTER_MEMORY_LIMIT:-${MEMORY_LIMIT:-1G}}
+
+    healthcheck:
+      # 与线上整栈一致。只判 HTTP 活着（首页 200），不带 token。
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8765/',timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 10s
+
+    # 启用 mihomo profile 时等代理先起来；不启用时 required: false 让它被忽略
+    # （需 Docker Compose ≥ 2.20）。
+    depends_on:
+      mihomo-proxy:
+        condition: service_started
+        required: false
 
     logging:
       driver: json-file
@@ -101,7 +142,7 @@ services:
   # 在重启后仍然生效（init 默认不覆盖已有配置）。
   mihomo-init:
     image: ${IMAGE:-swhesong/cpa-upstream-importer:latest}
-    pull_policy: ${PULL_POLICY:-missing}
+    pull_policy: ${PULL_POLICY:-always}
     build:
       context: .
       dockerfile: deploy/Dockerfile
@@ -128,7 +169,7 @@ services:
 
   mihomo-proxy:
     image: ${IMAGE:-swhesong/cpa-upstream-importer:latest}
-    pull_policy: ${PULL_POLICY:-missing}
+    pull_policy: ${PULL_POLICY:-always}
     build:
       context: .
       dockerfile: deploy/Dockerfile

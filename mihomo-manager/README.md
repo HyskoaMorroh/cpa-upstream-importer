@@ -22,9 +22,10 @@
 | `cpa-upstream-importer`（python:3.12-slim） | `python3`（标准库 urllib） | `curl` `wget` |
 
 所以 `healthcheck.sh` 只用 busybox 自带件（HTTP 请求靠 `nc` 手写），
-`healthcheck.py` 用 urllib。**不要**把两者混用：在 mihomo 容器里跑 `.py` 是
-`python3: not found`，在本镜像里跑 `.sh` 会因为缺 `curl` 失败 —— 两者都表现为
-「容器永远 unhealthy」，而不是明显的报错。
+`healthcheck.py` 用 urllib。`.py` **不能**在 mihomo 官方容器里跑（`python3: not found`）。
+`.sh` 两边都能跑：本镜像的 Dockerfile 装了 busybox 与 wget，`.sh` 会先找
+`nc`/`wget`，找不到就回退到 `busybox <applet>`（2026-09-19 起 compose 里
+mihomo-proxy 的 healthcheck 调的就是 `.sh`）。
 
 `bootstrap-mihomo.sh` 每次启动都把两份一起同步到共享卷（`healthcheck.sh`
 `healthcheck.py`），各自被自己的容器按文件名调用。
@@ -56,7 +57,79 @@ API 有响应、AUTO 组里还列着 59 个节点名），而 CPA 的 `proxy-url
 docker compose exec mihomo sh /root/.config/mihomo/healthcheck.sh; echo rc=$?
 ```
 
-## 快速开始
+## VPS 部署（镜像方式，推荐）
+
+VPS 只拉镜像，宿主上不放 mihomo 配置文件。mihomo 二进制、地理数据、模板和
+`bootstrap-mihomo.sh` 都在 `swhesong/cpa-upstream-importer` 镜像里。compose 里
+两个服务都用这个镜像：
+
+| 服务 | 做什么 | 生命周期 |
+|---|---|---|
+| `mihomo-init` | 执行 `bootstrap-mihomo.sh`，把模板按订阅展开成卷里的 `config.yaml` | 跑完即退 |
+| `mihomo`（本仓库 compose 里叫 `mihomo-proxy`，网络别名 `mihomo`） | 运行 `mihomo -d <卷>` | 常驻 |
+
+### 首次配置
+
+1. 在 `/opt/deploy/.env` 写订阅（二选一，可混用；同名时 `MIHOMO_SUB_<名称>` 优先）：
+
+   ```bash
+   # 写法一：每个订阅一个变量，名称部分就是 provider 名（自动转小写）
+   MIHOMO_SUB_WOG=https://sub.example.com/api/v1/client/subscribe?token=xxxx
+   MIHOMO_SUB_WOGB=https://sub2.example.com/link/yyyy?clash=1
+   # 写法二：一行写全，分号分隔
+   MIHOMO_SUBSCRIPTIONS=wog=https://sub.example.com/...;backup=https://sub2.example.com/...
+   # 9090 管理 API 的密钥，建议必填
+   MIHOMO_SECRET=换成一串随机字符
+   ```
+
+   provider 名、两个节点组的 `use:` 列表、订阅域名的 DIRECT 规则都由这里的
+   订阅清单生成。模板里的 `wog` / `wogb` 只是示例：**一个订阅都不配**时，
+   bootstrap 会报「未展开的占位符」并以非零状态退出，mihomo 不会启动。
+
+2. 启动并看结果：
+
+   ```bash
+   cd /opt/deploy
+   docker compose pull mihomo-init mihomo
+   docker compose up -d mihomo-init mihomo
+   docker compose logs mihomo-init        # 应看到「订阅 N 个: ...」「自举完成」
+   docker compose ps mihomo               # 约 1 分钟后应为 healthy
+   ```
+
+### VPS 更换订阅
+
+1. 改 `/opt/deploy/.env` 里的 `MIHOMO_SUB_*` 或 `MIHOMO_SUBSCRIPTIONS`。
+2. 重跑 init，再重启代理：
+
+   ```bash
+   cd /opt/deploy
+   docker compose up -d --force-recreate mihomo-init
+   docker compose logs mihomo-init        # 应看到「订阅或 MIHOMO_SECRET 已变化，按新订阅重建」
+   docker compose restart mihomo
+   ```
+
+bootstrap 在卷里记着订阅相关变量（`MIHOMO_SUB_*`、`MIHOMO_SUBSCRIPTIONS`、
+`MIHOMO_SECRET`）的 sha256 指纹（`.bootstrap-fingerprint`，只存哈希）。指纹变了
+就先备份旧配置（`config.yaml.backup-时间戳`），再按新订阅重建。指纹没变就保留
+现有配置，探测脚本写进 AUTO 组 filter 的结果也跟着保留。
+
+- 2026-09-27 之前的老卷里没有指纹文件。这类卷**第一次**启动只补记指纹、不重建，
+  所以升级后第一次改订阅要加 `MIHOMO_FORCE_REBUILD=1`：
+
+  ```bash
+  MIHOMO_FORCE_REBUILD=1 docker compose up -d --force-recreate mihomo-init
+  docker compose restart mihomo
+  ```
+
+  改完就把 `.env` 里的 `MIHOMO_FORCE_REBUILD` 清空。否则之后每次启动都会重建，
+  探测结果每次都被冲掉。
+- 查当前生效的订阅：`docker compose exec mihomo sh -c 'grep -A1 "^  [a-z0-9_-]*:$" /root/.config/mihomo/config.yaml | head'`
+  （路径以 compose 里的 `MIHOMO_TARGET_DIR` 为准）。
+
+## 快速开始（宿主机目录挂载的老部署）
+
+下面这套用 `update-mihomo-subscriptions.sh` 改宿主机上的 `mihomo/config.yaml`，
+只适用于「mihomo 配置目录挂在宿主机」的老部署。按上一节用镜像部署的，不需要这套。
 
 ### 1. 配置订阅
 

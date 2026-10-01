@@ -40,9 +40,35 @@
 
 name: build
 
+# 镜像与分支的关系 —— 读这里之前先别改触发条件（2026-10-01 记）
+# ==========================================================================
+# VPS（/opt/deploy）的 compose 里镜像是写死的 `swhesong/cpa-upstream-importer:latest`，
+# 而 `latest` 这个标签由下面 metadata 步骤的
+# `type=raw,value=latest,enable={{is_default_branch}}` 控制 ——
+# **只有默认分支（main）的构建才会更新它**。
+#
+# 这条认知的缺失代价极大：2026-09-30 那一轮，全部修复都在
+# `fix/verified-workflows-20260930` 分支的未提交工作树里，而当时
+# `push.branches` 只有 `[main]`。于是：
+#   · 本机测试 5158 项全绿、本机容器实测四个核心流程都正常
+#   · VPS `docker compose pull` 拉到的仍是 main 上的旧镜像
+#   · 用户看到的是「你说全绿，结果 VPS 前端一堆问题」
+# 根因不在代码，在**交付链路**：修好的代码从来没进过 VPS 拉的那个镜像。
+#
+# 所以现在：
+#   · 分支推送（`fix/**` / `feat/**`）**会**构建，产出 `type=ref,event=branch`
+#     那个以分支名命名的标签（例如 `fix-verified-workflows-20260930`），
+#     可以在 VPS 上临时改 `image:` 拉它做真机验证；
+#   · `latest` 的 `is_default_branch` 闸**不许动** —— 分支绝不能抢生产标签；
+#   · 要更新生产镜像，只有一条路：**合进 main**。
+# ==========================================================================
+
 on:
   push:
-    branches: [main]
+    # 分支构建只为「合并前能在真机上拉到一个镜像验证」。
+    # 通配符限定在 fix/ 与 feat/ 两个前缀，避免任何临时分支都触发
+    # 多架构构建（很贵）。其他前缀需要时手动 workflow_dispatch。
+    branches: [main, 'fix/**', 'feat/**']
     tags: ["v*"]
   pull_request:
     branches: [main]

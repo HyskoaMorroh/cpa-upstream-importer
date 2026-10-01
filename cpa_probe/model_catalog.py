@@ -40,9 +40,13 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 import time
 import urllib.request
+
+logger = logging.getLogger(__name__)
 
 # ---------------- 归并留痕 ----------------
 
@@ -66,6 +70,11 @@ _OPENAI_REASONING_RE = re.compile(r"^o\d+(?:[.\-]|$)")
 # 四族。kimi 是 2026-09-02 新增 —— 用户明确把它列进 compat 段的允许清单，
 # 而 CPA 的权威名录里也确实有 kimi provider（kimi-k2 … kimi-k3-256k）。
 FAMILIES = ("gemini", "gpt", "claude", "kimi")
+
+# codex 段只收 gpt-*，不收 o 系列（2026-09-27 用户在三选一里选定）。
+# 旧判例（2026-09-12）「o3 与 gpt-5.6 互不相干、都要」是世代比较的规则，
+# 与「codex 段收不收 o 系列」是两件事；用户这次定的是后者。
+CODEX_GPT_ONLY = True
 
 
 def bare_name(name: str) -> str:
@@ -94,6 +103,12 @@ def generation_family(name: str) -> str:
         ["o1-pro", "o3-pro", "o4-mini"]          → 只要 o3-pro
 
     第一例要求 gpt-5.6 不挤掉 o3 —— 两族分开才成立。
+
+    **2026-09-27 用户改判：codex 段只留 gpt 系列**（见 `CODEX_GPT_ONLY`）。
+    o 系列从此不进 codex 段（`section_allows` / `section_model_violation`
+    在 codex 段直接拒），上面三条判例只对仍收 o 系列的段（compat）成立；
+    `newest_generation_per_line` 本身不看段，判例照旧作为它的单元行为保留。
+    只有 o 系列的站，codex 段清单为空 → 不写（不拿写死的 gpt 名字顶替）。
     第二、三例里的 `o4-mini` 由 `is_low_tier` 先剔除（用户同一句话定的
     「凡是模型名称中带 mini 的一律排除」），所以它不会挤掉 o3 / o3-pro。
 
@@ -155,8 +170,8 @@ def gemini_pro_ok(name: str) -> bool:
         return False
 
 
-# 降级档：名字里带 mini / nano / lite / flash / fast 的一律不选
-# （用户 2026-09-12 定 mini，2026-09-16 补 flash 与 fast，
+# 降级档：名字里带 mini / nano / lite / flash / fast / haiku 的一律不选
+# （用户 2026-09-12 定 mini，2026-09-16 补 flash 与 fast，2026-09-27 补 haiku，
 # **不分类型、不看版本号**）。
 # ------------------------------------------------------------------------
 # 用户原话（2026-09-12）：「本项目无论什么类型，凡是模型名称中带 mini 的就算
@@ -164,6 +179,22 @@ def gemini_pro_ok(name: str) -> bool:
 # 用户原话（2026-09-16 第 ① 条）：「所有带 mini、flash、fast 的模型都不勾选，
 # 这种模型属于低档次模型，没有存在的价值」。
 # nano / lite 是同一档的其它写法，一并挡掉。
+#
+# 为什么 2026-09-27 补 haiku（本文件内部自相矛盾，实跑确认）
+# --------------------------------------------------------
+# `_TIER_HINTS` 给 haiku 打 4，比 flash 的 3 **更低**，即这个文件自己就认定
+# haiku 比 flash 更弱；`FALLBACK_MODELS['claude-api-key']` 也有意不含 haiku。
+# 但判定链上只硬排除 flash、放行 haiku，于是：
+#
+#   · 站上只有 `claude-3-5-haiku` 时六道闸全放行，它被写进 config.yaml；
+#   · 更糟的是同世代时它**保证占一个注册位** —— `_product_line('claude-haiku-5')`
+#     是 `claude-haiku`，自成一条产品线，`_round_robin` 每线取第一个，而它是
+#     那条线上唯一成员。`_WEAK` 把它排到线内最后毫无作用（只能线内降权，
+#     跨线轮转绕过它）。实测目录 [opus-5, opus-5-thinking, sonnet-5,
+#     fable-5-1, haiku-5] + limit=4 时，被挤掉的是 opus-5-thinking，
+#     入选的是 haiku-5 —— 正好与用户规则①相反。
+#
+# 放进 `_LOW_TIER` 而不是只改排序，才能同时消掉这两条路径。
 #
 # 为什么 flash 必须单列，而不是靠 gemini 段的 pro 闸兜住
 # --------------------------------------------------
@@ -184,17 +215,82 @@ def gemini_pro_ok(name: str) -> bool:
 # 这一条同时解决了本项目两套测试互斥的老问题：`o4-mini` 被这里先剔除，
 # 于是「族内比主版本」不会让它挤掉 `o3` / `o3-pro`，
 # 见 `newest_generation_per_line` 的两阶段说明。
+#
+# 2026-09-26 用户拍板：`gemini-3.1-pro` 后面的所有后缀（`-high` / `-low` /
+# `-preview*`）都算同一系列，一并保留 —— `low` **不**进降级档。
 _LOW_TIER = re.compile(
-    r"(?<![a-z0-9])(?:mini|nano|lite|flash|fast)(?![a-z0-9])")
+    r"(?<![a-z0-9])(?:mini|nano|lite|flash|fast|haiku)(?![a-z0-9])")
 
 
 def is_low_tier(name: str) -> bool:
-    """名字里带 mini / nano / lite / flash / fast —— 降级档，工具一律不挑。
+    """名字里带 mini / nano / lite / flash / fast / haiku —— 降级档，工具一律不挑。
 
     只管**工具自己挑不挑**。操作员显式手填的走 `section_protocol_ok`，
     那一层不问档次（手填是显式意图，见 plan.py 的 forced_models 分支）。
     """
     return bool(_LOW_TIER.search(bare_name(name)))
+
+
+# 推理算力档后缀 → 档序（越大越高）。用于 `newest_generation_per_line`
+# 的阶段 C：同一基名只留最高算力档。
+#
+# 为什么与 `_LOW_TIER` 分开（2026-09-30）
+# --------------------------------------
+# `_LOW_TIER` 管「独立的廉价型号」（`gpt-5-mini`、`gemini-3-flash` ——
+# 另一条产品线，无条件不选）。这里管「同一个型号的算力档」
+# （`gemini-3.1-pro-high` / `-low` —— reasoning effort 后缀）。
+# 后者只在**同基名有更高档时**才压掉，否则某站只提供 `-low` 变体时
+# 该段会被清空，撞上红线 2「严禁出现不勾选」。判据必须是相对的。
+#
+# 不硬编码型号名（红线 3）：只认后缀本身，新型号自动适用。
+_EFFORT_RANKS: dict[str, int] = {
+    "low": 1, "minimal": 1,
+    "medium": 2, "mid": 2, "standard": 2, "std": 2,
+    "high": 3, "max": 4, "ultra": 4,
+}
+
+# 裸基名的档序：高于一切具名档（站方默认档就是它的推荐档）。
+# 必须定义在 `_effort_split` 之前 —— 它在函数体里被引用，而模块加载时
+# 就会执行到那一行的默认返回。
+_BARE_EFFORT_RANK = 99
+
+# 末段后缀：只认**具名**算力档（`-high` / `-low` / `-medium` …）。
+#
+# 为什么**不认纯数字后缀**（2026-09-30 实测后收紧）
+# ------------------------------------------------
+# 原来把 `-\d{1,3}` 也当算力档，实测当场踩雷：
+#     claude-opus-5   ->  ('claude-opus', 1.05)   ← 把**版本号 5** 当成了算力档
+# 于是 `claude-opus-5` 与 `claude-opus-4-8` 会被归进同一个基名
+# `claude-opus` 相互压制，claude 段只剩一个模型 —— 比原来的 `-low` 问题
+# 严重得多（红线 2 要求同级全勾）。
+#
+# 数字在模型名里的含义本来就多义：版本（`claude-opus-5`）、日期戳
+# （`-20251001`）、上下文容量（`-256k`）、快照序号（`gpt-4-0613`）——
+# 算力档反而极少用裸数字。判不准就不判：宁可漏掉一个假想的 `-4` 档，
+# 也不能把版本号误当档位去压掉真模型。
+#
+# 世代/版本的比较由阶段 A/B 的 `generation()` 负责，那里有完整的版本语义；
+# 这一层只管「同一基名的具名算力档」。
+_EFFORT_SUFFIX = re.compile(r"^(.*?)[-.](" + "|".join(_EFFORT_RANKS) + r")$")
+
+
+def _effort_split(name: str) -> tuple[str, int]:
+    """拆出 (基名, 算力档序)。没有具名算力后缀的返回 (原名, 最高档)。
+
+    裸基名视为**最高档**：`gemini-3.1-pro` 是站方默认档，不该被它自己的
+    `gemini-3.1-pro-low` 顶掉。具名档按 low < medium < high < max 排。
+
+    只拆**一层**后缀，且只认 `_EFFORT_RANKS` 里的具名档：
+      · `gemini-3.1-pro-preview-search` 的 `search` 不在档表里 → 整名原样
+        返回（功能变体，不是算力档，规则③要求同级变体全留）
+      · `claude-opus-5` 的 `5` 是版本号 → 整名原样返回（见上面的说明）
+    """
+    n = bare_name(str(name or "")).lower()
+    m = _EFFORT_SUFFIX.match(n)
+    if not m:
+        return n, _BARE_EFFORT_RANK
+    return m.group(1), _EFFORT_RANKS[m.group(2)]
+
 
 
 # 非对话模型。写进 config.yaml 不会报错，但 CPA 路由过去必然失配 ——
@@ -322,6 +418,10 @@ def section_allows(section: str, name: str) -> bool:
         return False
     if section == "gemini-api-key":
         return gemini_pro_ok(n)
+    if (section == "codex-api-key" and CODEX_GPT_ONLY
+            and _OPENAI_REASONING_RE.match(n)):
+        # codex 段只留 gpt 系列（2026-09-27 用户改判，见 CODEX_GPT_ONLY）
+        return False
     want = SECTION_FAMILY.get(section)
     if want:
         return fam == want
@@ -366,6 +466,51 @@ def section_protocol_ok(section: str, name: str) -> bool:
     return True
 
 
+def section_model_violation(section: str, name: str) -> str:
+    """工具**自己挑**的模型能不能进这个段。不能则返回原因（空串 = 合规）。
+
+    写回前的最后一道族/档次闸（2026-09-26）。与 `section_allows` 的差别：
+    认不出族的名字（站方特供简写，如实测夹具里的 `opus-5`）不在这里拒 ——
+    它们只可能来自站方自己报的清单，拒掉会把唯一实测过的名字删掉。
+    这里只拒**能确定是错的**：
+
+      · 字符不安全 / 非对话模型（图像、语音、嵌入…）
+      · 降级档（mini / nano / lite / flash / fast / haiku）—— 高低档混在一段里，
+        CPA 轮询会把请求分给弱模型（用户：「模型勾选高低模型混乱错误」）
+      · 族错段：认得出族、且不是这个段的族。实测生产 config.yaml 的
+        codex 段里有 5 个条目挂着 `claude-opus-4-8` —— codex 段走 OpenAI
+        Responses，claude 模型路由过去必失配
+      · gemini 段只收 `gemini-<≥2.5>-pro*`
+
+    操作员显式手填的**不走这里**（那是 `section_protocol_ok` 的事）。
+    """
+    why = name_is_safe(name)
+    if why:
+        return why
+    n = bare_name(name)
+    if not is_chat_model(n):
+        return "非对话模型"
+    if is_low_tier(n):
+        return "降级档（mini/nano/lite/flash/fast/haiku）"
+    fam = family(n)
+    if section == "gemini-api-key":
+        return "" if gemini_pro_ok(n) else "gemini 段只收 gemini-≥2.5-pro*"
+    if (section == "codex-api-key" and CODEX_GPT_ONLY
+            and _OPENAI_REASONING_RE.match(n)):
+        return "codex 段只留 gpt 系列（o 系列不进，2026-09-27 用户改判）"
+    want = SECTION_FAMILY.get(section)
+    if want and fam and fam != want:
+        return f"{fam} 族模型不属于 {section}"
+    if fam == "gemini" and not gemini_pro_ok(n):
+        return "gemini 只收 ≥2.5 的 pro 档"
+    return ""
+
+
+def section_family_violations(section: str, models: list[str]) -> list[str]:
+    """清单里违反 `section_model_violation` 的名字（保序）。给写回前校验用。"""
+    return [m for m in (models or []) if section_model_violation(section, m)]
+
+
 # ---------------- 同系列取最新 ----------------
 
 # 版本 token：独立的数字串（允许 . 或 - 分隔的多段），前后不能紧贴字母数字。
@@ -401,6 +546,18 @@ _VERSION_RE = re.compile(
 # 同一套判据）。
 _O_SERIES_RE = re.compile(r"^o(\d+(?:[.\-]\d+)*)(?![A-Za-z0-9])")
 
+# 纯 8 位日期戳后缀（`-20251001`）。站方用它标同一款的发布日期，不是版本号。
+#
+# 为什么必须在 `series_and_version` 里剥掉，而不是留给下游截断：见那个函数的
+# docstring —— `generation` 取前两位只在版本号已经有两位时够用，单段版本号
+# （`claude-opus-5`）会把日期戳当成次版本号，于是带戳的写法淘汰掉不带戳的。
+#
+# 捕获组留住戳**前面**的部分，戳后面的后缀原样接上（`(?=$|[-.])` 只看边界，
+# 不消费它），所以 `claude-opus-5-20251001-preview` → `claude-opus-5-preview`，
+# 与不带戳的写法落在同一个系列同一个版本上。
+# 八位以外的数字段不碰：那可能是真的版本号（`gpt-4-32k` 的 32、`kimi-k2` 的 2）。
+_DATE_STAMP = re.compile(r"^(.*?)-\d{8}(?=$|[-.])")
+
 
 def series_and_version(name: str) -> tuple[str, tuple[int, ...] | None]:
     """拆成 (系列, 版本元组)。认不出版本时版本为 None。
@@ -413,8 +570,29 @@ def series_and_version(name: str) -> tuple[str, tuple[int, ...] | None]:
         kimi-k3          → ("kimi-k*", (3,))
         o1               → ("o*", (1,))             推理系列：o 后紧跟的数字是世代
         o4-mini          → ("o*-mini", (4,))
+
+    日期戳在**这一层**就剥掉（2026-09-27）
+    ------------------------------------
+    `claude-opus-5-20251001` 必须解析成 `(5,)` 而不是 `(5, 20251001)`。
+    下游 `generation` 取前两位本来是为这件事兜底，但它只在版本号**已经有两位**
+    时够用：
+
+        claude-haiku-4-5  (4,5)  vs  -20251001 版 (4,5,20251001)
+            → 前两位都是 (4,5)，相等，两个都留        ✓ 兜底生效
+        claude-opus-5     (5,)   vs  -20251001 版 (5,20251001)
+            → 前两位是 (5,0) vs (5,20251001)
+            → 日期戳被当成**次版本号**，带戳的那个胜出  ✗ 兜底漏了
+
+    也就是说单段版本号 + 日期戳会让「同一款的两种写法」变成「带戳的更新」，
+    把不带戳的那个淘汰掉 —— 而站方两种写法常常同时在目录里。`_VARIANT` 早就
+    列了八位日期戳，但那个正则只用于 `_product_line` 分组，没有在解析版本号
+    之前生效。这里在取版本号前先去掉纯日期戳后缀，两种写法就落在同一个版本上。
     """
     n = bare_name(name)
+    # 纯 8 位日期戳是「同一款的发布日期」，不是版本号的一部分。
+    # 只剥末尾的那一段：`claude-opus-5-20251001-preview` 这种保留后面的后缀，
+    # 去掉中间的戳，系列名仍然对得上不带戳的写法。
+    n = _DATE_STAMP.sub(lambda m: m.group(1), n)
     # 推理系列先判 —— `_VERSION_RE` 读不出它的版本（数字紧贴开头的 o），
     # 而「读不出版本」会让 o1 与 o3 一起躲过世代过滤。见 _O_SERIES_RE。
     mo = _O_SERIES_RE.match(n)
@@ -449,11 +627,93 @@ def series_and_version(name: str) -> tuple[str, tuple[int, ...] | None]:
 # 缺位补 0：`claude-opus-5` (5,) → (5, 0)，于是 `claude-opus-5-1` (5,1) 更新。
 # 这与语义一致 —— 5.1 是 5 的后续小版本。
 def generation(version: tuple[int, ...] | None) -> tuple[int, int] | None:
-    """版本元组 → 可比较的世代 (主, 次)。None 表示无从比较。"""
+    """版本元组 → 可比较的世代 (主, 次)。None 表示无从比较。
+
+    次版本缺失补 0（`(5,)` → `(5, 0)`）—— **不要改这个**。
+    `topup_to_market_top` 的阶段 C 靠它判「`claude-opus-5` 是
+    `claude-opus-5-5` 的旧次版本」，`tests/test_full_redetect.py` 与
+    `tests/test_planning_compliance.py` 共四条断言锁着那条行为。
+
+    「没标次版本不等于 0」这个更细的口径只在
+    `newest_generation_per_line` 的阶段 B 里需要（同主版本内的**同代兄弟**
+    不该互相淘汰），那里用 `_minor_is_explicit` 局部处理，不动这里的全局
+    语义 —— 两处要的判据不同，共用一个会破坏另一条。
+    """
     if not version:
         return None
     padded = (version + (0, 0))[:2]
     return (padded[0], padded[1])
+
+
+def _minor_is_explicit(name: str) -> bool:
+    """这个名字的版本号里**显式写了**次版本吗。
+
+    `gpt-6.1-sol` → True（(6, 1)）；`gpt-6-astra` → False（(6,)）。
+
+    为什么需要它（2026-09-30，本机实跑 CPA 权威名录）
+    ---------------------------------------------
+    `generation()` 把缺失的次版本补成 0，于是阶段 B 里
+        gpt-6-astra → (6, 0)   gpt-6.1-sol → (6, 1)
+    同产品线相比 (6,0) < (6,1)，`gpt-6-astra` / `gpt-6-luna` 被判低世代
+    淘汰。codex 段 8 个放行名最后只剩 `gpt-6.1-sol` 一个 —— 违反要求②
+    「gpt-6 系列**所有**模型名称」与要求③「同级系列全勾」。
+
+    但站方写 `gpt-6` 是**没标次版本**，不是「第 6.0 版」。而
+    `gpt-5.5` vs `gpt-5.6-luna` 两边都显式标了次版本，那是真实的世代差，
+    必须照旧淘汰（`tests/test_probe.py:780` 等四条断言守着）。
+
+    所以判据是「两边都显式标了才比次版本」，见 `_gen_supersedes`。
+    """
+    _series, version = series_and_version(bare_name(str(name or "")))
+    return bool(version) and len(version) > 1
+
+
+def _gen_supersedes(win: str, lose: str,
+                    gw: tuple[int, int], gl: tuple[int, int]) -> bool:
+    """在阶段 B 的同产品线比较里，`win` 是否**淘汰** `lose`。
+
+    两级判据（2026-09-30 定为两级，一级不够）
+    ------------------------------------
+      · **主版本**在粗产品线（`_product_line`）内比 —— `gpt-4o` 不得与
+        `gpt-6-sol` 并存这条老教训靠它，与分组键同粒度。
+      · **次版本**只在**同一条变体线**（`_generation_line`，即
+        `series_and_version` 的完整模板）内比，且两边都显式标了次版本。
+
+    为什么次版本要降到变体线（本机实跑，CPA 权威名录 codex 段 8 个放行名）
+
+        gpt-6-astra  (6,)   线 gpt-*-astra
+        gpt-6-sol    (6,)   线 gpt-*-sol
+        gpt-6.1-sol  (6,1)  线 gpt-*-sol
+        gpt-5.5      (5,5)  线 gpt-*
+        gpt-5.6-luna (5,6)  线 gpt-*-luna
+
+      · 在粗线 `gpt` 里比次版本 → `gpt-6.1-sol` 把 astra / luna 一起淘汰，
+        codex 段只剩 1 个模型，违反要求②「gpt-6 系列**所有**模型名称」。
+      · 完全不比次版本 → `gpt-6-sol` 与 `gpt-6.1-sol` 并存（同一条变体线
+        的新旧两代都写进 config.yaml），也违反要求③「只取最高级」。
+      · 降到变体线：`gpt-6.1-sol` 淘汰 `gpt-6-sol`（同线，两边都标了次版本
+        ——`(6,)` 没标，见下），astra / luna 各自成线不受影响。✓
+
+    `gpt-5.5` vs `gpt-5.6-luna` 是跨变体线（`gpt-*` vs `gpt-*-luna`），
+    按本判据不比次版本，但 `tests/test_probe.py:780` 要求 5.5 被淘汰 ——
+    那条由**阶段 A**（族内比主版本）之后的 `_stale_across_lines` 兜住，
+    见阶段 B 后面那一段。
+
+    次版本「两边都显式标了才比」：站方写 `gpt-6` 是没标次版本，不是
+    「第 6.0 版」。`generation()` 为别处的需要把它补成 0，这里用
+    `_minor_is_explicit` 还原真相。
+    """
+    if gw[0] != gl[0]:
+        return gw[0] > gl[0]
+    if _generation_line(win) != _generation_line(lose):
+        return False
+    # 同一条变体线内：站方自己在这条线上标了更高的次版本，说明它确实发了
+    # 新版（`gpt-6-sol` → `gpt-6.1-sol`），旧的那个出局。
+    # 没标次版本的一方按 `generation()` 的补 0 参与比较 —— 在**同线内**
+    # 那个补 0 是对的：同一条线上「gpt-6-sol」与「gpt-6.1-sol」就是先后两版。
+    # 跨线时才不能补（`gpt-6-astra` 与 `gpt-6.1-sol` 是两个并行型号），
+    # 上面那道线相等的闸已经把跨线的情形挡住了。
+    return gw[1] > gl[1]
 
 
 def newest_generation_per_line(names: list[str], *,
@@ -558,12 +818,112 @@ def newest_generation_per_line(names: list[str], *,
     cand = [(n, g) for n, g in cand if g[0] == top_major[generation_family(n)]]
 
     # ── 阶段 B：产品线内比完整世代，该世代的变体全留 ──
-    top_gen: dict[str, tuple[int, int]] = {}
+    #
+    # 分组键仍用 `_product_line`（粗线）—— 那是 2026-09-02 从「同系列取最新」
+    # 改过来的，为的是让 `gpt-5.5` 与 `gpt-5.6-luna` 能互相比较（按系列分组时
+    # 三者各自成系列，5.5 没有对手所以留下 —— 现场截图里 codex 段勾着
+    # `gpt-4o` 与 `gpt-5.5` 就是这个）。那条语义有 `tests/test_probe.py:780`
+    # 与 `tests/test_web.py` 三条断言守着，不能动。
+    #
+    # 真正的 bug 在**世代的比较口径**，不在分组（2026-09-30 定位）：
+    # `generation()` 原来把缺失的次版本补成 0，于是
+    #     gpt-6-astra  → (6, 0)
+    #     gpt-6.1-sol  → (6, 1)
+    # 同线相比 (6,0) < (6,1)，`gpt-6-astra` / `gpt-6-luna` 被判成低世代淘汰。
+    # 但站方写 `gpt-6` 是**没标次版本**，不是「第 6.0 版」—— 把它当 0 就等于
+    # 替站方声明了一个它没说过的版本号。
+    #
+    # 本机实跑（2026-09-30，CPA 权威名录 90 个，codex 段放行 8 个）：
+    #     gpt-6-luna gpt-6-astra gpt-6-sol gpt-6.1-sol
+    #     gpt-5.6-sol gpt-5.6-luna gpt-5.6-terra gpt-5.5
+    # 修前只选出 `gpt-6.1-sol` 一个 —— 违反要求②「gpt-6 系列**所有**模型
+    # 名称」与要求③「同级系列全勾」。
+    #
+    # 现在比较交给 `_gen_supersedes`（局部判据，不动 `generation` 的全局
+    # 补 0 语义 —— `topup_to_market_top` 的阶段 C 依赖那个补 0 判
+    # `claude-opus-5` 是 `claude-opus-5-5` 的旧次版本，有四条断言锁着）：
+    # 主版本照常比（4 < 5 < 6 仍然淘汰），次版本只在**两个名字都显式标了**
+    # 的时候比（5.5 < 5.6 仍然淘汰；6 与 6.1 互不淘汰、同时保留）。
+    #
+    # 「一个名字被本线里任何一个名字淘汰」才出局 —— 不能先算出线内「最高
+    # 世代」再按相等筛：淘汰关系在这里不是全序（6 与 6.1 互不淘汰），
+    # 取 max 会得到一个依赖遍历顺序的结果。
+    keep = set()
+    by_line: dict[str, list[tuple[str, tuple[int, int]]]] = {}
     for n, g in cand:
-        line = _product_line(n)
-        if line not in top_gen or g > top_gen[line]:
-            top_gen[line] = g
-    keep = {n for n, g in cand if g == top_gen[_product_line(n)]}
+        by_line.setdefault(_product_line(n), []).append((n, g))
+    for _line, members in by_line.items():
+        for n, g in members:
+            if not any(_gen_supersedes(other, n, og, g)
+                       for other, og in members if other != n):
+                keep.add(n)
+
+    # ── 阶段 B2：跨变体线的**旧次版本**也要淘汰 ──
+    #
+    # 阶段 B 把次版本比较降到了变体线（否则 `gpt-6.1-sol` 会把
+    # `gpt-6-astra` 一起淘汰，见 `_gen_supersedes`）。代价是跨变体线的
+    # 旧次版本漏了出去：
+    #
+    #     gpt-5.5       线 gpt-*        (5, 5)
+    #     gpt-5.6-luna  线 gpt-*-luna   (5, 6)
+    #     两者不同变体线 → 阶段 B 不比 → 5.5 留下
+    #
+    # 而 `tests/test_probe.py:780`（现场截图那组）要求 `gpt-5.5` 被淘汰：
+    # 按系列分组时 5.5 没有对手所以留下，正是 2026-09-02 要修掉的形态。
+    #
+    # 判据：**同粗产品线、同主版本**里出现了更高的**显式**次版本，则显式
+    # 标了更低次版本的名字出局。三个限定词都必要：
+    #   · 同粗线 —— gpt 与 claude 不互比（族已在阶段 A 分开，这里再保一层）
+    #   · 同主版本 —— 跨主版本归阶段 A（那里有实测豁免等另一套裁定）
+    #   · 显式次版本 —— `gpt-6-astra` 的 `(6,)` 没标次版本，不参与，
+    #     否则它会被 `gpt-6.1-sol` 淘汰，回到修前的形态
+    top_minor: dict[tuple[str, int], int] = {}
+    for n in keep:
+        if not _minor_is_explicit(n):
+            continue
+        g = generation(series_and_version(bare_name(n))[1])
+        if g is None:
+            continue
+        k = (_product_line(n), g[0])
+        if k not in top_minor or g[1] > top_minor[k]:
+            top_minor[k] = g[1]
+    for n in list(keep):
+        if not _minor_is_explicit(n):
+            continue
+        g = generation(series_and_version(bare_name(n))[1])
+        if g is None:
+            continue
+        if g[1] < top_minor.get((_product_line(n), g[0]), g[1]):
+            keep.discard(n)
+
+    # ── 阶段 C：同一基名的「算力档后缀」只留最高档（2026-09-30 加）──
+    #
+    # 用户规则④原话：「可以规避如下截图所示**部分高、低模型同时存在**没有
+    # 就高选择模型…等诸多 BUG 问题」。现场（投喂台快照 2026-09-19）：gemini
+    # 段种子兜底一次勾了 7 个，里面 `gemini-3.1-pro-high` 与
+    # `gemini-3.1-pro-low` 并存 —— 同一个基名 `gemini-3.1-pro` 的高低两档
+    # 同时写进 config.yaml，正是那句话点名要规避的形态。生产 config.yaml
+    # 也已落进这个结果（`romeo.example` 的 gemini 段同时有 pro 与 pro-low）。
+    #
+    # 为什么不能把 `low` 直接塞进 `_LOW_TIER`（那是上一版的做法，被否）
+    # -------------------------------------------------------------
+    # `_LOW_TIER` 是**无条件**排除：命中就永不入选。而 `-low` 与 `mini` /
+    # `flash` 的性质不同 —— `mini`/`flash` 是独立的廉价型号（另一条产品线），
+    # `-low` 只是同一个模型的**推理算力档**（high/medium/low 是 reasoning
+    # effort 后缀）。若无条件排除，当某站目录里**只有** `gemini-3.1-pro-low`
+    # 这一个变体时，该段会变成 0 个模型 —— 直接撞上红线 2「严禁出现不勾选」
+    # 与症状 C（「实测 0 个 · 已勾 0」）。
+    #
+    # 所以判据是**相对**的：同基名有更高档时才压掉低档，没有就保留。
+    # 这同时满足规则③「所有相同等级系列的模型全部都要勾选上」——
+    # 被压掉的不是「同等级的另一个型号」，而是「同一个型号的低算力档」。
+    #
+    # 档序取自后缀而非硬编码型号名（红线 3 禁硬编码）：数字越大越高，
+    # 具名档按 high > medium > low 排，无后缀（裸基名）视为最高档 ——
+    # 裸 `gemini-3.1-pro` 就是站方的默认档，永远不该被自己的 `-low` 顶掉。
+    # 实现搬到 `collapse_effort_tiers`（2026-09-30）—— 见那个函数的说明：
+    # `plan.py` 的族/档次终检也要走同一条收敛，两处不能各写一份。
+    keep = set(collapse_effort_tiers(sorted(keep)))
 
     # 按输入顺序输出，不按分组顺序 —— 调用方（rank_models）之后还要排序，
     # 但保持输入序让「没排序时也可复核」成立。
@@ -573,6 +933,55 @@ def newest_generation_per_line(names: list[str], *,
         if n in keep and n not in seen:
             seen.add(n)
             out.append(n)
+    return out
+
+
+def collapse_effort_tiers(names: list[str]) -> list[str]:
+    """同一基名的算力档只留最高档。保序去重，其余名字原样保留。
+
+    为什么必须是**独立的公开函数**（2026-09-30）
+    ------------------------------------------
+    这条收敛原来只写在 `newest_generation_per_line` 的阶段 C 里，而
+    `plan.py` 的「族 / 档次终检」走的是 `section_family_violations` ——
+    那是**逐条**判据（这个名字属不属于这个段、是不是降级档），看不见
+    「同基名还有更高档」这种**相对**关系。于是所有绕过
+    `newest_generation_per_line` 的路径（seed 兜底、`merged or v.models`
+    回退、应急 topup）都能把 `-low` 原样带到落盘。
+
+    本机实跑复现（2026-09-30，accounts.txt → 某站 gemini 段）：
+    方案里 `gemini-3.1-pro` 与 `gemini-3.1-pro-low` 并存且双双预勾 ——
+    正是规则④ 点名要规避的「部分高、低模型同时存在没有就高选择」。
+    阶段 C 的注释当时声称已修掉 gemini 段 `-high`/`-low` 并存，
+    实际只覆盖了走那个函数的那条路径。
+
+    判据仍是**相对**的（与阶段 C 同一套理由，不重复展开）：
+      · 同基名有更高档 → 压掉低档；
+      · 某站只提供 `-low` → 原样保留（否则该段清空，撞红线 2）；
+      · 裸基名视为最高档（站方默认档不该被自己的 `-low` 顶掉）；
+      · 版本号不是算力档（`claude-opus-5` 的 `5`），见 `_EFFORT_SUFFIX`。
+    """
+    src = [str(n) for n in (names or []) if n]
+    by_base: dict[str, list[str]] = {}
+    for n in src:
+        base, _rank = _effort_split(n)
+        by_base.setdefault(base, []).append(n)
+
+    drop: set[str] = set()
+    for _base, variants in by_base.items():
+        if len(variants) < 2:
+            continue
+        best = max(_effort_split(v)[1] for v in variants)
+        for v in variants:
+            if _effort_split(v)[1] < best:
+                drop.add(v)
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for n in src:
+        if n in drop or n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
     return out
 
 
@@ -803,6 +1212,75 @@ _TTL_BAD = 600
 _cache: dict = {"at": 0.0, "names": None, "ok": False, "why": ""}
 
 
+# ---------------- 第 1.5 层：上次拉通的名录（落盘） ----------------
+#
+# 2026-10-01 新增。动因是「严禁硬编码」这条要求与「段里不许有未定项」这条
+# 要求的冲突：远程名录拉不通时，原来直接掉到第 3 层 `FALLBACK_MODELS`，
+# 那是一张**写死在源码里、会随时间过期**的清单 —— 过期的表现是「填进
+# config.yaml 的模型 CPA 每次轮到都失败」，界面上却看着有值，比缺模型更
+# 难发现。
+#
+# 这一层把每次**成功**的远程名录落到磁盘；之后远程不通时先读它。
+# 于是写死的那一层退化为「这台机器从来没拉通过一次」时的最后兜底，
+# 而不是国内 VPS 的日常路径（直连 GitHub 不通是常态）。
+#
+# 落盘位置优先 `IMPORTER_BACKUP_DIR` —— 两个 compose 都把它挂成**命名卷**，
+# 容器重启后还在；/tmp 会被清掉，等于没存。目录不可写就静默跳过：
+# 这是加速层，不是功能依赖，不能让它把探测搞崩（2026-09-27 落盘日志
+# 那次 PermissionError 崩溃就是这么来的，见提交 3ceae78）。
+_DISK_CACHE_NAME = "model-catalog-last-good.json"
+# 落盘名录的保鲜期。超过它仍然用（比硬编码新），但在 why 里标出年龄，
+# 让界面能说清「这是 N 天前的名录」而不是假装是实时数据。
+_DISK_STALE_AFTER = 7 * 86400
+
+
+def _disk_cache_path() -> str | None:
+    import tempfile
+    for base in (os.environ.get("IMPORTER_CATALOG_CACHE_DIR"),
+                 os.environ.get("IMPORTER_BACKUP_DIR"),
+                 os.path.dirname(os.environ.get("IMPORTER_CONFIG", "") or "") or None,
+                 tempfile.gettempdir()):
+        if not base:
+            continue
+        try:
+            if os.path.isdir(base) and os.access(base, os.W_OK):
+                return os.path.join(base, _DISK_CACHE_NAME)
+        except OSError:
+            continue
+    return None
+
+
+def _disk_cache_save(names: list[str]) -> None:
+    path = _disk_cache_path()
+    if not path or not names:
+        return
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"at": time.time(), "names": names}, fh)
+        os.replace(tmp, path)          # 原子替换，避免读到半截文件
+    except OSError:
+        pass                            # 加速层，失败不影响功能
+
+
+def _disk_cache_load() -> tuple[list[str], float]:
+    """回 (名字列表, 落盘时间戳)。读不到回 ([], 0.0)。"""
+    path = _disk_cache_path()
+    if not path:
+        return [], 0.0
+    try:
+        with open(path, encoding="utf-8") as fh:
+            got = json.load(fh)
+        names = got.get("names")
+        if isinstance(names, list):
+            clean = [n for n in names if isinstance(n, str) and n.strip()]
+            if clean:
+                return clean, float(got.get("at") or 0.0)
+    except (OSError, ValueError, TypeError):
+        pass
+    return [], 0.0
+
+
 def _http_json(url: str, *, timeout: int, proxy: str | None):
     req = urllib.request.Request(url, headers={
         # GitHub 对无 UA 的请求会 403
@@ -822,10 +1300,18 @@ def remote_names(*, timeout: int = 8, proxy: str | None = None,
                  use_cache: bool = True) -> tuple[list[str], str]:
     """拉 CPA 权威名录里的全部模型 id。返回 (名字列表, 失败原因)。
 
-    两个地址依次试，任一成功即返回。全失败返回 ([], 原因)。
+    两个地址**并发**试，先返回的可用结果即采用。全失败时退到落盘的
+    上次成功名录（第 1.5 层）；连它也没有才返回 ([], 原因)，由调用方
+    掉到 `FALLBACK_MODELS`。
 
     超时 8 秒与 cpa_source_probe 对齐：这个调用可能出现在探测路径上，
     而国内 VPS 直连 GitHub 常不通 —— 长超时只会让整批探测变慢。
+
+    2026-10-01 改并发：原来两个地址**依次**试，各 8 秒，全不通的最坏
+    用时是 16 秒。而 `server._api_context` 在请求路径上同步调它，于是
+    容器刚起、缓存冷的那一次 `/api/context` 要等 16 秒才回 —— 首屏白屏
+    / 黑屏，刷新一次就好了（第二次吃失败缓存）。并发后最坏 8 秒，
+    且两个地址里只要有一个通就按它的真实耗时返回。
     """
     now = time.time()
     if use_cache and _cache["names"] is not None:
@@ -833,13 +1319,7 @@ def remote_names(*, timeout: int = 8, proxy: str | None = None,
         if now - _cache["at"] < ttl:
             return list(_cache["names"]), _cache["why"]
 
-    errors: list[str] = []
-    for url in _CATALOG_URLS:
-        try:
-            data = _http_json(url, timeout=timeout, proxy=proxy)
-        except Exception as e:                          # noqa: BLE001
-            errors.append(f"{url.split('/')[2]}: {type(e).__name__}")
-            continue
+    def _names_of(data) -> list[str]:
         names: list[str] = []
         # 结构：{provider: [{id, object, ...}, ...]}。只取 id，provider 分组
         # 对我们没意义 —— 段的归属由 section_allows 按名字判，不按 provider。
@@ -852,11 +1332,62 @@ def remote_names(*, timeout: int = 8, proxy: str | None = None,
                         mid = m["id"].strip()
                         if mid and mid not in names:
                             names.append(mid)
+        return names
+
+    def _one(url: str) -> tuple[str, list[str], str]:
+        try:
+            data = _http_json(url, timeout=timeout, proxy=proxy)
+        except Exception as e:                          # noqa: BLE001
+            return url, [], f"{url.split('/')[2]}: {type(e).__name__}"
+        names = _names_of(data)
         if names:
-            if use_cache:
-                _cache.update(at=now, names=names, ok=True, why="")
-            return list(names), ""
-        errors.append(f"{url.split('/')[2]}: 响应里没有模型 id")
+            return url, names, ""
+        return url, [], f"{url.split('/')[2]}: 响应里没有模型 id"
+
+    errors: list[str] = []
+    best: list[str] = []
+    try:
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=len(_CATALOG_URLS),
+                                    thread_name_prefix="catalog") as ex:
+            futs = {ex.submit(_one, u): u for u in _CATALOG_URLS}
+            for fut in _cf.as_completed(futs, timeout=timeout + 4):
+                _url, names, err = fut.result()
+                if names:
+                    best = names
+                    break                  # 先到先用，其余 future 自行结束
+                if err:
+                    errors.append(err)
+    except Exception as e:                              # noqa: BLE001
+        # 线程起不来（容器线程数吃紧）就退回串行，功能不能因此丢。
+        errors.append(f"并发拉取失败（{type(e).__name__}），已退回串行")
+        for url in _CATALOG_URLS:
+            _url, names, err = _one(url)
+            if names:
+                best = names
+                break
+            if err:
+                errors.append(err)
+
+    if best:
+        if use_cache:
+            _cache.update(at=now, names=best, ok=True, why="")
+        _disk_cache_save(best)
+        return list(best), ""
+
+    # 第 1.5 层：上次拉通的落盘名录。比写死的第 3 层新，优先用它。
+    disk, disk_at = _disk_cache_load()
+    if disk:
+        age_d = max(0, int((now - disk_at) // 86400)) if disk_at else -1
+        age = f"{age_d} 天前" if age_d >= 0 else "时间未知"
+        why = ("远程名录拉不通（" + ("；".join(errors) or "未知原因")
+               + f"），已改用落盘的上次成功名录（{age}，{len(disk)} 个模型）")
+        if disk_at and now - disk_at > _DISK_STALE_AFTER:
+            why += "；该名录已超过 7 天，请尽快恢复出网或配置代理"
+        if use_cache:
+            # 标 ok=False：它不是实时数据，10 分钟后应该再试一次远程。
+            _cache.update(at=now, names=disk, ok=False, why=why)
+        return list(disk), why
 
     why = "；".join(errors) or "未知原因"
     if use_cache:
@@ -874,9 +1405,33 @@ def remote_names(*, timeout: int = 8, proxy: str | None = None,
 #
 # 为什么不能只有这一层：写死的清单会过期，而过期的表现是「填进去的模型 CPA
 # 每次轮到都失败」—— 与缺模型一样坏，却更难发现（界面上看着有值）。
+#
+# 2026-09-26 更新到 gpt-6 / claude-opus-5-5 这一代，并**两代并存**（规则 ④）。
+#
+# 名字只取生产 config.yaml 里真实出现过的，不凭空编。实测分布：
+#     gpt-6-astra 55 · gpt-6-sol 6        ← 线顶（最新代，铺开得还少）
+#     gpt-5.6-sol 45 · -terra 28 · -luna 27 · gpt-5.6 10   ← 次新代，实际在扛量
+#     claude-opus-5-5 6                   ← 线顶
+#     claude-opus-5 49 · claude-fable-5-1 28 · claude-sonnet-5  ← 次新代
+#
+# 为什么不能只留线顶：这一层只在**远程名录拉不通、本地配置也没有**时才用到
+# （国内 VPS 常态）。那种情况下单写 gpt-6 系列，等于赌这个站已经开通了最新
+# 一代 —— 而生产数据说最新代只铺了 6 条、次新代有 100+ 条。赌输的表现是
+# 「填进去的模型 CPA 每次轮到都失败」，界面上却看着有值，比缺模型更难发现。
+# 规则 ④ 原话：线顶保留 + 实测最高的次新代一并保留。
+#
+# 为什么不能只留次新代：那就是「不就高」，违反规则 ②。
+#
+# 这一层被用到时会打 WARNING（见 latest_models），提醒它可能已经过期。
 FALLBACK_MODELS: dict[str, list[str]] = {
-    "codex-api-key": ["gpt-5.6-sol", "gpt-5.6", "gpt-5.6-luna", "gpt-5.6-terra"],
-    "claude-api-key": ["claude-opus-5", "claude-fable-5", "claude-sonnet-5"],
+    "codex-api-key": [
+        "gpt-6-astra", "gpt-6-sol",
+        "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6",
+    ],
+    "claude-api-key": [
+        "claude-opus-5-5", "claude-fable-5-1",
+        "claude-opus-5", "claude-sonnet-5",
+    ],
     "gemini-api-key": [
         "gemini-3.1-pro", "gemini-3.1-pro-high", "gemini-3.1-pro-preview",
         "gemini-3.1-pro-preview-search", "gemini-3.1-pro-preview-customtools",
@@ -884,10 +1439,57 @@ FALLBACK_MODELS: dict[str, list[str]] = {
     ],
     # compat 走 /chat/completions，四族都合法。给每族的头部型号 ——
     # 一个 provider 条目声明太多模型会拖慢 CPA 的模型注册，且多数用不上。
+    # 这里同样两代并存，但**只给 gpt 与 claude 两族**：实测生产配置里
+    # 只有这两族出现了明显的「线顶铺得少、次新代扛量」分布，gemini 与
+    # kimi 的线顶就是在用的那一代，铺第二代纯属增加注册成本。
     "openai-compatibility": [
-        "gpt-5.6-sol", "claude-opus-5", "gemini-3.1-pro", "kimi-k3",
+        "gpt-6-astra", "claude-opus-5-5", "gemini-3.1-pro", "kimi-k3",
+        "gpt-5.6-sol", "claude-opus-5",
     ],
 }
+
+
+# ---------------- 第 2.5 层：本进程见过的新鲜目录 ----------------
+#
+# 远程名录拉不通（国内 VPS 常态）时，内置清单是唯一剩下的来源 —— 而它必然
+# 过期。但同一轮探测里，**别的站**的 /v1/models 目录与实测通过的名字就是
+# 此刻市面上真实在卖的东西，比写死的清单新得多。这里收集它们，作为
+# 「远程名录 → 本地 config → 本轮目录 → 内置兜底」的第三层。
+#
+# 只收过了 `section_allows` 的名字（族、档次、字符都对），并且只在同一
+# 进程内有效（重启清零），不落盘 —— 它是「此刻」的证据，不是长期知识。
+import threading as _threading
+
+_SEEN_LOCK = _threading.Lock()
+_SEEN: dict[str, dict[str, float]] = {}
+_SEEN_TTL = 6 * 3600
+
+
+def note_catalog(section: str, names: list[str] | None) -> None:
+    """把站方目录 / 实测通过的名字记进本进程的新鲜目录（线程安全）。"""
+    if not names:
+        return
+    now = time.time()
+    with _SEEN_LOCK:
+        bucket = _SEEN.setdefault(section, {})
+        for n in names:
+            if isinstance(n, str) and section_allows(section, n):
+                bucket[n] = now
+
+
+def seen_catalog(section: str) -> list[str]:
+    """本进程近 6 小时见过的、这个段合规的名字（最近的在前）。"""
+    now = time.time()
+    with _SEEN_LOCK:
+        bucket = _SEEN.get(section) or {}
+        live = [(t, n) for n, t in bucket.items() if now - t < _SEEN_TTL]
+    return [n for _, n in sorted(live, reverse=True)]
+
+
+def reset_seen_catalog() -> None:
+    """测试用：清空本进程的新鲜目录。"""
+    with _SEEN_LOCK:
+        _SEEN.clear()
 
 
 # ---------------- 三层合并 ----------------
@@ -1124,7 +1726,10 @@ def topup_to_market_top(section: str, models: list[str], *,
     完整世代之间的收敛（阶段 B 的产品线取最高代）不动 —— `proven` 只影响
     「整代被更高主版本作废」这一条，不影响「同线取最高」。
     """
-    latest, src = latest_models(section, cfg=cfg, remote=remote, limit=0)
+    # 补齐项会写进 config.yaml —— 只取权威名录与本地配置里真实存在的名字，
+    # 不拿别站目录或写死清单顶替（2026-09-27，见 latest_models 的 for_registration）。
+    latest, src = latest_models(section, cfg=cfg, remote=remote, limit=0,
+                                for_registration=True)
     latest = [m for m in latest if section_allows(section, m)]
     if not latest:
         return list(models), [], ""
@@ -1449,6 +2054,15 @@ def topup_to_market_top(section: str, models: list[str], *,
         line = _product_line(n)
         if line not in _line_top or g > _line_top[line]:
             _line_top[line] = g
+    # 各产品线实测通过的最高世代（规则 ④ 豁免用，见 `_stale_minor`）
+    _line_proven: dict[str, tuple[int, int]] = {}
+    for n in (proven or []):
+        g = _cmp_gen(n)
+        if g is None:
+            continue
+        line = _product_line(n)
+        if line not in _line_proven or g > _line_proven[line]:
+            _line_proven[line] = g
 
     def _stale_minor(n: str) -> bool:
         """同一产品线、**同一主版本**内，次版本更低的那些。
@@ -1471,12 +2085,26 @@ def topup_to_market_top(section: str, models: list[str], *,
         不加这个限定时 `tests/test_full_redetect.py::
         test_model_rules_no_dead_end` 会挂在 `gpt-5.6` 被丢掉上 —— 那条
         断言从 924330f 起就锁着「两代都留」。
+
+        规则 ④ 豁免（2026-09-26）：这条线的最高次版本**没有实测通过**、而更低
+        的某一代实测通过时，实测最高的那一代留下（与最高次版本并存）。docx 原话
+        「按当前模型目录最高级别保留最新模型勾选……同时保留实测最高的次最新
+        模型」—— 只留一个没验过的名字，CPA 路由过去的那个站可能根本不卖它，
+        而验过的那一代反倒被删了。上一版在这里不看 proven，实测后果是
+        `max-context-length` 落不到实测模型上（那个模型整个被裁掉了）。
+        最高次版本本身实测通过时豁免不成立，照常只留高的。
         """
         g = _cmp_gen(n)
         if g is None:
             return False
-        top = _line_top.get(_product_line(n))
-        return top is not None and g[0] == top[0] and g[1] < top[1]
+        line = _product_line(n)
+        top = _line_top.get(line)
+        if top is None or g[0] != top[0] or g[1] >= top[1]:
+            return False
+        pv = _line_proven.get(line)
+        if pv is not None and pv != top and g == pv:
+            return False
+        return True
 
     _converged = [n for n in merged if not _stale_minor(n)]
     _minor_drop: list[str] = []
@@ -1517,7 +2145,8 @@ def topup_to_market_top(section: str, models: list[str], *,
 
 def latest_models(section: str, *, cfg: dict | None = None,
                   remote: list[str] | None = None,
-                  limit: int = 6) -> tuple[list[str], str]:
+                  limit: int = 6,
+                  for_registration: bool = False) -> tuple[list[str], str]:
     """该段「当前市面上最新」的模型清单。返回 (清单, 来源说明)。
 
     三层合并，可信度递减（见模块开头）：
@@ -1526,6 +2155,14 @@ def latest_models(section: str, *, cfg: dict | None = None,
       3. 内置兜底
 
     limit <= 0 返回完整注册清单；正数仍供有限探测队列使用。
+
+    `for_registration=True`（2026-09-27）：清单要**写进 config.yaml**（方案层
+    的 seed），而不只是拿去探测。此时只收前两层 —— 权威名录与本地配置都是
+    「真实存在的名字」；「本轮其他站目录」是**别的站**报的名字，拿来填这个站
+    是跨站污染；内置兜底是写死的猜测，违反修改要求第 5 条「禁止硬编码」。
+    两层都空就返回空清单，方案层据此判 writable=False、给出 skip_reason，
+    原条目保持不动。探测队列（默认 False）照旧可以用全部四层 —— 那里猜错
+    只多花一次请求，证据由实测给出。
 
     每一层都先过 `section_allows`，再对合并结果做 `newest_per_series`。
 
@@ -1551,13 +2188,44 @@ def latest_models(section: str, *, cfg: dict | None = None,
         src.extend(local)
         used.append(f"本地 config.yaml {len(local)} 个")
 
+    if not src and not for_registration:
+        # 第 3 层：本进程这一轮见过的新鲜目录（别的站实测/目录报过的名字）。
+        fresh = seen_catalog(section)
+        if fresh:
+            src.extend(fresh)
+            used.append(f"本轮其他站目录 {len(fresh)} 个")
+
+    if not src and for_registration:
+        return [], "权威名录与本地配置都没有可用名字（不拿别站目录或写死清单顶替）"
+
+    fallback_only = False
     if not src:
         built = [m for m in FALLBACK_MODELS.get(section, ())
                  if section_allows(section, m)]
         src.extend(built)
         used.append(f"内置兜底 {len(built)} 个")
+        fallback_only = True
+        # 写死的清单必然会过期 —— 用到它就说一声，运维能在日志里看见
+        # 「远程名录拉不通、本地也没有」这件事，而不是默默写进一代旧模型。
+        logger.warning(
+            "段 %s 的模型清单退到内置兜底（远程名录与本地配置都没有可用名字）"
+            "—— 内置清单可能已过期：%s", section, ", ".join(built))
 
-    out = newest_generation_per_line(src)
+    # 兜底清单**不再做世代收敛**（2026-09-26）。
+    #
+    # `newest_generation_per_line` 的职责是「从一堆真实存在的名字里挑最新
+    # 一代」—— 前提是这堆名字有来源（远程名录 / 本地配置 / 本轮目录），
+    # 收敛掉的旧代确实是该淘汰的。兜底层没有这个前提：它是**猜**的，猜的
+    # 时候收敛等于把「两代并存」这个已经想清楚的策略又抹平回一代。
+    #
+    # 实测后果：FALLBACK_MODELS 里 codex 段写了 gpt-6 与 gpt-5.6 两代
+    # （生产 config.yaml 实测 gpt-5.6-sol 45 条 / gpt-6-sol 6 条，次新代才是
+    # 扛量的那一代），收敛后只剩 ['gpt-6-astra', 'gpt-6-sol'] —— 等于赌这个
+    # 站已经开通最新代。赌输就是「填进去的模型 CPA 每次轮到都失败」。
+    #
+    # FALLBACK_MODELS 的内容已经逐条过了 `section_allows`（上面那行），
+    # 档次与族都是对的，两代并存是这一层刻意的设计，不是没清理干净。
+    out = src if fallback_only else newest_generation_per_line(src)
     # 排序必须在截取之前。不排的话取前 N 个拿到的是「输入顺序靠前」的那些，
     # 而输入顺序来自 CPA 名录的 JSON 排列 —— 与「哪个模型更该用」无关。
     # 实测 claude 段不排序时前三名是 haiku / sonnet / opus，正好倒过来。
@@ -1637,6 +2305,43 @@ def _product_line(name: str) -> str:
     if version is None or "*" not in series:
         return n
     return series.split("*", 1)[0].rstrip("-.") or n
+
+
+def _generation_line(name: str) -> str:
+    """世代比较用的**细**产品线 = `series_and_version` 的完整模板。
+
+    与 `_product_line` 的分工（2026-09-30 拆开）
+    ------------------------------------------
+    两者都从 `series_and_version` 出发，但截取位置不同，用途也不同：
+
+        名字            模板              _product_line   _generation_line
+        gpt-6-astra     gpt-*-astra       gpt             gpt-*-astra
+        gpt-6-sol       gpt-*-sol         gpt             gpt-*-sol
+        gpt-6.1-sol     gpt-*-sol         gpt             gpt-*-sol
+        gemini-3.1-pro  gemini-*-pro      gemini          gemini-*-pro
+
+      · `_product_line`（粗，`*` 之前那一截）→ 给 `_round_robin` 做**配额**：
+        「gpt 的三个同代变体不该占三个轮转位」，所以必须把它们归成一条线。
+      · `_generation_line`（细，整个模板）→ 给阶段 B 做**世代收敛**：
+        同一条线内比次版本（`gpt-6.1-sol` 压 `gpt-6-sol`），
+        不同线之间不比（`gpt-6-astra` 与 `gpt-6.1-sol` 各自保留）。
+
+    原来两处共用 `_product_line`，于是 `gpt-6.1-sol` 的次版本把同属最新主
+    版本的 `gpt-6-astra` / `gpt-6-luna` 一起淘汰，codex 段只剩 1 个模型 ——
+    违反要求②「gpt-6 系列**所有**模型名称」与要求③「同级系列全勾」。
+    实测依据见 `tests/test_generation_siblings.py`。
+
+    为什么不改 `_product_line` 本身：它的粗粒度对轮转配额是**对的**，
+    改了会让 compat 段的前 N 个全是 gpt 变体。两个判据本来就该分开。
+
+    读不出版本号时退回整个名字 —— 与 `_product_line` 同一套兜底理由
+    （无版本的名字在阶段 A 之前就被剔掉了，这里只保证函数总有返回值）。
+    """
+    n = bare_name(name)
+    series, version = series_and_version(n)
+    if version is None or "*" not in series:
+        return n
+    return series
 
 
 # 一个模型名要被当作「这个段的通用候选」，至少得有这么多个**不同的站**在用。

@@ -139,7 +139,20 @@ def _dead_section_params() -> None:
     sp = plan.sections.get("claude-api-key")
     eq("目录来源的判死段进得了方案", bool(sp is not None), True)
     if sp:
-        eq("模型取自目录", sp.models, ["claude-sonnet-5", "claude-opus-5-5"])
+        # 两条产品线各自升到市面最高次版本（2026-09-30 更新期望）
+        # -------------------------------------------------------
+        # 原期望 `["claude-sonnet-5", "claude-opus-5-5"]` 内部不一致：
+        # sonnet 线留在 `-5`，opus 线却升到 `-5-5`，而两条线在 CPA 权威名录
+        # 里都有 `-5-5`。`topup_to_market_top` 现在两条线一起补齐，
+        # 结果是一致的 `['claude-opus-5-5', 'claude-sonnet-5-5']` ——
+        # 符合要求②「每种类型只选该类型最高级别模型」与要求③
+        # 「所有相同等级系列的模型全部都要勾选上」。
+        #
+        # 这条与 `newest_generation_per_line` 无关（它对同一输入回
+        # `['claude-opus-5', 'claude-sonnet-5']`，与改动前一致）；
+        # `-5-5` 来自远程名录的 topup 补齐。
+        eq("模型取自目录并各线补到最高次版本",
+           sp.models, ["claude-opus-5-5", "claude-sonnet-5-5"])
         eq("标注来源是目录", sp.model_source, "catalog")
         eq("priority 是确定的整数", bool(isinstance(sp.priority, int)), True)
         eq("priority >= 1", sp.priority >= 1, True)
@@ -157,8 +170,13 @@ def _dead_section_params() -> None:
     if sp_seed:
         eq("标注来源是种子", sp_seed.model_source, "seed")
         eq("种子段可勾选", sp_seed.writable, True)
-        # 2026-09-17 反转（用户规则 ④）：种子填充的段也建议写
-        eq("种子段也建议写", sp_seed.recommended, True)
+        # 2026-09-29：跟上 09-28 裁定 —— 勾选闸与写入闸分开。
+        # 探测判死、目录与原配置都没有这一族 = 纯猜测，但**仍默认勾选**
+        # （规则 ③⑵④ 末句禁止「不勾选模型 / 待定 / 让用户手工选」）；
+        # 「低次品不能落盘」由 server.py 的 confirm_weak 闸在写回前拦一次。
+        eq("种子段默认仍勾选", sp_seed.recommended, True)
+        eq("种子段依据是最弱一档（写回时要确认）",
+           sp_seed.evidence_tier, "weak")
         eq("种子段 priority 是确定整数",
            bool(isinstance(sp_seed.priority, int)), True)
         eq("种子段 priority >= 1", sp_seed.priority >= 1, True)
@@ -383,7 +401,9 @@ def main() -> int:
     eq("最高世代 claude-opus-5 在清单里", "claude-opus-5" in _mn, True)
     from cpa_probe import model_catalog as _mcg
     _gens = {_mcg.generation(_mcg.series_and_version(n)[1]) for n in _mn}
-    eq("清单里只有一个世代（同代变体共存）", len(_gens), 1)
+    # 规则 ④（2026-09-26）：线顶 claude-opus-5-5 没实测、claude-opus-5 实测通过 ——
+    # 两代并存（同代变体照常共存），更低的 4-8 淘汰。
+    eq("最多两个世代（线顶 + 实测最高）", len(_gens) <= 2, True)
     eq("无重名 provider", h.no_dup_names(r["new"]), [])
 
     # ---------------------------------------------------------------- ②
@@ -458,16 +478,19 @@ def main() -> int:
                         for i in range(4)), compat_ok=False)
     eq("YAML 校验", r["yaml_ok"], True)
     eq("claude +4", r["d_claude"], 4)
-    # 2026-09-17 反转（用户规则 ④）：不可用段用市面最高级填充并建议写，
-    # 于是新站的 compat 段也进 provider —— 4 把 Key 同站合并成 1 个 provider。
-    eq("compat +1（种子填充）", r["d_provider"], 1)
-    eq("compat 有 diff", r["per_section"]["openai-compatibility"] > 0, True)
+    # 2026-09-29：跟上 09-28 裁定。compat 段判死、站方目录也没报 —— 清单是
+    # 市面猜测，但仍默认勾选（规则 ③⑵④），所以新站这里**会**多出一个
+    # provider。低次品不落盘由 server.py 的 confirm_weak 闸在写回前拦。
+    eq("compat 判死也进配置（weak 闸负责把关，不靠这里少写）",
+       r["d_provider"], 1)
+    eq("compat 有 diff", r["per_section"].get("openai-compatibility", 0), 1)
 
     section("⑦ claude 段不可用")
     r = h.run("\n".join(f"https://ncl.example.com,sk-ncl{i:04d}aaaabbbbc"
                         for i in range(4)), claude_ok=False)
     eq("YAML 校验", r["yaml_ok"], True)
-    eq("claude +4（种子填充）", r["d_claude"], 4)
+    # 同上：判死的 claude 段现在也默认勾选，4 把 Key 各一条。
+    eq("claude 段判死也进配置（weak 闸把关）", r["d_claude"], 4)
     eq("compat +1", r["d_provider"], 1)
 
     # ---------------------------------------------------------------- ⑧

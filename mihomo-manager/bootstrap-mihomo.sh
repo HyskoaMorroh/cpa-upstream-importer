@@ -10,8 +10,9 @@
 #   compose 里的顺序由 depends_on + service_completed_successfully 保证：
 #     mihomo-init（本脚本，跑完即退）-> mihomo（长驻）
 #
-# 幂等：卷里已有 config.yaml 就不覆盖，只补 healthcheck 与地理数据。
-#   想强制重建：设 MIHOMO_FORCE_REBUILD=1，或直接删掉卷里的 config.yaml。
+# 幂等：卷里已有 config.yaml 且订阅指纹未变就不覆盖，只补 healthcheck 与地理数据。
+#   订阅（MIHOMO_SUB_* / MIHOMO_SUBSCRIPTIONS）或 MIHOMO_SECRET 变化 → 自动重建（先备份）。
+#   想无条件重建：设 MIHOMO_FORCE_REBUILD=1，或直接删掉卷里的 config.yaml。
 #   不默认覆盖是因为探测脚本会把结果写进 AUTO 组的 filter，
 #   容器重启就冲掉那些结果等于让探测白跑。
 #
@@ -22,7 +23,7 @@
 #   MIHOMO_SECRET          RESTful API 鉴权密钥；留空则不设鉴权并告警
 #   MIHOMO_SUBSCRIPTIONS   订阅清单，多行或分号分隔的 `名称=URL`
 #   MIHOMO_SUB_<名称>      单个订阅的 URL（与上面二选一，大写名称）
-#   MIHOMO_FORCE_REBUILD   非空则强制用模板覆盖现有 config.yaml
+#   MIHOMO_FORCE_REBUILD   非空则强制用模板覆盖现有 config.yaml（订阅变化时无需设，会自动重建）
 
 set -eu
 
@@ -80,11 +81,37 @@ else
     log "! 未找到地理数据（$GEO_SRC），GEOIP/GEOSITE 规则会全部不匹配"
 fi
 
+# ---- 订阅指纹：订阅或 secret 变了就该重建 ----
+#
+# 2026-09-27 补。原来的规则是「卷里已有 config.yaml 就退出」，于是在 .env
+# 里改订阅 / 换 MIHOMO_SECRET 永远不生效 —— 用户以为换了机场，实际还在用
+# 旧节点，且日志里只有一行「配置已存在」。现在把订阅相关变量的 sha256 记在
+# 卷里的 .bootstrap-fingerprint，变了就按 FORCE 同样的路径（先备份）重建。
+#
+# 指纹只存哈希，不存原文：订阅 URL 自带 token，不该以明文多留一份。
+# 老卷没有指纹文件时只补记、不重建 —— 否则每台已部署的机器升级镜像后
+# 第一次启动都会冲掉探测脚本写进 AUTO 组的 filter。
+FP_FILE="$DST_DIR/.bootstrap-fingerprint"
+_fp_now=$( { env | grep -E '^MIHOMO_(SUB_[A-Za-z0-9_]+|SUBSCRIPTIONS|SECRET)=' | LC_ALL=C sort; } \
+    | sha256sum 2>/dev/null | cut -d' ' -f1 )
+_fp_old=""
+[ -f "$FP_FILE" ] && _fp_old=$(cat "$FP_FILE" 2>/dev/null || true)
+
 # ---- 已有配置且未要求重建：保留 ----
 if [ -f "$CONFIG" ] && [ -z "${MIHOMO_FORCE_REBUILD:-}" ]; then
-    log "配置已存在，保留不覆盖（要重建设 MIHOMO_FORCE_REBUILD=1）"
-    log "  $CONFIG"
-    exit 0
+    if [ -z "$_fp_old" ] && [ -n "$_fp_now" ]; then
+        printf '%s\n' "$_fp_now" > "$FP_FILE"
+        log "配置已存在，首次记录订阅指纹，保留不覆盖"
+        log "  $CONFIG"
+        exit 0
+    fi
+    if [ "$_fp_old" = "$_fp_now" ]; then
+        log "配置已存在且订阅未变，保留不覆盖（要重建设 MIHOMO_FORCE_REBUILD=1）"
+        log "  $CONFIG"
+        exit 0
+    fi
+    log "订阅或 MIHOMO_SECRET 已变化，按新订阅重建"
+    MIHOMO_FORCE_REBUILD=fingerprint
 fi
 
 if [ -f "$CONFIG" ]; then
@@ -276,5 +303,9 @@ if leftover:
           "mihomo 会因 URL 非法而启动失败" % ", ".join(sorted(leftover)))
     sys.exit(1)
 PY
+
+# 物化成功才记指纹：python 段失败时 set -e 已经退出，不会留下「新指纹 + 旧配置」
+[ -n "$_fp_now" ] && printf '%s
+' "$_fp_now" > "$FP_FILE"
 
 log "自举完成"

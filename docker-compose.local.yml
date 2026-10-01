@@ -1,7 +1,18 @@
-# 本地测试用 compose 配置
-# 用法：docker compose -f docker-compose.local.yml up --build
-
-version: '3.8'
+# 本地测试用 compose 配置（本地构建，不拉远程镜像）
+#
+#   cp .env.local.example .env.local && $EDITOR .env.local
+#   mkdir -p data && cp /path/to/config.yaml data/config.yaml
+#   docker compose -f docker-compose.local.yml up --build
+#
+# 与 docker-compose.yml 的区别只在「本地构建 + 挂 ./data 目录」。
+# 想尽量贴近 VPS 复现问题，用 docker-compose.yml（单文件挂载、内存上限、
+# 0:0 + cap_drop），并把 IMAGE 指到本地构建的 tag、PULL_POLICY=build。
+#
+# 2026-09-27 修：
+#   · 去掉过时的 `version:` 键（Compose v2 起忽略并告警）
+#   · MIHOMO_FORCE_REBUILD 原写 "0" —— bootstrap 按「非空即重建」判断，
+#     "0" 也非空，于是每次启动都冲掉 mihomo 配置。改为留空
+#   · mihomo 改用本项目镜像（与线上一致），补 healthcheck；importer 补 cap_drop
 
 services:
   # mihomo 配置初始化（一次性任务）
@@ -9,26 +20,43 @@ services:
     build:
       context: .
       dockerfile: deploy/Dockerfile
+    image: upstream-importer:local
     env_file: .env.local
+    user: "0:0"
+    restart: "no"
     environment:
       MIHOMO_TARGET_DIR: /mihomo-config
-      MIHOMO_FORCE_REBUILD: "0"
+      MIHOMO_FORCE_REBUILD: "${MIHOMO_FORCE_REBUILD:-}"
     volumes:
       - mihomo-config:/mihomo-config
     entrypoint: ["/app/mihomo-manager/bootstrap-mihomo.sh"]
     networks:
       - importer-net
 
-  # mihomo 代理
+  # mihomo 代理（与 importer 同一镜像，里面带 mihomo 二进制与地理数据）
   mihomo:
-    image: metacubex/mihomo:latest
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: upstream-importer:local
     container_name: mihomo
     restart: unless-stopped
+    user: "0:0"
+    entrypoint: ["/usr/local/bin/mihomo", "-d", "/mihomo-config"]
     ports:
       - "127.0.0.1:7890:7890"  # 混合代理端口
       - "127.0.0.1:9090:9090"  # RESTful API
     volumes:
-      - mihomo-config:/root/.config/mihomo
+      - mihomo-config:/mihomo-config
+    environment:
+      - MIHOMO_SECRET=${MIHOMO_SECRET:-}
+      - MIHOMO_GROUP=${MIHOMO_GROUP:-PROXY}
+    healthcheck:
+      test: ["CMD", "sh", "/mihomo-config/healthcheck.sh"]
+      interval: 60s
+      timeout: 40s
+      retries: 2
+      start_period: 30s
     depends_on:
       mihomo-init:
         condition: service_completed_successfully
@@ -40,6 +68,7 @@ services:
     build:
       context: .
       dockerfile: deploy/Dockerfile
+    image: upstream-importer:local
     container_name: cpa-upstream-importer
     restart: unless-stopped
     ports:
@@ -51,11 +80,22 @@ services:
       CPA_UPSTREAM_URL: ${CPA_UPSTREAM_URL:-http://host.docker.internal:8317}
       # 见 docker-compose.yml 的同名项说明 —— 不配则健康分定档静默失效
       CPA_MANAGEMENT_TOKEN: ${CPA_MANAGEMENT_TOKEN:-}
+      PROBE_PROXY: ${PROBE_PROXY:-http://mihomo:7890}
     volumes:
       - ./data:/data
       - ./backups:/backups
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8765/',timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 10s
     depends_on:
-      - mihomo
+      mihomo:
+        condition: service_started
     networks:
       - importer-net
     extra_hosts:

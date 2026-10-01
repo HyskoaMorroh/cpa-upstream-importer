@@ -552,8 +552,14 @@ id="p4" 在快照里出现 0 次           ← 第 4 步写回面板根本没渲
 
 不会出现模型乱、待定、低档乱选这三类。具体保证：
 
-1. **LOW_TIER 前后端一致** —— `mini / nano / lite / flash / fast`
-   五类在前端界面和后端写回两处用同一条正则，不会出现「界面已勾 → 写回被删」。
+1. **LOW_TIER 前后端一致** —— `mini / nano / lite / flash / fast / haiku`
+   六类在前端界面和后端写回两处用同一条正则，不会出现「界面已勾 → 写回被删」。
+   `haiku` 是 2026-09-27 补的：`_TIER_HINTS` 本来就给它打 4（比 `flash` 的 3
+   更低），`FALLBACK_MODELS` 的 claude 段也有意不含它，但判定链上只硬排除
+   `flash`。实测后果有两条 —— 站上只有 `claude-3-5-haiku` 时它被写进
+   config.yaml；同世代时它因自成一条产品线，在 `_round_robin` 里**保证**占一个
+   注册位，挤掉的反而是 `claude-opus-5-thinking`。注意 `-high` / `-low` 仍**不**
+   进降级档（2026-09-26 定：`gemini-3.1-pro` 的后缀都算同一系列）。
 2. **待定不会发生** —— `topup_to_market_top()` 强制填充：检测到任何已通模型就
    自动补全同 generation 全系列；若最新代全不通，也会填充最高档并保留次新代，
    不会让任何条目停在空值。
@@ -855,9 +861,13 @@ diff 无法复核。修复后 claude 段 8 个 `probed` 站占 493-500，5 个 `
 
   现在按**产品线**分组（剥掉版本与变体后缀：`-sol` / `-luna` / `-terra` /
   `-high` / `-low` / `-preview` / `-nano` / `-32k` / `-codex` …），线内取最高
-  世代。世代只比版本号前两位 —— `claude-haiku-4-5-20251001` 的日期戳不该让它比
-  `claude-haiku-4-5` 更新（同一款）。整条线都认不出版本时全留
+  世代。世代只比版本号前两位 —— `claude-opus-5-20251001` 的日期戳不该让它比
+  `claude-opus-5` 更新（同一款）。整条线都认不出版本时全留
   （`gpt-oss:120b` / `gpt-oss:20b`），无从比较不淘汰。
+
+  > 这个例子 2026-09-27 从 `claude-haiku-4-5` 换成了 `claude-opus-5`：haiku 当天
+  > 进了降级档，拿它举例会让人以为「日期戳」这条规则跟档次有关。两件事无关 ——
+  > 世代比较只管版本号，档次由 `LOW_TIER` 在更早一层就剔掉了。
 
   **2026-09-04 三次修正：`o` 系列**。现场截图里 codex 段同时勾着 `o1` 与 `o3`
   （连 `o1-pro` / `o3-mini` / `o3-pro` / `o4-mini` / `o4-mini-high` 一共七个全勾）。
@@ -1464,14 +1474,14 @@ codex 段梯子（6 档）：
 同时命中全部 12 个 claude 站，落到哪个由 priority + 加权轮询决定。「指名某站」
 这个能力事实上不存在。
 
-**解法**：14 站各自独占前缀（从域名生成，`api.alpharelay.com` → `ALP`、
-`betagate.cc` → `BET`），保留原名轮询，用 `models[].alias` 补段级兼容名。
+**解法**：14 站各自独占前缀（从域名生成，`api.alpha.example` → `ALP`、
+`bravo.example` → `BRA`），保留原名轮询，用 `models[].alias` 补段级兼容名。
 
 ```
 你想要的                        用哪个名字                  效果
 让 CPA 自动挑最好的站          claude-opus-5（原名）       按 priority 轮询全部 12 站
-指名 alpharelay                ALP/claude-opus-5           只落 alpharelay 那 7 条
-指名 betagate                  BET/claude-opus-5           只落 betagate 那 5 条
+指名 alpha 站                  ALP/claude-opus-5           只落 alpha 那 7 条
+指名 bravo 站                  BRA/claude-opus-5           只落 bravo 那 5 条
 兼容旧客户端（用 ANT/...）     ANT/claude-opus-5（别名）   同原名轮询
 ```
 

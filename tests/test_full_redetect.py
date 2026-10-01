@@ -2400,6 +2400,12 @@ def test_model_catalog_three_layers():
     import yaml
     from cpa_probe import model_catalog as mc
 
+    # 第 2.5 层（本进程见过的新鲜目录）是**模块级**状态，会被同一次运行里
+    # 先跑的用例填上。不清空的话「两层都空，落到内置兜底」这一段拿到的
+    # 来源是「本轮其他站目录」而不是「内置兜底」—— 断言失败，且失败原因
+    # 与被测逻辑无关（2026-09-26 踩过）。
+    mc.reset_seen_catalog()
+
     # ── ① 只有远程 ──
     remote = ["gpt-5.6-sol", "gpt-5.6-terra", "claude-opus-5", "claude-fable-5",
               "gemini-3.1-pro-preview", "kimi-k3", "grok-4.6", "gpt-oss-120b"]
@@ -2522,17 +2528,43 @@ gemini-api-key:
                           "gpt-5.6-terra"],
         "claude-api-key": ["claude-opus-5", "claude-fable-5",
                            "claude-sonnet-5"],
-        "gemini-api-key": ["gemini-3.1-pro", "gemini-3.1-pro-high",
+        # gemini 段：**功能变体**全留，**算力档**只留最高（2026-09-30 改）
+        # --------------------------------------------------------------
+        # 原来这里把 `gemini-3.1-pro-high` 与 `gemini-3.1-pro-low` 同时列为
+        # 必须出现 —— 那是 2026-09-26 的裁定（「`-pro` 后面所有后缀都算同一
+        # 系列，一并保留，`low` 不进降级档」）。
+        #
+        # 今日要求 3⑵③④ 推翻了那一半：「规避如下截图所示**部分高、低模型
+        # 同时存在**没有就高选择模型」。本机实跑（2026-09-30，accounts.txt）
+        # 复现了正是这个形态：方案里 `gemini-3.1-pro` 与
+        # `gemini-3.1-pro-low` 并存且双双预勾。
+        #
+        # 现在的口径（`collapse_effort_tiers`）：
+        #   · `-preview` / `-preview-search` / `-preview-customtools` /
+        #     `-request` 是**功能变体**，同级全留（要求③）；
+        #   · `-high` / `-low` / `-medium` 是同一个模型的**算力档**，
+        #     同基名只留最高 —— 裸 `gemini-3.1-pro` 是站方默认档，
+        #     档序最高，所以 `-high` 与 `-low` 都被它压掉。
+        #   · 某站只提供 `-low` 时仍然保留（否则该段清空，撞「严禁不勾选」），
+        #     那条由 `tests/test_effort_tier_gate.py` 守着。
+        "gemini-api-key": ["gemini-3.1-pro",
                            "gemini-3.1-pro-preview",
                            "gemini-3.1-pro-preview-search",
-                           "gemini-3.1-pro-preview-customtools",
-                           "gemini-3.1-pro-low"],
+                           "gemini-3.1-pro-preview-customtools"],
     }
     for sec, names in want.items():
         got, _src = mc.latest_models(sec, cfg=full_cfg, remote=full_remote,
                                      limit=12)
         missing = [n for n in names if n not in got]
         assert not missing, f"{sec} 缺用户指定的 {missing}：{got}"
+
+    # 算力档不得与裸基名并存（要求 3⑵③④ 的反向断言）
+    got_gem, _ = mc.latest_models("gemini-api-key", cfg=full_cfg,
+                                  remote=full_remote, limit=12)
+    for banned in ("gemini-3.1-pro-high", "gemini-3.1-pro-low"):
+        assert banned not in got_gem, (
+            f"算力档 {banned} 与裸 gemini-3.1-pro 并存 —— "
+            f"要求③④ 明确要规避「高、低模型同时存在」：{got_gem}")
 
     # ── ⑤ 幂等：同一批输入两次结果一致（diff 要可复核）──
     a = mc.latest_models("openai-compatibility", cfg=full_cfg,
@@ -2836,7 +2868,10 @@ def test_offfamily_manual_and_catalog():
     # ③ 目录里**有**四族的名字时，四族之外的不进清单（选型偏好照旧生效）
     p3 = plan(catalog=["grok-4.6", "claude-opus-5"])
     sp3 = p3.sections["openai-compatibility"]
-    assert sp3.models == ["claude-opus-5"], sp3.models
+    # 2026-09-25 用户裁定：claude-opus-5-5 与 claude-opus-5 是同一版本的高低
+    # 两档，只留高的。这里 claude-opus-5 只是目录报过、没有实测通过，规则 ④
+    # 的「保留实测最高」不成立 —— 所以只剩线顶。
+    assert sp3.models == ["claude-opus-5-5"], sp3.models
     assert "从没报过" not in " ".join(sp3.warnings)
 
     print("[OK] Off-family: 手填放行、目录只剩它们时收下、有四族时仍按偏好挑，"
@@ -4484,15 +4519,29 @@ openai-compatibility:
     # 原文件里没有的段：没有原清单 → 仍走 seed（不许凭空说「沿用」）
     assert plan.sections["gemini-api-key"].model_source == "seed"
 
-    # prior 与 seed 一样不够格新增一个原本不存在的段
+    # 新增段的准入按**依据强度**分档（2026-09-28 改，原来只看 model_source）
+    # ----------------------------------------------------------------------
+    # 旧契约是「prior 与 seed 一律不得新增段」。本机按 VPS 拓扑实跑
+    # accounts.txt 复现出它的后果：4 个新站 ×4 段全部 write_blocked →
+    # writable=False → recommended=False → 界面「未勾选任何项」、写回按钮
+    # disabled、priority 停在「定档计算中…」，正是规则 ③⑵④ 禁止的形态。
+    #
+    # 现判据与 `SectionPlan.evidence_tier` 对齐：
+    #   · prior —— 原 config.yaml 里已经写着的清单，先前一轮的实测沉淀，放行
+    #   · seed  —— 分两档：这一族在本站有据可查（目录报过 / 原配置有）才放行，
+    #             毫无痕迹的纯市面猜测仍然挡住
+    # 真正的 weak 段另有 server.py `_api_apply` 的 confirm_weak 二次确认闸。
     from cpa_probe.writeback import new_section_admitted
-    assert not new_section_admitted("prior"), (
-        "prior 不是本次实测依据，不许凭它新增段")
-    assert not new_section_admitted("seed")
+    assert new_section_admitted("prior"), (
+        "prior 是原配置里的实测沉淀，比工具猜测硬，应允许新增段")
+    assert new_section_admitted("seed", family_attested=True), (
+        "站方目录报过这一族、只是本轮没探通 —— 属规则④的正面适用面")
+    assert not new_section_admitted("seed", family_attested=False), (
+        "目录没报过、原配置也没有 —— 纯市面猜测，不许凭空新增段")
     for src in ("probed", "manual", "catalog"):
         assert new_section_admitted(src), src
 
-    print("[OK] Seed floor: 原清单优先于猜测、逐 Key 隔离、prior 不得新增段")
+    print("[OK] Seed floor: 原清单优先于猜测、逐 Key 隔离、新增段按依据强度分档")
 
 
 def test_assign_priorities_site_level():

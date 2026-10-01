@@ -134,3 +134,18 @@ mihomo-manager/mihomo-subscriptions.conf
 
 # .env：部署环境变量，含 MIHOMO_SECRET、MIHOMO_SUB_* 订阅 URL
 .env
+
+# ── 2026-09-27 泄露修补 ────────────────────────────────────────────
+# 这四个文件原本已被提交（前三个还推到了公开远程），而下面那条
+# `docs/*-handoff.md` 只覆盖 docs/ 下的交接文件 —— 仓库**根目录**的
+# handoff 不在它的范围里，于是漏了进去。忽略规则对已跟踪文件无效，
+# 所以除了补规则还必须 `git rm --cached`（本次已做）。
+#
+# tools/scrub.py 里是 18 个真实上游域名 -> 代号的映射表。源码用字符串
+# 拼接写，只能防 grep，不能防阅读：拿到仓库的人直接能拼出全部域名，而
+# 这张表本身就是「哪些站被脱敏过」的索引 —— 等于把脱敏结论反推回原文。
+# README 自己也写着这个脚本不适合放进仓库。
+tools/scrub.py
+# MEMORY.md 与根目录 handoff 含逐站 priority、Key 数量、排障现场。
+MEMORY.md
+/*-handoff.md

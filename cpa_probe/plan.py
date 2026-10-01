@@ -40,6 +40,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -56,6 +57,8 @@ from . import model_catalog
 # 「这个名字在这里没有作用」。
 from .pipeline import (MAX_MODELS_PER_SECTION, model_allowed,
                        model_fits_section)
+
+logger = logging.getLogger(__name__)
 
 # 只有 gemini 段在配置层去重（静默丢弃）
 _DEDUP_SECTIONS = {"gemini-api-key"}
@@ -1831,6 +1834,14 @@ class SectionPlan:
     # 「模型」列就是显示 config.yaml 里写了几个（rowData.ts:78），并排放在
     # 真实转发统计旁边，看着像测活结果 —— 那个坑不要再踩一遍。
     model_source: str = "probed"
+    # 这一族在这个站上是否「有据可查」——站方 /models 目录报过，或原
+    # config.yaml 里这个 (站, 段) 本来就有条目。由 build_plan 填。
+    #
+    # 只在 model_source == "seed" 时影响判断：seed 是「按市面最新代填充」，
+    # 有据时那是规则 ④ 的正面补全（medium），无据时纯属工具猜测（weak），
+    # 两者写进 config.yaml 的风险差一个量级，不能共用一个徽标。
+    # 见 `evidence_tier`。
+    family_attested: bool = False
     duplicate: bool = False
     duplicate_note: str = ""
     impacts: list[Impact] = field(default_factory=list)
@@ -1933,10 +1944,60 @@ class SectionPlan:
     # Additive API metadata; existing models and constructor positions stay intact.
     highest_models: list[str] = field(default_factory=list)
     model_provenance: dict[str, str] = field(default_factory=dict)
+    # 这一段探测的最终结论（照抄 SectionVerdict），供「建议写入」按证据判定。
+    #
+    # 为什么要带过来（2026-09-26 本机按 VPS 拓扑实跑）：accounts.txt 那 3 把
+    # Key 所在站 /v1/models 返回 0 个模型、四段全是「分组无该模型渠道」，
+    # 而方案把 12 段全部标成建议写入、用市面猜测的模型写了 418 行进
+    # config.yaml —— 这正是用户说的「低次品写入 config.yaml」。`recommended`
+    # 原来只看 model_source，看不到「站方已经明确拒绝」这条证据。
+    probe_usable: bool | None = None
+    probe_category: str = ""
+    probe_action: str = ""
 
     @property
     def hijacked(self) -> list[Impact]:
         return [i for i in self.impacts if i.hijacks]
+
+    # 依据强度的三档分级（2026-09-28）
+    # ================================
+    # 09-26 / 09-27 / 09-28 三次在 `evidence_block` 上来回收紧又放开，根因是
+    # 把两条要求当成了互斥：
+    #   · 规则 ③⑵④「严禁出现不勾选模型……让用户去手工选择」
+    #   · 「这样的低次品如何能写入 config.yaml 去破坏系统」
+    # 二选一必然牺牲一条 —— 09-27 收紧版实跑 accounts.txt 得到 16/16 段全不勾、
+    # 写回按钮 disabled（正是前者禁止的形态）；09-28 放开版则让站方目录返回
+    # 0 个模型的站也默认写入猜测清单（正是后者担心的形态）。
+    #
+    # 分层解法：**默认全勾**满足前者，**按依据强度分档 + 写回前对最弱一档
+    # 强制汇总确认**满足后者。勾选与确认是两道独立的闸，不再互相挤占。
+    #
+    #   strong  实测跑通 / 操作员手填   —— 直接写
+    #   medium  站方目录报过 / 原 config 里就有 —— 直接写
+    #   weak    纯市面猜测（seed 且这一族在这个站无据可查）—— 写回前汇总确认
+    #
+    # `_KEY_DEAD`（鉴权 / 余额）仍然单列：那是站方对**这把 Key 本身**的答复，
+    # 与选哪个模型无关，写任何清单都是死条目 —— 它继续走 `evidence_block`
+    # 默认不勾，不进这套分档。
+    _TIER_STRONG = frozenset({"probed", "manual"})
+    _TIER_MEDIUM = frozenset({"catalog", "prior"})
+
+    @property
+    def evidence_tier(self) -> str:
+        """依据强度：strong / medium / weak。界面按它上徽标，写回按它拦确认。
+
+        与 `model_source` 的区别：那个回答「清单从哪来」，这个回答「这份清单
+        有多硬」。seed 来源**不一定**就是 weak —— 站方目录报过这一族、或原
+        config.yaml 里本来就有这个段时，按最新代填充是有据可查的补全
+        （规则 ④ 的正面适用面），算 medium。
+        """
+        if self.model_source in self._TIER_STRONG:
+            return "strong"
+        if self.model_source in self._TIER_MEDIUM:
+            return "medium"
+        # seed：看这一族在这个站上是否有据可查。有据 = 规则 ④ 的补全，
+        # 无据 = 纯猜测，要在写回前被点名。见 `family_attested` 字段。
+        return "medium" if self.family_attested else "weak"
 
     @property
     def writable(self) -> bool:
@@ -1971,8 +2032,26 @@ class SectionPlan:
 
         依据强度仍然可见：`model_source` 照常带到界面上（「实测」「目录」
         「猜测」三档徽标），只是不再因为「不是实测」就默认不勾。
+
+        **2026-09-26：按证据收紧**（用户：「这样的低次品如何能写入 config.yaml」）
+        ------------------------------------------------------------------
+        09-17 那次把「不是实测」一律放行，结果是**站方已明确拒绝**的段也被
+        默认写入：本机按 VPS 拓扑实跑 accounts.txt，站方 /v1/models 返回 0 个
+        模型、四段全是「分组无该模型渠道」，方案仍用市面猜测的名字写了 12 段。
+        全量重探同样：66 个凭据里 49 个四段全灭，却有 183 段被默认勾上。
+
+        **2026-09-28：收紧面缩回到 Key 级拒绝那一类**（用户当日裁定）
+        --------------------------------------------------------
+        09-27 曾把它扩成「本轮没有一个模型实测通过就一律不勾」。本机实跑
+        accounts.txt 复现的后果是 16/16 段全部不勾、写回按钮 disabled ——
+        即 3⑵④ 最后一句明令禁止的形态。现在只保留 `_KEY_DEAD`（鉴权 / 余额）
+        这一条：那是站方对**这把 Key 本身**的答复，写任何清单都是死条目；
+        而「死路」只否定了试过的那几个模型，最终要写的市面最高代往往没被试过,
+        那正是规则 ④ 的适用面。判据与取舍逐条写在 `evidence_block` 里。
         """
         if not self.writable:
+            return False
+        if self.evidence_block:
             return False
         if any("换模" in w for w in self.warnings):
             return False
@@ -1981,6 +2060,130 @@ class SectionPlan:
         if any("截断反推" in w for w in self.warnings):
             return False
         return True
+
+    # 站方对**这把 Key 本身**给出的确定答复：鉴权失败、额度耗尽。与模型无关，
+    # 换模型、换时间、换代理都不会变（充值或换 Key 之后，下一轮重探会把它重新
+    # 放行）。「死路」不在这里：分组无该模型渠道 / 404 只否定了**试过的那几个
+    # 模型**，最终要写的市面最高代往往根本没试过 —— 那正是规则 ④ 的适用面。
+    _KEY_DEAD = frozenset({"鉴权", "余额"})
+
+    @property
+    def evidence_block(self) -> str:
+        """非空 = 证据不足以默认写入，值就是原因（直接显示给操作员）。
+
+        放行的证据（任一即可）：本轮实测通过 / 操作员手填 / 探测结论可用 /
+        规则 ④ 的「检测可能有 BUG、按该系列最高级填充」适用面。
+        **只有一类默认不写**：站方对这把 Key 本身给出确定答复（鉴权 / 余额）——
+        写哪个模型都一样死。它仍是完整方案（模型、priority、参数一项不缺），
+        操作员可手工勾选。
+
+        判据为什么切在这里、09-26 与 09-27 两次收紧为什么收回，见下方注释。
+        """
+        # 三次调整的时间线（每条都有现场依据，不要再来回翻）
+        # ================================================
+        # 09-17：撤掉「非 probed 一律不勾」。现场 golf.example 四段 401 →
+        #        model_source=seed → 一个都勾不到 → 模型列空白、priority 停在
+        #        「待定」。用户规则 ④ 要的正相反。
+        # 09-26：加回「seed 且判死不勾」。理由是站方 /v1/models 返回 0 个模型、
+        #        四段全「分组无该模型渠道」时仍写了 12 段猜测清单。
+        # 09-27：扩成「本轮没有一个模型实测通过 → catalog / prior / seed 全不勾」。
+        # 09-28：**收回到只留 Key 级拒绝**（用户当日裁定）。
+        #
+        # 09-28 的依据是本机实跑，不是推断：按 VPS 拓扑起 4 容器
+        # （nginx → importer → cli-proxy-api + 真 mihomo）、挂真实 295KB
+        # config.yaml、用 accounts.txt 的 4 行走真实前端（Playwright）。
+        # 结果 16/16 段 recommended=False、界面「未勾选任何项」、「生成写回方案」
+        # 按钮 disabled、priority 列停在「定档计算中…」—— 正是 3⑵④ 最后一句
+        # 明令禁止的「让出现一堆中文让用户去手工选择」。
+        #
+        # 判据切在哪里，以及为什么这是两条要求唯一不冲突的切法
+        # --------------------------------------------------
+        # 规则 ④ 的**前提句**已经写明适用面：「为了排除有时候检测模型BUG甚至
+        # 用代理去检测依然不通但是实际上能够正常调用使用」。也就是说
+        # 「挂代理也不通」是该规则的**触发条件**，拿它去阻断默认勾选，等于把
+        # 触发条件当成了否决条件 —— 09-27 那版就是这个错。
+        #
+        # 而「低次品写进 config.yaml」这条顾虑落在 `_KEY_DEAD`，且只落在那里：
+        #   · 鉴权（401）/ 余额（402）—— 站方对**这把 Key 本身**的确定答复
+        #     （分组未开通、额度耗尽），与选哪个模型无关；换模型、换时间、
+        #     换代理都不会变。写任何清单都是死条目。
+        #   · 「死路」（分组无该模型渠道 / 404）只否定了**试过的那几个模型**，
+        #     最终要写的市面最高代往往根本没被试过 —— 这正是规则 ④ 的适用面。
+        #
+        # 163 个全灭站的风险由另外三层兜住，不靠这道闸
+        # ------------------------------------------
+        #   · 试用期定档（probation=True）—— suggest_priority 取「挡住现有站
+        #     最少的那一档」，新站进不了顶层，在用站不会因此轮不到；
+        #   · `_validate_final`（server.py:834）的空 models 闸 —— 清单为空的段
+        #     一律拒绝落盘。那才是真正会让 CPA「每次轮到都失败」的形态，而
+        #     有清单的段至少是个可被下一轮重探纠正的候选；
+        #   · `model_source` 徽标（实测 / 目录 / 猜测）照常显示在界面上 ——
+        #     依据强度可见，操作员可以手工取消。
+        #
+        # 规则 ④ 的另一半（方案完整、不留空档、不出「待定」）由 writable 与
+        # topup_to_market_top 保证，与这道闸无关。
+        #
+        # 余额在 classify 里 usable=True（凭据有效、充值自愈），所以不能先按
+        # probe_usable 放行 —— 先看类别。
+        if self.model_source in ("probed", "manual"):
+            return ""
+        cat = (self.probe_category or "").strip()
+        why = (self.probe_action or "").strip() or cat or "探测未通过"
+        if cat in self._KEY_DEAD:
+            return (f"站方明确拒绝这把 Key（{cat}：{why}）—— 写哪个模型都是死条目，"
+                    "默认不写；充值或换 Key 后重探会自动放行，确知可用可手工勾选")
+        # 2026-09-28 撤回 09-27 的第三次收紧（用户当日裁定）
+        # ------------------------------------------------
+        # 09-27 那版在这里加了「本轮没有一个模型实测通过 → catalog / prior /
+        # seed 一律默认不写」。本机按 VPS 拓扑实跑 accounts.txt（4 行、真实
+        # 295KB config.yaml、真 mihomo 代理、真前端 Playwright）复现了它的
+        # 实际后果：**16/16 段全部 recommended=False**，界面「未勾选任何项」、
+        # 「生成写回方案」按钮 disabled、priority 列停在「定档计算中…」。
+        # 那正是用户 3⑵④ 最后一句要禁掉的形态 —— 「让出现一堆中文让用户去
+        # 手工选择」。
+        #
+        # 为什么撤回而不是折中：3⑵④ 的**前提句**写明了适用面 ——「为了排除
+        # 有时候检测模型BUG甚至用代理去检测依然不通但是实际上能够正常调用
+        # 使用」，接着「如果无论是挂代理还是不挂代理检测出来没有最新高级模型
+        # 数据不通，这个时候按该系列该类型模型的最高级进行填充勾选」。
+        # 也就是说「挂代理也不通」本身就是该条规则**触发条件**，不是排除条件。
+        # 用它来阻断默认勾选，等于把规则的触发条件当成了否决条件。
+        #
+        # 那么「低次品写进 config.yaml」这条顾虑落在哪里：落在上面那个
+        # `_KEY_DEAD` 分支，且**只落在那里**。401 / 402 是站方对**这把 Key
+        # 本身**的确定答复（分组未开通、额度耗尽），与选哪个模型无关，换模型、
+        # 换时间、换代理都不会变 —— 写任何清单都是死条目。而「死路」
+        # （分组无该模型渠道 / 404）只否定了**试过的那几个模型**，最终要写的
+        # 市面最高代往往根本没被试过，那恰恰是 3⑵④ 的适用面。
+        # 这条边界是两条要求唯一不冲突的切法。
+        #
+        # 09-19 那份 173 站快照里 163 个全灭站的风险由另外三层兜，不靠这道闸：
+        #   · 试用期定档（probation=True）—— suggest_priority 取「挡住现有站
+        #     最少的那一档」，新站进不了顶层，不会让在用站轮不到；
+        #   · `_validate_final`（server.py:834）的空 models 闸 —— 清单为空的段
+        #     一律拒绝落盘，那才是真正会让 CPA「每次轮到都失败」的形态；
+        #   · `model_source` 徽标（实测 / 目录 / 猜测）照常显示在界面上，
+        #     操作员看得见依据强度，可以手工取消。
+        #
+        # 走到这里的一律放行（catalog / prior / seed 都算规则 ④ 的适用面）。
+        # 不再按 model_source 分支 —— 依据强度交给界面的徽标表达，不影响默认值。
+        return ""
+
+    @property
+    def skip_reason(self) -> str:
+        """这一段为什么**不会**写（空串 = 会按勾选写）。界面直接显示这句。
+
+        与 `recommend_reason` 的区别：那句解释「建议不建议勾」，这句只回答
+        「为什么不写」—— 不可写（空清单 / 重复 / 写回闸）或默认不写（证据不足）。
+        """
+        if not self.writable:
+            return self.recommend_reason
+        return self.evidence_block
+
+    @property
+    def fallback_fill(self) -> bool:
+        """清单是规则 ④ 的兜底填充（没有目录证据，按最新代全量取）。"""
+        return self.model_source == "seed"
 
     @property
     def recommend_reason(self) -> str:
@@ -1991,6 +2194,8 @@ class SectionPlan:
             return self.write_blocked
         if not self.models:
             return "无可信模型，写进去等于死条目"
+        if self.evidence_block:
+            return self.evidence_block
         if self.model_source == "catalog":
             if self.catalog_stale:
                 return (f"模型取自站方目录（{len(self.models)} 个），但"
@@ -2005,9 +2210,13 @@ class SectionPlan:
                     f"条目的 {len(self.models)} 个模型 —— 那是先前一轮的实测"
                     "沉淀，比工具猜测硬；但本次没验过，默认不勾")
         if self.model_source == "seed":
-            return ("推理未验证到可用模型（探测未通过，或端点通但返回的模型"
-                    f"对不上），清单取自「当前市面最新」（{len(self.models)} 个）"
-                    " —— 参数已按试用期算全，勾选前请确认这些名字该站真有")
+            if self.evidence_tier == "weak":
+                return (f"⚠ 市面猜测：站方目录没报过这一族、原配置里也没有，"
+                        f"这 {len(self.models)} 个名字是按当前市面最新代填的"
+                        " —— 已按规则④默认勾选，但写回前会单独列出请你确认")
+            return (f"兜底：按规则④取最新代（{len(self.models)} 个）"
+                    " —— 推理未验证到可用模型，但这一族在本站有据可查"
+                    "（目录报过或原配置里就有）；参数已按试用期算全")
         if any("换模" in w for w in self.warnings):
             return "检测到静默换模 —— 计费却拿不到要的模型，默认不勾"
         if self.hijacked:
@@ -2192,6 +2401,11 @@ def build_plan(
     force = force or {}
     for section, v in result.sections.items():
         model_warns: list[str] = []
+        # 本站实测通过 / 目录报过的名字进本进程的新鲜目录，供后续「无证据」
+        # 段兜底时优先于写死清单使用（见 model_catalog.seen_catalog）。
+        model_catalog.note_catalog(
+            section, list(getattr(v, "models", []) or [])
+            + list(getattr(v, "catalog", []) or []))
         # 手填清单的过滤：**只挡协议层不可能成立的**，不挡族。
         #
         # 分两类，判据完全不同（2026-09-03 拿真实配置核实后区分开）：
@@ -2614,7 +2828,8 @@ def build_plan(
             remote, _why = model_catalog.remote_names()
             # limit=0 不截断注册清单；HTTP 探测预算由探测阶段单独管理。
             models, model_src = model_catalog.latest_models(
-                section, cfg=cfg, remote=remote, limit=0)
+                section, cfg=cfg, remote=remote, limit=0,
+                for_registration=True)
             # usable 段落到这里 = 端点通但模型全被拒收（换模/错误体）。
             # 那和「判死且目录读不到」是同一种处境：清单没有实测依据。
             # 记成 seed 让界面照实说，别让它顶着「实测」的徽标。
@@ -2731,43 +2946,61 @@ def build_plan(
                 if _note:
                     model_warns.append(_note)
 
-            # P0 修复：空模型强制回退（2026-09-12）
-            # -----------------------------------------------
-            # 背景：95% 检测失败（403/405/401/503）→ 空段 → 空模型 → 用户投诉
-            # 即使 topup_to_market_top 理论有回退，实际大量站点仍输出空模型
-            # 根因：检测全灭时 merged=[]，topup 可能因段名不匹配等原因也返回空
-            #
-            # 三层保障：
-            # 1. 优先：topup_to_market_top 的正常回退（已有）
-            # 2. 次之：强制调用 topup 并检查结果（此处新增）
-            # 3. 兜底：直接使用 FALLBACK_MODELS（最后防线）
+            # 空清单不再「强制回退」（2026-09-27 删掉 09-12 的 emergency /
+            # hardcoded-fallback 两层）。那两层在没有任何证据时拿写死的
+            # FALLBACK_MODELS 顶上，model_source 却仍是 probed/catalog —— 界面
+            # 看着像实测、默认勾上、落盘写进一批这个站从没报过的名字（用户：
+            # 「这样的低次品如何能写入 config.yaml 去破坏系统」）。空清单的段
+            # 由下方终检交给 seed（规则 ④ 的完整方案，但默认不写、新增段不放行），
+            # 仍空就 writable=False，界面显示 `skip_reason`，原条目不动。
             if not models:
                 logger.warning(
-                    f"段 {section} 基址 {base[:40]} 模型为空，触发强制回退")
+                    f"段 {section} 基址 {base[:40]} 模型为空，不写死兜底")
 
-                # 尝试再次调用 topup（无输入、无 cfg、无 remote）
-                emergency, emergency_added, emergency_src = \
-                    model_catalog.topup_to_market_top(section, [], cfg=None, remote=None)
-
-                if emergency:
-                    models = emergency
-                    model_src = f"emergency-fallback ({emergency_src})"
-                    logger.warning(
-                        f"  → 应急回退成功：{len(emergency)} 个模型从 {emergency_src}")
-                else:
-                    # 最后防线：直接取 FALLBACK_MODELS
-                    from .model_catalog import FALLBACK_MODELS
-                    hardcoded = FALLBACK_MODELS.get(section, [])
-                    if hardcoded:
-                        models = list(hardcoded)
-                        model_src = "hardcoded-fallback"
-                        logger.error(
-                            f"  → 应急回退也空，使用硬编码回退：{len(models)} 个模型")
-                    else:
-                        logger.critical(
-                            f"  → 所有回退均失败，段 {section} 基址 {base[:40]} "
-                            f"无任何模型可用！将生成空模型条目。")
-                        # 不抛异常，让调用方决定如何处理空条目
+            # 族 / 档次终检（2026-09-26）
+            # ------------------------------------------------------------
+            # 上面四条来源各自过了闸，但回退路径（`merged or v.models`、
+            # 应急 topup、硬编码）会把不合规的名字带回来。实测生产 config.yaml
+            # 的 codex 段挂着 5 个 `claude-opus-4-8`，gemini 段 `-high` 与
+            # `-low` 并存 —— 用户说的「模型勾选高低模型混乱」。这里统一再筛
+            # 一次：降级档、非对话、认得出族却错段的一律剔除。
+            #
+            # 剔空就按规则 ④ 兜底：最新代全量（`latest_models`），并记 seed
+            # （界面显示「兜底」）。**任何段都不许以零模型结束。**
+            _bad = model_catalog.section_family_violations(section, models)
+            if _bad:
+                models = [m for m in models if m not in set(_bad)]
+                model_warns.append(
+                    "已剔除不属于这个段或降级档的模型："
+                    + "、".join(_bad[:6]) + ("…" if len(_bad) > 6 else ""))
+            # 算力档收敛（2026-09-30 补接线）
+            # ------------------------------------------------------------
+            # 上面那条是**逐条**判据，看不见「同基名还有更高档」这种相对关系。
+            # 本机实跑复现（accounts.txt → 某站 gemini 段）：方案里
+            # `gemini-3.1-pro` 与 `gemini-3.1-pro-low` 并存且双双预勾 ——
+            # 正是规则④ 要规避的「部分高、低模型同时存在没有就高选择」。
+            # 收敛逻辑本来只在 `newest_generation_per_line` 的阶段 C 里，
+            # 绕过那个函数的路径（seed 兜底、`merged or v.models` 回退、
+            # 应急 topup）全都漏。这里补上同一条闸。
+            #
+            # 不会清空：某站只有 `-low` 时该函数原样保留它（红线 2）。
+            _collapsed = model_catalog.collapse_effort_tiers(models)
+            if len(_collapsed) != len(models):
+                _dropped = [m for m in models if m not in set(_collapsed)]
+                models = _collapsed
+                model_warns.append(
+                    "同一模型的低算力档已压掉（同基名保留最高档）："
+                    + "、".join(_dropped[:6])
+                    + ("…" if len(_dropped) > 6 else ""))
+            if not models:
+                _remote, _ = model_catalog.remote_names()
+                models, model_src = model_catalog.latest_models(
+                    section, cfg=cfg, remote=_remote, limit=0,
+                    for_registration=True)
+                models = [m for m in models
+                          if not model_catalog.section_model_violation(section, m)]
+                models = model_catalog.collapse_effort_tiers(models)
+                model_source = "seed"
             catalog_stale, stale_why = False, ""
         provenance = {
             m: ("verified" if v.usable and m in v.models else "inferred")
@@ -2916,10 +3149,21 @@ def build_plan(
             prompt_cache_note=getattr(v, "prompt_cache_note", ""),
             score=score,
             model_source=model_source,
+            # 依据强度分档的输入（2026-09-28）。两个证据源都在本函数里算过：
+            #   · v.catalog —— 本轮站方 /models 报出来的名字（过滤前全集）
+            #   · existing_models_for(...) —— 原 config.yaml 里这个条目的清单
+            # 任一非空 = 这一族在这个站上有痕迹，seed 填充属于规则 ④ 的正面
+            # 补全；两个都空 = 纯市面猜测，写回前要被点名确认。见 evidence_tier。
+            family_attested=bool(
+                list(getattr(v, "catalog", None) or [])
+                or existing_models_for(cfg, section, base, row.api_key)),
             catalog_stale=catalog_stale,
             catalog_stale_why=stale_why,
             highest_models=list(models),
             model_provenance=provenance,
+            probe_usable=bool(getattr(v, "usable", False)),
+            probe_category=str(getattr(v, "category", "") or ""),
+            probe_action=str(getattr(v, "action", "") or ""),
         )
         if model_warns:
             sp.warnings.extend(model_warns)
@@ -3561,15 +3805,76 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
             return 0
 
         dropped: list[str] = []     # 掉出自己空档的站
-        floor_hit = 0               # 压到 1 还排不下的站数
+        floor_hit = 0               # 连向上让位都找不到空整数的站数
+        lifted: list[tuple[str, int, int]] = []   # (host, 本来的 1, 让到的值)
         prev: int | None = None
         for idx, (host, sps, cap, best) in enumerate(caps):
             v = cap if prev is None else min(cap, prev - 1)
             while v >= 1 and v in taken:            # 撞现有档位就再降一格
                 v -= 1
             if v < 1:
-                v = 1
-                floor_hit += 1
+                # 地板碰撞：往下没有可用整数了。
+                #
+                # 2026-09-28 本机实测（accounts.txt 4 行 × 真实 config.yaml）：
+                # compat 段既有档位是 1..8 连号 + 12/19/26/31/34，新站 cap=15，
+                # 从 15 逐格降下来 12/8/7/6/5/4/3/2/1 全被 taken 占住，于是
+                # `v = 1` —— **两个站同时拿到 1**。codex 段同样（既有 3/4/5 连号）。
+                # 现场表现：前端 priority 列两站都显示 1，而需求 3⑶④ 要的正是
+                # 「同一类型不同域名的优先级一定要不同，哪怕算出来相同也要微调」。
+                #
+                # 原来这里只是 `v = 1; floor_hit += 1` 再加一条警告 ——
+                # 警告说的「会与已取 1 的站同层轮询」正是它自己制造的：
+                # 层级隔离下（selector.go:527-553 只取最高可用桶）同层的站按
+                # weight 轮询而非分先后，冗余退化成一个桶，用户第 6 条要的
+                # 「高优先级耗尽自动降级到低优先级站」就此失效。
+                #
+                # 改法：往**上**找最近的空整数。方向选上而不是继续往下，因为
+                # 往下已经没有整数可用（这正是走到这里的前提）。
+                #
+                # 搜索范围必须覆盖**整个档位谱的空整数**，不能只看 cap
+                # ------------------------------------------------------
+                # 2026-09-30 本机实测（真实 config.yaml，compat 段既有
+                # 1..8 + 12/19/26/31/34，四个新站 cap 都是 10）：原来写
+                # `range(1, cap + 1)`，而 1..10 里 1..8 被现有站占住、
+                # 9/10 被本批前两站拿走 —— 于是 `next(...)` 返回 0，落进
+                # `v = 1` 的兜底，**两个站又同时拿到 1**，而 1 本身还是
+                # 在用站的档位。测试 `test_priority_invariants.py` ① 就是
+                # 这个形状，改之前它是红的。
+                #
+                # cap 所在空档（8↔12）只容 9/10/11 三个整数，而本批有四个
+                # 站要排 —— 光在 cap 之下或 cap 那个空档里找，怎么找都不够。
+                # 真正空着的是更高的空档：12↔19 里 13..18 全是空的。
+                #
+                # 所以这里按「离 cap 最近」的顺序扫**全谱**空整数，优先
+                # cap 及以下（那是 suggest_priority 建议的安全区），用尽了
+                # 再往上取。上界是 `band.tiers[0] - 1` —— 绝不越过本段最高
+                # 的在用档位，那一步才是真的劫持顶层。
+                #
+                # 越过某个在用档位会改变这个站与那批现有站的先后关系，
+                # 这件事由下面的 `dropped` / `lifted` 如实报给操作员 ——
+                # 它本来就是为这种情形准备的告警，不是新增的静默行为。
+                #
+                # 为什么宁可越档也要取不同值：「站与站取不同值」是硬约束
+                # （需求 1 后半 + 3⑶④，且第 6 条的跨站降级容灾完全依赖它 ——
+                # 同档在 CPA 里按 weight 轮询而非分先后，冗余退化成一个桶），
+                # 而「分数高的排前面」只是偏好。两害相权取前者。
+                #
+                # 单调递减在这一支上必然被打破（让位的站会高于前一站），
+                # 这是**有意的取舍**，`lifted` 会说出来。
+                top_tier = band.tiers[0] if band.tiers else cap
+                pool = [c for c in range(1, max(top_tier, cap + 1))
+                        if c not in taken]
+                # 先 cap 及以下（由高到低，尽量贴着 cap），再 cap 之上（由低
+                # 到高，尽量少越档）。两段都按「离 cap 最近」排。
+                below = sorted((c for c in pool if c <= cap), reverse=True)
+                above = sorted(c for c in pool if c > cap)
+                v = next(iter(below + above), 0)
+                if v:
+                    lifted.append((host, 1, v))
+                else:
+                    # 整个档位谱一个空整数都没有 —— 那时才真的分不开。
+                    v = 1
+                    floor_hit += 1
             if v <= _floor_of(cap):
                 dropped.append(host)
             taken.add(v)
@@ -3625,6 +3930,14 @@ def assign_priorities(plans: list[ImportPlan], cfg: dict, *,
                 f"段 {section}：{len(dropped)}/{len(caps)} 个站排不进算法给的空档，"
                 f"已越过下一个现有档位（{head}）—— 它们与那批现有站的先后关系"
                 f"随之改变，请复核这几站的 priority")
+        if lifted:
+            head = "、".join(f"{h}→{v}" for h, _one, v in lifted[:4])
+            head += "…" if len(lifted) > 4 else ""
+            warns.append(
+                f"段 {section}：{len(lifted)} 个站按得分排下来已无可用整数"
+                f"（现有档位在低位连号），已上移到 cap 以下最近的空整数"
+                f"（{head}）—— 这样站与站的 priority 才互不相同；"
+                f"代价是这几站不再严格按得分先后排列，请复核")
         if floor_hit:
             warns.append(
                 f"段 {section}：{floor_hit} 个站已压到最低值 1，"

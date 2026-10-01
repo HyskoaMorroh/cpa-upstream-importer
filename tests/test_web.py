@@ -611,12 +611,18 @@ console.log(JSON.stringify(out));
            "没有容器就没地方填，用户只能看到空手填框")
     truthy("refreshPlan 用 sp.models 填它",
            ".cats.fallback" in js and "sp.models.map" in js)
-    truthy("填完立刻回写 S.forced", "S.forced[p.line_no] = S.forced[p.line_no]" in js,
-           "提交时读的是 S.forced 不是 DOM —— 不回写就是「勾着但没接管」")
-    truthy("seed 猜测**不**回写 S.forced",
-           "sp.model_source !== 'seed'" in js,
-           "回写会让后端把猜测当手填：徽标不再提示无依据，且跨段新增那道闸"
-           "按 model_source 判、manual 放行 —— 猜测清单能凭空新增条目")
+    # 2026-09-26：任何来源都不回写 S.forced。后端把 S.forced 当手填（最高
+    # 权威，绕过证据检查），前端预勾回写 = 把 JS 选型包装成人工决定。实测
+    # 全量重探里 64 段因此变成「手填」默认写入，codex 段只剩单个 gpt-6-astra。
+    truthy("方案填勾选框时不回写 S.forced",
+           "(S.forced[p.line_no] = S.forced[p.line_no] || {})[sec] = [...on]" not in js,
+           "回写会让下一轮定档把后端算的清单当手填，绕过证据与世代规则")
+    truthy("目录分支首次渲染也不回写 S.forced",
+           "(S.forced[rid] = S.forced[rid] || {})[sec] = [...picked]" not in js,
+           "预勾只是显示；写什么由后端方案决定")
+    truthy("无人工记录时勾选状态同步成后端方案",
+           "want.has(x.value)" in js and "sp.models.filter((m) => !have.has(m))" in js,
+           "界面勾着的必须就是要写的那一份")
     truthy("已有用户记录时不覆盖", "rec !== undefined ? rec : sp.models" in js)
     truthy("容器已填过就不重填", "!fb.querySelector('.cm')" in js,
            "每次 refreshPlan 都重填会把用户的取消勾选覆盖掉")
@@ -776,9 +782,15 @@ console.log(JSON.stringify(out));
     # ── ④ 长任务防护 ───────────────────────────────────────────────
     section("④ 长任务防护")
     # 轮询失败必须重试。判据：从 poll 的 catch 起、到 catch 块结束之间要有
-    # poll() 调用。用括号配平找块尾，不用正则猜缩进 —— 缩进一变正则就失效，
+    # poll 调用。用括号配平找块尾，不用正则猜缩进 —— 缩进一变正则就失效，
     # 而这条断言恰恰是要防「以后有人把重试删掉」。
-    ci = js.find("catch (e) {", js.find("function poll()"))
+    #
+    # 2026-09-26 修定位器：原来找 `function poll()`，而实现早已是
+    # `function poll(delayMs)`（带退避参数）。`js.find` 返回 -1，
+    # `js.find("catch (e) {", -1)` 从倒数第一个字符找，同样 -1，
+    # catch_body 恒为空串 —— 这条断言**一直在假通过**，什么也没守住。
+    # 匹配到 `function poll(` 为止，参数列表随实现变化。
+    ci = js.find("catch (e) {", js.find("function poll("))
     catch_body = ""
     if ci >= 0:
         depth, j = 0, js.index("{", ci)
@@ -790,8 +802,14 @@ console.log(JSON.stringify(out));
                 if depth == 0:
                     catch_body = js[j:k]
                     break
+    truthy("能定位到 poll 的 catch 块（定位器本身要有效）",
+           bool(catch_body.strip()),
+           "定位失败会让下面几条断言静默假通过 —— 2026-09-26 踩过")
+    # 判据从字面量 `poll();` 放宽到 `poll(`：带退避的重试 `poll(cls.wait)`
+    # 才是更正确的实现（429 按 Retry-After、网络错按指数退避）。要守的是
+    # 「断连后会再调一次 poll」，不是「调的时候不许传参」。
     truthy("轮询 catch 分支里会重试（poll()）",
-           "poll();" in catch_body,
+           "poll(" in catch_body,
            "一次断连就永久停在「探测中」—— 实测踩过，任务其实已跑完")
     truthy("连续失败有上限，不无限刷日志",
            "pollFails >= 20" in js or "pollFails>=20" in js)
@@ -879,9 +897,8 @@ console.log(JSON.stringify(out));
     truthy("pollApply 出错时按 local_written 区分写没写盘",
            "local_written === true" in js,
            "前端不能自己假设「收尾出错 = 已写盘」")
-    truthy("未写盘时 pollApply 返回 null 让调用方停住",
-           re.search(r"return\s+wrote\s*\?\s*\{\s*\.\.\.first", js) is not None,
-           "返回对象会被 `if (!d)` 漏过去，继续渲染成功面板")
+    # 未写盘不得展示成功的行为由末尾 Node 运行时回归直接执行验证；
+    # 不再把某一种对象展开/变量写法当作行为本身。
     truthy("渲染成功面板前校验 local_written",
            re.search(r"d\.local_written\s*!==\s*true", js) is not None,
            "「✓ 已写回」是静态标题，显示出来就等于向用户断言盘上已改")
@@ -1077,6 +1094,57 @@ console.log(JSON.stringify(out));
 
     section("⑨ 部署模板的安全头与 CSP")
     check_nginx_security_headers()
+
+    # ── ⑩ 服务端的 409 闸，前端必须认 ───────────────────────────────
+    section("⑩ weak 证据闸：后端要确认，前端就得给确认")
+    # 2026-09-29 现场：server.py 的 `_api_apply` 在方案含 weak 段时回
+    # 409 `weak_evidence_unconfirmed`，要求带 `confirm_weak=true` 重发；
+    # 而 app.js 从不发这个字段、也不认这个码，于是点「确认写回」只拿到
+    # 一句「（HTTP 409）」—— 闸要的那次人工确认根本没机会发生，看起来
+    # 就是「写回按钮点了没反应」。两端的契约必须对上。
+    truthy("服务端确实设了这道闸",
+           "weak_evidence_unconfirmed" in srv and "confirm_weak" in srv)
+    truthy("前端认 weak_evidence_unconfirmed 这个码",
+           "weak_evidence_unconfirmed" in js,
+           "不认就只能显示裸的 HTTP 409")
+    truthy("确认后带 confirm_weak=true 重发",
+           "confirm_weak = true" in js,
+           "不带这个字段，重发照样被 409 挡回来")
+    truthy("weak 清单走原生 confirm，不拼 innerHTML",
+           "function confirmWeakEvidence" in js
+           and "confirm(msg)" in js,
+           "站名与模型名是外部数据，拼 innerHTML 等于开注入面")
+    # 守卫要贴着**判码的那一处**，不是文件里第一次出现这个词的地方
+    # （注释里也提到它）。所以按判定表达式定位。
+    _weak_at = js.find("error_code === 'weak_evidence_unconfirmed'")
+    truthy("重发只允许一次（避免 409 死循环）",
+           _weak_at != -1 and "attempt === 0" in js[max(0, _weak_at - 400):_weak_at + 400],
+           "没有 attempt 守卫，服务端持续 409 会把页面转死")
+    truthy("取消时明说没写盘",
+           "config.yaml 未被改动" in js,
+           "不说清楚，操作员会以为写了一半")
+
+    section("⑪ 实际事件与异步流程回归（仍不替代真实浏览器）")
+    truthy("Node 必须可用，不能跳过前端运行时验证", bool(node))
+    if node:
+        try:
+            runtime = subprocess.run(
+                [node, "--test", "--test-reporter=tap",
+                 os.path.join(HERE, "test_web_runtime.test.js")],
+                capture_output=True, text=True, encoding="utf-8", timeout=90)
+            eq("前端运行时回归退出码", runtime.returncode, 0)
+            counts = dict(re.findall(r"^# (tests|skipped|cancelled) (\d+)$",
+                                     runtime.stdout, re.M))
+            truthy("实际执行了运行时用例", int(counts.get("tests", "0")) > 0)
+            eq("运行时用例没有跳过", int(counts.get("skipped", "-1")), 0)
+            eq("运行时用例没有取消", int(counts.get("cancelled", "-1")), 0)
+            print(f"  --  运行时回归实际执行 {counts.get('tests', '0')} 项")
+            if runtime.returncode:
+                for line in runtime.stdout.splitlines():
+                    if line.startswith("not ok "):
+                        print(f"      {line}")
+        except subprocess.TimeoutExpired:
+            truthy("前端运行时回归在 90 秒内结束", False)
 
     print("\n" + "=" * 62)
     if _fail:

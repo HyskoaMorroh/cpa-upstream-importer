@@ -416,9 +416,22 @@ class Store:
     # 上限按「一条占多少」定：plan 约 1.7MB × 8 ≈ 14MB，够一轮交互
     MAX_PLANS = 8
     # 批量方案比 plan 轻（只存两份文本 + 说明），但同样一份约 450KB。
-    MAX_BULKS = 4
+    # 批量预览与全局调优体检**共用这张表**（`put_bulk` 同时服务
+    # `/api/bulk-preview` 的 `bulk_id` 与 `/api/tuning` 的 `tuning_id`）。
+    #
+    # 2026-10-01 实测：上限原为 4。批量管理面板每改一次筛选就重发一次
+    # `/api/bulk-preview`，连发 5 次后第 1 个 `bulk_id` 已被淘汰，再点
+    # 「应用到已选各组」拿 404「批量方案不存在或已过期，请重新预览」——
+    # 界面上就是「选好选项点执行根本没反应」。先体检后批量（或反序）也会
+    # 互相挤掉，因为两种 id 抢同一个 4 格空间。
+    #
+    # 提到 32，与 jobs / applies / plan_tasks 对齐。单条只存 base_raw + text
+    # + notes（text 是改后全文，diff 不入表），32 份 300KB 配置约 10MB，
+    # 在 1G 内存上限内可接受；真正的保护是 TTL，不是这个格子数。
+    MAX_BULKS = 32
     MAX_JOBS = 32
     MAX_APPLIES = 32
+    MAX_PLAN_TASKS = 32
     TTL = 2 * 3600          # 2 小时没人碰就清
 
     def __init__(self) -> None:
@@ -579,15 +592,13 @@ class Store:
 
     def add_plan_task(self, task: "PlanTask") -> None:
         with self.lock:
-            # 上限从 8 提到 32、且 done 的任务 5 分钟内不淘汰（2026-09-17）
-            # ------------------------------------------------------------
-            # 现场两份快照都停在「定档轮询无响应 —— 刷新页面后重试」。
-            # 成因：前端每次勾选变化都防抖 180ms 发一次 /api/plan，一轮操作
-            # 几十次；每次缓存未命中都新建一个任务，8 条上限很快被挤满，
-            # 正在被轮询的那条 done 任务被 LRU 淘汰 → /api/plan-status 404
-            # → 前端连续 15 次 miss → 报「无响应」。任务本身没有问题。
-            # busy 判据加上「刚完成不到 300 秒」，给轮询方取结果的窗口。
-            self._evict("plan_tasks", self.plan_tasks, 32, self._plan_task_busy)
+            # 运行中任务和刚完成 300 秒内的结果不淘汰，给轮询方取结果的窗口。
+            # 这段保留策略不能让容量变成软上限：没有安全回收空间时拒绝新任务，
+            # 交给已有 CapacityError 响应通知前端退避，不继续创建后台线程。
+            self._evict("plan_tasks", self.plan_tasks,
+                        self.MAX_PLAN_TASKS - 1, self._plan_task_busy)
+            if len(self.plan_tasks) >= self.MAX_PLAN_TASKS:
+                raise CapacityError("定档任务容量已满，请等待已有任务结束后重试")
             self.plan_tasks[task.id] = task
             self._touch("plan_tasks", task.id)
 
@@ -713,7 +724,7 @@ def _safe_text(text: str) -> str:
     return text
 
 
-def _public(value, field: str = ""):
+def _public(value, field: str = "", *, strings_redacted: bool = False):
     """Redact only output copies; never mutate plans or config snapshots."""
     if isinstance(value, dict):
         if field.endswith("headers"):
@@ -721,14 +732,19 @@ def _public(value, field: str = ""):
             redacted = yaml.safe_load(redact_yaml_secrets(
                 yaml.safe_dump({"headers": value}, allow_unicode=True)))
             value = redacted["headers"]
-        return {key: _public(item, key) for key, item in value.items()}
+        return {key: _public(item, key, strings_redacted=strings_redacted)
+                for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_public(item, field) for item in value]
+        return [_public(item, field, strings_redacted=strings_redacted) for item in value]
     if not isinstance(value, str):
         return value
     if (_SECRET_NAME.search(field) and field not in _NOT_SECRET_FIELDS
             and not field.endswith("_masked")):
         return "***" if value else ""
+    # _public_with_context 已批量完成结构脱敏，不能对每个状态、模型名等
+    # 标量再做一次 YAML 往返。字段名保护与 URL/Authorization 规则仍保留。
+    if strings_redacted:
+        return _safe_text(value)
     # Reuse writeback's structural redactor for URL userinfo/query credentials.
     import yaml
     wrapped = yaml.safe_dump({"value": value}, allow_unicode=True)
@@ -778,7 +794,21 @@ def _public_with_context(value, context):
     # **不豁免 `base_url`**：URL 可能是 `https://user:password@relay/v1`，
     # 豁免会把密码原样发出去。它必须照常走脱敏（writeback 的 URL 分支
     # 只抹 password、保留 host 与 username，那才是正确口径）。
+    # 2026-10-01 补齐：原表只有 revision / fingerprint / bulk_id / tuning_id
+    # 四个 token 形态字段，漏了同样是「客户端要原样回传」的任务句柄 ——
+    # `plan_id`（/api/plan → /api/apply）、`job_id`（/api/probe → /api/job）、
+    # `plan_task_id`、`task_id`、以及 `Job.snapshot` 的 `id`。
+    #
+    # 为什么漏了就会坏：`redact_yaml_secrets` 是**盲替换**（text.replace），
+    # 配置里形如 `"0"` / `"cli"` / `"5s"` / `"true"` 的短凭据值会把 token
+    # 里恰好出现的同样片段一起换成掩码。bulk_id 就是这么被打坏过（见下方
+    # 2026-09-18 的记录）。job_id 的暴露面更大：`/api/probe` 的
+    # `_output_context` 就是请求体本身，而 `/api/job` 又把 context 塞进
+    # `entries[].headers` —— 短 header 值正是最容易撞上的那类。
+    # 后果分别是：轮询 /api/job/<坏id> 永远 404（「探测轮询无响应」）、
+    # 点写回拿 404「方案不存在或已过期」（投喂→写回整条链 no-op）。
     _INTEGRITY_FIELDS = {"revision", "fingerprint", "bulk_id", "tuning_id",
+                         "plan_id", "job_id", "plan_task_id", "task_id", "id",
                          "section", "index", "host", "line_no",
                          "key_count", "key_masked", "api_key_masked"}
     strings = []
@@ -829,7 +859,7 @@ def _public_with_context(value, context):
             redacted_value = next(cleaned)
             return original if idx in exempt else redacted_value
         return original
-    return _public(typed(value))
+    return _public(typed(value), strings_redacted=True)
 
 def _validate_final(preview: str, plans=(), *, cross_section: bool = True) -> tuple[bool, str]:
     """写盘前的最后一道闸。
@@ -1104,6 +1134,12 @@ def plan_json(p) -> dict:
                 # probed / catalog / manual —— 界面要标清模型是实测跑通的、
                 # 站方目录报的，还是操作员手填的，三者可信度差一截
                 "model_source": sp.model_source,
+                # 依据强度三档（2026-09-28）：strong 实测/手填、medium 目录或
+                # 原配置有据、weak 纯市面猜测。界面按它上徽标，写回前按它拦
+                # 一次汇总确认 —— 「默认全勾」与「低次品不能静默写入」两条
+                # 要求靠这个字段同时成立，不再互相挤占默认勾选。
+                "evidence_tier": sp.evidence_tier,
+                "family_attested": sp.family_attested,
                 "highest_models": list(getattr(sp, "highest_models", None) or []),
                 "model_provenance": dict(getattr(sp, "model_provenance", None) or {}),
                 "cloak_mode": getattr(sp, "cloak_mode", ""),
@@ -1153,6 +1189,10 @@ def plan_json(p) -> dict:
                 # 三类仍可写，但默认不勾 —— 见 SectionPlan.recommended。
                 "recommended": sp.recommended,
                 "recommend_reason": sp.recommend_reason,
+                # 为什么这一段不会写（空串 = 按勾选写）。前端直接显示，
+                # 不许再用「待定」或空白代替（2026-09-27）。
+                "skip_reason": sp.skip_reason,
+                "evidence_block": sp.evidence_block,
                 "warnings": sp.warnings,
                 "impacts": [
                     {"model": i.model, "current_top": i.current_top,
@@ -2017,6 +2057,19 @@ class Handler(BaseHTTPRequestHandler):
     # 写回后要主动 PUT 到这里让 CPA 重载 —— 它的 fsnotify 收不到
     # 单文件 bind mount 的外部写入（见 writeback.reload_cpa 的说明）。
     cpa_url = ""
+    # 服务端配置的 CPA 管理密码（compose 里 CPA_MANAGEMENT_TOKEN，与 CPA 容器的
+    # MANAGEMENT_PASSWORD 同值）。
+    #
+    # 为什么必须有（2026-09-26 本机按 VPS 拓扑实跑复现）：VPS compose 一直把
+    # 这个变量传给了投喂台，但代码从没读它。于是用 IMPORTER_TOKEN 登录时
+    # 「投喂写回 / 批量管理 / 调优体检」三条写路径全部落到「已写盘，但未触发
+    # CPA 重载 —— 没有可用的管理密码」，调优面板直接红字报错，CPA 继续跑旧配置。
+    # 运行健康度（按 CPA 实际状态定优先级）也因同一原因拿不到数据。
+    #
+    # CPA 侧依据：`internal/api/handlers/management/handler.go:73` 读
+    # MANAGEMENT_PASSWORD 明文，`:385` 常量时间比对放行 —— 所以这个值本身就是
+    # 一把有效的管理密钥，不需要再与 config 里的 bcrypt 哈希对上。
+    cpa_mgmt_env = ""
 
     # 失败封锁：与 CPA 自己的口径一致（handler.go:301-302，5 次 / 30 分钟）。
     # 投喂台的凭据等价于 CPA 写权限，不能给在线暴破留缺口。
@@ -2108,7 +2161,15 @@ class Handler(BaseHTTPRequestHandler):
 
     @classmethod
     def _check_cpa_password(cls, provided: str) -> bool:
-        """bcrypt 比对。没有 bcrypt 库时这条路径直接关闭，不退化成明文比较。"""
+        """bcrypt 比对。没有 bcrypt 库时这条路径直接关闭，不退化成明文比较。
+
+        另认服务端配置的明文管理密码（`cpa_mgmt_env`）—— 与 CPA 自己的口径
+        一致：它的 MANAGEMENT_PASSWORD 也是明文常量时间比对（handler.go:385），
+        config 里的 secret-key 哈希与之可以不同，两者任一匹配都放行。
+        """
+        if (provided and cls.accept_cpa_key and cls.cpa_mgmt_env
+                and _same_secret(provided, cls.cpa_mgmt_env)):
+            return True
         h = cls._cpa_mgmt_hash()
         if not h or not provided:
             return False
@@ -2338,16 +2399,41 @@ class Handler(BaseHTTPRequestHandler):
                                      key=lambda kv: kv[1][0])
                         Handler._plan_cache.pop(oldest[0], None)
                     Handler._plan_cache[_ck] = (time.time(), payload)
-            # 异步定档任务钩子（2026-09-17）：_plan_body 在后台线程里通过
-            # _json 发结果时，把 payload 存进 task.result 而不是发 HTTP。
-            # 注意：不替换 self._json，只在这里检查 flag，避免覆盖测试 mock。
-            _apt = getattr(self, "_async_plan_task", None)
-            if _apt is not None:
-                with _apt.lock:
+        # 异步定档任务钩子（2026-09-17；2026-09-26 移出 `code == 200`）。
+        # _plan_body 在后台线程里通过 _json 发结果时，把 payload 存进
+        # task.result 而不是发 HTTP。
+        # 注意：不替换 self._json，只在这里检查 flag，避免覆盖测试 mock。
+        #
+        # 为什么必须在 `code == 200` **之外**（2026-09-26）
+        # -----------------------------------------------
+        # 原来这段嵌在 `if code == 200:` 里面。当时能工作是因为 _plan_body
+        # 恰好只有两个出口、都是 `_json(200, …)`。但那是巧合，不是不变式：
+        #   · 任何一个非 200 的 _json（校验失败回 400、配置冲突回 409…）
+        #     都会掉到下面的真·HTTP 发送路径。而 _plan_async_body 传给
+        #     _plan_body 的是 `copy.copy(self)` —— 一个**共享同一个 socket
+        #     和缓冲区**的浅拷贝。后台线程于是在前台请求早已应答完的连接上
+        #     再 send_response 一次：字节交错或 RuntimeError，
+        #     浏览器侧表现就是 Failed to fetch。
+        #   · 同时 task.state 永远停在 "running"、finished 永远是 0.0，
+        #     /api/plan-status 就一直回 {state:"running"} —— 前端轮询到天荒
+        #     地老也等不到结论，正是「定档轮询无响应」。
+        #     3501 行那个兜底只在**抛异常**时才触发，return 不算。
+        # 现在任何状态码都在这里收口：200 记成功，非 200 记 error 并把原因
+        # 带给前端（前端 poll.state === 'error' 分支会显示它）。
+        _apt = getattr(self, "_async_plan_task", None)
+        if _apt is not None:
+            with _apt.lock:
+                if code == 200:
                     _apt.result = payload
                     _apt.state = "done"
-                    _apt.finished = time.time()
-                return          # 后台线程里不发 HTTP，直接返回
+                else:
+                    _apt.state = "error"
+                    _apt.error = (
+                        (payload or {}).get("error")
+                        or (payload or {}).get("message")
+                        or f"定档后台返回 {code}")
+                _apt.finished = time.time()
+            return          # 后台线程里不发 HTTP，直接返回
         if code >= 400 and "error_code" not in payload:
             payload = {**payload, "error_code": {
                 400: "invalid_request", 401: "unauthorized", 404: "not_found",
@@ -2361,6 +2447,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        if code in (429, 503) and payload.get("retryable"):
+            self.send_header("Retry-After", "5")
         self.end_headers()
         self.wfile.write(body)
 
@@ -2434,6 +2522,50 @@ class Handler(BaseHTTPRequestHandler):
         self._output_context = body
         return body
 
+    # 静态资源版本号（内容哈希）。
+    # ================================================================
+    # 2026-10-01 加。动因是用户反复遇到的「VPS 拉了新镜像，前端还是旧行为」：
+    # `index.html` 原样引 `/static/app.js`，脚本 URL 里没有任何版本标识，
+    # 而链路上有 Cloudflare（app.js 里专门有 524/522 分支），CF 默认按扩展名
+    # 缓存 `.js`。于是镜像换了、容器重启了，浏览器与边缘缓存仍在执行旧 app.js，
+    # **所有已修复的问题原样复现** —— 排查方向会被彻底带偏（看代码是对的，
+    # 看现场是错的）。
+    #
+    # 做法：`/` 的响应里把 `/static/app.js` 就地换成 `/static/app.js?v=<hash12>`。
+    # 哈希按 mtime+size 失效即可（文件在镜像里是只读的，内容变必然伴随新镜像、
+    # 新 mtime）；不按内容每次重算，那会给每次打开首页加一次全文件读取。
+    #
+    # 配套的缓存头在 `_static` 里：
+    #   · `/`（index.html）→ `no-store`，它必须每次重新取，否则拿不到新版本号
+    #   · `/static/*?v=…` → `immutable, max-age=1y`，带版本号就可以放心长缓存
+    #   · `/static/*` 不带版本号 → 仍是 `no-store`（直接开文件调试的路径）
+    #
+    # index.html 里**不写死**哈希 —— 保留裸的 `<script src="/static/app.js">`，
+    # 这样用浏览器直接打开 `web/index.html` 调试时仍然能加载到脚本。
+    _ASSET_VER: dict = {}
+    _ASSET_VER_LOCK = threading.Lock()
+
+    @classmethod
+    def _asset_version(cls, path: str) -> str:
+        """回内容哈希前 12 位；取不到回空串（调用方退化为不加版本号）。"""
+        try:
+            st = os.stat(path)
+            sig = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return ""
+        with cls._ASSET_VER_LOCK:
+            got = cls._ASSET_VER.get(path)
+            if got and got[0] == sig:
+                return got[1]
+        try:
+            with open(path, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()[:12]
+        except OSError:
+            return ""
+        with cls._ASSET_VER_LOCK:
+            cls._ASSET_VER[path] = (sig, digest)
+        return digest
+
     def _static(self, rel: str) -> None:
         # 防目录穿越。
         #
@@ -2463,10 +2595,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
         data = open(full, "rb").read()
+        # index.html：注入 app.js 的内容版本号。见上面 _asset_version 的说明。
+        if rel == "index.html":
+            ver = self._asset_version(os.path.join(root, "app.js"))
+            if ver:
+                data = data.replace(b'src="/static/app.js"',
+                                    b'src="/static/app.js?v=' + ver.encode() + b'"')
+        # 带版本号的资源可以长缓存；其余一律 no-store。
+        # index.html 自己**永远** no-store —— 它是版本号的载体，缓存了它
+        # 就等于缓存了旧版本号，整套版本化失效。
+        versioned = (rel != "index.html"
+                     and "v=" in urllib.parse.urlparse(self.path).query)
         self.send_response(200)
         self.send_header("Content-Type", ctype + ("; charset=utf-8" if "text" in ctype or "javascript" in ctype else ""))
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
+        if versioned:
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        else:
+            self.send_header("Cache-Control", "no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(data)
 
@@ -2549,6 +2695,29 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": f"未知路由 {route}"})
 
     def do_POST(self) -> None:  # noqa: N802
+        """与 `do_GET` 对称的兜底。
+
+        2026-10-01：原来 `_authed()` 与 `_body()` 都在 try **之外**，只有
+        路由分发段被包住。`_authed()` 内部会走 bcrypt 比对
+        （`_check_cpa_password`）并改 IP 失败表；bcrypt 缺失、哈希畸形或
+        IP 表并发异常抛出的**不是** ValueError 时，异常直接冒到
+        `socketserver.handle_error` —— 客户端拿到的是连接重置，浏览器里
+        就是 `Failed to fetch`，而 stderr 里是一条无归属的 traceback。
+        `_body()` 同理：它只接 ValueError，`_read_chunked` 抛别的类型会漏出去。
+        这正是 `do_GET` 的 docstring 里描述过、已经修掉的那个故障，
+        POST 侧当时没有跟着改。
+        """
+        try:
+            self._do_post()
+        except ValueError as e:
+            self._json(400, {"error": str(e), "error_code": "invalid_request"})
+        except Exception:
+            ref = _error_ref(f"POST {self.path.split('?')[0]}")
+            self._json(500, {"error": f"服务内部错误（{ref}）",
+                             "error_ref": ref,
+                             "hint": "完整堆栈在服务端日志，按这个 id 检索"})
+
+    def _do_post(self) -> None:
         route = urllib.parse.urlparse(self.path).path.rstrip("/")
         if not self._authed():
             self._json(401, {"error": "缺少或错误的 token"})
@@ -3940,7 +4109,9 @@ class Handler(BaseHTTPRequestHandler):
         cred = (body.get("_cred") or "").strip()
         if cred and not _same_secret(cred, type(self).token)                 and self._check_cpa_password(cred):
             return cred
-        return ""
+        # 最后兜底：服务端配置的管理密码。用 IMPORTER_TOKEN 登录时只有它能让
+        # 写回后的重载与运行健康度读取成立（见类属性 cpa_mgmt_env 的说明）。
+        return type(self).cpa_mgmt_env or ""
 
     def _api_apply_status(self, tid: str) -> None:
         """查询整个后台事务；仅 local_written=true 才表示已经写盘。"""
@@ -3999,7 +4170,27 @@ class Handler(BaseHTTPRequestHandler):
             "attempt_sec": round(attempt_sec, 2),
             "attempt_why": attempt_why,
             "edge_window_sec": cp.tuning.DEFAULT_EDGE_WINDOW_SEC,
-            "advices": [{"item": a.label, "current": a.current, "want": a.want,
+            # `advice_key` 与 `item` 同值并存（2026-09-26 加，2026-10-01 改名）。
+            # ----------------------------------------------------------------
+            # 前端 `web/app.js` 的 `#tnlist` 渲染读的是建议的键名，而最初这里
+            # 只发 `item` —— 于是每条建议的标题都渲染成字面量 `undefined`，
+            # 五条建议全部认不出改的是哪个键。现场就是「全局调优体检选完点
+            # 执行根本不生效」里「看不懂要改什么」那一半。
+            #
+            # 2026-09-26 的修法是补一个叫 `key` 的同值字段，**没修好**：
+            # `_public` 按**字段名**判敏，`_SECRET_NAME` 里有 `^key$`，而
+            # `_NOT_SECRET_FIELDS` 不含 `key` —— 出站时它被整体换成 `***`。
+            # 2026-10-01 本机实测（GET /api/tuning）四条建议的 `key` 全是
+            # `"***"`，标题从 `undefined` 变成 `***`，故障没好只是换了个样子。
+            #
+            # 改名为 `advice_key`：它不匹配 `^key$`，也不匹配 `api[-_]?key` /
+            # `client[-_]?key` / `mgmt[-_]?key`，所以不会被判敏。
+            # 不能走「把 `key` 加进 `_NOT_SECRET_FIELDS`」那条路 —— 那是全局
+            # 豁免，会让任何真的叫 `key` 的凭据字段跟着一起裸奔。
+            # `item` 保留：已经是对外 JSON 的一部分，可能有别的调用方
+            # （curl 排障、tests/test_api_compliance）按它取值，删掉是破坏性改动。
+            "advices": [{"item": a.label, "advice_key": a.label,
+                         "current": a.current, "want": a.want,
                          "why": a.why, "severity": a.severity,
                          "changed": a.changed} for a in advices],
             "notes": notes,
@@ -4288,6 +4479,33 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "未确认。写回需要 confirm=true"})
             return
 
+        # 弱证据段的二次确认闸（2026-09-28）
+        # ==================================
+        # 规则 ③⑵④ 要求「严禁出现不勾选模型」，所以纯市面猜测的段现在也默认
+        # 勾选。但「这样的低次品如何能写入 config.yaml 去破坏系统」同样成立 ——
+        # 两条要求不能靠同一个默认值同时满足，于是拆成两道闸：
+        #   · 勾选闸（recommended）—— 默认全勾，满足前者
+        #   · 本闸（confirm_weak）—— 落盘前把 weak 段单独列出来，满足后者
+        #
+        # 只拦 weak（seed 且这一族在本站无据可查）。strong / medium 照常直写 ——
+        # 对它们再弹一次确认只会训练操作员无脑点「确定」，反而让这道闸失效。
+        #
+        # 为什么放在 `_api_apply` 而不是前端：前端可以被绕过（curl 直接打
+        # /api/apply），而这条闸保护的是 config.yaml 的内容质量。前端那份
+        # 汇总只是把同一份清单提前显示出来，不是闸本身。
+        weak = _weak_tier_entries(entry)
+        if weak and body.get("confirm_weak") is not True:
+            self._json(409, {
+                "error": (f"有 {len(weak)} 个段的模型清单是市面猜测"
+                          "（站方目录没报过、原配置里也没有）"),
+                "error_code": "weak_evidence_unconfirmed",
+                "weak_sections": weak[:200],
+                "weak_total": len(weak),
+                "hint": "确认这些名字该站真有，再带 confirm_weak=true 重试；"
+                        "或回上一步取消勾选它们",
+            })
+            return
+
         self._submit_apply(entry, body)
 
     def _submit_apply(self, entry: dict, body: dict) -> None:
@@ -4316,6 +4534,37 @@ class Handler(BaseHTTPRequestHandler):
         self._json(202 if created else 200, task.snapshot())
 
 
+
+
+def _weak_tier_entries(entry: dict) -> list[dict]:
+    """方案里依据最弱的那一档：seed 填充且这一族在本站无据可查。
+
+    只看**将要写入**的那一份（`entry["plans"]` 已经被选择集剪过），所以操作员
+    取消勾选后这张表就跟着缩短 —— 闸的口径与落盘口径一致，不会出现「界面说
+    要确认 163 段、实际只写 3 段」那种吓人又没用的提示。
+
+    返回的每项只带站名、段名、模型数与前几个模型名 —— 不带 key、不带完整
+    清单。这张表会进 HTTP 响应体与前端 DOM，和 `plan_json` 同一条脱敏纪律。
+    """
+    out: list[dict] = []
+    for p in entry.get("plans") or []:
+        for sec, sp in (getattr(p, "sections", None) or {}).items():
+            if getattr(sp, "evidence_tier", "") != "weak":
+                continue
+            models = list(getattr(sp, "models", None) or [])
+            out.append({
+                "host": getattr(p, "host", ""),
+                "line_no": getattr(p, "line_no", 0),
+                "section": sec,
+                "model_count": len(models),
+                # 只给前 6 个，够操作员认出「这是不是这个站该有的名字」，
+                # 又不至于让 163 段的响应体膨胀到几百 KB。
+                "models": models[:6],
+                "more": max(0, len(models) - 6),
+            })
+    # 同站相邻，便于操作员一眼看出「整个站都是猜的」还是「只有一段」
+    out.sort(key=lambda x: (x["host"], x["section"]))
+    return out
 
 
 def _push_target_ok(base: str, configured: str) -> str:
@@ -4526,6 +4775,48 @@ def _commit_apply(task, entry, body, cfg_path, cpa_url, mgmt, client_key,
         task.finished = time.time()
 
 
+def _verify_failure_summary(result: dict) -> str:
+    """端到端验证失败时，给出**能指导下一步**的理由，而不是「网关验证失败」。
+
+    为什么（2026-09-27 本机按 VPS 拓扑跑完整全量重探复现）
+    ----------------------------------------------------
+    上一版这里是一句写死的「网关验证失败」。那一次写回的实际情况是：
+    配置已写盘、CPA PUT 200、读回一致 —— 唯一失败的是**运行时路由**验证。
+    但界面顶部只有红字「收尾出错 —— 配置已写盘，是重载或验证那一步失败：
+    网关验证失败」，而下方面板同时写着「✓ 已写回 / CPA 已重载：PUT 200 +
+    读回一致」。两句话在同一屏里互相打脸，没有任何一条说得出「到底哪个站
+    的哪个模型没验过、为什么」—— 用户读到的就是「乱七八糟、不知道成没成」。
+
+    所有细节本来就在 `result["verify_failed"]` 里（每项含 host / section /
+    model / msg），只是没被带到 `task.error`。这里把它们汇总出来：
+    先说清「盘已经写了、CPA 也收下了」，再说没验过的是哪几条、各自什么原因，
+    最后说明这一层失败的确切含义（不影响已落盘的配置，但新上游可能被换模
+    或拒绝），以及验证用的客户端 Key 来源。
+    """
+    failures = result.get("verify_failed") or []
+    total = len(result.get("verified") or [])
+    head = (f"配置已写盘，CPA 也已重载 —— 失败的只是最后一层"
+            f"「端到端运行时路由验证」：{len(failures)}/{total} 条没通过。")
+    lines = []
+    for item in failures[:6]:
+        if not isinstance(item, dict):
+            continue
+        # 同一个站同一段可能有多个模型，都要能对上号
+        where = " · ".join(str(item.get(k) or "?")
+                           for k in ("host", "section", "model"))
+        lines.append(f"  · {where} —— {item.get('msg') or '未给出原因'}")
+    if len(failures) > 6:
+        lines.append(f"  · 另有 {len(failures) - 6} 条，详见下方验证明细")
+    tail = ["这一层失败**不影响已经写进 config.yaml 的内容**，也不需要回滚：",
+            "它说的是「客户端打过来时这条上游会不会被换模或拒绝」还没证实。",
+            "可用的下一步：在 CPAMP 里对该站单独发一次请求，"
+            "或用「单站诊断」看它现在要什么 headers。"]
+    src = result.get("verify_key_src")
+    if src:
+        tail.append(f"（本次验证用的客户端 Key 来源：{src}）")
+    return "\n".join([head, *lines, "", *tail])
+
+
 def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
                     cfg_path: str, cfg_cpa_url: str,
                     mgmt: str, auto_client_key: str) -> None:
@@ -4727,8 +5018,12 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
         failed = not result.get("reload_ok") or bool(result.get("verify_failed"))
         task.state = "error" if failed else "done"
         if failed:
-            task.error = result.get("reload_msg") if not result.get("reload_ok") else "网关验证失败"
-            result["error_code"] = "reload_failed" if not result.get("reload_ok") else "verification_failed"
+            if not result.get("reload_ok"):
+                task.error = result.get("reload_msg")
+                result["error_code"] = "reload_failed"
+            else:
+                task.error = _verify_failure_summary(result)
+                result["error_code"] = "verification_failed"
         task.set_stage("error" if failed else "done")
     except Exception:
         task.state = "error"
@@ -4786,6 +5081,14 @@ def main() -> None:
                          "国内 VPS 直连 raw.githubusercontent 常不通")
     ap.add_argument("--no-cpa-key", action="store_true",
                     help="不接受 CPA 管理密钥登录，只认本服务的 token")
+    ap.add_argument("--cpa-mgmt-key",
+                    default=(os.environ.get("CPA_MANAGEMENT_TOKEN")
+                             or os.environ.get("CPA_MANAGEMENT_PASSWORD")
+                             or os.environ.get("MANAGEMENT_PASSWORD") or ""),
+                    help="CPA 管理密码（明文，与 CPA 容器的 MANAGEMENT_PASSWORD 同值）。"
+                         "写回后触发 CPA 重载、读运行健康度都要它；不给则只有用 "
+                         "CPA 管理密码登录本页时才能重载。容器内默认取 "
+                         "CPA_MANAGEMENT_TOKEN（compose 已设）")
     args = ap.parse_args()
 
     # 详细日志初始化（修改要求第 11 条，2026-09-18）
@@ -4848,6 +5151,7 @@ def main() -> None:
     Handler.backup_dir = args.backup_dir
     Handler.accept_cpa_key = not args.no_cpa_key
     Handler.cpa_url = args.cpa_url
+    Handler.cpa_mgmt_env = (args.cpa_mgmt_key or "").strip()
     Handler.cpa_source_root = args.cpa_source
     Handler.cpa_source_remote = not args.no_drift_remote
     Handler.cpa_source_ref = args.drift_ref

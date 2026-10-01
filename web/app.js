@@ -52,8 +52,8 @@ function famOf(m) {
 // 不报错，但 CPA 路由过去必然失配 —— 它们走的不是对话协议路径。
 const NON_CHAT = /-image(?:$|[-.])|-tts(?:$|[-.])|^imagen|-oss-|-embedding|-whisper|-moderation|-batch-inference/;
 
-// 降级档：名字里带 mini / nano / lite / flash / fast 的一律不选
-// （用户 2026-09-12 定 mini，2026-09-16 补 flash 与 fast，
+// 降级档：名字里带 mini / nano / lite / flash / fast / haiku 的一律不选
+// （用户 2026-09-12 定 mini，2026-09-16 补 flash 与 fast，2026-09-27 补 haiku，
 // **不分类型、不看版本号**）。与后端 model_catalog.is_low_tier 逐条等价。
 //
 // 必须按 **token 边界** 匹配：`gemini` 与 `kimi` 的字面里就含 `mini`。
@@ -71,7 +71,23 @@ const NON_CHAT = /-image(?:$|[-.])|-tts(?:$|[-.])|^imagen|-oss-|-embedding|-whis
 // 现场快照里已有 4 处 `anthropic/claude-opus-5-fast` 处于勾选态。
 //
 // 这就是为什么两侧必须逐字等价，而不是「后端是权威，前端差一点无所谓」。
-const LOW_TIER = /(?:^|[^a-z0-9])(?:mini|nano|lite|flash|fast)(?![a-z0-9])/;
+// 与后端 model_catalog.py 的 `_LOW_TIER` 逐字对齐 —— 两侧不一致的后果不是
+// 显示差异：界面勾上的名字进 S.forced，后端把 S.forced 当**手填**（最高
+// 权威，只过协议层校验），于是前端多放行一个档次就等于它能写进 config.yaml。
+//
+// 2026-09-26 的 `low`：**两侧都不进降级档**。用户当天拍板
+// `gemini-3.1-pro` 后面的所有后缀（`-high` / `-low` / `-preview*`）都算同一
+// 系列、一并保留，所以两侧正则都没有 `low`。（此处原注释曾写「后端已加 low、
+// 前端漏了」，与后端 `_LOW_TIER` 实际内容相反 —— 2026-09-27 订正。）
+//
+// 2026-09-27 补 `haiku`：后端 `_TIER_HINTS` 给 haiku 打 4，比 flash 的 3 更低，
+// 即代码自己就认定它更弱，却只硬排除 flash。实测后果有两条：站上只有
+// `claude-3-5-haiku` 时它被写进 config.yaml；同世代时它因自成一条产品线而在
+// `_round_robin` 里**保证占一个注册位**（挤掉的反而是 `opus-5-thinking`）。
+// 两侧同时补，才不会出现「界面勾了后端拒」或反过来。
+//
+// tests/test_web.py 的「放行集合两侧一致」就是锁这条不变式的。
+const LOW_TIER = /(?:^|[^a-z0-9])(?:mini|nano|lite|flash|fast|haiku)(?![a-z0-9])/;
 
 function isLowTier(m) {
   return LOW_TIER.test(bareName(m));
@@ -87,6 +103,29 @@ const SECTION_FAMILY = {
   'codex-api-key': 'gpt',
   'claude-api-key': 'claude',
 };
+
+// codex 段只收 gpt-*，不收 o 系列（2026-09-27 用户在三选一里选定）。
+// 与后端 model_catalog.CODEX_GPT_ONLY 逐字对齐 —— 后端 2026-09-27 加了这道
+// 闸，前端当时没跟上，于是 `tests/test_web.py` 的「放行集合两侧一致」开始
+// 失败：界面把 o1 / o1-pro / o3 / o3-pro 列进 codex 段还预勾，后端
+// `section_allows` 一个都不收。界面勾上的名字进 `S.forced`，后端把
+// `S.forced` 当手填（只过协议层），于是前端多放行的这一档真会写进
+// config.yaml —— 这正是「模型勾选高低模型混乱」的一条实际路径。
+//
+// 旧判例（2026-09-12）「o3 与 gpt-5.6 互不相干、都要」管的是**世代比较**，
+// 与「codex 段收不收 o 系列」是两件事；`newestGenerationPerLine` 不看段，
+// 那些判例照旧成立，只是 o 系列的落点从 codex 段变成 compat 段。
+const CODEX_GPT_ONLY = true;
+
+// 与后端 `_OPENAI_REASONING_RE`（`^o\d+(?:[.\-]|$)`）同一判据：锚在开头、
+// o 后紧跟数字。`omni-3` / `oss-20b` 不命中。
+// 与上面的 O_SERIES_RE 分开写是因为那一条要捕获版本数组给世代比较用，
+// 这一条只回答「是不是 o 系列」—— 判据同源，用途不同。
+const OPENAI_REASONING_RE = /^o\d+(?:[.\-]|$)/;
+
+function isOpenaiReasoning(m) {
+  return OPENAI_REASONING_RE.test(bareName(m));
+}
 
 // 这个模型名在这个段里**工具要不要挑它**。与后端 section_allows 对齐。
 // 用于：目录候选过滤、默认勾选。
@@ -110,6 +149,10 @@ function famOk(sec, m) {
     const mm = GEMINI_PRO.exec(n);
     if (!mm || parseFloat(mm[1]) < GEMINI_MIN) return false;
   }
+  // codex 段只留 gpt 系列（2026-09-27）。放在族判之后、段比对之前 ——
+  // 与后端 `section_allows` 里那句 `section == "codex-api-key" and
+  // CODEX_GPT_ONLY and _OPENAI_REASONING_RE.match(n)` 同一位置同一判据。
+  if (sec === 'codex-api-key' && CODEX_GPT_ONLY && isOpenaiReasoning(n)) return false;
   const want = SECTION_FAMILY[sec];
   return want ? f === want : true;          // compat：四族都行
 }
@@ -156,9 +199,15 @@ const VERSION_RE = /(?:^|[^A-Za-z0-9.])(k?)(\d+(?:[.\-]\d+)*)(o?)(?![A-Za-z0-9])
 // 锚在开头 + 紧跟数字，`omni-3` / `oss-20b` 不受影响。
 const O_SERIES_RE = /^o(\d+(?:[.\-]\d+)*)(?![A-Za-z0-9])/;
 
+// 纯 8 位日期戳后缀（`-20251001`）。与 Python 侧 `_DATE_STAMP` 逐字对齐。
+// 2026-09-27：前端缺这一步，`claude-opus-5` 与 `claude-opus-5-20251001` 被算成
+// (5) 与 (5,20251001) 两个世代，界面只预勾带戳的那个 —— 与后端写回的不一致。
+// 只剥第一段戳，戳后面的后缀原样接上；八位以外的数字段（32k、k2）不碰。
+const DATE_STAMP_RE = /^(.*?)-\d{8}(?=$|[-.])/;
+
 // 拆成 [系列, 版本数组]。认不出版本时版本为 null。
 function seriesAndVersion(m) {
-  const n = bareName(m);
+  const n = bareName(m).replace(DATE_STAMP_RE, '$1');
   const mo = O_SERIES_RE.exec(n);
   if (mo) {
     const nums = mo[1].split(/[.\-]/).map((x) => parseInt(x, 10));
@@ -541,6 +590,9 @@ const S = {
   timer: null,
   results: null,
   planId: null,
+  planInputKey: '',
+  previewPlanId: '',
+  previewInputKey: '',
   plans: null,
   overrides: {},        // {host: {section: {...}}}
   // 人工接管：{host: {section: [模型, ...]}}。任何段都可以接管 ——
@@ -601,9 +653,10 @@ async function api(path, opts = {}) {
     o.signal = ctl.signal;
     timer = setTimeout(() => ctl.abort(), ms);
   }
-  let r;
+  let r, txt;
   try {
     r = await fetch(path, o);
+    txt = await r.text();
   } catch (e) {
     // abort 的报错是 `AbortError`，原样抛出会显示成「signal is aborted」，
     // 看不出是超时。换成能指导下一步的文案。
@@ -611,17 +664,89 @@ async function api(path, opts = {}) {
       throw Object.assign(new Error(`请求超时（${Math.round(ms / 1000)} 秒无响应）`),
         { status: 0, timeout: true });
     }
-    throw e;
+    // fetch 自己抛的 TypeError（「Failed to fetch」/「NetworkError when …」/
+    // 「Load failed」）只说明 TCP/TLS 层没拿到响应：容器重启、被 OOM 杀、
+    // 反代超时断开都会这样。原文对用户毫无指导意义（2026-09-17 全量重探
+    // 现场满屏「定档失败：Failed to fetch」），换成能指导下一步的文案。
+    throw Object.assign(new Error('连接中断（容器可能重启或网关超时）'),
+      { status: 0, network: true, cause: e });
   } finally {
     if (timer) clearTimeout(timer);
   }
-  const txt = await r.text();
+  if (r.status === 204 && !txt.trim()) return {};
   let data;
   try { data = JSON.parse(txt); }
-  catch { data = { error: _proxyErrText(txt, r.status) }; }
-  if (!r.ok) throw Object.assign(new Error(data.error || r.statusText),
-    { data, status: r.status });
+  catch {
+    const error = _proxyErrText(txt, r.status);
+    if (r.ok) {
+      throw Object.assign(new Error(`${error}（HTTP ${r.status}，响应不是有效 JSON）`),
+        { status: r.status, invalidResponse: true });
+    }
+    data = { error };
+  }
+  if (data && typeof data === 'object' && data.boot_id) noteBootId(data.boot_id);
+  if (!r.ok) {
+    const ref = data && data.error_ref ? ` · error_ref ${data.error_ref}` : '';
+    const base = (data && data.error) || r.statusText || '请求失败';
+    const ra = parseFloat(r.headers.get('Retry-After') || '');
+    throw Object.assign(new Error(`${base}（HTTP ${r.status}${ref}）`),
+      { data, status: r.status, retryAfter: isFinite(ra) ? ra : null,
+        errorRef: (data && data.error_ref) || null });
+  }
   return data;
+}
+
+// ── 服务重启识别（boot_id）──
+// 任务只存在服务端内存里，容器一重启所有 job / plan / apply 任务都没了，
+// 轮询随之 404/410。后端在 /api/context 与各 *-status 里带 boot_id，
+// 这里记住第一次见到的值；变了就明确告诉用户「服务已重启」，而不是让
+// 界面停在「定档计算中…」。
+function noteBootId(id) {
+  if (!id) return;
+  if (!S.bootId) { S.bootId = id; return; }
+  if (S.bootId !== id) {
+    S.bootId = id;
+    S.bootChanged = true;
+    showBanner('服务已重启（boot_id 变化）—— 进行中的任务已丢失，请重新提交；'
+      + '若频繁出现，检查容器是否被 OOM 杀掉：docker inspect 看 OOMKilled / RestartCount', 'w');
+  }
+}
+
+// ── 轮询错误分类 ──
+// 同一份判定给 /api/job、/api/plan-status、/api/apply-status 三处轮询用。
+// 返回 { kind, wait }：
+//   auth      401 —— 重试无用，要重新登录
+//   expired   404/410 —— 任务已不在服务端（重启或被淘汰）
+//   throttled 429/503 —— 网关或任务仓限流；按 Retry-After 退避，**不算无响应**
+//   network   连接中断 / 超时 / 5xx —— 指数退避重试
+function classifyPollError(e, attempt) {
+  const st = e && e.status;
+  const expo = (base) => Math.min(30000, base * Math.pow(2, Math.min(attempt, 5)));
+  if (st === 401) return { kind: 'auth', wait: 0 };
+  if (st === 404 || st === 410) return { kind: 'expired', wait: 0 };
+  if (st === 429 || st === 503) {
+    const ra = e.retryAfter != null ? e.retryAfter * 1000 : expo(1000);
+    return { kind: 'throttled', wait: Math.max(1000, Math.min(60000, ra)) };
+  }
+  return { kind: 'network', wait: expo(1000) };
+}
+
+// ── 全局横幅 ──
+// 任何未捕获异常 / 未处理的 Promise 拒绝都显示出来，页面绝不静默黑屏。
+function showBanner(msg, cls) {
+  let box = document.getElementById('globalbanner');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'globalbanner';
+    box.setAttribute('role', 'alert');
+    document.body.insertBefore(box, document.body.firstChild);
+  }
+  box.className = 'gbanner ' + (cls || 'e');
+  box.innerHTML = `<span>${esc(String(msg))}</span>`
+    + ' <button type="button" class="gbclose" aria-label="关闭">×</button>';
+  box.hidden = false;
+  const b = box.querySelector('.gbclose');
+  if (b) b.onclick = () => { box.hidden = true; };
 }
 
 function step(n) {
@@ -670,8 +795,28 @@ async function boot() {
   }
   clearTimeout(slow);
   hideSkel();
+  // 先校验形状，**再**揭开 #app。
+  // ----------------------------
+  // 2026-10-01：原来先 `$('#app').hidden = false` 再读
+  // `S.ctx.sections` / `S.ctx.lines`。/api/context 回 200 但缺这两个键时
+  // （前后端版本不一致、或脱敏器误伤整块）这里抛 TypeError，而此刻 #app
+  // **已经可见**，后面的 renderBands/renderCpaHint/applyResources/
+  // renderDrift/updateBudget 全被跳过。顶层 `boot().catch` 会额外放出
+  // #gate 却不隐藏 #app —— 登录闸与空壳主界面同屏，所有参数格为空。
+  // 现场就是「字段全空白」与「半黑屏」。
+  const secs = S.ctx && S.ctx.sections;
+  if (!secs || typeof secs !== 'object' || typeof S.ctx.lines !== 'number') {
+    $('#app').hidden = true;
+    $('#gate').hidden = false;
+    $('#gate .panel').insertAdjacentHTML('beforeend',
+      '<div class="err">后端 /api/context 返回的形状不对（缺 sections/lines）。'
+      + '界面需要这两项才能渲染参数表，所以没有打开主界面 ——'
+      + '空壳界面比明确报错更难排查。请确认容器拉到的是最新镜像。</div>');
+    return;
+  }
   $('#app').hidden = false;
-  const entries = Object.values(S.ctx.sections).reduce((a, b) => a + b.entries, 0);
+  const entries = Object.values(secs).reduce(
+    (a, b) => a + ((b && b.entries) || 0), 0);
   $('#cfgmeta').textContent =
     `${S.ctx.lines.toLocaleString()} 行 · ${entries} 条目`;
   renderBands();
@@ -1050,6 +1195,21 @@ async function doParse() {
     return;
   }
 
+  // 形状闸：try/catch 只包住了请求，渲染段在它**之外**。
+  // --------------------------------------------------
+  // 2026-10-01：原来直接 `d.valid.forEach` 与 `r.bases[s].replace(...)`。
+  // 后端少回 `valid`/`invalid`，或 `bases` 缺任一段键（`sectionOrder()`
+  // 在 S.ctx 缺失时回落到硬编码的 4 段），`undefined.replace` 就抛
+  // TypeError —— 它逃出 doParse，而 `#btnparse.onclick = doParse` 让它
+  // 变成 unhandled rejection：`#parsebody` 从不写入、`#pparse` 保持
+  // hidden、`syncProbeBtn()` 不执行。现场就是「添加账号后字段一片空白」。
+  if (!d || !Array.isArray(d.valid) || !Array.isArray(d.invalid)) {
+    $('#parsemsg').innerHTML = '<span style="color:var(--bad)">'
+      + '后端 /api/parse 返回的形状不对（缺 valid/invalid 数组）——'
+      + '大概率是前后端版本不一致，请确认容器拉到的是最新镜像。</span>';
+    return;
+  }
+
   // 同主机分组 —— 让「第 2 个 key 起复用形态」这件事在解析阶段就可见
   const byHost = {};
   d.valid.forEach((r) => { (byHost[r.host] = byHost[r.host] || []).push(r); });
@@ -1059,13 +1219,16 @@ async function doParse() {
   const rows = d.valid.map((r, i) => {
     const n = byHost[r.host].length;
     const first = byHost[r.host][0] === r;
+    const bases = r.bases || {};
     return `<tr>
       <td class="num">${r.line_no}</td>
       <td class="m"><b>${esc(r.host)}</b>${n > 1
         ? ` <span class="pill p-i">${first ? '首个 · 全量探测' : '复用形态'}</span>` : ''}</td>
       <td class="m">${esc(r.key_masked)}</td>
       <td class="m" style="color:var(--ink-3)">${sectionOrder()
-        .map((s) => `${SECTION_LABEL[s]}: ${esc(r.bases[s].replace(/^https?:\/\//, ''))}`)
+        .map((s) => `${SECTION_LABEL[s]}: ${bases[s]
+          ? esc(String(bases[s]).replace(/^https?:\/\//, ''))
+          : '<span class="hint">后端未回该段 base-url</span>'}`)
         .join('<br>')}</td>
     </tr>`;
   }).join('');
@@ -1178,15 +1341,30 @@ $('#btndiag').onclick = async () => {
     return;
   }
   btn.disabled = false;
-  $('#diagmsg').textContent = `${d.total_calls} 次请求`;
+  // `total_calls` 缺字段时别渲染成 `undefined 次请求` —— 那看起来像
+  // 统计出错，实际是前后端字段没对上。
+  $('#diagmsg').textContent = typeof d.total_calls === 'number'
+    ? `${d.total_calls} 次请求` : '完成（后端未回请求计数）';
   renderDiag(d);
 };
 
 function renderDiag(d) {
   S.diagYaml = {};
+  // 形状闸。renderDiag 被 onclick 里的 try/catch **之外**调用，
+  // `Object.keys(undefined)` 抛 TypeError 后 `#diagout` 已被清空却再也不填，
+  // 整块「完整参数表」（priority / 前缀 / 模型 / 代理 / headers / 指纹 /
+  // 上下文上限 / 能力开关 / 系统建议）随之消失 —— 现场就是「所有参数缺失」。
+  if (!d || !d.sections || typeof d.sections !== 'object') {
+    $('#diagout').innerHTML = '<div class="err">后端 /api/diag 返回的形状不对'
+      + '（缺 sections）—— 参数表没法渲染。请确认容器拉到的是最新镜像。</div>';
+    return;
+  }
   const blocks = Object.keys(d.sections).map((sec) => {
-    const s = d.sections[sec];
-    const rungs = s.rungs.map((g) => {
+    const s = d.sections[sec] || {};
+    // `rungs` 下面还要数长度，缺字段时 `s.rungs.length` 会抛 —— 先归一。
+    const rungList = Array.isArray(s.rungs) ? s.rungs : [];
+    const rungCount = rungList.length;
+    const rungs = rungList.map((g) => {
       const cls = g.ok ? 'rung hit' : 'rung miss';
       const mark = g.ok ? '✓' : ' ';
       const body = g.body_patch ? ' +body' : '';
@@ -1206,20 +1384,20 @@ function renderDiag(d) {
     let concl;
     if (!s.hit) {
       concl = `<div class="note w" style="margin-top:10px">`
-        + `<b>整梯 ${s.rungs.length} 档全不通。</b>`
+        + `<b>整梯 ${rungCount} 档全不通。</b>`
         + `这不一定是站方拒绝你 —— 也可能是余额、限时段、或它只认浏览器。`
         + `看上面每档的正文摘要判断。`
         + `如果你确知这个站能用，导入时可以用「人工接管」填模型清单。</div>`;
-    } else if (!Object.keys(s.needed_headers).length) {
+    } else if (!Object.keys(s.needed_headers || {}).length) {
       concl = `<div class="note g" style="margin-top:10px">`
         + `<b>baseline 就通，不需要任何 header。</b>`
         + `导入时 <code>headers</code> 留空即可。</div>`;
     } else {
-      const yaml = yamlHeaders(s.needed_headers, s.base_url);
+      const yaml = yamlHeaders(s.needed_headers || {}, s.base_url);
       S.diagYaml[sec] = yaml;
       concl = `<div class="hdrbox">`
         + `<div><b>最小必需画像：${esc(s.hit.profile)}</b>`
-        + `（试了 ${s.rungs.length} 档）`
+        + `（试了 ${rungCount} 档）`
         + (s.needs_body ? ` · <b>还需要请求体字段</b>` : '')
         + `</div>`
         + (s.needs_body
@@ -1430,12 +1608,32 @@ function showResume() {
   };
 }
 
-function poll() {
+function poll(delayMs) {
   clearTimeout(S.timer);
+  const wait = delayMs != null ? delayMs : (S.jobPollMs || 900);
   S.timer = setTimeout(async () => {
     let d;
     try { d = await api(`/api/job/${S.jobId}?since=${S.cursor}`); }
     catch (e) {
+      const cls = classifyPollError(e, S.pollFails || 0);
+      // 任务已不在服务端（容器重启 / 被淘汰）：重试毫无意义，说清并给出路。
+      if (cls.kind === 'expired') {
+        $('#spin').hidden = true;
+        $('#p2h').textContent = '② 任务已过期';
+        $('#p2tag').textContent = '服务端已找不到这个任务（服务重启或任务被淘汰）';
+        $('#stream').insertAdjacentHTML('beforeend',
+          `<div class="s5">任务已过期（服务重启?）：${esc(e.message)} ——
+           已完成的结果若已显示会保留；请重新发起探测。</div>`);
+        showBanner('探测任务已过期（服务重启?）—— 请重新发起探测', 'w');
+        return;
+      }
+      // 限流（nginx 429 / 任务仓满 503）不是「无响应」：按 Retry-After 退避，
+      // 不计入连续失败次数。
+      if (cls.kind === 'throttled') {
+        $('#p2tag').textContent = `网关限流（HTTP ${e.status}），${Math.round(cls.wait / 1000)}s 后继续`;
+        poll(cls.wait);
+        return;
+      }
       // 轮询失败**必须重试**，不能就此放弃。
       //
       // 实测踩到：一次探测跑了 293 秒，中途轮询断了一下，UI 就永久停在
@@ -1467,12 +1665,16 @@ function poll() {
         showResume();
         return;
       }
-      poll();
+      poll(cls.wait);
       return;
     }
     S.pollFails = 0;          // 通了就清零，只关心**连续**失败
-    S.cursor = d.event_cursor;
-    renderStream(d.events);
+    if (d && d.poll_ms > 0) S.jobPollMs = Math.max(500, Math.min(10000, d.poll_ms));
+    // 游标只在后端真给了整数时才推进。缺字段时沿用旧值而不是写 undefined ——
+    // 否则下一轮请求变成 `?since=undefined`，后端严格解析回 400，计进
+    // pollFails，20 次后前端判「轮询中断」，而任务其实还在正常跑。
+    if (Number.isInteger(d && d.event_cursor)) S.cursor = d.event_cursor;
+    renderStream(d && d.events);
 
     // 进度条：用 unit_done/unit_total 而非 done_rows/total_rows ——
     // 全量重探的单元是「凭据」，与 rows 不是一回事（rows 可能为空）。
@@ -1575,6 +1777,8 @@ function poll() {
       $('#p2').insertAdjacentHTML('beforeend',
         '<div class="warn">已按请求停止 —— 未完成的站没有结论，'
         + '已完成的结果保留在下方。</div>');
+      // 已完成部分照样渲染（2026-09-26）：原来这里不渲染，停止后表格为空。
+      renderPartial(d);
       return;
     }
 
@@ -1583,10 +1787,23 @@ function poll() {
       $('#p2h').textContent = '② 探测出错';
       $('#p2').insertAdjacentHTML('beforeend',
         `<div class="err">探测出错<pre>${esc(d.error)}</pre></div>`);
+      renderPartial(d);
       return;
     }
     poll();
-  }, 900);
+  }, wait);
+}
+
+// 取消 / 出错时把已有的部分结果画出来，而不是留一张空表。
+function renderPartial(d) {
+  if (!d || !Array.isArray(d.results) || !d.results.length) return;
+  S.results = d.results;
+  try {
+    renderResults(d.results);
+  } catch (e) {
+    $('#p2').insertAdjacentHTML('beforeend',
+      `<div class="err">部分结果渲染失败：${esc(e.message)}</div>`);
+  }
 }
 
 const pad = (s, n) => esc(String(s == null ? '' : s).padEnd(n));
@@ -1608,7 +1825,13 @@ function tag(host) {
 }
 
 function renderStream(events) {
-  if (!events.length) return;
+  // 2026-10-01：原来直接 `events.length`。`api()` 对 204 空响应回 `{}`
+  // （见 api() 里的空体分支），此时 `d.events` 是 undefined ——
+  // `undefined.length` 抛 TypeError，而这里是被 `poll()` 的 setTimeout
+  // async 回调调用的，**不在任何 try 里**，于是变成 unhandled rejection：
+  // poll() 不再重排，#spin 永转，showResume() 也不触发。
+  // 现场表现就是「探测转圈不动、全量检测后字段全空白」。
+  if (!Array.isArray(events) || !events.length) return;
   const box = $('#stream');
   const html = events.map((e) => {
     if (e.kind === 'candidate-start') {
@@ -1918,11 +2141,18 @@ function siteCard(r) {
       const rec = (S.forced[rid] || {})[sec];
       const stale = staleCheck(sec, cat);
       const picked = new Set(rec !== undefined ? rec : stale.keep);
-      // 预勾的结果要立刻回写 S.forced，否则「勾选即注册」只是视觉上的 ——
-      // 提交时读的是 S.forced，不读 DOM。
-      if (rec === undefined && picked.size) {
-        (S.forced[rid] = S.forced[rid] || {})[sec] = [...picked];
-      }
+      // 这里的预勾**只是显示**，不回写 S.forced（2026-09-26 改）。
+      //
+      // 原来预勾的结果会立刻写进 S.forced，而后端把 S.forced 一律当成「操作员
+      // 手填」（model_source=manual）—— 手填是最高权威：不过世代规则之外的
+      // 证据检查、默认建议写入。于是前端 staleCheck 这套 JS 选型结果被包装成
+      // 人工决定送回去，绕过了后端整套选型与证据规则。本机全量重探实测：64 段
+      // 被这样变成「手填」并默认写入，其中 codex 段只剩单个 gpt-6-astra（同代的
+      // -luna / -sol 全丢）—— 用户报的「模型勾选高低混乱」就是两套选型打架。
+      //
+      // 现在：没有人工操作时，写什么模型只由后端方案决定（fillPlanIntoRows 会把
+      // 勾选状态同步成方案里的 sp.models）；只有操作员真的点了勾选框或手填，
+      // 才写 S.forced。
       return `<tr class="off" data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}">
         <td class="pick"><input type="checkbox" class="sel force"
           data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}"
@@ -2346,28 +2576,29 @@ function bindResultEvents() {
       // 模型清单的可信度由 model_source 在方案里标注（实测/目录/手填/猜测），
       // 那是「看得见的告知」，比「点不动的勾选框」有用。
       const key = pk(sel.dataset.rid, sel.dataset.sec);
+      if (!S.picks) {
+        S.picks = new Set($$('#results .sel').filter((x) => x.checked)
+          .map((x) => pk(x.dataset.rid, x.dataset.sec)));
+      }
       if (sel.checked) {
-        // 档位互斥：勾选时取消同站点其它档位
-        const rid = sel.dataset.rid;
-        const currentSec = sel.dataset.sec;
-        
-        // 从探测结果读当前段的 suggested_priority（档位）
-        const currentResult = (S.results || []).find(r => r.row.rid === rid);
-        const currentTier = currentResult?.sections?.[currentSec]?.suggested_priority;
-        
-        if (currentTier != null) {
-          // 取消同站点、不同档位的勾选
-          Array.from(S.picks).forEach(existingKey => {
-            const [pkRid, pkSec] = existingKey.split('	');
-            if (pkRid === rid && pkSec !== currentSec) {
-              const otherTier = currentResult?.sections?.[pkSec]?.suggested_priority;
-              if (otherTier != null && otherTier !== currentTier) {
-                S.picks.delete(existingKey);
-              }
-            }
-          });
-        }
-        
+        // 2026-09-26 删掉这里的「档位互斥」块。它从来没有执行过，而且
+        // 一旦被「修好」就会造成数据损坏，两条理由都成立：
+        //
+        // 一、彻底的死代码，三处都错：
+        //    · 读 `r.row.rid`，而 siteCard 写的是 `r.row.line_no`
+        //      —— currentResult 恒为 undefined
+        //    · 按 '\t' 切 pick key，而 pk() 用 '\u0000' 连接
+        //      —— pkRid / pkSec 恒为 undefined
+        //    · 读 `suggested_priority`，全仓（server.py、cpa_probe/、tests/）
+        //      没有任何地方产出这个字段 —— currentTier 恒为 undefined
+        //    于是 `if (currentTier != null)` 永远为假，整块从不进入。
+        //
+        // 二、就算字段名全对，这个行为本身是**反需求**的：它会在勾选一个
+        //    段时取消同站其它档位的勾选。而产品规则要的恰恰相反 ——
+        //    同一类型同一域名的所有 Key 共享同一个 priority，不同段之间
+        //    本来就应该各自独立勾选（一个站的 claude 段和 codex 段是两条
+        //    互不相干的上游）。档位由后端 assign_priorities 统一分配，
+        //    不该由前端的勾选动作反向干预。
         S.picks.add(key);
       } else {
         S.picks.delete(key);
@@ -2407,8 +2638,26 @@ function bindResultEvents() {
       const old = be.textContent;
       be.disabled = true; be.textContent = '导出中…';
       try {
-        const r = await fetch(`/api/export/${encodeURIComponent(S.jobId)}`,
-          { headers: { Authorization: 'Bearer ' + S.token } });
+        // 全文唯一绕过 api() 的请求 —— 它要的是 blob 而不是 JSON。
+        // 2026-10-01 补上 api() 已有的两样保护：超时 + abort，以及把
+        // 浏览器原文 `Failed to fetch` 换成人能看懂的话。原来二者都没有：
+        // 导出端点要序列化整个任务日志（全量重探可达数 MB），网关慢一点
+        // 就永久挂着，而 `alert(e.message)` 会把 `Failed to fetch` 原样弹出，
+        // api() 为此专门做的文案改写在这条路上完全无效。
+        const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        const tm = ac ? setTimeout(() => ac.abort(), 120000) : null;
+        let r;
+        try {
+          r = await fetch(`/api/export/${encodeURIComponent(S.jobId)}`,
+            { headers: { Authorization: 'Bearer ' + S.token },
+              signal: ac ? ac.signal : undefined });
+        } catch (err) {
+          throw new Error(err && err.name === 'AbortError'
+            ? '导出超时（120 秒）—— 日志太大或网关慢。任务仍在服务端，可稍后重试。'
+            : '导出请求没能发出去（网络或网关中断）—— 页面没坏，重试即可。');
+        } finally {
+          if (tm) clearTimeout(tm);
+        }
         if (!r.ok) throw new Error(`导出失败 ${r.status}`);
         const blob = await r.blob();
         const cd = r.headers.get('Content-Disposition') || '';
@@ -2503,6 +2752,8 @@ function applyPickPreset(mode) {
 // 又不至于让单次勾选感觉到延迟。
 let _planTimer = null;
 function schedulePlanRefresh() {
+  invalidatePlanPreview();
+  if (_planInFlight) _planRerun = true;
   if (_planTimer) clearTimeout(_planTimer);
   _planTimer = setTimeout(() => { _planTimer = null; refreshPlan(true); }, 180);
 }
@@ -2516,6 +2767,11 @@ function schedulePlanRefresh() {
 let _pickWhy = '';
 
 function syncPickUI() {
+  // 首轮定档尚未给默认选择；没有人工勾选时保持 null，不能提前改成空集合。
+  if (!S.picks) {
+    $('#btnplan').disabled = true;
+    return;
+  }
   $$('#results .sel').forEach((el) => {
     el.checked = S.picks.has(pk(el.dataset.rid, el.dataset.sec));
     const tr = el.closest('tr');
@@ -2540,30 +2796,46 @@ function syncPickUI() {
 // 当前这轮结束后再跑一次即可 —— 最新的勾选状态那时才是准的。
 let _planInFlight = null;
 let _planRerun = false;
+function planInputKey() {
+  return JSON.stringify({
+    jobId: S.jobId, overrides: S.overrides, forced: S.forced,
+    selected: S.picks ? [...S.picks].sort() : null,
+    byScore: $('#o_probation') ? !$('#o_probation').checked : false,
+  });
+}
+
+function invalidatePlanPreview() {
+  if (S.previewPlanId && S.previewInputKey !== planInputKey()) {
+    S.previewPlanId = '';
+    S.previewInputKey = '';
+    $('#btnapply').disabled = true;
+  }
+}
+
 async function refreshPlan(silent) {
+  invalidatePlanPreview();
   if (_planInFlight) { _planRerun = true; return _planInFlight; }
-  _planInFlight = _refreshPlanOnce(silent).finally(() => {
-    _planInFlight = null;
-    if (_planRerun) {
+  // 所有等待者都等到补算结束，再拿同一份最新结果；不能在 finally 里另起
+  // 一个无人等待的请求，否则可见 diff 与随后更新的 planId 会来自两份方案。
+  _planInFlight = (async () => {
+    let result;
+    do {
       _planRerun = false;
-      // 清掉「定档计算中」占位文字再触发重算（2026-09-19）
-      // -----------------------------------------------
-      // 首轮定档完成后 applyPickPreset('rec') 把 _planRerun 设为 true，
-      // 这里触发第二轮 refreshPlan(true)（silent）。但 _planInFlight 已被
-      // 清零，后续的 syncPickUI 由第二轮完成后才调 —— 期间 #pickstat
-      // 停在「定档计算中… Xs」占位文字不消。
-      // MHTML1（09-19 23:50）的「定档计算中… 6s 长期停住」正是这么来的。
-      // 在启动第二轮之前先把 pickstat 刷成当前已选数量，让用户知道
-      // 第一轮已有结果、第二轮是补算而不是一直在算第一轮。
-      syncPickUI();
-      refreshPlan(true);
-    }
+      if (_planTimer) { clearTimeout(_planTimer); _planTimer = null; }
+      result = await _refreshPlanOnce(silent);
+      if (_planRerun) syncPickUI();
+    } while (_planRerun);
+    return result;
+  })().finally(() => {
+    _planInFlight = null;
+    if (_planRerun) schedulePlanRefresh();
   });
   return _planInFlight;
 }
 
 async function _refreshPlanOnce(silent) {
   let d;
+  const requestKey = planInputKey();
   const body = {
     job_id: S.jobId,
     overrides: S.overrides,
@@ -2620,13 +2892,55 @@ async function _refreshPlanOnce(silent) {
           method: 'POST', body: { plan_task_id: taskId }, timeoutMs: 15000,
         });
         misses = 0;
-      } catch (_) {
-        if (++misses >= 15) {
+      } catch (e) {
+        // 按错误类型分别处理，不再把所有失败一律算成「无响应」
+        // （2026-09-26）。原来这里 `catch (_)` 一刀切，于是：
+        //   · nginx 限流回 429 —— 后台任务跑得好好的，界面却报链路已断
+        //   · 任务被 LRU 淘汰回 404 —— 真实原因（任务没了）被吞掉，
+        //     用户只看到「刷新页面后重试」，刷新后当然还是一样
+        //   · token 失效回 401 —— 重试 15 次全是徒劳
+        // /api/job 那条轮询早就用 classifyPollError 分类了（见 662），
+        // 这条没用，两条轮询对同一种故障给出不同结论。现在统一。
+        const cl = classifyPollError(e, misses);
+        if (cl.kind === 'auth') {
           const meta = $('#planmeta');
-          if (meta) meta.innerHTML = `<div class="err">定档轮询 30 秒无响应，链路可能已断</div>`;
-          if (stat) stat.innerHTML = `<span class="err">定档轮询无响应 —— 刷新页面后重试</span>`;
+          if (meta) meta.innerHTML = `<div class="err">登录已失效，请重新登录后再定档</div>`;
+          if (stat) stat.innerHTML = `<span class="err">登录已失效 —— 重新登录</span>`;
           return null;
         }
+        if (cl.kind === 'expired') {
+          const meta = $('#planmeta');
+          if (meta) {
+            meta.innerHTML = `<div class="err">定档任务已不在服务端`
+              + `（容器重启，或并发定档过多把它挤掉了）</div>`;
+          }
+          if (stat) {
+            stat.innerHTML = `<span class="err">定档任务已过期 —— 点「生成写回方案」重新定档</span>`;
+          }
+          return null;
+        }
+        // 限流不计入 misses：后台任务没事，是网关在挡。按 Retry-After 退避。
+        if (cl.kind === 'throttled') {
+          if (stat) {
+            stat.innerHTML = `<span class="hint">定档计算中…（网关限流，`
+              + `${Math.round(cl.wait / 1000)}s 后重试）</span>`;
+          }
+          await new Promise((r) => setTimeout(r, cl.wait));
+          continue;
+        }
+        if (++misses >= 15) {
+          const meta = $('#planmeta');
+          if (meta) {
+            meta.innerHTML = `<div class="err">定档轮询连续 15 次无响应`
+              + `（约 ${misses * 2}–${misses * 17} 秒），链路可能已断：`
+              + `${esc(e.message || '连接中断')}</div>`;
+          }
+          if (stat) {
+            stat.innerHTML = `<span class="err">定档轮询无响应 —— 刷新页面后重试</span>`;
+          }
+          return null;
+        }
+        if (cl.wait) await new Promise((r) => setTimeout(r, cl.wait));
         continue;
       }
       if (!poll) continue;
@@ -2672,7 +2986,12 @@ async function _refreshPlanOnce(silent) {
     return null;
   }
 
+  if (requestKey !== planInputKey()) {
+    _planRerun = true;
+    return null;
+  }
   S.planId = d.plan_id; S.plans = d.plans;
+  S.planInputKey = requestKey;
 
   // 首次：按系统建议预勾选。
   //
@@ -2702,6 +3021,13 @@ function planWarnings(d) {
 $('#btnplan').onclick = async () => {
   const d = await refreshPlan(false);
   if (!d) return;
+  if (d.plan_id !== S.planId || S.planInputKey !== planInputKey()) {
+    $('#planmeta').textContent = '输入已更新，请重新生成写回预览。';
+    $('#btnapply').disabled = true;
+    return;
+  }
+  S.previewPlanId = d.plan_id;
+  S.previewInputKey = S.planInputKey;
 
   const nLines = d.diffs.reduce((a, x) => a + x.lines.length, 0);
   const skipped = d.plans.flatMap((p) =>
@@ -2745,6 +3071,8 @@ $('#btnplan').onclick = async () => {
 };
 
 $('#btnreplan').onclick = () => {
+  S.previewPlanId = ''; S.previewInputKey = '';
+  $('#btnapply').disabled = true;
   $('#p4').hidden = true; $('#p3').hidden = false; step(3);
 };
 
@@ -2895,8 +3223,10 @@ function fillPlanIntoRows(d) {
         `#results tr[data-rid="${cssq(p.line_no)}"][data-sec="${cssq(sec)}"]:not(.wrow)`);
       if (!tr) return;
       const inp = tr.querySelector('.pi');
-      // priority=0 是无效值（CPA 要求 >=1），保持空字符串显示 placeholder
-      if (inp && inp.value === '' && sp.priority > 0) inp.value = sp.priority;
+      const override = (S.overrides[p.line_no] || {})[sec] || {};
+      const manual = Number.isFinite(override.priority) && override.priority > 0;
+      // 自动值随方案更新；明确的手工覆盖保留。无效值清空，不沿用上一轮档位。
+      if (inp && !manual) inp.value = sp.priority > 0 ? String(sp.priority) : '';
 
       // 目录读不到的段：把后端方案里的模型填成勾选框。
       //
@@ -2935,10 +3265,32 @@ function fillPlanIntoRows(d) {
         // prior 与 seed 同办（2026-09-06）：那份清单也不是操作员填的，
         // 而是从原 config.yaml 搬回来的。回写会让后端当成手填，
         // 徽标与跨段闸都跟着变 —— 与 seed 完全同一个坑。
-        if (rec === undefined && sp.model_source !== 'seed'
-            && sp.model_source !== 'prior') {
-          (S.forced[p.line_no] = S.forced[p.line_no] || {})[sec] = [...on];
+        //
+        // 2026-09-26：catalog / probed 也同办 —— **任何**来源都不回写。
+        // 这份清单是后端方案算的，后端提交时本来就写它；回写只会让下一轮
+        // 定档把它当手填，绕过证据检查（见渲染不可用行那里的说明）。
+      }
+      // 没有人工接管记录时，勾选状态一律同步成后端方案（唯一真源）。
+      //
+      // 目录分支的勾选框是首次渲染时按前端 staleCheck 预勾的，只是占位显示；
+      // 方案到了之后若不同步，界面勾着的与实际写的会是两份清单。方案里有、
+      // 目录里没有的名字（市面补齐的同代变体）补成勾选项，写什么就显示什么。
+      if ((S.forced[p.line_no] || {})[sec] === undefined && (sp.models || []).length) {
+        const want = new Set(sp.models);
+        const boxes = $$('.cm', tr);
+        boxes.forEach((x) => { x.checked = want.has(x.value); });
+        const have = new Set(boxes.map((x) => x.value));
+        const host = tr.querySelector('.cats');
+        const missing = sp.models.filter((m) => !have.has(m));
+        if (host && missing.length) {
+          host.insertAdjacentHTML('beforeend', missing.map((m) => `
+            <label class="catpick" title="方案补齐：站方目录没报，按同代市面清单补上">
+              <input type="checkbox" class="cm" checked
+                data-rid="${esc(p.line_no)}" data-host="${esc(p.host)}"
+                data-sec="${esc(sec)}" value="${esc(m)}">${esc(m)}</label>`).join(''));
         }
+        const n = tr.querySelector('.cmn');
+        if (n) n.textContent = String($$('.cm', tr).filter((x) => x.checked).length);
       }
       // weight: 0 必须显眼 —— 全量重探会如实把原值搬回来。
       // weight: 0 必须显眼 —— 全量重探会如实把原值搬回来。
@@ -3110,8 +3462,51 @@ const KNOWN_HEADERS = [
   'authorization', 'x-api-key', 'content-type',
 ];
 
-async function pollApply(taskId, first) {
-  const box = $('#applymsg');
+/* 弱证据段的人工确认（2026-09-29 补）
+   ==================================
+   服务端 `_api_apply` 在方案里含 weak 段（seed 填充、站方目录没报过、原
+   config.yaml 里也没有这一族）时返回 409 `weak_evidence_unconfirmed`，
+   要求带 `confirm_weak=true` 再来一次。这个页面此前不认这个码，于是含猜测
+   清单的方案点「确认写回」只拿到一句「（HTTP 409）」—— 闸想要的那次确认
+   根本没机会发生，看起来就是「写回点不动」。
+
+   刻意用原生 confirm 而不是自绘弹层：站名与模型名都是外部数据，走
+   textContent 语义的原生对话框，不给 innerHTML 留注入面（本文件 1485 行的
+   全量重探确认也是同一个做法）。 */
+function confirmWeakEvidence(payload) {
+  const rows = Array.isArray(payload.weak_sections) ? payload.weak_sections : [];
+  const total = payload.weak_total || rows.length;
+  // 同一个站的多段并成一行：163 段全灭那种规模，逐段列会把对话框撑爆，
+  // 而操作员真正要判断的是「这个站是不是整个都在猜」。
+  const byHost = new Map();
+  for (const r of rows) {
+    const host = r.host || '(未知站)';
+    if (!byHost.has(host)) byHost.set(host, []);
+    byHost.get(host).push(r);
+  }
+  const lines = [];
+  let shown = 0;
+  for (const [host, secs] of byHost) {
+    if (shown >= 12) { lines.push(`… 另有 ${byHost.size - shown} 个站未列出`); break; }
+    const detail = secs.map((s) => {
+      const names = (s.models || []).join(', ');
+      const more = s.more ? ` +${s.more}` : '';
+      return `${s.section}: ${names}${more}`;
+    }).join('\n    ');
+    lines.push(`· ${host}\n    ${detail}`);
+    shown += 1;
+  }
+  const msg = `有 ${total} 个段的模型清单是「市面猜测」——\n`
+    + `站方 /models 目录没报过这一族，原 config.yaml 里也没有。\n\n`
+    + lines.join('\n')
+    + `\n\n这些名字写进 config.yaml 后，若该站其实没有，`
+    + `CPA 每次轮到都会失败。\n\n`
+    + `确定写入？（取消则不写，可回上一步逐段取消勾选）`;
+  return Promise.resolve(confirm(msg));
+}
+
+async function pollApply(taskId, first, box = $('#applymsg')) {
+  let last = first || {};
   let fails = 0;
   for (;;) {
     await new Promise((r) => setTimeout(r, 900));
@@ -3122,13 +3517,20 @@ async function pollApply(taskId, first) {
     } catch (e) {
       fails += 1;
       if (fails >= 20) {
-        box.innerHTML = `<span style="color:var(--bad)">轮询中断（${esc(e.message)}）
-          —— <b>配置已写盘</b>，但重载与验证结果拿不到了。
-          可${cpaRestartHint()} 确认生效。</span>`;
+        const wrote = last.local_written === true;
+        box.innerHTML = `<span style="color:var(--${wrote ? 'warn' : 'bad'})">
+          <b>${wrote ? '已确认本地写盘，但后续结果未知' : '写回结果未知，无法确认配置是否写入'}</b>
+          —— 轮询中断（${esc(e.message)}）。任务 ${esc(taskId)} 的状态尚未确认，
+          请恢复状态查询后再操作，不要重复提交。</span>`;
         return null;
       }
       continue;
     }
+    if (!st || !['running', 'done', 'error'].includes(st.state)) {
+      box.innerHTML = '<span style="color:var(--bad)">写回结果未知：任务状态响应无效，未确认完成。</span>';
+      return null;
+    }
+    last = { ...last, ...st };
     const pct = st.verify_total
       ? Math.round(st.verify_done / st.verify_total * 100) : 0;
     const bar = st.verify_total
@@ -3147,25 +3549,71 @@ async function pollApply(taskId, first) {
       // 「配置已写盘」，并且把 st 合并后返回；调用方只判 `if (!d)`，判不住，
       // 于是继续渲染「✓ 已写回」+ 一排空的 written/backup/diffs。
       // 用户看到的是「写回成功但全是空白」，真相是一个字节都没写。
-      const wrote = st.local_written === true;
-      box.innerHTML = `<span style="color:var(--bad)">${wrote
-        ? '收尾出错 —— <b>配置已写盘</b>，是重载或验证那一步失败：'
-        : '<b>写回失败 —— 配置未写盘</b>，config.yaml 未被改动：'}
-        <pre>${esc(st.error || '')}</pre></span>`;
-      // 没写盘就没有任何结果可展示，返回 null 让调用方停在错误态。
-      return wrote ? { ...first, ...st } : null;
+      //
+      // 2026-09-27 再改措辞：写盘成功时不要用「收尾出错」打头。那一轮实跑
+      // 里配置已写盘、CPA PUT 200 读回一致，只有运行时路由验证没过，顶部
+      // 却是红字「收尾出错」，而下方面板同时写「✓ 已写回 / CPA 已重载」——
+      // 同一屏两句话互相打脸。现在按「已写盘 / 未写盘」给两种完全不同的
+      // 标题与颜色：前者是黄色的「部分完成」，后者才是红色的失败。
+      // 具体没过的是哪几条由后端的 _verify_failure_summary 写进 st.error。
+      const wrote = last.local_written === true;
+      box.innerHTML = wrote
+        ? `<span style="color:var(--warn)">
+            <b>已写盘，但最后一步没走完</b> —— config.yaml 已更新，
+            下面这一层需要你决定要不要跟进：
+            <pre>${esc(st.error || '')}</pre></span>`
+        : `<span style="color:var(--bad)">
+            <b>${last.local_written === false ? '写回失败 —— 后端确认配置未写盘' : '写回结果未知 —— 缺少写盘回执'}</b>：
+            <pre>${esc(st.error || '')}</pre></span>`;
+      return wrote ? last : null;
     }
-    if (st.state !== 'running') return { ...first, ...st };
+    if (st.state === 'done') return last;
   }
+}
+
+async function awaitApplyReceipt(first, box) {
+  if (!first || typeof first !== 'object' || Array.isArray(first)) {
+    box.innerHTML = '<span style="color:var(--bad)">写回结果未知：后端未返回有效回执。</span>';
+    return null;
+  }
+  const result = first.task_id && !['done', 'error'].includes(first.state)
+    ? await pollApply(first.task_id, first, box) : first;
+  if (!result) return null;
+  if (result.local_written !== true || result.state === 'running') {
+    const failed = result.state === 'error' && result.local_written === false;
+    box.innerHTML = `<span style="color:var(--bad)">${failed
+      ? '写回失败，后端确认配置未写入' : '写回结果未知，尚未确认完成'}：
+      ${esc(result.error || result.reload_msg || '缺少完成的写盘回执')}</span>`;
+    return null;
+  }
+  return result;
+}
+
+function applyReceiptHtml(result) {
+  const partial = result.state === 'error' || result.push_ok === false
+    || result.reload_ok === false;
+  const complete = !partial && result.reload_ok === true;
+  const title = partial ? '已写盘，但后续步骤未完成'
+    : complete ? '已写盘，CPA 已重载' : '已写盘；重载结果未提供';
+  const backup = (result.backup || '').split(/[\\/]/).pop();
+  const detail = result.error || result.reload_msg || result.push_msg || '';
+  return `<span style="color:var(--${complete ? 'ok' : 'warn'})">${title}`
+    + (backup ? `，备份 ${esc(backup)}` : '')
+    + (detail ? `<br>${esc(detail)}` : '') + '</span>';
 }
 
 $('#btnapply').onclick = async () => {
   const btn = $('#btnapply');
+  if (!S.previewPlanId || S.previewInputKey !== planInputKey()) {
+    $('#applymsg').textContent = '预览已失效，请重新生成写回方案；本次没有提交。';
+    btn.disabled = true;
+    return;
+  }
   btn.disabled = true;
   $('#applymsg').innerHTML = '<span class="spin"></span> 写回中…';
   // 写盘之后要让 CPA 立即生效。_cred 总是带上：用户若是用 CPA 管理密码
   // 登录的（默认路径），服务端直接复用它去 PUT，无需在这里再输一遍。
-  const body = { plan_id: S.planId, confirm: true, _cred: S.token };
+  const body = { plan_id: S.previewPlanId, confirm: true, _cred: S.token };
   body.push = {
     mgmt_key: $('#o_mgmt').value,          // 留空则服务端复用 _cred
     client_key: $('#o_client').value.trim(),
@@ -3183,23 +3631,45 @@ $('#btnapply').onclick = async () => {
   //
   // 服务端的地址白名单（_push_target_ok）**保留**：它现在防的是绕过界面
   // 直接打 /api/apply 的调用方，而不是本页面。
+  // 弱证据段的二次确认（2026-09-29）
+  // ================================
+  // 服务端的 `confirm_weak` 闸（server.py:_api_apply）在方案含 weak 段时返回
+  // 409 `weak_evidence_unconfirmed`。这个页面此前从不发这个字段，于是任何
+  // 含猜测清单的方案点「确认写回」都只能拿到一句「（HTTP 409）」——
+  // 界面上看就是「写回按钮点了没反应 / 报个看不懂的错」，而闸想要的那次
+  // 人工确认根本没机会发生。
+  //
+  // 这里把 409 的载荷渲染成操作员能判断的清单（站 · 段 · 模型名），确认后
+  // 带 confirm_weak=true 重发一次。取消则什么都不写。闸仍在服务端 ——
+  // 这里只是把它需要的那次确认补上。
   let d;
-  try { d = await api('/api/apply', { method: 'POST', body }); }
-  catch (e) {
-    $('#applymsg').innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
-    btn.disabled = false;
-    return;
+  for (let attempt = 0; ; attempt += 1) {
+    try { d = await api('/api/apply', { method: 'POST', body }); break; }
+    catch (e) {
+      const payload = e && e.data;
+      if (attempt === 0 && e && e.status === 409
+          && payload && payload.error_code === 'weak_evidence_unconfirmed') {
+        const okToWrite = await confirmWeakEvidence(payload);
+        if (!okToWrite) {
+          $('#applymsg').innerHTML =
+            '<span class="hint">已取消 —— config.yaml 未被改动。'
+            + '可回上一步取消勾选这些段，或先补探测再写。</span>';
+          btn.disabled = false;
+          return;
+        }
+        body.confirm_weak = true;
+        continue;
+      }
+      $('#applymsg').innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
+      btn.disabled = false;
+      return;
+    }
   }
 
-  // 落盘已完成（同步做的），重载与验证在后台跑 —— 轮询到结束。
-  //
-  // 为什么必须异步（2026-09-02 现场 524）：重载 1-3 秒 + 验证单个最长 45 秒，
-  // 79 凭据那种规模累计破 100 秒，Cloudflare 直接切断连接返回 524，前端拿到
-  // 的是 CF 的 HTML 拦截页而不是 JSON。任务其实成功了，用户看到的是失败。
-  if (d.task_id) {
-    d = await pollApply(d.task_id, d);
-    if (!d) { btn.disabled = false; return; }
-  }
+  // 初始回执只代表任务受理，写盘、推送和重载都可能尚未开始。
+  // 统一等待任务终态并核对 local_written，不能把 HTTP 202 当作写盘成功。
+  d = await awaitApplyReceipt(d, $('#applymsg'));
+  if (!d) { btn.disabled = false; return; }
   // 出错但已写盘时，pollApply 刚写进 #applymsg 的错误原文必须留着 ——
   // 无条件清空会把唯一一条真实失败信息擦掉，只剩下面那个绿色成功面板。
   if (d.state !== 'error') $('#applymsg').textContent = '';
@@ -3383,19 +3853,41 @@ const BM_SEC_CLS = {
 // HTML 安全，且不会出现在段名或域名里。
 const bmKey = (g) => g.section + '␟' + g.host;
 
+/* `#bmwhy` 的常态文案。bmBusy 与 bmLoad 的失败分支会临时改写它，
+   bmRender 每次都要复位回来 —— 否则加载完了还挂着「正在读取…」。
+   取自 index.html 里那句，两处必须一致。 */
+const BM_IDLE_HINT = '勾选上方卡片后可批量操作；单站改档直接在卡片头部输入';
+
 function bmStat() {
   const t = BM.groups;
-  // 分裂按**两种**口径统计：段内（同段同 host 多档）与跨协议（同 host 跨段
-  // 多档）。只数前者会漏掉「同一个网站在 claude 段 900、codex 段 350」那种
-  // —— 那同样违反「同网址同优先级」，而 `/api/routes` 早就把 `site_split`
-  // 算好给了前端，原代码却从没显示它。
-  const split = t.filter((g) => g.split || g.site_split).length;
-  const off = t.reduce((n, g) => n + g.entries.filter((e) => !e.enabled).length, 0);
+  // 两个口径**必须分开数**（2026-09-26 本机按 VPS 拓扑实跑修）。
+  // ------------------------------------------------------------
+  // 后端给两个字段，语义完全不同：
+  //   · `split`      —— 同段同 host 多档。**违规**：修改要求第 6 条
+  //                     「同一类型相同网址上游优先级要保持相同」。
+  //   · `site_split` —— 同 host 跨段多档。**允许**：同一条要求写得很清楚
+  //                     「不同类型相同网址可以不同」，优先级只在同类型内比较。
+  //
+  // 原来这里（以及 bmCard 的红框、`#bmscope` 的计数）把两者一视同仁地算成
+  // 「档位分裂」，于是实跑时 50 组全部标红、顶部写「50 组分裂」，而
+  // 「只选分裂组」按钮按 `g.split` 取数只得 0 组 —— 界面自相矛盾，红色边框
+  // 也彻底失去指路作用（全都红等于没有红）。用户那句「点了根本不会生效」
+  // 有一半是这个：看起来满屏分裂，点「只选分裂组」却一个都选不中。
+  const split = t.filter((g) => g.split).length;
+  const cross = t.filter((g) => !g.split && g.site_split).length;
+  // `entries` 可能缺。bmStat() 跑在 bmLoad 的 try 里，一条坏 group 让
+  // `g.entries.filter` 抛 TypeError → 落进 bmLoad 的 catch → `#bmgrid` 写
+  // 「读取失败：Cannot read properties…」并**禁掉五个批量按钮**，
+  // 而 /api/routes 其实回了 200 和完整数据。现场就是「路由批量管理：
+  // 选了也点不动」。2026-10-01 加闸：坏 group 按 0 条算，不拖垮整个面板。
+  const off = t.reduce((n, g) => n
+    + (Array.isArray(g.entries) ? g.entries.filter((e) => !e.enabled).length : 0), 0);
   const ent = t.reduce((n, g) => n + g.entries.length, 0);
   $('#bmstat').innerHTML =
       `<div><b>${t.length}</b><i>分组（段 × 网址）</i></div>`
     + `<div><b>${ent}</b><i>条目</i></div>`
     + `<div class="${split ? 's-bad' : ''}"><b>${split}</b><i>档位分裂</i></div>`
+    + `<div class="${cross ? 's-cross' : ''}"><b>${cross}</b><i>跨段不同档</i></div>`
     + `<div class="${off ? 's-off' : ''}"><b>${off}</b><i>已停用</i></div>`;
 }
 
@@ -3420,15 +3912,23 @@ function bmCard(g) {
       CPA 按层级取最高那一桶，低档的实质是冷备 —— 高档几条会先被打光配额。
       勾选本组后点「统一优先级」即可对齐到 ${Math.max(...pris)}。</div>` : '';
   // 站级跨段分裂（`site_split`）与段内分裂（`split`）是两件事：
-  // 后者是同段同 host 多档，前者是**同一网站在不同协议段**拿到不同档 ——
-  // 后者同样违反「同网址同优先级」，但原卡片完全没显示它。
+  // 后者是同段同 host 多档（**违规**），前者是同一网站在不同协议段拿到不同档。
+  //
+  // 跨段不同档**不是违规**（2026-09-26 修）：修改要求第 6 条原文
+  // 「同一类型相同网址上游优先级也要保持相同（不同类型相同网址可以不同，
+  // 优先级主要在同一类型进行综合比较）」。原来这段把它写成「同样违反
+  // 「同网址同优先级」」，措辞与红框（`g.split || g.site_split`）都成了误判 ——
+  // 生产配置里每个跨段站都会命中，用户以为满屏都是问题。
+  // 现在只作**提示**：它影响的是「同一网站在各段的相对顺位」，不是不变式。
   const sitewarn = (g.site_split && (g.site_priorities || []).length > 1) ? `
-    <div class="bm-warn">跨协议：本站 ${esc(g.host)} 在各段拿到
-      ${g.site_priorities.join(' / ')} 共 ${g.site_priorities.length} 个档位，
-      同样违反「同网址同优先级」。</div>` : '';
+    <div class="bm-note">跨协议：本站 ${esc(g.host)} 在各段拿到
+      ${g.site_priorities.join(' / ')} 共 ${g.site_priorities.length} 个档位。
+      这是**允许**的 —— 按类型分别比较，各段各排各的序；只是想提醒你
+      层间相对顺位不一致。</div>` : '';
   const allOff = g.entries.every((e) => !e.enabled);
+  // 红框只给**真的违规**：段内档位分裂。跨段不同档不红（见 sitewarn 的说明）。
   return `
-  <div class="bm-card ${on ? 'sel' : ''} ${g.split || g.site_split ? 'split' : ''} ${dirty ? 'edited' : ''}" data-k="${esc(k)}">
+  <div class="bm-card ${on ? 'sel' : ''} ${g.split ? 'split' : ''} ${dirty ? 'edited' : ''}" data-k="${esc(k)}">
     <div class="bm-head">
       <input type="checkbox" class="bmck" ${on ? 'checked' : ''} data-k="${esc(k)}">
       <span class="bm-sec ${BM_SEC_CLS[g.section] || ''}">${esc(BM_SEC_CN[g.section] || g.section)}</span>
@@ -3439,7 +3939,7 @@ function bmCard(g) {
           title="${allOff ? '把本站全部条目重新启用' : '把本站全部条目停用'}">${allOff ? '启用' : '停用'}</button>
         <button class="bm-mini del" data-act="del" title="把本站全部条目列入删除预览">删除…</button>
       </span>
-      <span class="bm-pri ${g.split || g.site_split ? 'bad' : ''}">
+      <span class="bm-pri ${g.split ? 'bad' : ''}">
         <span class="bm-tint" style="background:${bmTint(pris.length ? Math.max(...pris) : null)}"></span>
         ${pris.length > 1 ? `<em class="s">${pris.join('/')}</em>` : ''}
         <input class="bm-priin ${dirty ? 'dirty' : ''} ${bad ? 'bad' : ''}"
@@ -3499,6 +3999,9 @@ function bmRender() {
   $('#bmact').dataset.idle = idle ? '1' : '0';
   ['#bmunify', '#bmenable', '#bmdisable', '#bmdelete', '#bmsetpri']
     .forEach((s) => { $(s).disabled = idle; });
+  // 文案要**复位**：bmBusy / bmLoad 的失败分支把它改成过「正在读取…」与
+  // 「读取失败…」。不复位的话，加载成功后那句话还挂在那里，用户以为还在转。
+  $('#bmwhy').textContent = BM_IDLE_HINT;
   $('#bmwhy').hidden = !idle;
   bmPresets();
   bmdSync();
@@ -3526,10 +4029,36 @@ function bmPresets() {
 }
 
 
+/* 加载期间把整条工具栏禁掉（2026-09-26 本机按 VPS 拓扑实跑修）。
+
+   现场：打开面板后 `/api/routes` 在浏览器里实测要 28.6 秒（同一接口 curl
+   只要 0.6 秒 —— 差额是首屏 JS、`/api/context` 与它抢同一个连接池）。
+   这 28 秒里 `BM.groups` 还是空数组，而筛选、全选、只选分裂组、五个批量
+   按钮**全都是可点的**：
+     · 点「只选分裂组」→ 在空数组上过滤 → 面板刷成「没有匹配的分组」
+     · 顶部一直显示「筛选出 0 组」
+     · 五个操作按钮因为选中集为空而恒灰
+   用户看到的就是「路由批量管理点了根本不会生效」—— 而后端数据完全正常
+   （实测 50 组 / 133 条目）。等数据到了再放行，并且明说在等什么。 */
+function bmBusy(on) {
+  ['#bmq', '#bmsec', '#bmfilter', '#bmreload', '#bmall', '#bmnone',
+   '#bmsplit', '#bmunify', '#bmenable', '#bmdisable', '#bmdelete',
+   '#bmpri', '#bmsetpri'].forEach((s) => {
+    const el = $(s);
+    if (el) el.disabled = on;
+  });
+  const why = $('#bmwhy');
+  if (why && on) {
+    why.hidden = false;
+    why.textContent = '正在读取路由清单…（配置很大时要十几秒）';
+  }
+}
+
 async function bmLoad() {
   $('#bmgrid').innerHTML = '<div class="bm-empty">读取中…</div>';
+  bmBusy(true);
   try {
-    const d = await api('/api/routes');
+    const d = await api('/api/routes', { timeoutMs: 120000 });
     BM.groups = d.groups || [];
     BM.revision = d.revision || '';
     // 选中集按 (段,网址) 而不是下标 —— 重新读取后下标可能因别处改动而移位，
@@ -3541,11 +4070,27 @@ async function bmLoad() {
     // 放弃草稿确实会丢用户输入，所以只在**显式重新读取**时丢，
     // 不在每次 bmRender 时丢。
     BMD.clear();
+    bmBusy(false);
     bmStat();
     bmRender();
   } catch (e) {
+    bmBusy(false);
+    // 读不到就说清楚「按钮为什么点不动」，不要只在网格里留一行小字 ——
+    // 用户的视线在工具栏上。
     $('#bmgrid').innerHTML =
-      `<div class="bm-empty" style="color:var(--bad)">读取失败：${esc(e.message)}</div>`;
+      `<div class="bm-empty" style="color:var(--bad)">读取失败：${esc(e.message)}`
+      + `<br><span class="hint">批量操作已禁用（没有路由清单就无从下手）。`
+      + `点「重新读取」重试；持续失败看容器日志。</span></div>`;
+    const why = $('#bmwhy');
+    if (why) {
+      why.hidden = false;
+      why.textContent = `路由清单读取失败：${e.message} —— 点「重新读取」重试`;
+    }
+    ['#bmunify', '#bmenable', '#bmdisable', '#bmdelete', '#bmsetpri']
+      .forEach((s) => { const el = $(s); if (el) el.disabled = true; });
+    // 重新读取必须留着，否则用户没有任何自救手段。
+    const rl = $('#bmreload');
+    if (rl) rl.disabled = false;
   }
 }
 
@@ -3566,6 +4111,14 @@ function bmOps(kind, arg) {
   // 就地草稿先落进 ops —— 它与批量动作是**叠加**关系：用户可以
   // 「把 A 站改成 900 的同时把选中的 5 个站统一到 500」。
   const ops = bmDraftOps(BMD, BM.groups);
+  // 'draft' 是「只提交就地草稿」（#bmdirtygo），没有批量动作要叠加。
+  //
+  // 2026-09-26 修：原来没有这个分支，于是 kind==='draft' 掉进最后的 else，
+  // 在那里 `const want = kind === 'enable'` 求值为 **false** —— 每个**选中**
+  // 组的所有启用条目都被追加了一条 `disable` op。用户点「预览并写回这些
+  // 改动」想提交的是单站档位草稿，实际方案里却多出「把这些站全部停用」。
+  // 没选中任何组时才碰巧无害，而卡片是可以既选中又有草稿的。
+  if (kind === 'draft') return ops;
   bmSelected().forEach((g) => {
     if (kind === 'unify' || kind === 'setpri') {
       // setpri：用户给定的值，整组所有 Key 都写它。
@@ -3582,7 +4135,8 @@ function bmOps(kind, arg) {
       // 就地草稿已经定过的站，批量值不覆盖它 —— 用户对单站的显式指定
       // 优先于批量动作，后者是粗粒度默认。少了这一条，用户「A 站 900」
       // 会被随后的「全选统一到 500」静默吃掉。
-      if (BMD.has(bmdKey(g.section, g.host))) return;
+      const draft = BMD.get(bmdKey(g.section, g.host));
+      if (draft && typeof draft.priority === 'number') return;
       g.entries.forEach((e) => {
         if (e.priority !== target) {
           ops.push({ section: g.section, index: e.index, fingerprint: e.fingerprint,
@@ -3828,12 +4382,13 @@ $('#bmapply').onclick = async () => {
   btn.disabled = true;
   msg.textContent = '写回中…';
   try {
-    const d = await api('/api/bulk-apply', {
+    const first = await api('/api/bulk-apply', {
       method: 'POST',
       body: { bulk_id: BM.bulkId, confirm: true, push: bmPush() },
     });
-    msg.innerHTML = `<span style="color:var(--ok)">已写回 ${d.notes.length} 处，`
-      + `备份 ${esc((d.backup || '').split(/[\\/]/).pop())}</span>`;
+    const d = await awaitApplyReceipt(first, msg);
+    if (!d) return;
+    msg.innerHTML = applyReceiptHtml(d);
     $('#bmpreview').hidden = true;
     BM.bulkId = '';
     BM.sel.clear();
@@ -3887,43 +4442,57 @@ async function tnRun() {
     const d = await api('/api/tuning');
     TN.id = d.tuning_id || '';
 
-    basis.innerHTML = `单次失败尝试按 <b>${esc(String(d.attempt_sec))}</b> 秒算`
-      + `（${esc(d.attempt_why || '')}）· 回源窗口 `
-      + `<b>${esc(String(d.edge_window_sec))}</b> 秒`;
+    // 缺字段时显示「未知」而不是字面量 undefined —— 后者让操作员以为
+    // 是计算结果，实际是前后端字段没对上。
+    const numOr = (v, unit) => (typeof v === 'number' && isFinite(v)
+      ? `<b>${esc(String(v))}</b> ${unit}` : `<b class="hint">未知</b>`);
+    basis.innerHTML = `单次失败尝试按 ${numOr(d.attempt_sec, '秒')}算`
+      + `（${esc(d.attempt_why || '后端未给依据')}）· 回源窗口 `
+      + numOr(d.edge_window_sec, '秒');
 
     // 顶层池实况。这是全部结论的输入，先摆出来 —— 只给建议不给依据，
     // 操作员没法判断该不该改。
     $('#tntiers').innerHTML = (d.tiers || []).map((t) => {
-      if (!t.credentials) {
-        return `<div class="bm-card"><b>${esc(t.section)}</b>
+      if (!t || !t.credentials) {
+        return `<div class="bm-card"><b>${esc((t && t.section) || '?')}</b>
           <span class="hint">顶层没有可计费凭据</span></div>`;
       }
+      // hosts 缺失时不能 `t.hosts.length` —— 一条坏数据会让整块 #tntiers
+      // 变成空白（TypeError 逃到 catch，只剩一行报错）。
+      const nhost = Array.isArray(t.hosts) ? t.hosts.length : 0;
       const run = t.longest_same_host_run > 3
         ? `<span class="tier warn">最长连续同站 ${t.longest_same_host_run} 个
-             （${esc(t.run_host)}）—— 会连打同一个站</span>`
-        : `<span class="hint">最长连续同站 ${t.longest_same_host_run} 个</span>`;
+             （${esc(t.run_host || '?')}）—— 会连打同一个站</span>`
+        : `<span class="hint">最长连续同站 ${t.longest_same_host_run || 0} 个</span>`;
       return `<div class="bm-card"><b>${esc(t.section)}</b>
         <div class="hint">顶层档位 ${esc(String(t.top_priority))} ·
-          <b>${t.credentials}</b> 个凭据 · ${t.hosts.length} 个站</div>
+          <b>${t.credentials}</b> 个凭据 · ${nhost} 个站</div>
         ${run}</div>`;
     }).join('');
 
     $('#tnnotes').innerHTML = (d.notes || []).map(
       (n) => `<div class="warn b">${esc(n)}</div>`).join('');
 
-    const pending = (d.advices || []).filter((a) => a.changed);
+    const pending = (d.advices || []).filter((a) => a && a.changed);
     $('#tnlist').innerHTML = (d.advices || []).map((a) => {
       const sev = TN_SEV[a.severity] || TN_SEV.warn;
+      // 标题取 `item`。历史上这里读过 `a.key`，而后端那个同值字段恰好叫
+      // `key` —— `_SECRET_NAME` 里有 `^key$`，出站被整体换成 `***`，
+      // 于是标题从 undefined 变成 `***`，两次都认不出改的是哪个键。
+      // 后端已改名为 `advice_key`；这里按 item → advice_key → key 依次兜底，
+      // 让新旧两版镜像都能正确渲染（VPS 可能还在跑旧镜像）。
+      const label = a.item || a.advice_key
+        || (a.key && a.key !== '***' ? a.key : '') || '(后端未给键名)';
       if (!a.changed) {
-        return `<div class="bm-card"><b>${esc(a.key)}</b>
+        return `<div class="bm-card"><b>${esc(label)}</b>
           <span class="hint">当前 <code>${esc(String(a.current))}</code>
           已经是建议值，无需改动</span></div>`;
       }
-      return `<div class="warn ${sev.cls}"><b>${esc(a.key)}</b>
+      return `<div class="warn ${sev.cls}"><b>${esc(label)}</b>
         <span class="tag">${sev.label}</span><br>
         <code>${esc(String(a.current))}</code> →
         <code>${esc(String(a.want))}</code>
-        <div class="hint">${esc(a.why)}</div></div>`;
+        <div class="hint">${esc(a.why || '')}</div></div>`;
     }).join('') || '<p class="hint">没有可改项。</p>';
 
     (d.problems || []).forEach((p) => {
@@ -3931,10 +4500,20 @@ async function tnRun() {
         `<div class="warn b">改不动：${esc(p)}</div>`);
     });
 
-    if (TN.id && d.diff) {
+    // 闸门只看「有 tuning_id 且确实有待改项」。
+    // ------------------------------------------
+    // 2026-10-01：原条件是 `TN.id && d.diff`。`#tnapply` 是本面板唯一的
+    // 执行入口，整块嵌在 `#tnpreview` 里。后端回 `diff: ""`（空串为假值）
+    // 或省略 diff 时，即便 advices 里有多条 changed（#tnlist 全列出来了、
+    // #tncnt 也算了数），预览块仍保持 hidden —— 用户看到一屏建议，
+    // 却找不到也点不到任何执行按钮。这就是「选完选项点执行根本不生效」
+    // 的另一半：按钮不存在，不是点了没反应。
+    // 现在 diff 为空时照样放出按钮，只在 diff 位置说明「后端未回 diff」。
+    if (TN.id && pending.length) {
       $('#tncnt').textContent = `${pending.length} 处`;
       $('#tndiff').textContent = d.diff
-        + (d.diff_truncated ? '\n…（diff 过长已截断）' : '');
+        ? d.diff + (d.diff_truncated ? '\n…（diff 过长已截断）' : '')
+        : '后端这次没有回 diff —— 仍可写回，但请写回后用「参考 · 当前档位谱」复核。';
       $('#tnpreview').hidden = false;
     } else {
       $('#tnpreview').hidden = true;
@@ -3946,33 +4525,9 @@ async function tnRun() {
   }
 }
 
-/* 自己轮询而不复用 pollApply：那个函数把进度写死在 #applymsg（投喂流程的
-   收尾区），在这个面板里调它会把状态写到一个用户看不见的地方。 */
-async function tnPoll(taskId) {
-  const msg = $('#tnmsg');
-  let fails = 0;
-  for (;;) {
-    await new Promise((r) => setTimeout(r, 900));
-    let st;
-    try {
-      st = await api(`/api/apply-status/${encodeURIComponent(taskId)}`);
-      fails = 0;
-    } catch (e) {
-      fails += 1;
-      if (fails >= 20) {
-        msg.innerHTML = `<span style="color:var(--bad)">轮询中断
-          （${esc(e.message)}）—— <b>配置可能已写盘</b>，
-          请在 VPS 上核对后再操作</span>`;
-        return null;
-      }
-      continue;
-    }
-    if (st.state === 'running') {
-      msg.innerHTML = `<span class="spin"></span> ${esc(st.stage || '收尾中')}`;
-      continue;
-    }
-    return st;
-  }
+/* 保留调优轮询入口，回执校验与进度处理复用投喂和批量写回的同一实现。 */
+async function tnPoll(taskId, first = {}) {
+  return awaitApplyReceipt({ ...first, task_id: taskId }, $('#tnmsg'));
 }
 
 $('#tnrun').onclick = () => tnRun();
@@ -3988,15 +4543,10 @@ $('#tnapply').onclick = async () => {
       method: 'POST',
       body: { tuning_id: TN.id, confirm: true, push: bmPush() },
     });
-    const st = first.task_id ? await tnPoll(first.task_id) : first;
+    const st = first && first.task_id
+      ? await tnPoll(first.task_id, first) : await awaitApplyReceipt(first, msg);
     if (!st) return;
-    if (st.state === 'error') {
-      msg.innerHTML = `<span style="color:var(--bad)">${esc(st.error || '写回失败')}</span>`;
-      return;
-    }
-    const bak = (st.backup || '').split(/[\\/]/).pop();
-    msg.innerHTML = '<span style="color:var(--ok)">已写回'
-      + (bak ? `，备份 ${esc(bak)}` : '') + '</span>';
+    msg.innerHTML = applyReceiptHtml(st);
     $('#tnpreview').hidden = true;
     TN.id = '';
     await tnRun();
@@ -4013,16 +4563,40 @@ $('#tnapply').onclick = async () => {
 // unhandled rejection —— 页面停在骨架屏，控制台里一条红字，用户看到的是
 // 「黑屏 / 一直转圈」，没有任何可操作的提示。
 // 这里把失败显式画到启动区，并给出下一步。
+//
+// 2026-09-26：原兜底里调的 `hideSkel()` 是 boot() 内部的局部函数，在这里
+// 是 ReferenceError —— 被外层 try 吞掉，于是启动失败时依旧什么都不显示
+// （黑屏的一条真路径）。改成直接操作骨架元素，并同时打全局横幅。
 boot().catch((e) => {
   try {
-    hideSkel();
     const box = $('#bootmsg');
     if (box) {
       box.innerHTML = `<div class="err">启动失败：${esc(e && e.message || e)}</div>`
         + `<div class="hint">刷新页面重试；持续如此请把容器日志里的 `
         + `error_ref 发出来排查。</div>`;
     }
+    const skel = $('#bootbox');
+    // 骨架里有 #bootmsg 时保留骨架（让报错可见），否则收起骨架
+    if (skel && !(box && skel.contains(box))) skel.hidden = true;
     const gate = $('#gate');
     if (gate) gate.hidden = false;
+    showBanner(`启动失败：${e && e.message || e}`, 'e');
   } catch (_) { /* 兜底本身不能再抛 */ }
+});
+
+// 全局兜底（2026-09-26）：任何渲染路径里的未捕获异常 / 未处理 rejection
+// 都显示横幅，并把卡在「计算中」的占位格换成原因 —— 页面绝不静默黑屏。
+window.addEventListener('error', (ev) => {
+  try {
+    const m = ev && (ev.message || (ev.error && ev.error.message));
+    if (!m) return;                      // 资源加载错误（img 等）不打扰
+    showBanner(`页面脚本异常：${m} —— 刷新页面可恢复；反复出现请截图控制台`, 'e');
+  } catch (_) { /* 忽略 */ }
+});
+window.addEventListener('unhandledrejection', (ev) => {
+  try {
+    const r = ev && ev.reason;
+    const m = (r && r.message) || String(r);
+    showBanner(`后台操作失败：${m}`, 'e');
+  } catch (_) { /* 忽略 */ }
 });

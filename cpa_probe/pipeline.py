@@ -1153,6 +1153,7 @@ class Prober:
 
         # 目录优先。拿不到就是空列表，`_probe_order` 自动回落到种子。
         v.catalog = self._stage0_catalog(row, section, base)
+        model_catalog.note_catalog(section, v.catalog)
 
         # 基线阶段只打前几个 —— 这里的目的是「定段归属 + 找最小门票」，
         # 不是把目录验穷。验穷是 _stage2 的活，且有 max_model_attempts 兜着。
