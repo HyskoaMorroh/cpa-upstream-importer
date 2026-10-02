@@ -134,6 +134,7 @@ footer{color:var(--dim);font-size:.85rem;text-align:center;padding-top:26px;
     <li><a href="#nginx">配置 nginx.conf</a></li>
     <li><a href="#proxy">配置代理（复用 mihomo）</a></li>
     <li><a href="#deploy">部署与启动</a></li>
+    <li><a href="#probe-policy">主动探测许可与持久预算</a></li>
     <li><a href="#flow4">四个核心流程怎么用</a></li>
     <li><a href="#rules">模型选择与定档规则</a></li>
     <li><a href="#trouble">排错对照表</a></li>
@@ -430,7 +431,9 @@ curl -s -o /dev/null -w 'HTTP %{http_code}  耗时 %{time_total}s\n' http://127.
 </li>
 </ol>
 
-<h2 id="probe-policy">主动探测许可与持久预算</h2>
+<h2 id="probe-policy">8. 主动探测许可与持久预算</h2>
+<div class="warn"><b>从旧版本升级</b>
+拉取新镜像后，默认不再自动向上游发探测请求。解析、配置分析、定档、预览和写回照常可用；界面会把没探测过的条目标成“未实测”，不再按它自动启用新条目。需要恢复主动探测的站点，按本节配置许可文件。</div>
 <div class="bad"><b>站方禁止测试时，不主动发送任何探针</b>
 公告中的“连续超过 10 次”没有给出可适用的统计窗口，不能推导出 9 次安全。改问候词、换 Key、代理或客户端画像都不是规避限制的办法。</div>
 <p>缺少许可文件时，默认被动分析。许可文件是 <code>/backups/probe-policy.json</code>，账本是 <code>/backups/probe-policy.sqlite3</code>，放在已有持久卷中。不要删除账本来恢复额度；不要对已有停止状态自动解封。</p>
@@ -450,7 +453,7 @@ curl -s -o /dev/null -w 'HTTP %{http_code}  耗时 %{time_total}s\n' http://127.
 <p>目录 GET、生成请求、能力检查、握手和重试都计数。自动重定向被拒绝，以免隐式追加请求。403、429 或明确禁测/封禁响应会停止整个 provider 的后续请求；账本错误也拒绝发送。未完成的预留不会靠重启自动清零。</p>
 <p>CPA 管理重载可以成功，同时上游仍然“未实测”。两者独立报告，不能把写回成功当成上游验证成功。</p>
 
-<h2 id="flow4">8. 四个核心流程怎么用</h2>
+<h2 id="flow4">9. 四个核心流程怎么用</h2>
 
 <h3>① 投喂 → 写回（添加新账号）</h3>
 <ol class="steps">
@@ -475,7 +478,7 @@ curl -s -o /dev/null -w 'HTTP %{http_code}  耗时 %{time_total}s\n' http://127.
 <div class="warn"><b>全量重探很慢</b>
 是否发请求由服务端许可决定，不由“全量”按钮决定。重复点击、新建任务、换 Key、协议或代理都不刷新预算。页面关闭并不代表后台任务被取消，请以任务状态为准。</div>
 
-<h2 id="rules">9. 模型选择与定档规则</h2>
+<h2 id="rules">10. 模型选择与定档规则</h2>
 
 <h3>模型清单从哪来</h3>
 <p>来源按证据强度选择；权威名录和已有配置可以合并，不是四个互斥开关。被动模式不读取站方目录：</p>
@@ -504,7 +507,7 @@ curl -s -o /dev/null -w 'HTTP %{http_code}  耗时 %{time_total}s\n' http://127.
   <li>原本在配置里被停用、但本次探测证明可用的站，会重新启用并补齐全部参数。</li>
 </ul>
 
-<h2 id="trouble">10. 排错对照表</h2>
+<h2 id="trouble">11. 排错对照表</h2>
 
 <table>
 <tr><th>现象</th><th>先查什么</th><th>怎么修</th></tr>
