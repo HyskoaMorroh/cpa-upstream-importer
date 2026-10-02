@@ -18,6 +18,7 @@
 - Require Node runtime tests at the release gate. Public tests no longer depend on a private domain mapping file.
 
 ### Security
+- The compatibility section uses the generic `OAI` fallback prefix only when no existing configured prefix can be reused; existing configured prefixes remain authoritative.
 - Provider rules and ledgers stay outside public Git history and image build context.
 - The private domain map is separate from the public sanitizer; missing maps cannot trigger a write operation.
 - Local testing cannot establish a universal safe probe rate. Operators must follow each provider's actual permission and limits.

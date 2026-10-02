@@ -49,7 +49,7 @@ SECTION_PREFIX_FALLBACK = {
     "gemini-api-key": "GLE",
     "codex-api-key": "CDX",
     "claude-api-key": "ANT",
-    "openai-compatibility": "cielo",
+    "openai-compatibility": "OAI",
 }
 
 # 前缀合法形态：字母开头，大写字母与数字，2-6 位。
@@ -149,7 +149,7 @@ def assign(hosts, *, reserved=(), existing=None) -> dict[str, str]:
         遍历顺序就会得到不同的分配。
       · 候选序列由主机名唯一决定（见 _variants），不含随机与时间。
 
-    reserved 是不能占用的值。段级兼容前缀（ANT/CDX/GLE/cielo）总是自动避开 ——
+    reserved 是不能占用的值。段级兼容前缀（ANT/CDX/GLE/OAI）总是自动避开 ——
     站级前缀若与段级同名，`ANT/claude-opus-5` 就同时是「段级轮询」和
     「指名某站」两种语义，行为取决于哪个条目先匹配，不可预测。
 
