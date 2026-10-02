@@ -155,3 +155,6 @@ MEMORY.md
 probe-policy.json
 *.probe-policy.json
 probe-policy.sqlite3*
+
+# Local cached-image validation helper, never a release build.
+Dockerfile.wt

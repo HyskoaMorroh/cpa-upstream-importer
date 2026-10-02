@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — 2.0
+## 2.0.0 — 2026-10-02
 
 ### Changed
 - Upstream probing is passive by default. Active probing now requires explicit provider authorization and a persistent request budget. This is a breaking default change; existing deployments remain usable for configuration analysis and writeback without granting probe permission.
