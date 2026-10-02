@@ -229,38 +229,27 @@ class TransportComplianceTests(unittest.TestCase):
                     self.assertEqual(result.status, "000")
                     self.assertIn("redirect", result.error.lower())
 
-    def test_same_origin_redirect_preserves_headers_and_no_implicit_user_agent(self):
+    def test_same_origin_redirect_is_blocked_without_a_hidden_second_request(self):
         def respond(request):
-            if request.path == "/start":
-                reply(request, b"", status=302, headers={"Location": "/final"})
-            else:
-                reply(request)
-
+            reply(request, b"", status=302, headers={"Location": "/final"})
         with local_server(respond) as (url, received):
             result = fetch(url + "/start", headers={"x-api-key": "fixture-only"})
-        self.assertEqual(result.status, "200")
-        self.assertEqual(result.error, "")
-        self.assertEqual(result.body, '{"ok":true}')
-        self.assertEqual([path for path, _ in received], ["/start", "/final"])
-        final_headers = {key.lower(): value for key, value in received[-1][1].items()}
-        self.assertEqual(final_headers["x-api-key"], "fixture-only")
-        self.assertNotIn("user-agent", final_headers)
+        self.assertEqual(result.status, "000")
+        self.assertEqual(result.policy_code, "redirect_blocked")
+        self.assertEqual([path for path, _ in received], ["/start"])
+        first_headers = {key.lower(): value for key, value in received[0][1].items()}
+        self.assertEqual(first_headers["x-api-key"], "fixture-only")
+        self.assertNotIn("user-agent", first_headers)
 
-    def test_redirect_origin_uses_scheme_host_and_effective_port(self):
+    def test_all_redirect_destinations_require_an_explicit_new_request(self):
         handler = next(h for h in client._opener(None).handlers
                        if isinstance(h, urllib.request.HTTPRedirectHandler))
         request = urllib.request.Request("https://EXAMPLE.invalid:443/start")
-        redirected = handler.redirect_request(
-            request, io.BytesIO(), 302, "Found", {}, "https://example.invalid/end"
-        )
-        self.assertEqual(redirected.full_url, "https://example.invalid/end")
-        for target in ("http://example.invalid/end",
-                       "https://example.invalid:444/end",
-                       "https://other.invalid/end"):
+        for target in ("https://example.invalid/end", "http://example.invalid/end",
+                       "https://example.invalid:444/end", "https://other.invalid/end"):
             with self.subTest(target=target):
                 with self.assertRaises(urllib.error.URLError):
-                    handler.redirect_request(request, io.BytesIO(), 302, "Found",
-                                             {}, target)
+                    handler.redirect_request(request, io.BytesIO(), 302, "Found", {}, target)
 
     def test_compressed_bombs_are_transport_failures(self):
         expanded = b"a" * (client.READ_LIMIT * 2)
@@ -442,7 +431,7 @@ class TransportComplianceTests(unittest.TestCase):
         self.assertEqual(result.status, "000")
         self.assertIn("timeout", result.error.lower())
 
-    def test_redirect_hops_share_the_original_deadline(self):
+    def test_redirect_chain_is_stopped_at_the_first_hop(self):
         def respond(request):
             if request.server.stop.wait(0.2):
                 return
@@ -459,7 +448,7 @@ class TransportComplianceTests(unittest.TestCase):
             elapsed = time.monotonic() - started
         self.assertLess(elapsed, 0.65)
         self.assertEqual(result.status, "000")
-        self.assertIn("timeout", result.error.lower())
+        self.assertEqual(result.policy_code, "redirect_blocked")
 
     def test_redirect_body_is_not_drained_without_a_bound(self):
         def respond(request):
@@ -481,8 +470,8 @@ class TransportComplianceTests(unittest.TestCase):
             result = fetch(url + "/start", timeout=0.4)
             elapsed = time.monotonic() - started
         self.assertLess(elapsed, 1.1)
-        self.assertEqual(result.status, "200")
-        self.assertEqual(result.body, '{"ok":true}')
+        self.assertEqual(result.status, "000")
+        self.assertEqual(result.policy_code, "redirect_blocked")
 
 
 if __name__ == "__main__":

@@ -2323,7 +2323,7 @@ def test_client_send_never_raises():
     src = _io.open(_os.path.join(_root, "cpa_probe", "client.py"),
                    encoding="utf-8").read()
     truthy("HTTPError 分支里的正文读取有自己的 try",
-           "except Exception as read_err:" in src,
+           "except Exception as read_error:" in src,
            "裸写 `raw = e.read(...)` 时那一行抛的异常不受同一 try 的"
            "其余 handler 保护")
 

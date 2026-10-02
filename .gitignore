@@ -149,3 +149,9 @@ tools/scrub-domains.local.py
 # MEMORY.md 与根目录 handoff 含逐站 priority、Key 数量、排障现场。
 MEMORY.md
 /*-handoff.md
+
+# Local tools/worktrees and provider permissions are never release content.
+.claude/
+probe-policy.json
+*.probe-policy.json
+probe-policy.sqlite3*

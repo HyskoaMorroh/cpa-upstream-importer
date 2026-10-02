@@ -43,7 +43,8 @@ SUITES = ["test_probe.py", "test_server.py", "test_pipeline.py",
           "test_plan_capacity.py", "test_priority_invariants.py",
           "test_public_redaction.py", "test_recovery_catalog.py",
           "test_request_path_latency.py", "test_transient_connection.py",
-          "test_release_gate.py"]
+          "test_release_gate.py", "test_probe_policy.py",
+          "test_probe_policy_transport.py", "test_passive_flows.py"]
 
 # 前端用例跑在 Node 上，`web/app.js` 的真实函数由 vm 直接取源码执行。
 # 它们原来只能手跑，于是「python tests/run.py 全绿」从来不包含前端 ——
@@ -156,7 +157,11 @@ def main() -> None:
 
     for suite in SUITES:
         path = os.path.join(HERE, suite)
-        cmd = [sys.executable, path]
+        # Policy tests exercise the real fail-closed engine. Legacy protocol
+        # tests explicitly authorize synthetic fixtures, never real upstreams.
+        policy_suites = {"test_probe_policy.py", "test_probe_policy_transport.py", "test_passive_flows.py"}
+        cmd = ([sys.executable, path] if suite in policy_suites else
+               [sys.executable, os.path.join(HERE, "with_synthetic_policy.py"), path])
         print(f"\n{'#' * 66}\n# {suite}\n{'#' * 66}")
         r = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace",
                            capture_output=True, env=env)

@@ -1096,6 +1096,8 @@ def verdict_json(v) -> dict:
         "prompt_cache_note": v.prompt_cache_note,
         "category": v.category,
         "action": v.action,
+        "probe_policy_code": getattr(v, "probe_policy_code", ""),
+        "probe_policy_reason": getattr(v, "probe_policy_reason", ""),
         "summary": v.summary(),
         "attempts": [
             {
@@ -1134,6 +1136,8 @@ def plan_json(p) -> dict:
                 # probed / catalog / manual —— 界面要标清模型是实测跑通的、
                 # 站方目录报的，还是操作员手填的，三者可信度差一截
                 "model_source": sp.model_source,
+                "probe_policy_code": getattr(sp, "probe_policy_code", ""),
+                "probe_policy_reason": getattr(sp, "probe_policy_reason", ""),
                 # 依据强度三档（2026-09-28）：strong 实测/手填、medium 目录或
                 # 原配置有据、weak 纯市面猜测。界面按它上徽标，写回前按它拦
                 # 一次汇总确认 —— 「默认全勾」与「低次品不能静默写入」两条
@@ -3077,7 +3081,9 @@ class Handler(BaseHTTPRequestHandler):
             remote_ref=type(self).cpa_source_ref,
             proxy=type(self).drift_proxy or None)
 
+        from cpa_probe.probe_policy import get_policy
         self._json(200, {
+            "probe_policy": get_policy().summary(),
             "config_path": type(self).cfg_path,
             "lines": raw.count("\n") + 1,
             "bytes": len(raw.encode("utf-8")),
@@ -3150,8 +3156,8 @@ class Handler(BaseHTTPRequestHandler):
         所以它不建 Job、不进 STORE、不能被 /api/plan 引用。想导入的话，前端把
         结果预填回步骤①走正常流水线 —— 诊断与写回之间必须有人工确认这一跳。
 
-        同步返回（不走轮询）：单段 3-8 次请求、几秒内完成，为它引入一套任务
-        状态不值得。四段全查才 25 次，也在可接受范围。
+        同步返回（不走轮询）；实际请求必须经过站点授权与共享预算。
+        不能把固定的请求次数认定为安全阈值，策略拒绝时明确返回未实测。
         """
         res = cp.parse_lines(f"{body.get('url') or ''},{body.get('key') or ''}")
         if not res.valid:
@@ -3193,7 +3199,19 @@ class Handler(BaseHTTPRequestHandler):
         out_lock = threading.Lock()
 
         def _diag_one(section: str) -> None:
+            from cpa_probe.pipeline import ProbePolicyStop
             base = cp.base_for_section(row.bare, section)
+            def stopped(code, reason):
+                with out_lock:
+                    out[section] = {"base_url": base, "model": "", "rungs": [],
+                                    "hit": None, "needed_headers": {}, "needs_body": False,
+                                    "calls": 0, "category": "未实测",
+                                    "probe_policy_code": code, "probe_policy_reason": reason}
+            try:
+                prober._policy_check(base, {"Authorization": "Bearer " + row.api_key})
+            except ProbePolicyStop as stop:
+                stopped(stop.code, stop.reason)
+                return
             # 先问站方目录，再挑模型（2026-09-18）
             # --------------------------------
             # 原来这里写死 `SEED_MODELS[section][0]` —— 种子是本工具**猜**的
@@ -3206,6 +3224,9 @@ class Handler(BaseHTTPRequestHandler):
             catalog: list[str] = []
             try:
                 catalog = prober._stage0_catalog(row, section, base) or []
+            except ProbePolicyStop as stop:
+                stopped(stop.code, stop.reason)
+                return
             except Exception:           # 目录端点不可用不该让诊断整段失败
                 catalog = []
             if catalog:
@@ -3225,12 +3246,17 @@ class Handler(BaseHTTPRequestHandler):
             _CRED = ("余额", "鉴权")
             gate_hit: dict | None = None
             base_gated = False
+            policy_code, policy_reason = "", ""
             for prof in cp.profiles.ladder(section, cfg):
                 hdrs, patch = cp.profiles.materialize(prof, row.api_key)
-                att = prober._call(section, base, row.api_key, model,
-                                   combo=prof.name,
-                                   extra_headers=hdrs or None,
-                                   body_patch=patch or None)
+                try:
+                    att = prober._call(section, base, row.api_key, model,
+                                       combo=prof.name,
+                                       extra_headers=hdrs or None,
+                                       body_patch=patch or None)
+                except ProbePolicyStop as stop:
+                    policy_code, policy_reason = stop.code, stop.reason
+                    break
                 row_out = {
                     "profile": prof.name, "tier": prof.tier,
                     "family": prof.family, "alt": prof.alt,
@@ -3269,6 +3295,8 @@ class Handler(BaseHTTPRequestHandler):
                 "gate_headers": (gate_hit or {}).get("headers", {}) or {},
                 "gate_then": (gate_hit or {}).get("category", ""),
                 "calls": len(rungs),
+                "probe_policy_code": policy_code,
+                "probe_policy_reason": policy_reason,
             }
             with out_lock:
                 out[section] = got
@@ -4945,8 +4973,8 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
                 # 而服务端仍在傻跑完整个循环。
                 #
                 # 三道保护：
-                #   · 并行（打的是 CPA 自己的入口，不是上游站 —— 没有
-                #     站方限频问题；CPA 内部自会按凭据轮询与冷却）
+                #   · 网关业务请求仍会转发到上游，不能绕过站方限制；
+                #     无具体目标绑定时 verify_upstream 明确报告策略跳过
                 #   · 单次 timeout 收到 45 秒（业务请求正常 2-4 秒，
                 #     45 秒还不回就是有问题，没必要等满 120）
                 #   · 条数上限 24 —— 超出的部分明确报「未验证」，
@@ -4974,12 +5002,15 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
                 verified = [None] * len(todo)
 
                 def _one(i: int, host: str, sec: str, model: str) -> None:
+                    probe_scope = {}
                     vok, vmsg = verify_upstream(
-                        cpa_base, client_key, sec, model, timeout=45,
+                        cpa_base, client_key, sec, model, timeout=45, scope=probe_scope,
                     )
                     task.bump_verify()
                     verified[i] = {"host": host, "section": sec,
                                    "model": model, "ok": vok, "msg": vmsg,
+                                   "skipped": probe_scope.get("verification_status") == "skipped_policy",
+                                   "policy_code": probe_scope.get("policy_code", ""),
                                    "verification_scope": scopes[(host, sec, model)],
                                    "target_verified": bool(vok and scopes[(host, sec, model)] == "unique_prefix")}
 
@@ -5013,7 +5044,11 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
                         f"单次写回最多验 {MAX_VERIFY} 个，避免请求超时。"
                         f"它们已写入 config.yaml，可稍后单独验证")
                 result["verified"] = verified
-                result["verify_failed"] = [v for v in verified if not v["ok"]]
+                result["verify_failed"] = [v for v in verified if not v["ok"] and not v.get("skipped")]
+                policy_skips = [v for v in verified if v.get("skipped")]
+                if policy_skips:
+                    result["verify_skipped"] = (f"{len(policy_skips)} 项上游未实测：自动网关生成验证已停止。"
+                                                "本次写盘与 CPA 管理重载结果单独报告。")
                 # 只报来源，绝不报值 —— 这是 CPA 的入口凭据
                 result["verify_key_src"] = key_src
                 if not verified:

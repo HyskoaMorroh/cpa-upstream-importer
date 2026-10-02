@@ -1954,6 +1954,8 @@ class SectionPlan:
     probe_usable: bool | None = None
     probe_category: str = ""
     probe_action: str = ""
+    probe_policy_code: str = ""
+    probe_policy_reason: str = ""
 
     @property
     def hijacked(self) -> list[Impact]:
@@ -2049,6 +2051,8 @@ class SectionPlan:
         而「死路」只否定了试过的那几个模型，最终要写的市面最高代往往没被试过,
         那正是规则 ④ 的适用面。判据与取舍逐条写在 `evidence_block` 里。
         """
+        if self.probe_policy_code:
+            return False
         if not self.writable:
             return False
         if self.evidence_block:
@@ -2188,6 +2192,8 @@ class SectionPlan:
     @property
     def recommend_reason(self) -> str:
         """为什么建议 / 不建议。UI 直接显示这句，让勾选可复核。"""
+        if self.probe_policy_code:
+            return "未实测或实测已停止：" + self.probe_policy_reason
         if self.duplicate:
             return "已存在，跳过"
         if self.write_blocked:
@@ -3397,6 +3403,12 @@ def build_plan(
                 "上游返回 200 但 input_tokens 远小于发送量，该值是实测容量而非声明值"
             )
 
+        sp.probe_policy_code = getattr(v, "probe_policy_code", "")
+        sp.probe_policy_reason = getattr(v, "probe_policy_reason", "")
+        if sp.probe_policy_code:
+            sp.reenable_fields = []
+            sp.priority_reason = "未实测或实测已停止；仅依据现有配置与静态规则定档。" + sp.probe_policy_reason
+            sp.warnings.append("探测策略未完成实测，不自动启用该条目：" + sp.probe_policy_reason)
         plan.sections[section] = sp
 
     return plan

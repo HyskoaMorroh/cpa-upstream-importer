@@ -464,7 +464,7 @@ openai-compatibility: [{api-key-entries: [{api-key: fixture-compat}]}]
         response = SimpleNamespace(status="200", body='{"content":[{"type":"text","text":"result"}]}')
         with patch("cpa_probe.client.send", return_value=response):
             self.assertTrue(wb.verify_upstream("https://unit.example", "fixture-client", "claude-api-key", "fixture-model", scope=scope)[0])
-        self.assertEqual(scope, {"verification_scope": "gateway", "target_verified": False})
+        self.assertEqual(scope, {"direct_target": True, "verification_scope": "direct_target", "target_verified": False})
 
     def test_merge_alias_source_preserves_semantics(self):
         raw = """defaults: &defaults

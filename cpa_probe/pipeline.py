@@ -431,6 +431,13 @@ class Attempt:
         }
 
 
+class ProbePolicyStop(Exception):
+    """Authorization/budget stop; this is not evidence of an upstream failure."""
+    def __init__(self, code: str, reason: str):
+        super().__init__(reason)
+        self.code, self.reason = code, reason
+
+
 @dataclass
 class SectionVerdict:
     """一个候选在一个段上的结论。直接决定要不要写进这一段、带什么字段。"""
@@ -514,6 +521,8 @@ class SectionVerdict:
     identity_verified_models: list[str] = field(default_factory=list)
     budget_exhausted: bool = False
     source_snapshot_id: str = ""
+    probe_policy_code: str = ""
+    probe_policy_reason: str = ""
 
     @property
     def need_ua(self) -> bool:
@@ -530,6 +539,8 @@ class SectionVerdict:
                 base += f"（可调用时段 {self.time_window[0]}~{self.time_window[1]}）"
             return base
         bits = [f"{len(self.models)} 模型"]
+        if self.probe_policy_code:
+            bits.append("后续实测已停止：" + self.probe_policy_reason)
         if self.need_proxy:
             bits.append("需代理")
         if self.profile_name:
@@ -594,6 +605,7 @@ class Prober:
         self.session_id = uuid.uuid4().hex
         self.client_headers = dict(self.cfg_snapshot.get("probe-client-headers") or {})
         self._cancelled = threading.Event()
+        self._policy_local = threading.local()
         self.proxy = proxy
         self.gap = gap
         self.timeout = timeout
@@ -738,11 +750,28 @@ class Prober:
         return (base_for_section(base, section, declared_base=True), section,
                 hashlib.sha256(context.encode()).hexdigest())
 
+    def _policy_check(self, url: str, headers: dict) -> None:
+        from .probe_policy import get_policy
+        decision = get_policy().check(url, headers)
+        if not decision.allowed:
+            raise ProbePolicyStop(decision.code, decision.reason)
+
+    @staticmethod
+    def _policy_verdict(row, section, stop):
+        return SectionVerdict(section=section, base_url=base_for_section(row.bare, section),
+                              category="未实测", action=stop.reason,
+                              probe_policy_code=stop.code,
+                              probe_policy_reason=stop.reason)
+
     def _send(self, url: str, **kwargs):
+        self._policy_check(url, kwargs.get("headers") or {})
         host = host_of(url)
         with HOST_LIMITER.slot(host, max(self.gap, self._host_gap.get(host, 0)),
                                self._check_cancel):
-            return client.send(url, **kwargs)
+            response = client.send(url, **kwargs)
+        if getattr(response, "policy_code", ""):
+            raise ProbePolicyStop(response.policy_code, response.error)
+        return response
 
     @property
     def live_proxy(self) -> str | None:
@@ -880,6 +909,8 @@ class Prober:
         proxy: str | None = None,
         text: str | None = None,
     ) -> Attempt:
+        # 策略拒绝时不进入节流、画像重试或代理回退。
+        self._policy_check(base, {"Authorization": "Bearer " + key})
         # 按 (host, section) 节流：同站同段保持 gap，其余互不等待
         self._throttle(host_of(base), section)
         entry = self._entry(section, base, key)
@@ -1147,6 +1178,8 @@ class Prober:
         """
         base = base_for_section(row.bare, section)
         v = SectionVerdict(section=section, base_url=base)
+        if hasattr(self, "_policy_local"):
+            self._policy_local.verdict = v
         seen: list[tuple[str, str]] = []      # 每个候选的 (类别, 处置)
         # 模型专属死路单独一张表（2026-09-05）。它们**不参与**「整段是什么
         # 状况」的评选，但在没有别的结论时仍要报出来 —— 否则段判不可用却
@@ -1752,7 +1785,7 @@ class Prober:
             if token:
                 sep = "&" if "?" in url else "?"
                 page_url = f"{url}{sep}pageToken={urllib.parse.quote(token)}"
-            resp = client.send(
+            resp = self._send(
                 page_url, headers=headers, body=b"", method="GET",
                 proxy=proxy, timeout=min(self.timeout, 30),
             )
@@ -2011,8 +2044,13 @@ class Prober:
         # （applyCodexWebsocketHeaders 也会带 UA / x-codex-beta-features）。
         headers.update({k: val for k, val in (v.min_headers or {}).items()
                         if val and k.lower() != "content-type"})
+        self._policy_check(ws_url, headers)
         resp = client.ws_handshake(ws_url, headers=headers,
                                    timeout=min(self.timeout, 30))
+        if getattr(resp, "policy_code", ""):
+            v.websockets = None
+            v.websockets_note = "未实测：" + resp.error
+            raise ProbePolicyStop(resp.policy_code, resp.error)
         excerpt = _body_excerpt(resp.body) if resp.body else ""
         att = Attempt(
             section=v.section, model="(ws-handshake)", combo="ws-upgrade",
@@ -2615,15 +2653,25 @@ class Prober:
         只有「验穷模型 + 换模抽样 + 上限实测」这三步跳过：段不通时它们全都
         问不出有效结果，白烧请求。
         """
-        v = self._stage1(row, section)
-        if v.usable:
-            self._stage2(row, v)
-            self._stage4_swap(row, v)
-            self._stage4_context(row, v)
-            # 能力开关放最后：它要用到 v.models（compat 那一支）与
-            # v.min_headers（codex 的 WS 握手也要带门票），两者都在前面几步
-            # 才定下来。
-            self._stage5_capabilities(row, v)
+        v = None
+        self._policy_local.verdict = None
+        try:
+            v = self._stage1(row, section)
+            if v.usable:
+                self._stage2(row, v)
+                self._stage4_swap(row, v)
+                self._stage4_context(row, v)
+                self._stage5_capabilities(row, v)
+        except ProbePolicyStop as stop:
+            v = v or self._policy_local.verdict
+            if v is None:
+                v = self._policy_verdict(row, section, stop)
+            v.probe_policy_code, v.probe_policy_reason = stop.code, stop.reason
+            if not v.usable and not v.category:
+                v.category = "已停止" if stop.code == "provider_stopped" else "未实测"
+            v.action = (v.action + "；" if v.action else "") + stop.reason
+        finally:
+            self._policy_local.verdict = None
         return v
 
     # 哪些失败类别是「站 + 段」级的 —— 换一把 Key 结论不变。
@@ -2690,6 +2738,10 @@ class Prober:
         路径维度、仍按 host；compat 段用含路径的 provider 身份。两处用同一个
         函数，不再各写一套。
         """
+        try:
+            self._policy_check(base_for_section(row.bare, section), {"Authorization": "Bearer " + row.api_key})
+        except ProbePolicyStop as stop:
+            return self._policy_verdict(row, section, stop)
         from .batch import entry_scope
         # 用 `row.bare`（原始裸地址）而不是 `row.base_for(section)`：
         # 后者是 ParsedRow 才有的派生方法，而这里只需要「同一个上游」这个

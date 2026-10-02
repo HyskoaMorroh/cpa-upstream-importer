@@ -29,48 +29,70 @@ READ_LIMIT = 4 * 1024 * 1024
 
 
 class Response:
-    __slots__ = ("status", "body", "elapsed_ms", "error")
+    __slots__ = ("status", "body", "elapsed_ms", "error", "policy_code")
 
-    def __init__(self, status: str, body: str, elapsed_ms: int, error: str = ""):
+    def __init__(self, status: str, body: str, elapsed_ms: int, error: str = "",
+                 policy_code: str = ""):
         self.status = status
         self.body = body
         self.elapsed_ms = elapsed_ms
         self.error = error
+        self.policy_code = policy_code
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Response {self.status} {len(self.body)}B {self.elapsed_ms}ms>"
 
 
-def _origin(url: str) -> tuple[str, str | None, int | None]:
-    parsed = urllib.parse.urlsplit(url)
-    return (parsed.scheme.lower(), parsed.hostname,
-            parsed.port if parsed.port is not None
-            else {"http": 80, "https": 443}.get(parsed.scheme.lower()))
+def get_policy():
+    # Lazy import keeps non-network helpers usable if policy loading fails.
+    # Both network entry points fail closed on any policy error.
+    from .probe_policy import get_policy as load_policy
+    return load_policy()
 
 
-class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+def _safe_error(error: BaseException) -> str:
+    """Exception text may contain a URL, credentials or echoed request headers."""
+    if isinstance(error, (socket.timeout, TimeoutError)):
+        return "timeout"
+    return type(error).__name__
+
+
+def _policy_failure(t0: float) -> Response:
+    return Response("000", "", int((time.monotonic() - t0) * 1000),
+                    "policy_skip: policy unavailable", policy_code="policy_error")
+
+
+def _settle_policy(policy, permit, url, headers, status, body, error):
+    """Settle once, and surface terminal stops on this response, not the next."""
+    try:
+        if policy.finish(permit, status, body, error) is False:
+            return "policy_error", "策略账本结算失败，已停止后续请求"
+        check = getattr(policy, "check", None)
+        if callable(check):
+            decision = check(url, headers)
+            if decision.code in ("provider_stopped", "ledger_unavailable"):
+                return decision.code, decision.reason
+    except Exception:
+        return "policy_error", "策略账本不可用，已停止后续请求"
+    return "", ""
+
+
+class _RedirectBlocked(urllib.error.HTTPError):
+    pass
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if _origin(req.full_url) != _origin(newurl):
-            fp.close()
-            raise urllib.error.URLError("cross-origin redirect blocked")
-        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
-        # urllib otherwise drains the unused redirect body without a size limit.
         fp.close()
-        return redirected
+        raise urllib.error.URLError("automatic redirect blocked")
 
-    def http_error_307(self, req, fp, code, msg, headers):
-        # Python 3.9 does not handle 307; delegate to redirect_request.
-        newurl = headers.get("Location")
-        if not newurl:
-            return None
-        return self.http_error_302(req, fp, code, msg, headers)
+    def http_error_302(self, req, fp, code, msg, headers):
+        # No hidden wire attempt, including same-origin redirects. Do not drain
+        # the redirect body: it may be unbounded or never finish.
+        raise _RedirectBlocked(req.full_url, code, "automatic redirect blocked",
+                               headers, fp)
 
-    def http_error_308(self, req, fp, code, msg, headers):
-        # Python 3.9 does not handle 308; delegate to redirect_request.
-        newurl = headers.get("Location")
-        if not newurl:
-            return None
-        return self.http_error_301(req, fp, code, msg, headers)
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
 
 def _time_left(deadline: float) -> float:
@@ -122,7 +144,7 @@ def _deadline_connection(connection_type, deadline: float, host, **kwargs):
 
 
 def _opener(proxy: str | None, *, deadline: float | None = None):
-    handlers: list = [_SameOriginRedirectHandler()]
+    handlers: list = [_NoRedirectHandler()]
     if proxy:
         handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
     else:
@@ -195,93 +217,104 @@ def send(
     proxy: str | None = None,
     timeout: int = 120,
 ) -> Response:
-    """发一次请求。任何异常都转成 Response，不抛出。
+    """发请求；每次实际尝试单独授权，所有异常均转成 Response。
 
-    status 取值：HTTP 状态码字符串，或 "000"（连接层失败，见 error）。
+    status 为 HTTP 状态码或 "000"；策略拒绝另有 policy_code，不代表站方失败。
     """
-    req = urllib.request.Request(url, data=body, method=method)
-    for k, v in headers.items():
-        req.add_header(k, v)
-
     t0 = time.monotonic()
     deadline = t0 + timeout
-    # 状态码与正文分两步取（2026-09-05 修）。
-    #
-    # 为什么不能在 except 里读正文
-    # ------------------------
-    # Python 的语义：except 块**内部**抛出的异常不受同一 try 的其余 handler
-    # 保护。原来 `raw = e.read(READ_LIMIT)` 就写在 HTTPError 的 handler 里，
-    # 所以下面 socket.timeout 与兜底 Exception 都接不到它 —— 异常一路穿出
-    # send()，而本函数的 docstring 承诺「任何异常都转成 Response，不抛出」，
-    # 上游两条调用路径都按这个不变式写。
-    #
-    # 实测触发：`403 + Content-Length: 5000` 但只写 2 字节后挂住
-    # （Cloudflare 拦截页、nginx 慢响应都是这形态）→ TimeoutError。
-    # 后果：并行路径把这个**只是回应慢的活站**写成「死路 · 探测异常」
-    # 并建议降权；串行路径让整个 job 报错，一批凭据全丢。
-    err = ""
-    raw = b""
-    status = ""
-    content_encoding = ""
-    http_error = False
-    # 只对安全读取补发一次。连接中断不代表请求尚未被服务端执行：
-    # 自动重发 POST 可能重复生成、计费或写入；保持执行结果未知交给调用方。
-    # 已收到响应头后也不重新请求，避免把正文中断伪装成一次完整响应。
-    attempts_left = 2 if method.upper() in ("GET", "HEAD", "OPTIONS") else 1
-    while True:
-        attempts_left -= 1
-        try:
-            with _opener(proxy, deadline=deadline).open(
-                req, timeout=_time_left(deadline)
-            ) as resp:
-                status = str(resp.status)
-                content_encoding = resp.headers.get("Content-Encoding", "")
-                raw = _read_body(resp)
-            break
-        except urllib.error.HTTPError as e:
-            # 状态码先记下 —— 它已经到手且有价值（403 就是 403，正文读不全
-            # 不改变这个事实）。正文单独一段读，失败也不丢状态码。
-            status = str(e.code)
-            http_error = True
-            try:
-                with e:
-                    content_encoding = e.headers.get("Content-Encoding", "")
-                    raw = _read_body(e)
-            except Exception as read_err:      # noqa: BLE001
-                err = f"正文读取失败：{read_err!r}"
-            break
-        except urllib.error.URLError as e:
-            # URLError 把真正的原因包在 .reason 里，掐断类要看那一层。
-            if (attempts_left > 0 and not status and _is_transient_conn_error(e.reason)
-                    and time.monotonic() < deadline):
-                continue
-            return Response("000", "", int((time.monotonic() - t0) * 1000),
-                            str(e.reason))
-        except (socket.timeout, TimeoutError):
-            return Response("000", "", int((time.monotonic() - t0) * 1000),
-                            "timeout")
-        except Exception as e:  # 兜底：SSL 错误等
-            if (attempts_left > 0 and not status and _is_transient_conn_error(e)
-                    and time.monotonic() < deadline):
-                continue
-            return Response("000", "", int((time.monotonic() - t0) * 1000),
-                            repr(e))
+    try:
+        req = urllib.request.Request(url, data=body, method=method)
+        for k, v in headers.items():
+            req.add_header(k, v)
+    except Exception as error:
+        return Response("000", "", 0, _safe_error(error))
 
-    text = ""
-    if not err:
+    # A disconnect may follow execution/billing. Never replay POST, nor any
+    # response whose status has already arrived. Safe retries need a NEW permit.
+    attempts = 2 if method.upper() in ("GET", "HEAD", "OPTIONS") else 1
+    for attempt in range(attempts):
         try:
-            _time_left(deadline)
-            if method.upper() != "HEAD" and status not in ("204", "304"):
-                text = _decode_body(raw, content_encoding=content_encoding,
-                                    strict=True, deadline=deadline)
-            _time_left(deadline)
-        except Exception as decode_err:      # noqa: BLE001
-            err = f"正文解码失败：{decode_err!r}"
-            text = ""
-            if not http_error:
-                status = "000"
-    elapsed = int((time.monotonic() - t0) * 1000)
-    return Response(status, text, elapsed, err)
+            policy = get_policy()
+            permit = policy.reserve(url, headers)
+        except Exception:
+            return _policy_failure(t0)
+        if not permit.allowed:
+            return Response("000", "", int((time.monotonic() - t0) * 1000),
+                            permit.reason, policy_code=permit.code)
+
+        status = "000"  # Actual wire status for finish(), even on read failure.
+        raw = b""
+        text = ""
+        err = ""
+        content_encoding = ""
+        http_error = False
+        retry = False
+        policy_code = ""
+        finish_failed = False
+        try:
+            try:
+                with _opener(proxy, deadline=deadline).open(
+                    req, timeout=_time_left(deadline)
+                ) as resp:
+                    status = str(resp.status)
+                    content_encoding = resp.headers.get("Content-Encoding", "")
+                    raw = _read_body(resp)
+            except _RedirectBlocked as error:
+                status = str(error.code)
+                err = "automatic redirect blocked"
+                policy_code = "redirect_blocked"
+                error.close()
+            except urllib.error.HTTPError as error:
+                # Header/body failures must not discard a 403/429 stop signal.
+                status = str(error.code)
+                http_error = True
+                try:
+                    with error:
+                        content_encoding = error.headers.get("Content-Encoding", "")
+                        raw = _read_body(error)
+                except Exception as read_error:
+                    err = "正文读取失败：" + _safe_error(read_error)
+            except Exception as error:
+                cause = error.reason if isinstance(error, urllib.error.URLError) else error
+                err = _safe_error(cause)
+                retry = (attempt + 1 < attempts and status == "000"
+                         and _is_transient_conn_error(cause)
+                         and time.monotonic() < deadline)
+
+            if not err:
+                try:
+                    _time_left(deadline)
+                    if method.upper() != "HEAD" and status not in ("204", "304"):
+                        text = _decode_body(raw, content_encoding=content_encoding,
+                                            strict=True, deadline=deadline)
+                    _time_left(deadline)
+                except Exception as decode_error:
+                    err = "正文解码失败：" + _safe_error(decode_error)
+                    text = ""
+        except Exception as error:
+            err = _safe_error(error)
+            retry = False
+        finally:
+            # Cover opener construction, response headers, body and decoding,
+            # including a retry's failed attempt. Never reload another engine.
+            settled_code, settled_reason = _settle_policy(
+                policy, permit, url, headers, status, text, err)
+            if settled_code:
+                policy_code, err = settled_code, settled_reason
+                retry = False
+                finish_failed = settled_code in ("policy_error", "ledger_unavailable")
+
+        if finish_failed:
+            return _policy_failure(t0)
+        if policy_code == "provider_stopped":
+            return Response(status, text, int((time.monotonic() - t0) * 1000),
+                            err, policy_code=policy_code)
+        if retry:
+            continue
+        result_status = "000" if err and not http_error else status
+        return Response(result_status, text, int((time.monotonic() - t0) * 1000),
+                        err, policy_code=policy_code)
 
 
 # 压缩正文的 magic byte。
@@ -437,19 +470,19 @@ def probe_proxy(proxy: str, *, timeout: int = 4) -> tuple[bool, str]:
     才失败 —— 实测日志里 5 个 key × 多段 = 十几分钟纯粹白等，而
     preflight 早就报过 `mihomo:7890 不通`。
 
-    预检只做一次 CONNECT 级握手，4 秒内没结果就判不可用。之后整轮探测
-    直接跳过所有 via-proxy 尝试，把那十几分钟降到 4 秒。
+    预检只连代理自身的 TCP 端口，不发送 CONNECT 或任何上游请求。
+    4 秒内没结果就判不可用，之后整轮探测跳过 via-proxy 尝试。
     """
     host, port = _split_proxy(proxy)
     if not host:
-        return False, f"代理地址无法解析：{proxy}"
+        return False, "代理地址无法解析"
     t0 = time.monotonic()
     sock = None
     try:
         sock = socket.create_connection((host, port), timeout=timeout)
         return True, f"{host}:{port} 可连接（{int((time.monotonic()-t0)*1000)}ms）"
     except OSError as e:
-        return False, f"{host}:{port} 不通 —— {e.__class__.__name__}: {e}"
+        return False, "代理不通 —— " + _safe_error(e)
     finally:
         if sock is not None:
             try:
@@ -511,6 +544,94 @@ def ws_handshake(
     headers: dict[str, str] | None = None,
     timeout: int = 10,
 ) -> Response:
+    """授权后做一次 WS 握手。policy_code 非空表示跳过，并非不支持。"""
+    t0 = time.monotonic()
+    try:
+        policy = get_policy()
+        permit = policy.reserve(url, headers)
+    except Exception:
+        return _policy_failure(t0)
+    if not permit.allowed:
+        return Response("000", "", int((time.monotonic() - t0) * 1000),
+                        permit.reason, policy_code=permit.code)
+
+    result = Response("000", "", 0, "handshake interrupted")
+    finish_failed = False
+    try:
+        result = _ws_handshake_once(url, headers=headers, timeout=timeout)
+    except Exception as error:
+        result = Response("000", "", int((time.monotonic() - t0) * 1000),
+                          _safe_error(error))
+    finally:
+        # On incomplete headers the public body retains its original raw-buffer
+        # contract, but an already received 403/429 must still stop the engine.
+        status = result.status
+        if status == "000" and result.body.startswith("HTTP/"):
+            parts = result.body.split("\r\n", 1)[0].split()
+            if len(parts) >= 2 and len(parts[1]) == 3 and parts[1].isdigit():
+                status = parts[1]
+        settled_code, settled_reason = _settle_policy(
+            policy, permit, url, headers, status, result.body, result.error)
+        if settled_code:
+            result.policy_code, result.error = settled_code, settled_reason
+            finish_failed = settled_code in ("policy_error", "ledger_unavailable")
+    return _policy_failure(t0) if finish_failed else result
+
+
+def _ws_error_body(sock, initial: bytes, deadline: float, started: float) -> Response:
+    """Parse a bounded rejected-upgrade body, including chunked/compressed data."""
+    class PrefixReader(io.RawIOBase):
+        def __init__(self):
+            self.prefix = memoryview(initial)
+        def readable(self):
+            return True
+        def readinto(self, buffer):
+            if self.prefix:
+                size = min(len(buffer), len(self.prefix))
+                buffer[:size] = self.prefix[:size]
+                self.prefix = self.prefix[size:]
+                return size
+            sock.settimeout(_time_left(deadline))
+            data = sock.recv(len(buffer))
+            buffer[:len(data)] = data
+            return len(data)
+    class PrefixSocket:
+        def makefile(self, *args, **kwargs):
+            return io.BufferedReader(PrefixReader())
+    response = http.client.HTTPResponse(PrefixSocket())
+    response.begin()
+    status = str(response.status)
+    data = bytearray()
+    error = ""
+    try:
+        while len(data) <= 65536:
+            _time_left(deadline)
+            chunk = response.read1(min(4096, 65537 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > 65536:
+            error = "握手拒绝正文超过读取上限"
+    except Exception as exc:
+        error = _safe_error(exc)
+    finally:
+        response.close()
+    try:
+        body = _decode_body(bytes(data[:65536]),
+                            content_encoding=response.headers.get("Content-Encoding", ""),
+                            strict=True, deadline=deadline)
+    except Exception as exc:
+        body = bytes(data[:65536]).decode("utf-8", errors="replace")
+        error = error or _safe_error(exc)
+    return Response(status, body, int((time.monotonic() - started) * 1000), error)
+
+
+def _ws_handshake_once(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout: int = 10,
+) -> Response:
     """对 `ws://` / `wss://` 发一次 WebSocket 握手，返回 Response。
 
     status 是 HTTP 状态码字符串（`101` = 升级成功），或 `000`（连接层失败）。
@@ -534,10 +655,10 @@ def ws_handshake(
     parsed = urllib.parse.urlsplit(url)
     scheme = (parsed.scheme or "").lower()
     if scheme not in ("ws", "wss"):
-        return Response("000", "", 0, f"不是 ws/wss 地址：{url}")
+        return Response("000", "", 0, "不是 ws/wss 地址")
     host = parsed.hostname or ""
     if not host:
-        return Response("000", "", 0, f"地址里没有主机名：{url}")
+        return Response("000", "", 0, "地址里没有主机名")
     port = parsed.port or (443 if scheme == "wss" else 80)
     path = parsed.path or "/"
     if parsed.query:
@@ -615,6 +736,11 @@ def ws_handshake(
             if not chunk:
                 break
             buf += chunk
+        separator = bytes((13, 10))
+        first = buf.split(separator, 1)[0].split()
+        if (separator + separator in buf and len(first) >= 2
+                and first[1].isdigit() and first[1] != b"101"):
+            return _ws_error_body(sock, buf, deadline, t0)
     except (socket.timeout, TimeoutError):
         # 分两种说：连不上 vs 连上了但握手响应没读完。后者是上面那个 deadline
         # 修复的正常出口（recv 撞上剩余时间），措辞要与「站方压根没回应」
@@ -624,11 +750,9 @@ def ws_handshake(
                if buf else f"握手超时（{timeout}s 内未收到任何响应）")
         return Response("000", buf.decode("utf-8", errors="replace"),
                         int((time.monotonic() - t0) * 1000), why)
-    except OSError as e:
-        return Response("000", "", int((time.monotonic() - t0) * 1000),
-                        f"{type(e).__name__}: {e}")
     except Exception as e:                                   # noqa: BLE001
-        return Response("000", "", int((time.monotonic() - t0) * 1000), repr(e))
+        return Response("000", buf.decode("utf-8", errors="replace"),
+                        int((time.monotonic() - t0) * 1000), _safe_error(e))
     finally:
         if sock is not None:
             try:
@@ -646,7 +770,7 @@ def ws_handshake(
     status = parts[1] if len(parts) >= 2 and parts[1].isdigit() else "000"
     body = rest.decode("utf-8", errors="replace")
     if status == "000":
-        return Response("000", body, elapsed, f"状态行无法解析：{first[:80]}")
+        return Response("000", body, elapsed, "状态行无法解析")
 
     if status == "101":
         want = base64.b64encode(
@@ -662,8 +786,8 @@ def ws_handshake(
             # 101 但 accept 算不对 —— 不是真的 WS 端点（反代吞了 Upgrade
             # 自己回 101 的形态见过）。当作不支持，并把实情写进 error。
             return Response("101", body, elapsed,
-                            f"Sec-WebSocket-Accept 不匹配（收到 {got or '缺失'}）"
-                            f"—— 对端回了 101 但不是真正的 WebSocket 端点")
+                            "Sec-WebSocket-Accept 不匹配"
+                            "—— 对端回了 101 但不是真正的 WebSocket 端点")
     return Response(status, body, elapsed)
 
 

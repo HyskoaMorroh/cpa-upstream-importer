@@ -3,7 +3,7 @@
 **CPA（CLIProxyAPI）上游账号批量导入**：粘贴 `url,key` → 自动探测判定 →
 建议 priority → diff 确认 → 写回 `config.yaml` → 触发 CPA 重载 → 端到端验证。
 
-[![build](https://img.shields.io/badge/tests-passing-brightgreen)](tests/)
+[![build](https://github.com/HyskoaMorroh/cpa-upstream-importer/actions/workflows/build.yml/badge.svg)](tests/)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-amd64%20%7C%20arm64-lightgrey)](deploy/Dockerfile)
 
@@ -30,6 +30,24 @@
 > —— 讲清每一步<b>为什么这么设计</b>，每条判定背后都是一次实测误判的修正。
 
 ---
+
+
+## 探测许可与封号风险
+
+默认只做被动分析，不向用户上游发送请求。配置解析、模型规则检查、定档、差异预览和写回仍可使用；“未实测”不是“不可用”，也不是“已验证可用”。
+
+只有站方明确允许主动探测，并且管理员给该站配置了许可规则，才会发起请求。`/models`、生成请求、能力检查、WebSocket 握手、重试和代理请求共用预算。不要把公告中的“超过 10 次封禁”理解为 9 次安全；统计窗口和适用范围必须以站方政策为准。
+
+- `IMPORTER_PROBE_POLICY_FILE`：私有 JSON 许可文件，建议 `/backups/probe-policy.json`。
+- `IMPORTER_PROBE_LEDGER`：持久化 SQLite 账本，建议 `/backups/probe-policy.sqlite3`。已有 backup 卷必须保留，不能靠重启、换 Key、换代理或重建任务重置限额。
+- 缺文件、格式错误、账本不可写或损坏时拒绝主动请求，不自动放行。
+- 403/429 或明确禁测、封禁响应会停止该 provider；不会自动换凭据、代理或画像继续试，也不会自动解封。
+- HTTP 自动重定向不再跟随，避免隐藏的第二次请求绕开预算；确认站方许可后填写最终 API 地址。
+- CPA 管理重载与业务探针不同：管理重载可以完成，但未绑定实际目标的网关生成验证默认跳过。写回成功不能称为上游验证成功。
+
+配置结构为 `{"version":1,"sites":{}}`，空站点表即被动模式。每个站点规则必须明确提供 `enabled`、`provider`、`max_requests`、`max_requests_per_credential`、`window_seconds`、`min_interval_seconds`。`provider` 用来把同一服务的不同域名归入一个共享预算；不支持通配符授权。额度、窗口与间隔没有“免封号默认值”，请按站方允许的政策设置。策略文件与账本不提交 Git，也不打入镜像。
+
+对不允许测试的站点，使用真实业务已有的日志、配置和模型说明进行被动检查；不要通过改写测试文本或伪装正常业务规避其限制。
 
 ## 快速上手
 

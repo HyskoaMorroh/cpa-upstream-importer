@@ -975,7 +975,7 @@ def main() -> int:
         pre = [d for k, d in pre_events if k == "proxy-precheck"]
         eq("发出 proxy-precheck 事件", len(pre), 1)
         eq("预检判定不通", pre[0]["ok"], False)
-        eq("预检说明带地址", "127.0.0.1:9" in pre[0]["detail"], True)
+        truthy("预检提供安全错误说明", pre[0]["detail"])
 
         all_attempts = [a for v in r_dead.sections.values() for a in v.attempts]
         eq("死代理下零次 via-proxy 尝试",

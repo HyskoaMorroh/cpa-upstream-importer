@@ -821,9 +821,20 @@ async function boot() {
     `${S.ctx.lines.toLocaleString()} 行 · ${entries} 条目`;
   renderBands();
   renderCpaHint();
+  renderProbePolicy();
   applyResources();
   renderDrift();
   updateBudget();
+}
+
+function renderProbePolicy() {
+  const box = $('#probepolicy');
+  if (!box) return;
+  const policy = (S.ctx && S.ctx.probe_policy) || {};
+  const count = Number.isInteger(policy.authorized_sites) ? policy.authorized_sites : 0;
+  box.textContent = policy.mode === 'restricted' && count > 0
+    ? `已配置 ${count} 个站点的主动探测许可；仍受共享预算、最小间隔和限制停手机制约束。未授权站点仅被动分析。`
+    : '默认被动检查：不发送上游探针。解析、配置分析、定档与写回预览仍可使用；未实测不代表不可用。';
 }
 
 // ── 画像基线漂移 ──
@@ -2288,7 +2299,7 @@ function siteCard(r) {
       <td class="pick"><input type="checkbox" class="sel"
         data-rid="${esc(rid)}" data-host="${esc(host)}" data-sec="${esc(sec)}"></td>
       <td class="m"><b>${esc(label)}</b></td>
-      <td><span class="pill p-ok">可用</span></td>
+      <td><span class="pill ${v.probe_policy_code ? 'p-m' : 'p-ok'}">${v.probe_policy_code ? '部分实测，已停止' : '可用'}</span></td>
       <td>
         <div class="mlist"></div>
         ${uAll.length ? `<div class="cats">${uAll.map((m) => `
@@ -3655,7 +3666,9 @@ function applyReceiptHtml(result) {
     : complete ? '已写盘，CPA 已重载' : '已写盘；重载结果未提供';
   const backup = (result.backup || '').split(/[\\/]/).pop();
   const detail = result.error || result.reload_msg || result.push_msg || '';
-  return `<span style="color:var(--${complete ? 'ok' : 'warn'})">${title}`
+  const untested = result.verify_skipped;
+  return `<span style="color:var(--${complete && !untested ? 'ok' : 'warn'})">${title}`
+    + (untested ? `<br>上游未实测：${esc(untested)}` : '')
     + (backup ? `，备份 ${esc(backup)}` : '')
     + (detail ? `<br>${esc(detail)}` : '') + '</span>';
 }

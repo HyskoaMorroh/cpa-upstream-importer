@@ -121,3 +121,34 @@ test('a preset click with a plan still selects rows', () => {
   assert.equal(ctx.S.picks.size, 1, 'the section with models must be selected');
   assert.equal(ctx.refreshed, 1, 'selecting must schedule a plan refresh');
 });
+
+test('policy banner defaults to passive when metadata is absent', () => {
+  const node = {textContent: ''};
+  const context = {S: {ctx: {}}, $: () => node};
+  vm.createContext(context);
+  vm.runInContext(sourceFunction('renderProbePolicy'), context);
+  context.renderProbePolicy();
+  assert.match(node.textContent, /被动/);
+  assert.match(node.textContent, /不发送/);
+});
+
+test('policy banner describes explicit authorization without promising safety', () => {
+  const node = {textContent: ''};
+  const context = {S: {ctx: {probe_policy: {mode: 'restricted', authorized_sites: 2, reason: '按站方许可设置'}}}, $: () => node};
+  vm.createContext(context);
+  vm.runInContext(sourceFunction('renderProbePolicy'), context);
+  context.renderProbePolicy();
+  assert.match(node.textContent, /2/);
+  assert.match(node.textContent, /预算/);
+  assert.doesNotMatch(node.textContent, /保证安全|不会封号/);
+});
+
+test('write receipt distinguishes skipped verification from a proven upstream', () => {
+  const context = {esc: value => String(value)};
+  vm.createContext(context);
+  vm.runInContext(sourceFunction('applyReceiptHtml'), context);
+  const text = context.applyReceiptHtml({local_written: true, state: 'done', reload_ok: true,
+    verify_skipped: '按策略跳过网关生成验证'});
+  assert.match(text, /已写盘/);
+  assert.match(text, /未实测/);
+});

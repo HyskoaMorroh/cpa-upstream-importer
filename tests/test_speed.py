@@ -175,8 +175,8 @@ def main() -> int:
     sf._reuse_shape = fake_reuse
 
     class Row:
-        host = "same.com"
-        bare = "https://same.com"
+        host = "same.invalid"
+        bare = "https://same.invalid"
         api_key = "k"
 
         def masked(self):

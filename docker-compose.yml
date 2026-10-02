@@ -46,6 +46,8 @@ services:
       IMPORTER_PORT: "8765"
       IMPORTER_CONFIG: "/data/config.yaml"
       IMPORTER_BACKUP_DIR: "/backups"
+      IMPORTER_PROBE_POLICY_FILE: "${IMPORTER_PROBE_POLICY_FILE:-/backups/probe-policy.json}"
+      IMPORTER_PROBE_LEDGER: "${IMPORTER_PROBE_LEDGER:-/backups/probe-policy.sqlite3}"
       # 不设则每次启动随机生成并打印到日志；也可直接用 CPA 后台管理密码登录
       IMPORTER_TOKEN: "${IMPORTER_TOKEN:-}"
       # 写回后主动 PUT 让 CPA 立即重载 —— inotify 事件可能丢，而 CPA 没有

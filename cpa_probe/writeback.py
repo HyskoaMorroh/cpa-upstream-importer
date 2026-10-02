@@ -2671,10 +2671,18 @@ def verify_upstream(
     返回仍为 (bool, str)。可选 scope 字典报告 verification_scope=gateway、
     target_verified=False；本函数没有站点或目标凭据绑定能力。
     """
+    # CPA 业务请求可能再路由到任意上游或凭据，不能把“本地网关”当作
+    # 对所有上游的探测授权。默认仅报告写盘/管理重载，跳过额外生成请求。
+    # direct_target 仅供调用方明确绑定的直接端点使用；管理 API 不接受此标志。
+    if not (scope and scope.get("direct_target") is True):
+        if scope is not None:
+            scope.update(verification_scope="gateway", target_verified=False,
+                         verification_status="skipped_policy", policy_code="unbound_gateway")
+        return False, "未实测：CPA 网关未绑定具体上游与凭据，已跳过自动生成验证，避免预算外请求"
     from .fingerprint import backend_of, model_matches, resp_id, resp_model
     from .request import probe_text_for
     if scope is not None:
-        scope.update(verification_scope="gateway", target_verified=False)
+        scope.update(verification_scope="direct_target", target_verified=False)
 
     # 端到端验证的请求最终仍会落到**上游站**（CPA 只是转发），所以同样
     # 受站方反测活的影响。按 (客户端 Key, 模型) 派生而不是用全局唯一那
@@ -2716,6 +2724,10 @@ def verify_upstream(
     except Exception:
         return False, "gateway · 请求失败（已隐藏异常内容）"
 
+    if getattr(resp, "policy_code", ""):
+        if scope is not None:
+            scope.update(verification_status="skipped_policy", policy_code=resp.policy_code)
+        return False, "未实测：" + resp.error
     if resp.status != "200":
         from .classify import classify
 
@@ -3215,6 +3227,7 @@ def mark_new_sections(cfg: dict, plans: list[ImportPlan]) -> int:
     writable / recommended 与落盘结果不一致 —— 上一版正是如此，界面显示
     「建议写入」、默认勾上，勾了写不进。
     """
+    from .parse import host_of
     owned = owned_sections(cfg)
     blocked = 0
     for plan in plans:
@@ -3223,6 +3236,11 @@ def mark_new_sections(cfg: dict, plans: list[ImportPlan]) -> int:
             # 让复用同一批对象的调用方（测试、脚本）也拿到干净结果。
             sp.new_section = is_new_section(cfg, sp, owned)
             sp.write_blocked = ""
+            is_new_entry = sp.section not in owned.get((host_of(sp.base_url), sp.api_key), set())
+            if is_new_entry and getattr(sp, "probe_policy_code", ""):
+                sp.write_blocked = "未实测或已触发停止策略，不自动新增启用条目；请先核实站方许可与有效证据"
+                blocked += 1
+                continue
             if sp.new_section and not new_section_admitted(
                     sp.model_source,
                     family_attested=getattr(sp, "family_attested", False)):

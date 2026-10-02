@@ -102,3 +102,7 @@ docs/tutorial.html
 *.docx
 *.pdf
 Dockerfile.wt
+
+probe-policy.json
+*.probe-policy.json
+probe-policy.sqlite3*

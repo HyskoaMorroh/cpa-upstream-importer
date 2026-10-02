@@ -119,7 +119,7 @@ footer{color:var(--dim);font-size:.85rem;text-align:center;padding-top:26px;
 <button class="theme" id="themebtn" type="button">切换主题</button>
 <header><div class="inner">
   <h1>CPA 上游灌输 · 配置与使用教程</h1>
-  <p>把中转站账号批量探测、定档、写回 CPA 的 <code>config.yaml</code>，并保留原有注释与格式。</p>
+  <p>默认被动分析；取得站方许可后按共享预算探测。保留配置分析、定档、预览与写回。</p>
 </div></header>
 
 <div class="wrap">
@@ -147,7 +147,7 @@ footer{color:var(--dim);font-size:.85rem;text-align:center;padding-top:26px;
 <b>一次完整导入经过四步</b>
 <ol>
   <li><b>解析</b> —— 把 <code>URL,密钥</code> 的文本解析成结构化条目，去重、校验格式。</li>
-  <li><b>探测</b> —— 对每个站的每个段（codex / claude / gemini / openai-compatibility）真实发请求，判断可不可用、支持哪些模型、需要哪些请求头。</li>
+  <li><b>策略检查</b> —— 未授权站点不发请求，明确显示“未实测”。获准的目录查询、生成、能力检查与握手共用 provider 及账号预算。</li>
   <li><b>定档</b> —— 根据探测结果计算 priority、权重、前缀、代理、请求伪装等全部参数，生成写回方案。</li>
   <li><b>写回</b> —— 行级编辑 <code>config.yaml</code>，保留原有注释与格式，写前备份、写后校验并通知 CPA 重载。</li>
 </ol>
@@ -213,7 +213,8 @@ IMPORTER_MEMORY_LIMIT=1g
 
 # 代理订阅（等同凭据，绝不要提交到任何仓库）
 MIHOMO_SECRET=填一个随机长字符串
-MIHOMO_SUB_MAIN=填你的机场订阅地址</pre>
+MIHOMO_SUB_WOG=填模板第一项订阅地址
+MIHOMO_SUB_WOGB=填模板第二项订阅地址</pre>
 </div>
 
 <h2 id="compose">4. 配置 docker-compose.yml</h2>
@@ -240,6 +241,8 @@ MIHOMO_SUB_MAIN=填你的机场订阅地址</pre>
       IMPORTER_LOG_LEVEL: "${IMPORTER_LOG_LEVEL:-INFO}"
       IMPORTER_LOG_TO_FILE: "${IMPORTER_LOG_TO_FILE:-0}"
       IMPORTER_BACKUP_DIR: /backups
+      IMPORTER_PROBE_POLICY_FILE: /backups/probe-policy.json
+      IMPORTER_PROBE_LEDGER: /backups/probe-policy.sqlite3
     volumes:
       # :Z 是 SELinux 标签，CentOS/RHEL enforcing 下必须加
       - ./config.yaml:/data/config.yaml:Z
@@ -250,7 +253,7 @@ MIHOMO_SUB_MAIN=填你的机场订阅地址</pre>
         condition: service_started
       # 等代理就绪再起：否则启动头 40 秒走代理的探测会失败
       mihomo:
-        condition: service_started
+        condition: service_healthy
         required: false
     healthcheck:
       test: ["CMD","python3","-c",
@@ -338,7 +341,7 @@ volumes:
 </div>
 
 <div class="bad"><b>Cloudflare 橙云会在 nginx 之前掐断</b>
-Cloudflare 代理模式对回源有约 100 秒硬超时，nginx 配 900 秒也救不了 —— 超过就回 524，前端看到的就是 <code>Failed to fetch</code>。本项目已把定档改成异步任务来绕开它，但如果你还有别的长请求，把这个域名<strong>改成灰云（仅 DNS）</strong>最省事。</div>
+反向代理与 Cloudflare 都可能有各自的回源超时。长任务应使用短请求提交、后台执行和状态轮询，不能只增加 nginx 超时。不要把关闭代理防护当作通用修复；先按错误码和请求耗时定位。</div>
 
 <h2 id="proxy">6. 配置代理（复用 mihomo）</h2>
 <p>很多中转站按出口 IP 拦截（Cloudflare 人机验证等）。本项目的镜像里自带 mihomo 二进制，可以直接起一个代理服务复用。</p>
@@ -352,7 +355,8 @@ Cloudflare 代理模式对回源有约 100 秒硬超时，nginx 配 900 秒也�
     entrypoint: ["/bin/sh","/app/mihomo-manager/bootstrap-mihomo.sh"]
     environment:
       MIHOMO_SECRET:   "${MIHOMO_SECRET}"
-      MIHOMO_SUB_MAIN: "${MIHOMO_SUB_MAIN}"
+      MIHOMO_SUB_WOG: "${MIHOMO_SUB_WOG}"
+      MIHOMO_SUB_WOGB: "${MIHOMO_SUB_WOGB}"
       # 非空时强制重建配置；平时留空，按订阅指纹自动判断
       MIHOMO_FORCE_REBUILD: "${MIHOMO_FORCE_REBUILD:-}"
     volumes:
@@ -426,6 +430,26 @@ curl -s -o /dev/null -w 'HTTP %{http_code}  耗时 %{time_total}s\n' http://127.
 </li>
 </ol>
 
+<h2 id="probe-policy">主动探测许可与持久预算</h2>
+<div class="bad"><b>站方禁止测试时，不主动发送任何探针</b>
+公告中的“连续超过 10 次”没有给出可适用的统计窗口，不能推导出 9 次安全。改问候词、换 Key、代理或客户端画像都不是规避限制的办法。</div>
+<p>缺少许可文件时，默认被动分析。许可文件是 <code>/backups/probe-policy.json</code>，账本是 <code>/backups/probe-policy.sqlite3</code>，放在已有持久卷中。不要删除账本来恢复额度；不要对已有停止状态自动解封。</p>
+<div class="codebox"><div class="cap">有效且不会发起主动探测的初始策略</div><button class="copy" type="button">复制</button>
+<pre>{
+  "version": 1,
+  "sites": {}
+}</pre></div>
+<p>需要主动测试时，先取得站方许可，再为准确的主机名配置以下字段；不支持通配符。这里不提供所谓“免封号”通用次数。</p>
+<table><tr><th>字段</th><th>含义</th></tr>
+<tr><td><code>enabled</code></td><td>是否明确启用主动探测，必须是真正的 JSON 布尔值</td></tr>
+<tr><td><code>provider</code></td><td>服务商分组；同服务的多个域名使用同一分组，不能借别名增加预算</td></tr>
+<tr><td><code>max_requests</code></td><td>站方许可范围内的 provider 总请求额度</td></tr>
+<tr><td><code>max_requests_per_credential</code></td><td>同一凭据的额度，不能覆盖 provider 总额度</td></tr>
+<tr><td><code>window_seconds</code></td><td>按站方许可确定的统计窗口，不能从公告自行猜测</td></tr>
+<tr><td><code>min_interval_seconds</code></td><td>按站方许可确定的最小间隔；只减速并不能保证安全</td></tr></table>
+<p>目录 GET、生成请求、能力检查、握手和重试都计数。自动重定向被拒绝，以免隐式追加请求。403、429 或明确禁测/封禁响应会停止整个 provider 的后续请求；账本错误也拒绝发送。未完成的预留不会靠重启自动清零。</p>
+<p>CPA 管理重载可以成功，同时上游仍然“未实测”。两者独立报告，不能把写回成功当成上游验证成功。</p>
+
 <h2 id="flow4">8. 四个核心流程怎么用</h2>
 
 <h3>① 投喂 → 写回（添加新账号）</h3>
@@ -433,9 +457,9 @@ curl -s -o /dev/null -w 'HTTP %{http_code}  耗时 %{time_total}s\n' http://127.
 <li><b>粘贴账号</b> 每行一条 <code>URL,密钥</code>。URL 带不带 <code>/v1</code> 都行，工具会按段自动补。</li>
 <li><b>点「解析」</b> 看清有几条有效、几条被判无效以及原因。</li>
 <li><b>点「开始探测」</b> 进度条按站推进。每个站四个段分别探，实时显示请求数。</li>
-<li><b>核对方案</b> 探完自动定档。重点看三列：段判定、模型勾选、priority。想改就直接改，改完会自动重算。</li>
+<li><b>核对方案</b> 分析后自动定档。重点看段判定、模型来源与 priority；“未实测”不是不可用，也不能作为自动启用的依据。更改勾选后会重算方案。</li>
 <li><b>点「生成预览」</b> 看 diff。<strong>这一步只读，不写盘</strong>。</li>
-<li><b>点「确认写回」</b> 写前备份 → 行级编辑 → 校验 → 通知 CPA 重载 → 验证上游。全过程有进度。</li>
+<li><b>点「确认写回」</b> 写前备份 → 行级编辑 → 校验 → 通知 CPA 管理重载。未绑定实际目标的网关生成验证默认跳过，回执会明确显示“上游未实测”。</li>
 </ol>
 
 <h3>② 路由批量管理</h3>
@@ -447,14 +471,14 @@ curl -s -o /dev/null -w 'HTTP %{http_code}  耗时 %{time_total}s\n' http://127.
 <p>读当前 config.yaml，按实际的站点分布给出可改项（重试次数、流式缓冲、冷却策略等），逐条说明依据，可一键写回。</p>
 
 <h3>④ 全量重探</h3>
-<p>把 config.yaml 里<strong>已有的站</strong>全部重新探测一遍，重新定档、重新生成参数。用于：站点状态变了、CPA 升级了、或者怀疑现有配置有问题。</p>
+<p>对 config.yaml 的全部已有条目重新分析。未授权站点只检查静态配置和已有证据，不发请求、不自动重新启用；已授权站点仍受跨任务共享预算限制。</p>
 <div class="warn"><b>全量重探很慢</b>
-几百个条目要跑十几到几十分钟。确保 nginx 超时 900 秒、Cloudflare 是灰云、内存上限 1G 以上。中途别关页面 —— 关了任务仍在后端跑，但进度看不到了。</div>
+是否发请求由服务端许可决定，不由“全量”按钮决定。重复点击、新建任务、换 Key、协议或代理都不刷新预算。页面关闭并不代表后台任务被取消，请以任务状态为准。</div>
 
 <h2 id="rules">9. 模型选择与定档规则</h2>
 
 <h3>模型清单从哪来</h3>
-<p>四层优先级，前一层拿不到才用后一层：</p>
+<p>来源按证据强度选择；权威名录和已有配置可以合并，不是四个互斥开关。被动模式不读取站方目录：</p>
 <table>
 <tr><th>层</th><th>来源</th><th>说明</th></tr>
 <tr><td>1</td><td>CPA 权威名录</td><td>从 CPA 项目在线拉取，与 CPA 实际认识的模型集合同源</td></tr>
@@ -496,7 +520,7 @@ curl -s -o /dev/null -w 'HTTP %{http_code}  耗时 %{time_total}s\n' http://127.
 
 <h3>需要我协助排查时，请提供</h3>
 <div class="codebox">
-  <div class="cap">收集诊断信息（输出已自动脱敏，可直接贴出）</div>
+  <div class="cap">仅在本地查看诊断信息。以下简单替换不构成完整脱敏，原始输出不要直接公开。</div>
   <button class="copy" type="button">复制</button>
 <pre>cd /opt/deploy
 echo "=== 容器状态 ==="
