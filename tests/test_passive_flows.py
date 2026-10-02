@@ -141,5 +141,21 @@ class PassiveFlowTests(unittest.TestCase):
         self.assertIn('未实测', reason)
         self.assertFalse(scope['target_verified'])
 
+class PublicDefaultsTests(unittest.TestCase):
+    """Shipped defaults must not carry one deployment's naming."""
+
+    def test_compat_fallback_prefix_is_generic(self):
+        from cpa_probe import prefixes
+        fallback = prefixes.SECTION_PREFIX_FALLBACK['openai-compatibility']
+        self.assertEqual('OAI', fallback)
+        self.assertTrue(fallback.isascii() and fallback.isupper())
+
+    def test_existing_configured_prefix_still_wins(self):
+        from cpa_probe import prefixes
+        assigned = prefixes.assign(['site-a.invalid'],
+                                   existing={'site-a.invalid': 'KEEPME'})
+        self.assertEqual('KEEPME', assigned['site-a.invalid'])
+
+
 if __name__ == '__main__':
     unittest.main()
