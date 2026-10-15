@@ -175,6 +175,29 @@ _RULES: list[tuple[str, str, str, set[str] | None]] = [
     #     换 IP 无效（实测带代理仍被拦）。
     #   · CF 的 challenge-platform / cdn-cgi = 边缘按 IP 声誉挑战，换 IP 有效。
     ("WAF", "站方自建拦截页", r"访问已被拦截|安全验证|人机验证", None),
+    # 云厂商 WAF 的**标记字段**（2026-10-15 本机实测加）
+    # ----------------------------------------------
+    # 现场：golf.example 这几小时内上了阿里云 WAF。拦截页回的是
+    # **HTTP 200**，正文是 HTML，里面没有任何中文拦截字样，只有厂商标记：
+    #
+    #   <meta name="aliyun_waf_aa" content="…">
+    #   <meta name="aliyun_waf_bb" content="…">
+    #   appkey: "CF_APP_WAF",  // 应用标识
+    #
+    # 上面那条中文规则一个都匹配不上，于是落到状态码兜底：整页 HTML 的 200
+    # 被判「临时」（可重试、该试代理）。实测代价：11 次判「临时」、2 次白试
+    # 代理与重试 —— 而 `_PROXY_POINTLESS` 里「WAF」那条早就写明「认客户端
+    # 形态而非 IP，实测三段都配了 mihomo 仍返回同一个拦截页」。今天复测一致：
+    # 直连与过 mihomo 都回同一个拦截页，换出口完全无效。
+    #
+    # 方向错比多跑几次更坏：判「临时」会让操作员以为「稍后能好」，而真正该做
+    # 的是换请求形态或等站方放行。
+    #
+    # 只认**厂商专有的标记名**，不认泛泛的 "waf" 三个字母 —— 后者会把正常
+    # 响应里偶然出现该子串的情形误判（例如模型名或用户内容里带 waf）。
+    ("WAF", "云厂商 WAF 拦截页",
+     r"aliyun_waf|CF_APP_WAF|tencent_waf|x-waf-|sec_waf|wzws[-_]?waf"
+     r"|huawei_waf|baidu_waf|safeline|modsecurity", None),
     # cdn-cgi 也承载统计、邮件保护和静态资源；仅目录名不能证明被拦截。
     # 保留明确挑战端点与 cf-mitigated 标记，避免把普通 404 页永久停站。
     ("IP封", "CF 挑战或边缘拦截",
