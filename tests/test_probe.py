@@ -16,6 +16,7 @@ import copy
 import io
 import os
 import sys
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # fixture_cfg
@@ -33,6 +34,37 @@ from cpa_probe.writeback import (
 
 FAILED: list[str] = []
 PASSED = 0
+
+
+def isolated_loopback_policy(test):
+    """Each synthetic transport scenario gets its own real, loopback-only ledger.
+
+    A fixture's deliberate 403 must not stop unrelated fixture servers, nor
+    read/write the operator's persisted policy state. Policy persistence itself
+    is covered by test_probe_policy_transport.py.
+    """
+    from functools import wraps
+    import tempfile
+    from cpa_probe.probe_policy import ProbePolicy
+
+    @wraps(test)
+    def run(*args, **kwargs):
+        with tempfile.TemporaryDirectory() as directory:
+            engines = []
+
+            def fresh_policy():
+                rule = {"enabled": True, "provider": "loopback-fixture",
+                        "max_requests": 10, "max_requests_per_credential": 10,
+                        "window_seconds": 3600, "min_interval_seconds": 0}
+                engine = ProbePolicy(
+                    {"version": 1, "sites": {"127.0.0.1": rule}},
+                    os.path.join(directory, f"scenario-{len(engines)}.sqlite3"))
+                engines.append(engine)
+                return engine
+
+            with patch("cpa_probe.client.get_policy", side_effect=fresh_policy):
+                return test(*args, **kwargs)
+    return run
 
 
 def eq(name: str, got, want) -> None:
@@ -484,10 +516,16 @@ def test_priority() -> None:
     }
     bp_row = cp.parse_lines("https://brand-new.example.com,sk-probation-test-1")[0]         if isinstance(cp.parse_lines("https://brand-new.example.com,sk-x"), list)         else cp.parse_lines("https://brand-new.example.com,sk-probation-test-1").valid[0]
 
+    from cpa_probe.pipeline import Attempt
     bp_res = CandidateResult(row=bp_row)
     bp_v = SectionVerdict(section="claude-api-key", usable=True,
                           base_url="https://brand-new.example.com",
-                          models=["opus-5"])
+                          models=["opus-5"],
+                          attempts=[Attempt(section="claude-api-key", model="opus-5",
+                                            combo="fixture", status="200", category="可用",
+                                            action="", elapsed_ms=1, resp_model="opus-5",
+                                            response_valid=True,
+                                            successful_base_url="https://brand-new.example.com")])
     bp_res.sections = {"claude-api-key": bp_v}
 
     plan_prob = cp.build_plan(bp_row, bp_res, bp_cfg)          # 默认试用期
@@ -910,6 +948,8 @@ def test_request() -> None:
 # ==========================================================================
 
 
+@patch("cpa_probe.model_catalog.remote_names", new=lambda **_kwargs: (
+    ["claude-opus-5-5"], "测试固定名录，不访问网络"))
 def test_real_config(path: str) -> None:
     section(f"真实 config.yaml · {os.path.basename(path)}")
     import yaml
@@ -946,9 +986,17 @@ def test_real_config(path: str) -> None:
         "https://regress-test.example.com,sk-regress1234567890").valid[0]
     res = CandidateResult(row=row)
 
-    def mk(sec, models, **kw):
-        v = SectionVerdict(section=sec, usable=True,
-                           base_url=row.base_for(sec), models=models)
+    from cpa_probe.pipeline import Attempt
+
+    def mk(sec, models, source_row=row, **kw):
+        base = source_row.base_for(sec)
+        v = SectionVerdict(section=sec, usable=True, base_url=base, models=models,
+                           attempts=[Attempt(section=sec, model=m, combo="fixture",
+                                             status="200", category="可用", action="",
+                                             elapsed_ms=1, resp_model=m,
+                                             response_valid=True,
+                                             successful_base_url=base)
+                                     for m in models])
         for k, val in kw.items():
             setattr(v, k, val)
         return v
@@ -974,62 +1022,60 @@ def test_real_config(path: str) -> None:
     }
 
     plan = cp.build_plan(row, res, cfg, bands=bands)
-    # 判死段现在**进方案**（有种子模型兜底、六项参数算全），只是不建议写。
-    # 断言从「被跳过」改成「不建议写」—— 那才是这条用例真正要保的：
-    # 判死的段不会在用户没勾的情况下落进 config.yaml。
+    # 候选保留供展示，但缺少本轮成功证据不能成为默认写入项。
     eq("不可用段进了方案", "gemini-api-key" in plan.sections, True)
-    eq("不可用段可勾选", plan.sections["gemini-api-key"].writable, True)
-    # 2026-09-29：断言跟上 09-28 裁定 —— 勾选与写入拆成两道独立的闸。
-    #
-    # 这条断言在 09-26 写成「默认不写」，09-28 用户裁定后代码改成「默认全勾 +
-    # 写回前对 weak 段强制确认」，断言没跟上，于是 test_probe / test_edges 共
-    # 8 项红着。而 CI 是 `build: needs: test`（.github/workflows/build.yml:105），
-    # 测试红 = 不出镜像：最后一个成功构建停在 09-20（9a3117d），此后 c225b22
-    # 与 8beff88 两次全红，8beff88 修的「写回被推送地址连坐、界面谎报 ✓ 已写回」
-    # 因此从未进过镜像 —— 用户 mhtml 里「✓ 已写回」与「推送 CPA：配置推送
-    # 地址格式无效」同屏出现，正是这个。所以断言必须与当日裁定对齐。
-    #
-    # 为什么是「默认勾 + 写回时确认」而不是「默认不写」：规则 ③⑵④ 末句
-    # 明令「严禁出现不勾选模型比如出现待定……让用户去手工选择」。09-27 的
-    # 收紧版实跑 accounts.txt 得到 16/16 段全不勾、写回按钮 disabled ——
-    # 正是那句话禁止的形态。低次品不落盘这条要求由另一道闸保：
-    # server.py 的 `confirm_weak`（weak 段写回前逐条列出请操作员确认）。
     sp_dead = plan.sections["gemini-api-key"]
-    eq("不可用且无依据的段仍默认勾选（规则③⑵④：严禁不勾选）",
-       sp_dead.recommended, True)
-    eq("但它的依据被标成最弱一档 —— 写回时由 confirm_weak 闸单独确认",
-       sp_dead.evidence_tier, "weak")
-    truthy("勾选理由说清这是猜测",
-           "猜" in sp_dead.recommend_reason, sp_dead.recommend_reason)
-    eq("四段全部建议写（判死段靠 weak 闸把关，不靠不勾）",
-       len([1 for p in plan.sections.values() if p.recommended]), 4)
+    eq("不可用无证据段不建议写入", sp_dead.recommended, False)
+    eq("不可用无证据段依据最弱", sp_dead.evidence_tier, "weak")
+    truthy("拒写理由明确", sp_dead.recommend_reason)
+    eq("三个实测成功段建议写入",
+       len([1 for p in plan.sections.values() if p.recommended]), 3)
     eq("无劫持顶层警告",
        [w for p in plan.sections.values() for w in p.warnings if "抢走" in w], [])
 
     # build_diffs 按 writable 筛，而判死段现在也 writable —— 生产路径靠
     # /api/plan 先剪一遍（selected=None 退到 recommended）。这里模拟那一步。
-    only_rec = copy.copy(plan)
-    only_rec.sections = {k: v for k, v in plan.sections.items() if v.recommended}
+    # 默认整批 Apply 必须拒绝混入目录推断模型的新增段，不能只测手工筛选路径。
+    default_plan = copy.deepcopy(plan)
+    default_diffs = build_diffs(raw, [default_plan])
+    default_new = yaml.safe_load(apply_diffs(raw, default_diffs))
+    for sec, sp in default_plan.sections.items():
+        if set(sp.models) - set(sp.verified_models):
+            truthy(f"默认 Apply 拦截 {sec} 未验证模型", sp.write_blocked)
+            eq(f"默认 Apply 保留 {sec} 原配置",
+               default_new.get(sec), cfg.get(sec))
+    only_rec = copy.deepcopy(plan)
+    only_rec.sections = {k: v for k, v in only_rec.sections.items() if v.recommended}
+    # 模拟写回方案只选取本轮实测模型；目录补齐项不能冒充成功证据。
+    for sp in only_rec.sections.values():
+        if sp.probe_usable:
+            sp.models = [m for m in sp.models if m in sp.verified_models]
     diffs = build_diffs(raw, [only_rec])
-    eq("生成 4 处插入", len(diffs), 4)
+    eq("判死段不进入建议写入集合",
+       "gemini-api-key" in only_rec.sections, False)
     out = apply_diffs(raw, diffs)
     ok, msg = validate(out)
     eq("合并后 YAML 校验通过", ok, True)
     print(f"      {msg}")
 
     new = yaml.safe_load(out)
-    # gemini 段也 +1：判死 + 无依据的段现在默认勾选（规则 ③⑵④），
-    # 低次品不落盘由 server.py 的 confirm_weak 闸把关，不靠这里少写一条。
+    eq("最终 YAML 仅改变三个实测成功段",
+       {k for k in set(cfg) | set(new) if cfg.get(k) != new.get(k)},
+       {"claude-api-key", "codex-api-key", "openai-compatibility"})
+    # 默认勾选不构成成功证据；判死 Gemini 不得新增到配置。
     for sec, delta in (("claude-api-key", 1), ("codex-api-key", 1),
-                       ("openai-compatibility", 1), ("gemini-api-key", 1)):
+                       ("openai-compatibility", 1), ("gemini-api-key", 0)):
         eq(f"{sec} 条目 +{delta}",
            len(new[sec]) - len(cfg[sec]), delta)
 
-    # 只追加，绝不改动现有行
+    # 与写入前独立比较实际 YAML，不能依赖内部 Diff 的分段/整篇表示方式。
     for sec in cp.SECTIONS:
-        old = [e.get("priority") for e in cfg[sec]]
-        eq(f"{sec} 现有 priority 未被改动",
-           [e.get("priority") for e in new[sec]][:len(old)], old)
+        eq(f"{sec} 现有条目所有字段未被改动",
+           new[sec][:len(cfg[sec])], cfg[sec])
+    for sec, sp in only_rec.sections.items():
+        added = new[sec][len(cfg[sec]):]
+        eq(f"{sec} 新条目仅含所选实测模型",
+           [m["name"] for m in added[0].get("models", [])], sp.models)
 
     n_old = sum(1 for l in raw.split("\n") if l.strip().startswith("#"))
     n_new = sum(1 for l in out.split("\n") if l.strip().startswith("#"))
@@ -1077,6 +1123,7 @@ def test_real_config(path: str) -> None:
     # 5 个重名 compat provider，每个只带 1 个 Key。而现有 12 个 provider 全部
     # 是「一站一条、多 Key 挂 api-key-entries」（foxtrot 15 个、relay-l 15 个）。
     # CPA 的 compat 段不去重，重名会让同一站注册成 N 个 provider、模型清单重复 N 遍。
+
     import collections as _c
 
     multi_keys = [f"sk-multikey-{i:04d}-aaaabbbbcccc" for i in range(5)]
@@ -1093,27 +1140,37 @@ def test_real_config(path: str) -> None:
                                              category="死路", action="分组无该模型渠道"),
             "codex-api-key": SectionVerdict(section="codex-api-key", usable=False,
                                             category="边缘", action="403 且正文为空"),
-            "claude-api-key": SectionVerdict(
-                section="claude-api-key", usable=True,
-                base_url=mrow.base_for("claude-api-key"),
-                models=["claude-opus-5", "claude-opus-4-8"]),
-            "openai-compatibility": SectionVerdict(
-                section="openai-compatibility", usable=True,
-                base_url=mrow.base_for("openai-compatibility"),
-                models=["claude-opus-5", "claude-opus-4-8"],
+            "claude-api-key": mk("claude-api-key",
+                ["claude-opus-5", "claude-opus-4-8"], source_row=mrow),
+            "openai-compatibility": mk("openai-compatibility",
+                ["claude-opus-5", "claude-opus-4-8"], source_row=mrow,
                 min_headers={"User-Agent": "cli-proxy-openai-compat"}),
         }
         m_plans.append(cp.build_plan(mrow, mres, cfg, bands=m_bands, seen=m_seen))
 
+    for mp in m_plans:
+        for sp in mp.sections.values():
+            if sp.probe_usable:
+                sp.models = [m for m in sp.models if m in sp.verified_models]
     m_diffs = build_diffs(raw, m_plans)
-    per_sec = _c.Counter(d.section for d in m_diffs)
-    eq("claude 段 5 处（每 Key 一条）", per_sec["claude-api-key"], 5)
-    eq("compat 段只 1 处（归并）", per_sec["openai-compatibility"], 1)
 
     m_out = apply_diffs(raw, m_diffs)
     m_ok, _m_msg = validate(m_out)
     eq("归并后 YAML 校验通过", m_ok, True)
     m_new = yaml.safe_load(m_out)
+    eq("多 Key 最终 YAML 仅改变成功的两段",
+       {k for k in set(cfg) | set(m_new) if cfg.get(k) != m_new.get(k)},
+       {"claude-api-key", "openai-compatibility"})
+    for sec in cp.SECTIONS:
+        eq(f"多 Key {sec} 原条目全部保留",
+           m_new[sec][:len(cfg[sec])], cfg[sec])
+    native_added = m_new["claude-api-key"][len(cfg["claude-api-key"]):]
+    eq("Claude 新条目恰好覆盖五个输入 Key",
+       [entry["api-key"] for entry in native_added], multi_keys)
+    for entry, mp in zip(native_added, m_plans):
+        eq("Claude 每个 Key 仅写自己的已验证模型",
+           [model["name"] for model in entry.get("models", [])],
+           mp.sections["claude-api-key"].models)
 
     kk = [e for e in m_new["openai-compatibility"]
           if isinstance(e, dict) and "multikey-test" in str(e.get("base-url", ""))]
@@ -1148,10 +1205,8 @@ def test_real_config(path: str) -> None:
     # 这条才是「就高选择」的真正判据，且对自带样本与真实配置都成立。
     from cpa_probe import model_catalog as _mcg
     _gens = {_mcg.generation(_mcg.series_and_version(n)[1]) for n in _mn}
-    # 2026-09-26 规则 ④：claude-opus 线的最高次版本 claude-opus-5-5（市面名录）
-    # 这次没有实测通过，而 claude-opus-5 实测通过 —— 两代并存，更低的
-    # claude-opus-4-8 照常淘汰。所以不变式是「只剩线顶 + 实测最高」，不是「只剩一代」。
-    truthy("线顶 claude-opus-5-5 在清单里", "claude-opus-5-5" in _mn, _mn)
+    # 名录最高次版本只供预览；没有逐模型成功证据时，不写入配置。
+    truthy("仅目录推断的 claude-opus-5-5 不写入", "claude-opus-5-5" not in _mn, _mn)
     eq("清单里最多两个世代（线顶 + 实测最高）", len(_gens) <= 2, True)
     eq("headers 只写一次", kk[0].get("headers"),
        {"User-Agent": "cli-proxy-openai-compat"})
@@ -1271,6 +1326,7 @@ def test_client_send_never_raises():
            _time.monotonic() - t0 < 6, "超时没生效")
 
 
+@isolated_loopback_policy
 def test_compressed_body_is_decoded():
     """压缩过的正文必须解开 —— 否则整条正文判定链失效。
 
@@ -2030,6 +2086,7 @@ def test_field_names_are_not_mistaken_for_hosts():
            f"实得 {sorted(band2.unhealthy_hosts)} —— 补排除表时把这条路弄哑了")
 
 
+@isolated_loopback_policy
 def test_ws_handshake_has_a_real_deadline():
     """WS 握手的 timeout 必须是**整次握手**的截止时间，不是每次 recv 的超时。
 
@@ -2238,6 +2295,7 @@ def test_ws_handshake_has_a_real_deadline():
            "只在循环外 settimeout 一次就是原缺陷")
 
 
+@isolated_loopback_policy
 def test_client_send_never_raises():
     """`client.send` 的 docstring 承诺「任何异常都转成 Response，不抛出」。
 
@@ -2297,9 +2355,10 @@ def test_client_send_never_raises():
     r = None
     t0 = _time.monotonic()
     try:
-        r = _client.send(f"http://127.0.0.1:{port}/v1/messages",
-                         headers={"Content-Type": "application/json"},
-                         body=b"{}", timeout=2)
+        with patch.object(_client, "_settle_policy", wraps=_client._settle_policy) as settle:
+            r = _client.send(f"http://127.0.0.1:{port}/v1/messages",
+                             headers={"Content-Type": "application/json"},
+                             body=b"{}", timeout=2)
     except BaseException as e:                  # noqa: BLE001
         raised = e
     dt = _time.monotonic() - t0
@@ -2310,9 +2369,12 @@ def test_client_send_never_raises():
            f"破掉「任何异常都转成 Response」，并行路径会把活站判死并降权")
     if r is not None:
         eq("状态码保住（403 就是 403）", r.status, "403")
-        truthy("错误里说清是正文读取失败",
-               "正文读取失败" in (r.error or ""),
-               f"实得 {r.error!r}")
+        # 403 会让当前任务停止；对用户优先显示策略原因，但读取错误必须
+        # 传入结算边界，且真实 HTTP 状态不能丢失。
+        truthy("结算保留正文读取失败原因",
+               "正文读取失败" in settle.call_args.args[6])
+        eq("403 在当前响应标记任务停止", r.policy_code, "provider_job_stopped")
+        truthy("策略停止原因可读", bool(r.error))
         truthy(f"按 timeout 返回（实测 {dt:.1f}s）", dt < 6, f"{dt:.1f}s")
 
     # 源码判据：正文读取必须在**独立的** try 里，不能裸在 except 块内

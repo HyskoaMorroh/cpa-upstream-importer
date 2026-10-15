@@ -188,12 +188,23 @@ ARG APP_GID=10001
 # 注意这只解决**镜像内目录**的属主。`/data/config.yaml` 是宿主单文件挂载，
 # 它的属主由宿主决定，容器改不了；所以 `.env.example` 里关于
 # `IMPORTER_UID` 必须与宿主 config.yaml 属主对齐的说明仍然必要。
+#
+# `/backups` 还要 `chmod 1777`（2026-10-04 本机实测补）。
+# -----------------------------------------------------
+# chown 到 APP_UID 只对「容器以该 uid 运行」成立。而两个 compose 的
+# `user` 默认是 `0:0`，同时 `cap_drop: [ALL]` 把 CAP_DAC_OVERRIDE 也去掉了：
+# 此时 root 是普通用户，0755 的属主位把它关在自己的账本目录外。
+# 实测后果：`/backups/probe-policy.sqlite3` 建不出来 → probe_policy
+# 按 fail-closed 拒绝每一次上游请求 → 八个账号四段全是
+# 「未实测 — 持久账本不可用」且零请求，而界面仍显示授权正常。
+# 粘滞位保证任何 uid 都能建自己的账本与备份，又不能删别人的文件。
 RUN set -eux; \
     groupadd -g "${APP_GID}" -r importer 2>/dev/null || true; \
     useradd -r -u "${APP_UID}" -g "${APP_GID}" -m importer 2>/dev/null || \
       useradd -r -u "${APP_UID}" -m importer; \
     mkdir -p /data /backups; \
-    chown -R "${APP_UID}:${APP_GID}" /app /data /backups
+    chown -R "${APP_UID}:${APP_GID}" /app /data /backups; \
+    chmod 1777 /backups
 USER ${APP_UID}
 
 # 容器内绑 0.0.0.0 是对的 —— 只监听 127.0.0.1 的话 compose 的端口映射

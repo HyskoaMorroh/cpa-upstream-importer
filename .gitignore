@@ -77,6 +77,11 @@ graphify-out/
 logs/
 *.log
 backups/
+# 容器把 config.yaml 挂在 /data 下，本地跑 docker-compose.local.yml 时
+# 这个目录会接到写回产物与备份 —— 都带明文上游 Key。
+# 2026-10-15 补：此前只靠「它是空目录、git 不跟踪空目录」侥幸没泄露，
+# 一旦本地跑过一次写回就会出现真实 config。
+data/
 tmp/
 *.tmp
 
@@ -158,3 +163,34 @@ probe-policy.sqlite3*
 
 # Local cached-image validation helper, never a release build.
 Dockerfile.wt
+
+# Private requirement captures and local audit notes are not release content.
+*.mhtml
+*.docx
+*.pdf
+/findings.md
+/progress.md
+/task_plan.md
+
+# 本机工具的工作目录（2026-10-11 补）。
+#
+# 这两个目录此前**既未跟踪也未被忽略** —— 一次 `git add -A` 就会把它们推上
+# 公共仓库。实际内容核查过，两个都带私密信息：
+#   · .memsearch/   跨会话记忆索引。里面有本部署自有基础设施的子域名、
+#                   第三方上游域名、Windows 账号名与会话 UUID。
+#   · .playwright-mcp/  浏览器自动化留下的页面快照与控制台日志。快照里是
+#                   私有管理面板（含登录页），暴露本机在运维哪些后台。
+#                   其中 console-*.log 本来就被上面的 `*.log` 命中，
+#                   但 page-*.yml 没有 —— 半个目录被忽略比全不忽略更危险，
+#                   因为看起来像「已经处理过了」。
+# 两者都是工具产物，不是发布内容，整目录排除。
+.memsearch/
+.playwright-mcp/
+
+# handoff 记录一律不入仓（递归，与 .dockerignore 对齐）。
+#
+# 为什么要递归：原来只有 `docs/*-handoff.md` 与 `/*-handoff.md` 两条窄规则，
+# 新建子目录放交接记录就会漏网。而 handoff 里按惯例会写当轮实测到的站点、
+# 档位与失败链 —— 恰好是最不该公开的那部分。历史上这类文件确实被提交过
+# （7 个提交），所以这里按 .dockerignore 的口径收紧。
+**/*handoff*.md

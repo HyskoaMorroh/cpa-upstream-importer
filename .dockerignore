@@ -106,3 +106,8 @@ Dockerfile.wt
 probe-policy.json
 *.probe-policy.json
 probe-policy.sqlite3*
+
+# Local audit notes must not enter the image build context.
+/findings.md
+/progress.md
+/task_plan.md

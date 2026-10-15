@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cpa_probe import model_catalog as mc
+from cpa_probe import cpa_source_probe as csp
 
 
 class CatalogueRecoveryTests(unittest.TestCase):
@@ -123,8 +124,10 @@ class UnreachableHostBudgetTests(unittest.TestCase):
         rows = cpa.parse_lines('\n'.join(
             f'https://unreachable.example,sk-fixture-{i:04d}' for i in range(6)),
             allow_private=True).valid
-        prober = Prober(gap=0., timeout=1, probe_context=False, swap_samples=0,
-                        probe_capabilities=False, workers=1)
+        # Source identity refresh is independent of the simulated breaker.
+        with patch.object(csp, 'cached_identity', return_value=csp.CpaIdentity()):
+            prober = Prober(gap=0., timeout=1, probe_context=False, swap_samples=0,
+                            probe_capabilities=False, workers=1)
         probes = []
 
         def never_answers(row, section):
@@ -138,7 +141,9 @@ class UnreachableHostBudgetTests(unittest.TestCase):
 
         with patch.object(Prober, '_full_probe', side_effect=never_answers,
                           autospec=False):
-            results = [prober.probe(r) for r in rows]
+            # Repeated attempts share the same credential and request context.
+            # A timeout on one key is not evidence about another key.
+            results = [prober.probe(rows[0]) for _ in rows]
 
         section = cpa.SECTIONS[0]
         per_section = [p for p in probes if p[1] == section]
@@ -159,7 +164,7 @@ class ConnectionFailureBreakerTests(unittest.TestCase):
     never advances.
     """
 
-    def _run(self, statuses, keys=8):
+    def _run(self, statuses, keys=8, *, distinct_credentials=False):
         from cpa_probe.pipeline import Prober, SectionVerdict, Attempt
         import cpa_probe as cpa
 
@@ -182,13 +187,20 @@ class ConnectionFailureBreakerTests(unittest.TestCase):
 
         lines = [f'https://flaky.example,sk-k-{i:04d}' for i in range(keys)]
         rows = cpa.parse_lines(chr(10).join(lines), allow_private=True).valid
-        prober = Prober(gap=0., timeout=1, probe_context=False, swap_samples=0,
-                        probe_capabilities=False, workers=1)
+        # Keep constructor identity discovery offline as well as probe traffic.
+        with patch.object(csp, 'cached_identity', return_value=csp.CpaIdentity()):
+            prober = Prober(gap=0., timeout=1, probe_context=False, swap_samples=0,
+                            probe_capabilities=False, workers=1)
         with patch.object(Prober, '_full_probe', side_effect=probe,
                           autospec=False):
-            [prober.probe(r) for r in rows]
+            [prober.probe(r if distinct_credentials else rows[0]) for r in rows]
         section = cpa.SECTIONS[0]
         return [c for c in calls if c[1] == section]
+
+    def test_failure_evidence_does_not_skip_distinct_credentials(self):
+        probes = self._run(['000'] * 64, distinct_credentials=True)
+        self.assertEqual(8, len(probes))
+        self.assertEqual(8, len({key for key, _, _ in probes}))
 
     def test_an_unreachable_host_stops_being_reprobed(self):
         probes = self._run(['000'] * 64)

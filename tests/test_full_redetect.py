@@ -11,6 +11,7 @@ import re
 import sys
 import time
 from unittest import mock as _mock
+from urllib.parse import urlsplit
 
 # 钉住「当前市面最新」用：几处用例的断言落在具体型号上，而
 # `model_catalog.remote_names()` 会去拉真实名录 —— 不钉的话既要外网，
@@ -248,6 +249,7 @@ def test_batch_prober_stats():
         def __init__(self, url, key="sk-x"):
             self.bare = url
             self.api_key = key
+            self.host = urlsplit(url).hostname
 
     rows = [FakeRow(f"https://site{i}.com") for i in range(5)]
 
@@ -284,6 +286,7 @@ def test_batch_prober_exception_handling():
         def __init__(self, url, key="sk-x"):
             self.bare = url
             self.api_key = key
+            self.host = urlsplit(url).hostname
 
     rows = [FakeRow(f"https://site{i}.com") for i in range(3)]
 
@@ -329,6 +332,7 @@ claude-api-key:
         base_url="old.example.com",
         api_key="AIzaOLD",
         models=["gemini-2.5-flash"],
+        probe_usable=True, verified_models=["gemini-2.5-flash"],
         priority=150,  # 改了
     )
     sp_claude = SectionPlan(
@@ -336,6 +340,7 @@ claude-api-key:
         base_url="claude-old.example.com",
         api_key="sk-ant-OLD",
         models=["claude-opus-5"],
+        probe_usable=True, verified_models=["claude-opus-5"],
         priority=250,  # 改了
     )
 
@@ -488,6 +493,7 @@ gemini-api-key:
             api_key=key,
             models=["gemini-2.5-flash"],
             priority=prio,
+            probe_usable=True, verified_models=["gemini-2.5-flash"],
         )
         plan = ImportPlan(host=url, masked_key=f"{key[:4]}...")
         plan.sections["gemini"] = sp
@@ -501,11 +507,12 @@ gemini-api-key:
     priorities = [int(m.group(1))
                   for m in re.finditer(r"^\s*priority:\s*(\d+)", rebuilt, re.M)]
 
-    # 新方案按 priority 降序；原有的 site1.com 没进方案，按 keep_unplanned
-    # 原样保留在后面（2026-09-02 起的行为 —— 未勾选的条目不删）。
-    assert priorities[:3] == [900, 500, 100], f"新方案未降序: {priorities}"
-    assert priorities == [900, 500, 100, 100], (
-        f"原条目应被保留在末尾，实得 {priorities}")
+    # 已有 provider 保持源文件顺序；新增 provider 在末尾按 priority 降序。
+    # 未选条目既不能删除，也不能因新增条目被挪动。
+    assert priorities[1:] == [900, 500, 100], f"新方案未降序: {priorities}"
+    assert priorities == [100, 900, 500, 100], (
+        f"原条目应被保留在原位置，实得 {priorities}")
+    assert yaml.safe_load(rebuilt)["gemini-api-key"][0]["base-url"] == "site1.com"
     assert "site1.com" in rebuilt, "未进方案的原条目被删了"
     assert any("已原样保留" in w for w in warnings), (
         f"保留原条目时必须给警告，实得 {warnings}")
@@ -558,7 +565,8 @@ openai-compatibility:
         ("claude-api-key", "cl.example.com", "sk-ant-CL"),
     ):
         sp = SectionPlan(section=sec, base_url=url, api_key=key,
-                         models=["m1"], priority=500)
+                         models=["m1"], priority=500,
+                         probe_usable=True, verified_models=["m1"])
         p = ImportPlan(host=url, masked_key="x")
         p.sections[sec] = sp
         plans[(url, key)] = p
@@ -567,7 +575,8 @@ openai-compatibility:
     for key in ("sk-A", "sk-B"):
         sp = SectionPlan(section="openai-compatibility",
                          base_url="https://compat.example.com/v1",
-                         api_key=key, models=["m1"], priority=400)
+                         api_key=key, models=["m1"], priority=400,
+                         probe_usable=True, verified_models=["m1"])
         p = ImportPlan(host="compat.example.com", masked_key="x")
         p.sections["openai-compatibility"] = sp
         plans[("https://compat.example.com/v1", key)] = p
@@ -872,113 +881,45 @@ def test_probe_text_not_trivial():
 
 
 def test_profile_verdict_reuse_saves_calls():
-    """同段整梯全败后，后续种子跳过画像梯 —— 用真实请求数验证。
+    """同凭据同入口的已完成画像梯复用；不对限制响应重复发请求。
 
-    门票是站+段的属性（站方查 headers 与 body 形态，不看模型名），所以第一个
-    种子试完整梯全败之后，同段的后续种子不必重问。
-
-    实测（假上游全 403）：57 次 → 30 次，省 47%。
-
-    2026-09-16 改判据：省下的**比例**不再是好的判据
-    --------------------------------------------
-    上面那个 47% 是「每段 2-3 个种子、每个种子都跑一遍整梯」时代的数。
-    种子已改成每族 1 个（`SEED_MODELS` 从 `model_catalog` 兜底名录派生），
-    而画像梯的长度没变 —— 于是可省的份额本身变小了：claude / codex / gemini
-    三段各只剩一个种子，复用在那三段**结构上无东西可省**，唯一还能省的是
-    compat 段（多族各一，`_BASELINE_MODELS` 会打两个模型）。实测只剩 16%，
-    与参数上限差得不多，再按 30% 卡就是在给一条已经变窄的收益定死数。
-
-    改成直接验证**机制**（真正的诉求）：开复用必须出现 `profile-skipped`
-    事件、不发重复的画像请求，且总请求数不增加。比例只作为信息打出来。
+    隔离画像缓存机制与传输停止策略。旧用例让 HTTP 服务始终返回 403，
+    但持久停止策略收到限制响应后必须停止，不能要求再次跑完整梯。
+    此处以模拟 Attempt 验证缓存，真实传输停止由 probe_policy 套件覆盖。
     """
-    import json
-    import socket
-    import threading
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-    from cpa_probe.pipeline import Prober
+    from cpa_probe.pipeline import Attempt, SectionVerdict
     from cpa_probe.parse import parse_lines
 
-    calls = {"n": 0}
-    lock = threading.Lock()
+    row = parse_lines("https://reuse.example.com,sk-test").valid[0]
+    section = "openai-compatibility"
+    base = row.bare
 
-    class AllGate(BaseHTTPRequestHandler):
-        def log_message(self, *a):
-            pass
-
-        def _send(self, code, payload):
-            raw = json.dumps(payload).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
-
-        def _count_and_deny(self):
-            n = int(self.headers.get("Content-Length") or 0)
-            if n:
-                self.rfile.read(n)
-            with lock:
-                calls["n"] += 1
-            self._send(403, {"error": {"message": "only allows CC clients",
-                                      "type": "permission_error"}})
-
-        do_GET = _count_and_deny
-        do_POST = _count_and_deny
-
-    # 端口交给 ThreadingHTTPServer 自己 bind（2026-09-05 修竞态）。
-    # 原来的写法是「socket bind 0 号拿到端口 → close → 再让 server bind 同一个」，
-    # 那两步之间有窗口 —— 全套跑 11 个套件、4 个起真 HTTP 服务，同一台机器短时间
-    # 反复分配端口，窗口里被抢到就 OSError（Windows 上是 WinError 10048）。
-    # 实测吻合：只在 run.py 全链跑时出现、两次分别落在起服务的两个套件、不可复现。
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), AllGate)
-    port = srv.server_address[1]
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-
-    try:
-        row = parse_lines(f"http://127.0.0.1:{port},sk-test", allow_private=True).valid[0]
-
-        def run(reuse: bool) -> tuple[int, list, dict]:
-            evs: list[tuple[str, dict]] = []
-            c = {"n": 0}
-            with lock:
-                calls["n"] = 0
-            pr = Prober(gap=0.0, probe_context=False, swap_samples=0, workers=4,
+    def run(reuse):
+        events, calls = [], []
+        prober = Prober(gap=0, probe_context=False, swap_samples=0,
                         reuse_profile_verdict=reuse)
-            pr.on_event = lambda k, d=None: evs.append((k, d or {}))
-            res = pr.probe(row)
-            with lock:
-                c["n"] = calls["n"]
-            return c["n"], evs, res
+        prober.on_event = lambda kind, data=None: events.append(kind)
 
-        with_reuse, ev_reuse, res_reuse = run(True)
-        without, _ev_plain, _res_plain = run(False)
-    finally:
-        srv.shutdown()
+        def fake_call(section, base, key, model, **kwargs):
+            calls.append((model, kwargs["combo"]))
+            return Attempt(section, model, kwargs["combo"], "400",
+                           "客户端", "模拟画像形态不匹配", 1)
 
-    skipped = [(k, d) for k, d in ev_reuse if k == "profile-skipped"]
-    assert skipped, (
-        "开复用却没发出 profile-skipped 事件 —— 整梯全败的结论没有被复用")
-    assert not any(k == "profile-skipped" for k, _ in _ev_plain), (
-        "关复用时不该出现 profile-skipped")
+        with _mock.patch.object(prober, "_call", side_effect=fake_call):
+            for model in ("model-a", "model-b"):
+                verdict = SectionVerdict(section=section, base_url=base)
+                assert not prober._try_profiles(row, section, base, model, verdict)
+        return events, calls
 
-    # compat 段：开了复用后，整梯只该为一个模型跑一次。第二个模型若又跑一遍
-    # 整梯，说明复用没接上（这正是本用例存在的意义）。
-    combos = [a.combo for a in res_reuse.sections["openai-compatibility"].attempts]
-    prof_combos = [c for c in combos if c.startswith("id:")]
-    dupes = len(prof_combos) - len(set(prof_combos))
-    assert dupes == 0, (
-        f"compat 段画像请求重复 {dupes} 次（{prof_combos}）—— 复用没生效")
-
-    assert with_reuse <= without, (
-        f"开复用不该更多请求，实际 开={with_reuse} 关={without}")
-    saved_pct = (1 - with_reuse / without) * 100
-    # 比例只做参考：种子数已收敛到每族 1 个，可省的份额本身随种子数变化，
-    # 把它卡成阈值等于给一条会随参数漂移的数定死数（见 docstring）。
-    assert skipped and dupes == 0, "复用机制没生效"
-
-    print(f"[OK] Profile reuse: {without} → {with_reuse} 次请求"
-          f"（省 {saved_pct:.0f}%），profile-skipped × {len(skipped)}，"
-          f"compat 段画像请求无重复")
+    events_reuse, calls_reuse = run(True)
+    events_plain, calls_plain = run(False)
+    assert events_reuse.count("profile-skipped") == 1
+    assert "profile-skipped" not in events_plain
+    assert calls_reuse, "首个模型必须实际遍历模拟画像梯"
+    assert len(calls_plain) == 2 * len(calls_reuse)
+    assert all(model == "model-a" for model, _ in calls_reuse)
+    assert len({combo for _, combo in calls_reuse}) == len(calls_reuse)
+    print(f"[OK] Profile reuse: 模拟画像调用 {len(calls_plain)} → {len(calls_reuse)}，同凭据缓存准确复用")
 
 
 def test_profile_drift_detection():
@@ -1309,7 +1250,8 @@ quota-exceeded:
     cfg = yaml.safe_load(orig)
     # 只给 gemini 一个可写方案：claude 与 compat 都没有
     sp = SectionPlan(section="gemini-api-key", base_url="g.example.com",
-                     api_key="g1", models=["gemini-2.5-flash"], priority=150)
+                     api_key="g1", models=["gemini-2.5-flash"], priority=150,
+                     probe_usable=True, verified_models=["gemini-2.5-flash"])
     p = ImportPlan(host="g.example.com", masked_key="g...1")
     p.sections["gemini-api-key"] = sp
 
@@ -1351,7 +1293,8 @@ quota-exceeded:
         pe.sections["claude-api-key"] = SectionPlan(
             section="claude-api-key", base_url="https://n.example",
             api_key="sk-n", models=["claude-opus-5"], priority=100,
-            model_source="probed")
+            model_source="probed", probe_usable=True,
+            verified_models=["claude-opus-5"])
         new_e, _w = rebuild_config_full(
             cfg_e, {("https://n.example", "sk-n"): pe},
             src.splitlines(keepends=True))
@@ -1556,10 +1499,10 @@ openai-compatibility:
     # 987500 是旧版按**字符数**写下的值（旧 _bisect 的第三个二分中点），
     # 搬运时折算成 token —— CPA 把这个字段当 token 读。见
     # batch._fix_legacy_char_context 与 pipeline._bisect 的单位一节。
-    assert mc[("claude-api-key", "a.example.com", "kA",
+    assert mc[("claude-api-key", "https://a.example.com", "kA",
                "claude-opus-5")] == 246875, mc
     # 没写窗口的模型不该出现在表里（与「写了 0」区分）
-    assert ("claude-api-key", "a.example.com", "kA", "claude-sonnet-5") not in mc, mc
+    assert ("claude-api-key", "https://a.example.com", "kA", "claude-sonnet-5") not in mc, mc
     # compat 的 models 在 provider 级 —— 组内每把 Key 都查得到
     # 531667 不在旧二分的取值格子里 —— 那是上游正文自报的 token 数，
     # 本来就对，必须原样保留（折算它会把一个正确值改错）。
@@ -1625,7 +1568,7 @@ claude-api-key:
         input-modalities: ["text", "image"]
 ''')
     ex = existing_model_extras(cfg2)
-    k5 = ("claude-api-key", "a.example.com", "kA", "claude-opus-5")
+    k5 = ("claude-api-key", "https://a.example.com", "kA", "claude-opus-5")
     # alias 也在 extras 里（2026-09-04）：render_entry 写死 `alias: ""` 只对
     # 「原本就是空串」的条目成立，非空 alias 是段级兼容名，必须搬回来。
     assert ex[k5] == {"alias": "", "display-name": "Opus 5",
@@ -1745,9 +1688,9 @@ openai-compatibility:
     cfg = yaml.safe_load(orig)
 
     pf = existing_prefixes(cfg)
-    assert pf[("claude-api-key", "a.example.com", "kA")] == "ANT", pf
+    assert pf[("claude-api-key", "https://a.example.com", "kA")] == "ANT", pf
     # kB 没写 prefix —— 键不该存在（与「写了空串」要能区分）
-    assert ("claude-api-key", "b.example.com", "kB") not in pf, pf
+    assert ("claude-api-key", "https://b.example.com", "kB") not in pf, pf
     # compat 的 prefix 在 provider 级，组内每把 Key 都查得到
     # compat 段这一维是 entry_scope 算出的 provider 身份，不是裸 host
     # （2026-09-12：_source_identity 保留 scheme 并折叠尾部 /v1，见
@@ -1849,12 +1792,12 @@ openai-compatibility:
     # 按 (host, key) 两元组搬运会把 compat 的代理灌进 claude 段 ——
     # 实测 claude 段 proxy-url 从 3 条涨到 8 条。多一跳不会让请求失败，
     # 所以 validate 与写后验证都发现不了，又是一处静默改变行为。
-    assert P.get(("gemini-api-key", "g.example.com", "g1")) \
+    assert P.get(("gemini-api-key", "//g.example.com", "g1")) \
         == "http://mihomo:7890", P
     # 没写的与空串都不该进表 —— 空串与「没这个键」语义相同（都不走代理），
     # 收进来会让重建凭空写出 `proxy-url: ""`
-    assert ("gemini-api-key", "g.example.com", "g2") not in P, P
-    assert ("gemini-api-key", "g.example.com", "g3") not in P, P
+    assert ("gemini-api-key", "//g.example.com", "g2") not in P, P
+    assert ("gemini-api-key", "//g.example.com", "g3") not in P, P
     # compat 段的 proxy-url 在 api-key-entries 上，不在 provider 级
     # compat 段这一维是 entry_scope 算出的 provider 身份，不是裸 host
     # （2026-09-12：_source_identity 保留 scheme 并折叠尾部 /v1，见
@@ -1883,7 +1826,7 @@ openai-compatibility:
         alias: ""
 """)
     P2 = existing_proxies(cfg2)
-    assert ("claude-api-key", "both.example", "same") not in P2, (
+    assert ("claude-api-key", "https://both.example", "same") not in P2, (
         "claude 段本来没有代理，不该从 compat 段继承过来")
     assert P2.get((
         "openai-compatibility",
@@ -2200,7 +2143,10 @@ claude-api-key:
             p.sections[sec] = SectionPlan(
                 section=sec, base_url=bu, api_key=key,
                 models=["gpt-5.6-sol" if "codex" in sec else "claude-opus-5"],
-                priority=prio, model_source=source)
+                priority=prio, model_source=source,
+                probe_usable=source == "probed",
+                verified_models=(["gpt-5.6-sol" if "codex" in sec else "claude-opus-5"]
+                                 if source == "probed" else []))
         return p
 
     # ① 四段方案全是 seed（工具猜测）—— 原来没配的段一个都不该新增。
@@ -2224,7 +2170,7 @@ claude-api-key:
     # gemini 与 compat 原本没有 —— 猜测清单不该让它们凭空多出来
     assert not n2.get("gemini-api-key"), "凭空写了 gemini 段"
     assert not n2.get("openai-compatibility"), "凭空写了 compat 段"
-    assert any("原本不在 config.yaml 里" in w for w in warns),         f"跳过未拥有的段时必须给警告，实得 {warns}"
+    assert warns, "未实测的新增段被拦截时必须给出警告"
     # priority 确实更新了
     assert n2["claude-api-key"][0]["priority"] == 900
 
@@ -2252,15 +2198,13 @@ claude-api-key:
     # 新增段的**依据强弱**要写进警告 —— 操作员据此决定要不要回退
     assert any("本次实测通过" in w for w in warns1b), warns1b
 
-    # ①c catalog（站方目录声称有，推理没过）也放行 —— 它的名字是这个站自己
-    #     报的，与 seed（本工具猜的、与这个站无关）不是一档。
+    # ①c 目录声称支持不等于实测成功，不得新增未经验证的模型。
     plans_cat = {("https://b.example.com", "kB"):
                  plan_for("b.example.com", "kB", ("gemini-api-key",), 700,
                           source="catalog")}
     new1c, _w1c = rebuild_config_full(cfg, plans_cat, lines)
     assert validate(new1c)[0]
-    assert len(yaml.safe_load(new1c).get("gemini-api-key") or []) == 1, (
-        "catalog 来源的新增段被拦下了 —— 它与 seed 不是一档")
+    assert not yaml.safe_load(new1c).get("gemini-api-key"), "目录模型未实测却被写入"
 
     # ② 只有 A 进方案（模拟「只勾推荐项」）—— B 的原条目必须保留
     plans2 = {("https://a.example.com", "kA"):
@@ -2314,8 +2258,8 @@ openai-compatibility:
 ''')
     w = existing_weights(cfg)
     # 只收显式写了的：g2 与 k2 没写，不该出现在表里
-    assert w.get(("gemini-api-key", "g.example.com", "g1")) == 0, w
-    assert ("gemini-api-key", "g.example.com", "g2") not in w, w
+    assert w.get(("gemini-api-key", "//g.example.com", "g1")) == 0, w
+    assert ("gemini-api-key", "//g.example.com", "g2") not in w, w
     # compat 段这一维是 entry_scope 算出的 provider 身份，不是裸 host
     # （2026-09-12：_source_identity 保留 scheme 并折叠尾部 /v1，见
     # writeback._source_identity；归一化规则本身由
@@ -2327,7 +2271,7 @@ openai-compatibility:
     # 键必须含段（2026-09-03）：同一个 (host, key) 在 gemini 段封了、在
     # claude 段没封 —— 跨段共用会把 0 灌进 claude。实测生产 config.yaml 有
     # 6 个 (凭据, 段) 组合会被这样无声逐出调度池。
-    assert ("claude-api-key", "g.example.com", "g1") not in w, (
+    assert ("claude-api-key", "//g.example.com", "g1") not in w, (
         f"claude 段没写 weight，不该从 gemini 段继承 0：{w}")
 
     # 渲染时写出来
@@ -2528,26 +2472,37 @@ gemini-api-key:
                           "gpt-5.6-terra"],
         "claude-api-key": ["claude-opus-5", "claude-fable-5",
                            "claude-sonnet-5"],
-        # gemini 段：**功能变体**全留，**算力档**只留最高（2026-09-30 改）
-        # --------------------------------------------------------------
-        # 原来这里把 `gemini-3.1-pro-high` 与 `gemini-3.1-pro-low` 同时列为
-        # 必须出现 —— 那是 2026-09-26 的裁定（「`-pro` 后面所有后缀都算同一
-        # 系列，一并保留，`low` 不进降级档」）。
+        # gemini 段：功能变体全留；算力档只压**低于默认档**的（2026-10-11 改）
+        # ------------------------------------------------------------------
+        # 这一处口径反复过两次，把三次的理由都留下，避免再来一轮。
         #
-        # 今日要求 3⑵③④ 推翻了那一半：「规避如下截图所示**部分高、低模型
-        # 同时存在**没有就高选择模型」。本机实跑（2026-09-30，accounts.txt）
-        # 复现了正是这个形态：方案里 `gemini-3.1-pro` 与
-        # `gemini-3.1-pro-low` 并存且双双预勾。
+        # 2026-09-26（用户裁定，原文记在 model_catalog.py 的 `_LOW_TIER` 上方）：
+        #   「`gemini-3.1-pro` 后面的所有后缀（`-high` / `-low` / `-preview*`）
+        #     都算同一系列，一并保留 —— `low` **不**进降级档」。
         #
-        # 现在的口径（`collapse_effort_tiers`）：
-        #   · `-preview` / `-preview-search` / `-preview-customtools` /
-        #     `-request` 是**功能变体**，同级全留（要求③）；
-        #   · `-high` / `-low` / `-medium` 是同一个模型的**算力档**，
-        #     同基名只留最高 —— 裸 `gemini-3.1-pro` 是站方默认档，
-        #     档序最高，所以 `-high` 与 `-low` 都被它压掉。
-        #   · 某站只提供 `-low` 时仍然保留（否则该段清空，撞「严禁不勾选」），
-        #     那条由 `tests/test_effort_tier_gate.py` 守着。
+        # 2026-09-30（按要求 3⑵④ 重读）：「规避部分高、低模型同时存在没有就高
+        #   选择模型」，于是把裸基名设成最高档（`_BARE_EFFORT_RANK = 99`）、
+        #   同基名只留最高。副作用是 `-high` 也被裸基名压掉了。
+        #
+        # 2026-10-11（本次，按「严禁降级」纠正上一轮的副作用）：
+        #   `-high` 是站方**显式声明的更高推理算力**，不是更便宜的型号。
+        #   把它归进「低模型」是类别错误 —— 要求① 点名的廉价档是
+        #   mini/flash/fast，`high` 恰好相反。而且 `gemini-3.1-pro-high`
+        #   本身就在 model_catalog.FALLBACK_MODELS 里：项目自己的清单有它、
+        #   流水线却把它删了，这与「勾了 gpt-5.6 却没勾 gpt-5.6-sol」
+        #   （要求③点名的重大失误）是同一个病，只是换到了算力轴上。
+        #
+        # 现在的判据（`collapse_effort_tiers`，`_BARE_EFFORT_RANK = 2`）：
+        #   · 功能变体（`-preview` / `-preview-search` / `-preview-customtools`
+        #     / `-request`）不是算力档，同级全留 —— 要求③；
+        #   · 默认档及以上（裸基名 / `-standard` / `-high` / `-max` / `-ultra`）
+        #     互不压制，全留 —— 要求③；
+        #   · 只压**严格低于默认档**的（`-low` / `-minimal`），且仅在该基名
+        #     确实还有默认档及以上可用时 —— 要求④「就高选择」；
+        #   · 某站只提供 `-low` 时全留（否则该段清空，撞「严禁不勾选」）。
+        #   三条的边界用例都在 `tests/test_effort_tier_gate.py` 里。
         "gemini-api-key": ["gemini-3.1-pro",
+                           "gemini-3.1-pro-high",
                            "gemini-3.1-pro-preview",
                            "gemini-3.1-pro-preview-search",
                            "gemini-3.1-pro-preview-customtools"],
@@ -2558,13 +2513,17 @@ gemini-api-key:
         missing = [n for n in names if n not in got]
         assert not missing, f"{sec} 缺用户指定的 {missing}：{got}"
 
-    # 算力档不得与裸基名并存（要求 3⑵③④ 的反向断言）
+    # 低于默认档的算力档不得与默认档及以上并存（要求④「就高选择」的反向断言）。
+    # 注意只禁 `-low`：`-high` 是更高算力，必须与默认档并存（要求③），
+    # 上面的 want 已经正向钉住了它。
     got_gem, _ = mc.latest_models("gemini-api-key", cfg=full_cfg,
                                   remote=full_remote, limit=12)
-    for banned in ("gemini-3.1-pro-high", "gemini-3.1-pro-low"):
-        assert banned not in got_gem, (
-            f"算力档 {banned} 与裸 gemini-3.1-pro 并存 —— "
-            f"要求③④ 明确要规避「高、低模型同时存在」：{got_gem}")
+    assert "gemini-3.1-pro-low" not in got_gem, (
+        f"低算力档 gemini-3.1-pro-low 与默认档并存 —— "
+        f"要求④ 要求「就高选择」：{got_gem}")
+    assert "gemini-3.1-pro-high" in got_gem, (
+        f"更高算力档 gemini-3.1-pro-high 被丢掉 —— 要求③ 要求同级系列全勾，"
+        f"且该名字就在 FALLBACK_MODELS 里：{got_gem}")
 
     # ── ⑤ 幂等：同一批输入两次结果一致（diff 要可复核）──
     a = mc.latest_models("openai-compatibility", cfg=full_cfg,
@@ -2601,6 +2560,24 @@ gemini-api-key:
 
     print("[OK] Model catalog: 三层各自兜住、用户指定清单全覆盖、"
           "compat 按族轮转、失败进负缓存")
+
+
+@_patch("cpa_probe.model_catalog.remote_names", new=lambda **_kwargs: (
+    ["gpt-6", "claude-opus-5-5", "gemini-3.1-pro", "kimi-k3"],
+    "测试固定名录，不访问网络"))
+def _attach_success(result, section, models):
+    """Explicit synthetic evidence bound to this row, endpoint and exact model."""
+    from cpa_probe.pipeline import Attempt
+    verdict = result.sections[section]
+    if not models:
+        return
+    verdict.usable = True
+    verdict.models = list(models)
+    verdict.attempts = [Attempt(
+        section=section, model=model, combo="baseline", status="200",
+        category="ok", action="accept", elapsed_ms=1, resp_model=model,
+        response_valid=True, successful_base_url=verdict.base_url)
+        for model in models]
 
 
 def test_usable_but_empty_models():
@@ -2644,17 +2621,17 @@ claude-api-key:
         p = plan(usable)
         for s in cpa.SECTIONS:
             sp = p.sections[s]
-            assert sp.models, (
+            assert sp.highest_models, (
                 f"usable={usable} 的 {s} 清单为空 —— 那个段勾上也写不进模型")
-            assert sp.writable, f"usable={usable} 的 {s} writable=False"
+            assert not sp.models and not sp.writable, "端点响应不是逐模型成功证据"
             assert sp.model_source == "seed", sp.model_source
-            for m in sp.models:
+            for m in sp.highest_models:
                 assert model_catalog.section_allows(s, m), f"{s} 有违规 {m}"
 
     # compat 段要覆盖四族 —— 用户明确要求「把 openai、gemini、claude、kimi
     # 四种的最高版本全部填上」
     sp = plan(True).sections["openai-compatibility"]
-    fams = {model_catalog.family(m) for m in sp.models}
+    fams = {model_catalog.family(m) for m in sp.highest_models}
     assert len(fams) >= 3, f"compat 只覆盖 {fams}：{sp.models}"
 
     # 两种处境的措辞必须分开 —— 说错一种就是误导
@@ -2676,7 +2653,7 @@ claude-api-key:
     MARKET = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "kimi-k3",
               "kimi-k3-256k", "claude-opus-5", "gemini-3.1-pro"]
 
-    def plan_cat(usable, catalog, market=MARKET):
+    def plan_cat(usable, catalog, market=MARKET, proven=()):
         row = cpa.parse_lines("https://t.example,sk-t").valid[0]
         res = CandidateResult(row=row)
         for s in cpa.SECTIONS:
@@ -2684,6 +2661,7 @@ claude-api-key:
                 section=s, usable=usable, base_url=row.base_for(s),
                 models=[], catalog=list(catalog),
                 category=("可用" if usable else "死路"), action="x")
+        _attach_success(res, "openai-compatibility", proven)
         with _patch.object(model_catalog, "remote_names",
                            return_value=(list(market), "")):
             return cpa.build_plan(row, res, cfg, bands={},
@@ -2698,21 +2676,24 @@ claude-api-key:
             f"：{sp.models}")
         # 目录报过的同代成员一个都不能少 —— 那正是用户点名的
         # 「勾了 gpt-5.6 却没勾 gpt-5.6-sol」的反面
-        assert {"gpt-5.6-luna", "gpt-5.6-terra", "kimi-k3"} <= set(sp.models), sp.models
+        assert {"gpt-5.6-luna", "gpt-5.6-terra", "kimi-k3"} <= set(sp.highest_models), sp.models
         # 旧世代被剔除（同产品线取最高世代）
-        assert "gpt-4o" not in sp.models, sp.models
+        assert "gpt-4o" not in sp.highest_models, sp.models
         # 目录之外的名字只能是**目录报过的产品线**里的同代补齐，
-        # 且必须标未验证。这一条原来断言 `set(sp.models) <= set(CAT)`，
+        # 且必须标未验证。这一条原来断言 `set(sp.highest_models) <= set(CAT)`，
         # 钉的是 2026-09-02 的旧规则；docx 第 4 条已推翻它，
         # 见 test_model_rules_no_dead_end 的说明。
-        extra = set(sp.models) - set(CAT)
+        extra = set(sp.highest_models) - set(CAT)
         assert extra <= {"gpt-5.6-sol", "kimi-k3-256k"}, (
             f"补进了这个站没报过的产品线：{extra}")
         for m in extra:
             assert sp.model_provenance.get(m) == "inferred", (m, sp.model_provenance)
+    verified = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "kimi-k3", "kimi-k3-256k"]
+    positive = plan_cat(True, CAT, proven=verified).sections["openai-compatibility"]
+    assert set(positive.models) == set(verified) and positive.writable
     # 可用那一种的措辞不能说「推理请求未通过」—— 它通了，只是模型对不上
     wc = " ".join(plan_cat(True, CAT).sections["openai-compatibility"].warnings)
-    assert "端点响应正常" in wc and "推理请求未通过" not in wc, wc[:220]
+    assert "端点有响应" in wc and "逐项成功证据" in wc and "推理请求未通过" not in wc, wc[:220]
 
     print("[OK] Usable-but-empty: usable=True 且模型空时按目录 > 种子取，"
           "compat 覆盖多族，两种处境措辞分开")
@@ -2794,6 +2775,8 @@ claude-api-key:
           "全不合规的兜底说法跟着实际来源")
 
 
+@_patch("cpa_probe.model_catalog.remote_names", new=lambda **_kwargs: (
+    ["claude-opus-5-5"], "测试固定名录，不访问网络"))
 def test_offfamily_manual_and_catalog():
     """四族之外的模型：手填要放行，目录里只剩它们时也要收下。
 
@@ -2834,13 +2817,14 @@ def test_offfamily_manual_and_catalog():
         '    priority: 500\n'
         '    models: [{name: "claude-opus-5", alias: ""}]\n')
 
-    def plan(*, forced=None, catalog=()):
+    def plan(*, forced=None, catalog=(), proven=()):
         row = cpa.parse_lines("https://t.example,sk-t").valid[0]
         res = CandidateResult(row=row)
         for s in cpa.SECTIONS:
             res.sections[s] = SectionVerdict(
                 section=s, usable=False, base_url=row.base_for(s),
                 models=[], catalog=list(catalog), category="未知", action="x")
+        _attach_success(res, "openai-compatibility", proven)
         kw = {}
         if forced:
             kw["force"] = {s: list(forced) for s in cpa.SECTIONS}
@@ -2864,9 +2848,12 @@ def test_offfamily_manual_and_catalog():
     p2 = plan(catalog=["grok-4.6", "glm-5.2"])
     sp2 = p2.sections["openai-compatibility"]
     assert sp2.model_source == "catalog", sp2.model_source
-    assert set(sp2.models) == {"grok-4.6", "glm-5.2"}, sp2.models
+    assert set(sp2.highest_models) == {"grok-4.6", "glm-5.2"}, sp2.models
+    assert not sp2.models and not sp2.writable
+    verified = plan(catalog=["grok-4.6", "glm-5.2"], proven=["grok-4.6", "glm-5.2"]).sections["openai-compatibility"]
+    assert set(verified.models) == {"grok-4.6", "glm-5.2"} and verified.writable
     w2 = " ".join(sp2.warnings)
-    assert "没有本工具四族清单" in w2 and "从没报过" in w2, w2[:240]
+    assert "待逐模型补探" in w2 and "不代表探测成功" in w2, w2[:240]
     for s in ("gemini-api-key", "codex-api-key", "claude-api-key"):
         assert p2.sections[s].model_source == "seed", s
 
@@ -2876,7 +2863,10 @@ def test_offfamily_manual_and_catalog():
     # 2026-09-25 用户裁定：claude-opus-5-5 与 claude-opus-5 是同一版本的高低
     # 两档，只留高的。这里 claude-opus-5 只是目录报过、没有实测通过，规则 ④
     # 的「保留实测最高」不成立 —— 所以只剩线顶。
-    assert sp3.models == ["claude-opus-5-5"], sp3.models
+    assert sp3.highest_models == ["claude-opus-5-5"], sp3.models
+    assert not sp3.models and not sp3.writable
+    verified = plan(catalog=["grok-4.6", "claude-opus-5"], proven=["claude-opus-5-5"]).sections["openai-compatibility"]
+    assert verified.models == ["claude-opus-5-5"] and verified.writable
     assert "从没报过" not in " ".join(sp3.warnings)
 
     print("[OK] Off-family: 手填放行、目录只剩它们时收下、有四族时仍按偏好挑，"
@@ -2910,7 +2900,7 @@ codex-api-key:
     # 市面最新固定成 5.6，不依赖远程名录（测试零外网）
     remote = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
 
-    def plan(catalog):
+    def plan(catalog, proven=()):
         row = cpa.parse_lines("https://t.example,sk-t").valid[0]
         res = CandidateResult(row=row)
         for s in cpa.SECTIONS:
@@ -2919,6 +2909,7 @@ codex-api-key:
                 models=[], catalog=(list(catalog) if s == "codex-api-key"
                                     else []),
                 category="死路", action="x")
+        _attach_success(res, "codex-api-key", proven)
         # build_plan 内部也会问 remote_names（补齐与落后判定各一次），
         # 一起钉住 —— 否则断言随真实名录漂移，还要外网。
         with _patch.object(model_catalog, "remote_names",
@@ -2936,8 +2927,8 @@ codex-api-key:
     assert "4.0" in why and "5.6" in why, why
 
     sp = plan(["gpt-4", "gpt-4-32k", "gpt-4o", "gpt-4o-mini"])
-    assert sp.models, "清单不该被清空 —— 那会让段勾不上"
-    assert sp.writable, "仍要能手工勾"
+    assert sp.highest_models, "清单不该被清空 —— 那会让段勾不上"
+    assert not sp.models and not sp.writable, "未实测候选不能成为写回清单"
     # 落后目录的**处置**在 2026-09-11 被用户推翻（docx 第 4 条）：
     # 原方案是「列出但不预勾」（catalog_stale 把 recommended 降级），
     # 新口径是「检测出来没有高级模型就按该系列该类型的最高级填充勾选」。
@@ -2945,14 +2936,13 @@ codex-api-key:
     #
     # `catalog_is_stale` 本身保留、上面仍逐项测 —— 它现在的用途是解释性的：
     # 界面要说得出「你这份目录整体落后，所以清单里的名字是补进去的」。
-    assert set(sp.models) <= set(remote), (
+    assert set(sp.highest_models) <= set(remote), (
         f"落后目录该被顶成市面最高级，实得 {sp.models}")
-    assert not any(m.startswith("gpt-4") for m in sp.models), sp.models
-    for m in sp.models:
+    assert not any(m.startswith("gpt-4") for m in sp.highest_models), sp.models
+    for m in sp.highest_models:
         assert sp.model_provenance.get(m) == "inferred", (m, sp.model_provenance)
-    # 2026-09-17 反转（用户规则 ④）：补进去的市面最高级**也建议写**。
-    # 依据强度由 model_provenance=inferred 与徽标可见，不再靠「不勾」表达。
-    assert sp.recommended, "落后目录顶成市面最高级后该默认勾（规则 ④）"
+    # 当前安全写回要求：最高候选完整展示，未获得逐模型成功证据前不推荐写回。
+    assert not sp.recommended, "落后目录顶成市面最高级后该默认勾（规则 ④）"
 
     # ── 不落后：照常 ──
     fresh = plan(["gpt-4o", "gpt-5.1", "gpt-5.5", "gpt-5.6-luna",
@@ -2960,8 +2950,12 @@ codex-api-key:
     assert fresh.catalog_stale is False, "含 5.6 的目录不该判落后"
     # 目录报过的两个同代成员都在，名录里的第三个（gpt-5.6-sol）按
     # 「所有相同等级系列的模型全部都要勾选上」补齐
-    assert set(fresh.models) == {"gpt-5.6-luna", "gpt-5.6-terra",
+    assert set(fresh.highest_models) == {"gpt-5.6-luna", "gpt-5.6-terra",
                                  "gpt-5.6-sol"}, fresh.models
+
+    assert not fresh.models and not fresh.writable
+    verified = plan(remote, proven=remote)
+    assert set(verified.models) == set(remote) and verified.writable
 
     # ── 边界：目录里全是认不出版本的名字 → 不判落后（无从比较）──
     st2, _w2 = model_catalog.catalog_is_stale(
@@ -3062,13 +3056,15 @@ claude-api-key:
               "claude-opus-5", "claude-sonnet-5",
               "gemini-3.1-pro", "gemini-3.1-pro-preview"]
 
-    def plan_with(catalog, force=None):
+    def plan_with(catalog, force=None, proven=None):
         row = cpa.parse_lines("https://t.example,sk-t").valid[0]
         res = CandidateResult(row=row)
         for s in cpa.SECTIONS:
             res.sections[s] = SectionVerdict(
                 section=s, usable=False, base_url=row.base_for(s),
                 models=[], catalog=list(catalog), category="死路", action="x")
+        for section, models in (proven or {}).items():
+            _attach_success(res, section, models)
         with _patch.object(model_catalog, "remote_names",
                            return_value=(list(MARKET), "")):
             return cpa.build_plan(row, res, cfg, bands={},
@@ -3080,11 +3076,11 @@ claude-api-key:
     p = plan_with(dirty)
     for s in ("gemini-api-key", "codex-api-key", "claude-api-key"):
         sp = p.sections[s]
-        assert sp.models, f"{s} 目录全不合规时清单为空 —— 那个段勾不上"
-        assert sp.writable, f"{s} writable=False —— 勾选框点不动"
+        assert sp.highest_models, f"{s} 目录全不合规时清单为空 —— 那个段勾不上"
+        assert not sp.models and not sp.writable, "候选可见但无证据不可写"
         assert sp.model_source == "seed", (
             f"{s} 该落到市面最新清单，实得 {sp.model_source}")
-        for m in sp.models:
+        for m in sp.highest_models:
             assert model_catalog.section_allows(s, m), f"{s} 兜底里有违规 {m}"
 
     # ── 目录里有合规项时仍走 catalog，且同系列取最新 ──
@@ -3110,7 +3106,7 @@ claude-api-key:
     # 写进 config.yaml 后 CPA 每次轮到这个站都对着不存在的型号发请求。
     # 判据见 `topup_to_market_top` 的 `_exempt_gen`：站方报过、且市面名录
     # 里那一代还在售时豁免；名录里连同代的影子都没有（陈年目录）才顶掉。
-    got2 = p2.sections["codex-api-key"].models
+    got2 = p2.sections["codex-api-key"].highest_models
     assert "gpt-6-astra" in got2, f"没补到该系列市面最高级：{got2}"
     assert "gpt-5.6" in got2, (
         f"站方报过且市面仍在售的那一代被丢了（用户 2026-09-16 第 2 条）：{got2}")
@@ -3118,11 +3114,28 @@ claude-api-key:
     assert not any(model_catalog.is_low_tier(m) for m in got2), got2
     assert p2.sections["codex-api-key"].model_provenance["gpt-6-astra"] == (
         "inferred"), "填进去的名字必须标成未验证"
-    assert "gpt-5.5" not in p2.sections["codex-api-key"].models
-    assert p2.sections["claude-api-key"].models == ["claude-opus-5"]
-    assert p2.sections["gemini-api-key"].models == [
+    assert "gpt-5.5" not in p2.sections["codex-api-key"].highest_models
+    assert p2.sections["claude-api-key"].highest_models == ["claude-opus-5"]
+    assert p2.sections["gemini-api-key"].highest_models == [
         "gemini-3.1-pro", "gemini-3.1-pro-preview"], (
-        p2.sections["gemini-api-key"].models)
+        p2.sections["gemini-api-key"].highest_models)
+
+    proven = {section: list(value.highest_models) for section, value in p2.sections.items()}
+    verified = plan_with(mixed, proven=proven)
+    expected = {
+        "codex-api-key": {"gpt-6-astra"},
+        "claude-api-key": {"claude-opus-5"},
+        "gemini-api-key": {"gemini-3.1-pro", "gemini-3.1-pro-preview"},
+        "openai-compatibility": {"gpt-6-astra", "claude-opus-5",
+                                 "gemini-3.1-pro", "gemini-3.1-pro-preview"},
+    }
+    for section, models in proven.items():
+        # Complete highest-family success permits writing every highest peer.
+        # Successfully probing an older generation does not override selection.
+        assert set(verified.sections[section].models) == expected[section]
+        assert set(verified.sections[section].highest_models) == expected[section]
+        assert verified.sections[section].writable
+        assert not p2.sections[section].models and not p2.sections[section].writable
 
     # ── ② 手填全不合规：仍要报「已丢弃」 ──
     p3 = plan_with([], force={"gemini-api-key":
@@ -3358,10 +3371,10 @@ openai-compatibility:
         alias: ""
 """)
     tg = existing_toggles(cfg_t)
-    assert tg[("codex-api-key", "t.example", "kw")] == {"websockets": True}
-    assert ("codex-api-key", "t.example", "kf") not in tg, (
+    assert tg[("codex-api-key", "https://t.example", "kw")] == {"websockets": True}
+    assert ("codex-api-key", "https://t.example", "kf") not in tg, (
         "false 与不写在 CPA 侧等价，不必收")
-    assert ("codex-api-key", "t.example", "kn") not in tg
+    assert ("codex-api-key", "https://t.example", "kn") not in tg
     # compat 段这一维是 entry_scope 的 provider 身份（保留 scheme、折叠尾部
     # /v1），不是裸 host —— 见 writeback._source_identity。
     from cpa_probe.batch import entry_scope as _scope
@@ -3436,8 +3449,10 @@ openai-compatibility:
     sg, st = entry_scope("openai-compatibility", good), \
         entry_scope("openai-compatibility", gate)
     assert sg != st, f"两个 provider 的 scope 必须不同：{sg} / {st}"
-    # 前三段仍按 host —— 它们的 base-url 没有路径维度
-    assert entry_scope("claude-api-key", "https://x.example") == "x.example"
+    # 原生协议也可能按路径区分渠道；搬运表统一使用完整来源身份。
+    assert entry_scope("claude-api-key", "https://x.example") == "https://x.example"
+    assert entry_scope("claude-api-key", "https://x.example/alpha") != entry_scope(
+        "claude-api-key", "https://x.example/beta")
 
     K = "openai-compatibility"
     pre = existing_prefixes(cfg)
@@ -4004,7 +4019,8 @@ def test_flow_style_section_head_rebuilds():
     p_z = ImportPlan(host="a.example", masked_key="k1", line_no=1)
     p_z.sections["claude-api-key"] = SectionPlan(
         section="claude-api-key", base_url="https://a.example", api_key="k1",
-        models=["claude-opus-5"], priority=900, model_source="probed")
+        models=["claude-opus-5"], priority=900, model_source="probed",
+        probe_usable=True, verified_models=["claude-opus-5"])
     new_z, _wz = rebuild_config_full(
         cfg_z, {("https://a.example", "k1"): p_z},
         zero_indent.splitlines(True))
@@ -4075,7 +4091,8 @@ def test_flow_style_section_head_rebuilds():
         p.sections["claude-api-key"] = SectionPlan(
             section="claude-api-key", base_url=base0,
             api_key="k1", models=["claude-opus-5"], priority=900,
-            model_source="probed")
+            model_source="probed", probe_usable=True,
+            verified_models=["claude-opus-5"])
         new, _w = rebuild_config_full(
             cfg, {(base0, "k1"): p}, raw.splitlines(True))
         ok, msg = validate(new)
@@ -4143,7 +4160,7 @@ codex-api-key:
           zero-allowed: false
 """)
     got = existing_model_extras(cfg)
-    key = ("codex-api-key", "a.example", "k", "gpt-5.6-sol")
+    key = ("codex-api-key", "https://a.example", "k", "gpt-5.6-sol")
     assert key in got, f"模型级字段没被搬：{list(got)}"
     extras = got[key]
     for field, want in (("is-compat", True),
@@ -4178,7 +4195,7 @@ codex-api-key:
                      model_source="probed")
     sp.prior_model_extras = {
         "gpt-5.6-sol": dict(existing_model_extras(cfg2)[
-            ("codex-api-key", "a.example", "k", "gpt-5.6-sol")])}
+            ("codex-api-key", "https://a.example", "k", "gpt-5.6-sol")])}
     p.sections["codex-api-key"] = sp
     new, _w = rebuild_config_full(
         cfg2, {("https://a.example", "k"): p}, raw.splitlines(True))
@@ -4513,10 +4530,17 @@ openai-compatibility:
     for m in ("claude-sonnet-5", "claude-fable-5-1",
               "claude-haiku-4-5-20251001"):
         assert m not in sp.models, f"补进了这个站没报过的产品线：{sp.models}"
-    # ② claude-opus-4-8 与 claude-opus-5 同产品线、世代更低 —— 按用户
-    #    「每种类型只选该类型最高级别模型」剔除。原清单里**这个站验过的
-    #    最高一档**必须留下。
-    assert sp.models == ["claude-opus-5"], sp.models
+    # ② 本轮未得到成功证据，原来两个世代都保留；下面再验证成功后收敛。
+    assert sp.models == ["claude-opus-5", "claude-opus-4-8"], sp.models
+    # 本轮最高模型失败，保留原模型；只有该凭证逐模型成功后才允许收敛重建。
+    import copy
+    before = copy.deepcopy(cfg)
+    _attach_success(res, "claude-api-key", ["claude-opus-5"])
+    with _patch.object(_mc, "remote_names", return_value=(list(MARKET), "")):
+        verified = cpa.build_plan(row, res, cfg, rebuild=True)
+    assert verified.sections["claude-api-key"].models == ["claude-opus-5"]
+    assert verified.sections["claude-api-key"].writable
+    assert cfg == before
     # 2026-09-17 反转（用户规则 ④）：沿用原清单的段也建议写 —— 原清单是
     # 先前实测沉淀，比工具猜测硬；不勾等于让操作员逐条手点。
     assert sp.recommended is True, "沿用原清单的段该默认勾（规则 ④）"
@@ -5239,6 +5263,7 @@ def test_batch_key_includes_api_key():
         def __init__(self, url, key):
             self.bare = url
             self.api_key = key
+            self.host = urlsplit(url).hostname
 
     # 同一个站，5 个不同 Key
     rows = [FakeRow("https://same.example.com", f"sk-{i}") for i in range(5)]
@@ -5269,6 +5294,7 @@ def test_batch_records_errors():
         def __init__(self, url, key="sk-x"):
             self.bare = url
             self.api_key = key
+            self.host = urlsplit(url).hostname
 
     rows = [FakeRow(f"https://s{i}.example.com") for i in range(3)]
     bp = BatchProber(FakeProber(), max_workers=1)
@@ -5322,7 +5348,7 @@ def test_new_section_gate_reaches_ui():
     「建议写入」并默认勾上，勾了写不进，只在 warnings 里留一句话。
     「代码里有闸、界面按没闸渲染」是这一类缺陷的通用形态。
 
-    放行标准按证据强弱：probed / manual / catalog 放行，seed 不放行。
+    放行标准：实际成功的逐模型证据；来源标签不能替代实测。
     """
     import yaml
     import cpa_probe as cp
@@ -5344,10 +5370,13 @@ claude-api-key:
                 base_url="https://a.example.com" + ("/v1" if "codex" in sec else ""),
                 api_key="kA",
                 models=["claude-opus-5" if "claude" in sec else "gpt-5.6-sol"],
-                priority=500, model_source=source)
+                priority=500, model_source=source,
+                probe_usable=source == "probed",
+                verified_models=(["claude-opus-5" if "claude" in sec else "gpt-5.6-sol"]
+                                 if source == "probed" else []))
         return p
 
-    for src in ("probed", "manual", "catalog"):
+    for src in ("probed",):
         p = mk(src)
         blocked = cp.mark_new_sections(cfg, [p])
         cx = p.sections["codex-api-key"]
@@ -5357,6 +5386,11 @@ claude-api-key:
             f"{src} 有依据却被拦下：{cx.write_blocked}")
         # 已占有的段不该被标成新增
         assert not p.sections["claude-api-key"].new_section
+
+    for src in ("manual", "catalog"):
+        unverified = mk(src)
+        assert cp.mark_new_sections(cfg, [unverified]) == 1, src
+        assert not unverified.sections["codex-api-key"].writable, src
 
     p = mk("seed")
     blocked = cp.mark_new_sections(cfg, [p])
@@ -5375,25 +5409,26 @@ claude-api-key:
     cp.mark_new_sections(cfg, [p])
     assert p.sections["codex-api-key"].write_blocked == before
 
-    # 手填之后同一个方案要放行：server 把 overrides["models"] 记成 manual，
-    # 再调一次这个函数就该解锁。
+    # 改来源标签不能洗掉未实测状态；重新实测生成新方案才可放行。
     p.sections["codex-api-key"].model_source = "manual"
-    assert cp.mark_new_sections(cfg, [p]) == 0
-    assert not p.sections["codex-api-key"].write_blocked
-    assert p.sections["codex-api-key"].writable
+    assert cp.mark_new_sections(cfg, [p]) == 1
+    assert p.sections["codex-api-key"].write_blocked
+    assert not p.sections["codex-api-key"].writable
+    reprobed = mk("probed")
+    assert cp.mark_new_sections(cfg, [reprobed]) == 0
+    assert reprobed.sections["codex-api-key"].writable
 
-    # 全新凭据（整个 key 都不在 cfg 里）不受这道闸约束 —— 那是增量导入
+    # 全新凭据同样需要逐模型实测证据。
     p2 = ImportPlan(host="b.example.com", masked_key="kB", line_no=2)
     p2.sections["codex-api-key"] = SectionPlan(
         section="codex-api-key", base_url="https://b.example.com/v1",
         api_key="kB", models=["gpt-5.6-sol"], priority=100,
         model_source="seed")
-    assert cp.mark_new_sections(cfg, [p2]) == 0
+    assert cp.mark_new_sections(cfg, [p2]) == 1
     assert not p2.sections["codex-api-key"].new_section
-    assert p2.sections["codex-api-key"].writable
+    assert not p2.sections["codex-api-key"].writable
 
-    print("[OK] New-section gate: probed/manual/catalog 放行、seed 拦下且"
-          "界面三态与落盘一致、手填可解锁、新凭据不受约束")
+    print("[OK] New-section gate: per-model evidence required; UI agrees with writeback")
 
 
 def test_full_redetect_without_new_rows():

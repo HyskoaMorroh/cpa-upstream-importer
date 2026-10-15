@@ -174,10 +174,25 @@ _RULES: list[tuple[str, str, str, set[str] | None]] = [
     #   · 站方自建的拦截页（访问已被拦截 / 安全验证）= WAF 按客户端形态拦，
     #     换 IP 无效（实测带代理仍被拦）。
     #   · CF 的 challenge-platform / cdn-cgi = 边缘按 IP 声誉挑战，换 IP 有效。
-    ("WAF", "站方自建拦截页", r"访问已被拦截|安全验证|人机验证|访问受限", None),
+    ("WAF", "站方自建拦截页", r"访问已被拦截|安全验证|人机验证", None),
+    # cdn-cgi 也承载统计、邮件保护和静态资源；仅目录名不能证明被拦截。
+    # 保留明确挑战端点与 cf-mitigated 标记，避免把普通 404 页永久停站。
     ("IP封", "CF 挑战或边缘拦截",
-     r"challenge-platform|cf-mitigated|cdn-cgi", None),
+     r"challenge-platform|cf-mitigated|cdn-cgi/(?:challenge(?:/|\b)|l/chk_(?:jschl|captcha)\b)", None),
     ("IP封", "CF Attention Required", r"attention required|just a moment", None),
+
+    # 限制范围必须保留：一把凭证或目录端点无权限，不证明整个站点
+    # 禁止编程访问。显式客户端、探针、WAF 和 IP 拒绝先于这些窄匹配；
+    # 不允许一段凭证说明掩盖同一响应中的真实全站拒绝。
+    ("鉴权", "当前凭证访问权限受限",
+     r"(?:密钥|凭证|账号|账户)(?:的)?(?:访问受限|访问权限不足|无权访问)"
+     r"|\b(?:api[ _-]?key|credential|token)\s+(?:access\s+(?:is\s+)?restricted|lacks?\s+permission)\b",
+     {"401", "403"}),
+    ("门禁", "模型目录端点访问权限受限",
+     r"(?:模型目录|模型列表|目录端点)(?:的)?(?:访问受限|访问权限不足|无权访问)"
+     r"|\b(?:models?\s+(?:catalog|endpoint)|model\s+list)\s+(?:access\s+(?:is\s+)?restricted|permission\s+denied)\b",
+     {"401", "403"}),
+    ("WAF", "未限定范围的访问限制", r"访问受限", None),
 
     # ---- 门禁 ----
     ("门禁", "1m 上下文未开通", r"1m\s*上下文|\b1m\b.*context|context.*\b1m\b", {"400", "403"}),
@@ -192,9 +207,21 @@ _RULES: list[tuple[str, str, str, set[str] | None]] = [
      r"|分组不匹配|密钥分组|key.{0,10}分组.{0,10}(?:不|错)", None),
     ("死路", "分组无该模型渠道", MODEL_CHANNEL_BODY, None),
 
+    # 显式无效凭证也可能由兼容网关返回 400；不是未知状态或身份通过。
+    # 放在客户端/WAF/模型分组规则之后，保留更具体的限制证据。
+    ("鉴权", "API key 无效",
+     r"\bapi[ _-]?key\s+(?:is\s+)?not\s+valid\b"
+     r"|\binvalid[ _-]+api[ _-]?key\b|\bapi[ _-]?key[ _-]+invalid\b",
+     {"400", "401", "403"}),
+
     # ---- 临时 ----
     ("临时", "站方负载上限", r"负载已经?达到?上限", None),
 ]
+
+
+_SCOPED_ACCESS_REASONS = frozenset({"当前凭证访问权限受限", "模型目录端点访问权限受限"})
+_SCOPED_ACCESS_PATTERNS = tuple(pattern for _, why, pattern, _ in _RULES
+                                if why in _SCOPED_ACCESS_REASONS)
 
 
 def classify(status: str, body: str) -> tuple[str, str]:
@@ -210,6 +237,14 @@ def classify(status: str, body: str) -> tuple[str, str]:
         if codes is not None and s not in codes:
             continue
         if re.search(pattern, low, re.I):
+            if why in _SCOPED_ACCESS_REASONS:
+                # Remove only the positively identified scoped clauses. A second
+                # unscoped restriction must retain the pre-existing WAF stop.
+                remainder = low
+                for scoped_pattern in _SCOPED_ACCESS_PATTERNS:
+                    remainder = re.sub(scoped_pattern, "", remainder, flags=re.I)
+                if "访问受限" in remainder:
+                    return "WAF", "未限定范围的访问限制"
             return kind, why
 
     # ---- 关键词全不命中，退到状态码 ----

@@ -46,6 +46,7 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -76,6 +77,7 @@ STATIC = os.path.join(HERE, "web")
 # 它跑过 Cloudflare 的 100 秒就变成 524，而用户侧只看到一页 HTML 错误页。
 # 原来这里一个 logging 都没有，慢在哪只能靠猜。
 logger = logging.getLogger("importer.server")
+BOOT_ID = secrets.token_hex(12)
 
 # --------------------------------------------------------------------------
 # 任务状态
@@ -89,6 +91,8 @@ class Job:
         self.id = job_id
         self.rows = rows
         self.opts = opts
+        self.kind = "probe"
+        self.result: dict | None = None  # 只读诊断的完整结果，不是可写探测方案。
         self.events: list[dict] = []
         self.event_cursor = 0
         self.results: list = []
@@ -97,12 +101,15 @@ class Job:
         self.started = time.time()
         self.finished = 0.0
         self.calls = 0
+        self.phase = ""
+        self.phase_message = ""
         self.lock = threading.Lock()
         # 每个工作单元完成的时刻（相对 started 的秒数）。
         self.unit_done: list[float] = []
         # 在飞单元：{站名: 起始时刻}。用来回答「现在卡在谁身上」——
         # 这是操作员真正需要的信息，见 _progress 的说明。
         self.unit_flight: dict[str, float] = {}
+        self.unit_names: dict[str, str] = {}
         # 工作单元总数。普通探测=行数；全量重探=去重后的凭据数，由那条
         # 路径在算出来之后回填（它开始时还不知道会有多少个凭据）。
         self.unit_total: int = len(rows)
@@ -122,8 +129,79 @@ class Job:
     MAX_EVENTS = 6000
     KEEP_HEAD = 200
 
+    # 事件日志里 host 的显示词干（2026-10-13 加）
+    # ------------------------------------------
+    # 与前端 `tag()`（web/app.js）同口径：api.foo.com -> foo，
+    # sub.foo.co.uk -> foo。日志目录是 bind-mount 出去的，完整私有域名
+    # 不该原样落盘；词干足够把不同站区分开来排障。
+    _LOG_HOST_KEYS = ("host", "site", "bare")
+
+    @staticmethod
+    def _log_host(host: str) -> str:
+        parts = str(host or "").split(".")
+        if not parts or not parts[0]:
+            return "-"
+        stem = parts[-3] if len(parts) >= 3 else parts[0]
+        if stem in ("api", "www"):
+            stem = parts[-2] if len(parts) >= 2 else stem
+        return stem[:12]
+
+    # 日志里允许原样带出的字段。白名单而非黑名单：事件载荷由 cpa_probe
+    # 的 53 个 on_event 调用点产生，将来加字段时漏掉一次脱敏判断的代价
+    # 是把凭据或完整域名写进落盘日志，所以宁可少记也不猜。
+    _LOG_SAFE_FIELDS = (
+        "section", "model", "combo", "status", "category", "elapsed_ms",
+        "count", "limit", "untrusted", "result", "name", "rate_pct",
+        "reason", "probe_policy_code", "models", "window", "gap", "was",
+        "source", "sections", "skipped", "endpoint_types", "phase",
+        "attempts", "usable", "ok", "why",
+    )
+
+    def _log_event(self, kind: str, data: dict) -> None:
+        """把事件同步记一条 DEBUG 日志。
+
+        为什么必须有（2026-10-13 本机实测）
+        --------------------------------
+        `emit` 原来只往内存事件表写，日志一个字都不记。于是
+        `IMPORTER_LOG_LEVEL=DEBUG` + `IMPORTER_LOG_TO_FILE=1` 全开时，
+        10 个候选、421 次推理尝试的一整轮探测**落盘只有 1 行**
+        （「异步定档完成：… · 10 个候选」）。每站每段的判定只存在于
+        浏览器的事件流里 —— 浏览器一关、容器一换就没了，而要求第 10 条
+        要的正是「出错时能及时排查」。VPS 上 `docker compose logs
+        upstream-importer` 捞不到任何探测线索，这就是「我说全绿、
+        你那边一堆问题」最难查的一环。
+
+        脱敏：host 走 `_log_host` 只留词干，其余字段按
+        `_LOG_SAFE_FIELDS` 白名单过。凭据本来就不该进事件载荷
+        （cpa_probe 用 `row.masked()`），这里再挡一道。
+        """
+        try:
+            bits = []
+            for key in self._LOG_HOST_KEYS:
+                if data.get(key):
+                    bits.append(self._log_host(data[key]))
+                    break
+            for field in self._LOG_SAFE_FIELDS:
+                if field not in data:
+                    continue
+                value = data[field]
+                if isinstance(value, (list, tuple)):
+                    value = ",".join(str(x) for x in value[:8])
+                text = str(value)
+                if len(text) > 160:
+                    text = text[:157] + "..."
+                bits.append(f"{field}={text}")
+            logger.debug("[%s] %s %s", self.id[:8], kind, " ".join(bits))
+        except Exception:      # noqa: BLE001
+            # 日志绝不能影响探测本身。记不下来就算了，不让它冒上去。
+            pass
+
     def emit(self, kind: str, data: dict) -> None:
+        self._log_event(kind, data)
         with self.lock:
+            if kind == "info" and data.get("phase"):
+                self.phase = data["phase"]
+                self.phase_message = data.get("msg", "")
             self.event_cursor += 1
             self.events.append({"t": round(time.time() - self.started, 1),
                                 "kind": kind, **data, "seq": self.event_cursor})
@@ -157,21 +235,27 @@ class Job:
                     "_trunc": True,
                     "seq": self.event_cursor,
                     "msg": f"（省略 {self.dropped} 条中间事件 —— 事件表上限 "
-                           f"{self.MAX_EVENTS} 条。完整记录在服务端 stderr）",
+                           f"{self.MAX_EVENTS} 条。保留任务开头与最近事件；"
+                           "省略内容无法从本次事件导出恢复）",
                 }] + tail
 
-    def mark_unit_start(self, name: str) -> None:
-        """一个工作单元开始。name 必须是**脱敏**的站名，不能带 api_key。"""
+    def mark_unit_start(self, name: str, *, unit_id: str | None = None) -> None:
+        """一个工作单元开始。name 须脱敏；unit_id 仅用任务内序号，不能带 api_key。"""
         with self.lock:
-            self.unit_flight[name] = time.time() - self.started
+            identity = name if unit_id is None else unit_id
+            self.unit_flight[identity] = time.time() - self.started
+            self.unit_names[identity] = name
 
-    def mark_unit_done(self, name: str | None = None, n: int = 1) -> None:
+    def mark_unit_done(self, name: str | None = None, n: int = 1, *,
+                       unit_id: str | None = None) -> None:
         """记 n 个工作单元完成。两条探测路径都要调，否则那条路没有进度。"""
         now = time.time() - self.started
         with self.lock:
             self.unit_done.extend([now] * n)
-            if name is not None:
-                self.unit_flight.pop(name, None)
+            identity = name if unit_id is None else unit_id
+            if identity is not None:
+                self.unit_flight.pop(identity, None)
+                self.unit_names.pop(identity, None)
 
     # ETA 的最小样本数。少于这个数不给任何秒数 —— 宁可显示「估算中」，
     # 也不给一个必然错的数字：先报 2 分钟后来变 8 分钟会让人做错决定。
@@ -230,7 +314,7 @@ class Job:
         # 在飞最久的那个 —— 判断「是不是卡住了」只需要这一个数字。
         if flight:
             name, t0 = min(flight.items(), key=lambda kv: kv[1])
-            out["slowest_host"] = name
+            out["slowest_host"] = self.unit_names.get(name, name)
             out["slowest_age"] = round(now - t0, 1)
 
         n = len(done)
@@ -274,6 +358,8 @@ class Job:
                 **prog,
                 "id": self.id,
                 "state": self.state,
+                "phase": self.phase if self.state in ("pending", "running") else self.state,
+                "phase_message": self.phase_message if self.state in ("pending", "running") else "",
                 "error": self.error,
                 "calls": self.calls,
                 "elapsed": round((self.finished or time.time()) - self.started, 1),
@@ -367,6 +453,7 @@ class PlanTask:
     def __init__(self, task_id: str, body: dict):
         self.id = task_id
         self.state = "running"      # running | done | error
+        self.start_failed = False  # 未启动的任务不占用完成结果保留窗口。
         self.body = body            # 入参存档，前端轮询时不用重传
         self.result: dict = {}      # 计算完毕后填入，与原 /api/plan 响应体一致
         self.error = ""
@@ -604,7 +691,7 @@ class Store:
 
     @staticmethod
     def _plan_task_busy(task) -> bool:
-        if task is None:
+        if task is None or getattr(task, "start_failed", False):
             return False
         if getattr(task, "state", "") == "running":
             return True
@@ -875,27 +962,26 @@ def _validate_final(preview: str, plans=(), *, cross_section: bool = True) -> tu
         返回 400，前端把错误写进折叠着的 `#bmmsg` —— 用户看到的就是
         「选好选项点执行，根本没反应」。分裂照常作为提示回传，不再阻断。
     """
+    plans = list(plans)
     ok, msg = validate(preview)
     if not ok:
         return ok, msg
     # 空 models 闸（2026-09-18）
     # ------------------------
-    # 在此之前这道闸只查三件事：YAML 合法、priority 是整数、同站档位一致。
-    # **不查 models 是否为空** —— 于是「探测全灭 → 目录读不到 → 清单为空」
-    # 的段只要被勾上（前端 `selected` 自报，落盘侧无质量判据），就照样写进
-    # config.yaml。CPA 拿到 models 为空的条目，每次轮到它必失败，
-    # 而界面上看不出任何异常。这就是用户说的「低次品写进 config.yaml」。
-    #
-    # 端到端验证里早有同样的判据（`if not sp.writable or not sp.models`），
-    # 但那是**写盘之后**的抽验，拦不住写入本身。
-    empty = [sp for sp in plans
-             if getattr(sp, "writable", False) and not getattr(sp, "models", None)]
+    # 调用方传入的是已选段组成的 Plan，而不是 SectionPlan。渲染器会跳过
+    # 不可写段；这里必须明确拒绝已选但无模型的段，避免静默漏写却返回 valid。
+    # writable 自身要求 models 非空，不能用它作为空模型检查的前提。
+    # 只检查本次选择，保留配置中的既有条目仍由各自的兼容性规则处理。
+    selected_sections = [sp for plan in plans
+                         for sp in (plan.sections.values()
+                                    if hasattr(plan, "sections") else (plan,))]
+    empty = [sp for sp in selected_sections if not getattr(sp, "models", None)]
     if empty:
         names = "、".join(
             f"{cp.host_of(str(getattr(sp, 'base_url', '')))}/{getattr(sp, 'section', '?')}"
             for sp in empty[:3])
         more = f" 等 {len(empty)} 条" if len(empty) > 3 else ""
-        return False, (f"这些段没有任何模型，写进去 CPA 每次轮到都会失败：{names}{more}"
+        return False, (f"这些已选段没有任何模型，无法生成完整写回方案：{names}{more}"
                        f" —— 请先取消勾选，或在「模型」列手工填入站方支持的模型名")
     issues = cp.priority_split_within_host(list(plans))
     import yaml
@@ -1061,6 +1147,9 @@ def verdict_json(v) -> dict:
         # 站方 /models 目录 —— 判死的段靠它给出可勾选的模型候选，
         # 没有它前端只能让操作员手打模型名（现场反馈的主要摩擦点）
         "catalog": list(getattr(v, "catalog", None) or []),
+        "model_scan_candidates": list(getattr(v, "model_scan_candidates", None) or []),
+        "model_scan_pending": list(getattr(v, "model_scan_pending", None) or []),
+        "model_scan_pending_reason": getattr(v, "model_scan_pending_reason", ""),
         "need_proxy": v.need_proxy,
         "min_headers": v.min_headers,
         # 请求指纹：通过时用的画像档名，以及该档是否需要请求体补丁。
@@ -1145,6 +1234,9 @@ def plan_json(p) -> dict:
                 "evidence_tier": sp.evidence_tier,
                 "family_attested": sp.family_attested,
                 "highest_models": list(getattr(sp, "highest_models", None) or []),
+                "verified_models": list(getattr(sp, "verified_models", None) or []),
+                "model_rebuild": bool(getattr(sp, "model_rebuild", False)),
+                "model_scan_pending": list(getattr(sp, "model_scan_pending", None) or []),
                 "model_provenance": dict(getattr(sp, "model_provenance", None) or {}),
                 "cloak_mode": getattr(sp, "cloak_mode", ""),
                 "fingerprint_profile": getattr(sp, "fingerprint_profile", ""),
@@ -1372,11 +1464,18 @@ def _clamp(opts: dict, name: str, default):
     返回类型跟 default 走（int 默认给 int，float 默认给 float）——
     `Prober(gap=...)` 与 `workers=...` 对类型敏感。
 
+    `default=None` 表示「这个参数没有服务端默认值，交给下游自己决定」：
+    缺失或类型错时原样返回 None，而不是硬塞一个数。`gap` 用它来区分
+    「前端留空 → Prober 走自适应起点」与「前端填 0 → 操作员要求零间隔」
+    （2026-10-13 加；前者过去被压成 0，等于悄悄禁用自适应）。
+
     静默钳制而不是报 400：这些参数多半来自前端的滑块与输入框，用户手打一个
     大数字时更希望「按上限跑」而不是「整个请求失败」。真正的攻击者也一样被
     压到上限，目的达到了。钳过就在事件流里说一句，不静默。
     """
     lo, hi = _LIMITS[name]
+    if name not in opts and default is None:
+        return None
     raw = opts.get(name, default)
     try:
         val = float(raw)
@@ -1473,6 +1572,24 @@ def _emit_opt_notices(job: Job) -> None:
         job.emit("info", {"msg": str(trunc)})
 
 
+def _create_prober_for_job(job: Job | None, **kwargs):
+    """Expose constructor waits through the existing task stream, without extra probes."""
+    if job is None:
+        return Prober(**kwargs)
+    job.emit("info", {"phase": "initializing",
+                      "msg": "正在初始化探测器与源身份快照…"})
+    try:
+        prober = Prober(**kwargs)
+    except Exception:
+        message = "探测器初始化失败，未开始候选探测"
+        job.emit("info", {"phase": "initialization-failed", "msg": message})
+        # Constructor exceptions can contain remote URLs or authentication values.
+        raise RuntimeError(message) from None
+    job.emit("info", {"phase": "probing",
+                      "msg": "探测器初始化结束，开始探测（不代表源身份已核验通过）"})
+    return prober
+
+
 def run_job(job: Job, cfg_path: str) -> None:
     job.state = "running"
     try:
@@ -1480,10 +1597,11 @@ def run_job(job: Job, cfg_path: str) -> None:
         import yaml
         with open(cfg_path, encoding="utf-8") as stream:
             cfg = yaml.safe_load(stream) or {}
-        prober = Prober(
+        prober = _create_prober_for_job(job,
             cfg_snapshot=cfg,
             proxy=_resolve_proxy(str(job.opts.get("proxy") or "")),
-            gap=_clamp(job.opts, "gap", 1.5),
+            # gap=None（前端留空）走 Prober 的自适应起点；填了数字即地板。
+            gap=_clamp(job.opts, "gap", None),
             timeout=_clamp(job.opts, "timeout", 120),
             probe_context=bool(job.opts.get("probe_context", True)),
             # 能力开关探测（codex 的 websockets、compat 的
@@ -1498,6 +1616,10 @@ def run_job(job: Job, cfg_path: str) -> None:
             max_model_attempts=_clamp(job.opts, "max_model_attempts", 10),
             reuse_profile_verdict=bool(
                 job.opts.get("reuse_profile_verdict", True)),
+            # 段前置闸（2026-10-09）。手动勾选优先，零额外请求；未勾选时由
+            # 一次目录 GET 判定（section_gate），判不出来就探全部四段。
+            sections_hint=job.opts.get("sections"),
+            prescan_sections=bool(job.opts.get("prescan_sections", True)),
             on_event=job.emit,
         )
 
@@ -1536,19 +1658,32 @@ def run_job(job: Job, cfg_path: str) -> None:
         slots: list = [None] * len(job.rows)
 
         def one(i: int, row) -> None:
-            job.mark_unit_start(row.host)
+            job.mark_unit_start(row.host, unit_id=f"candidate-{i}")
             slots[i] = prober.probe(row)
             with job.lock:
                 # done_rows 是进度显示用的，只数已完成的，与顺序无关
                 job.results = [x for x in slots if x is not None]
             # 锁外调 —— mark_unit_done 自己要拿同一把锁，在锁内调会死锁
-            job.mark_unit_done(row.host)
+            job.mark_unit_done(row.host, unit_id=f"candidate-{i}")
 
         if cand_workers > 1 and len(job.rows) > 1:
+            # 与全量重探一致，按 host 轮流提交。连续的同站凭据会等待
+            # provider 准入，不能让它们先占满 worker，堵住其他站点。
+            # 每条凭据仍独立探测，结果用原始下标回填；不放宽准入保护。
+            host_rows = {}
+            for i, row in enumerate(job.rows):
+                host_rows.setdefault(row.host, deque()).append((i, row))
+            queues = deque(host_rows.values())
+            ordered_rows = []
+            while queues:
+                queue = queues.popleft()
+                ordered_rows.append(queue.popleft())
+                if queue:
+                    queues.append(queue)
             with concurrent.futures.ThreadPoolExecutor(
                     max_workers=cand_workers,
                     thread_name_prefix="probe-cand") as ex:
-                futs = [ex.submit(one, i, r) for i, r in enumerate(job.rows)]
+                futs = [ex.submit(one, i, r) for i, r in ordered_rows]
                 for f in concurrent.futures.as_completed(futs):
                     f.result()      # 让异常冒出去，走下面的 error 分支
         else:
@@ -1692,6 +1827,21 @@ def _clean_override_models(section: str, raw_models: list) -> list[str]:
     return kept
 
 
+def _catalog_public_reason(why: str) -> str:
+    """Expose cache provenance, never remote exception URLs or credentials."""
+    if not why:
+        return ""
+    snapshot = re.search(r"已改用落盘的上次成功名录（(?:\d+ 天前|时间未知)，\d+ 个模型）", why)
+    if snapshot:
+        reason = "远程名录更新失败，" + snapshot.group(0)
+        if "该名录已超过 7 天" in why:
+            reason += "；该名录已超过 7 天，请尽快恢复出网或配置代理"
+        return reason
+    if "后台" in why:
+        return "权威名录正在后台刷新；当前世代信息可能来自上次快照，请稍后刷新名录状态。"
+    return "权威名录暂不可用或更新失败；请检查出网或代理后刷新名录状态。"
+
+
 def _market_top_gen(cfg: dict) -> tuple[dict, dict, str]:
     """各段「当前市面最新」的最高世代。返回 (全局, 逐产品线, 缺失原因)。
 
@@ -1725,7 +1875,7 @@ def _market_top_gen(cfg: dict) -> tuple[dict, dict, str]:
     try:
         remote, why = cp.model_catalog.remote_names_nonblocking()
         if not remote:
-            return {}, {}, (why or "权威名录暂不可用")
+            return {}, {}, _catalog_public_reason(why or "权威名录暂不可用")
         for sec in cp.SECTIONS:
             names, _src = cp.model_catalog.latest_models(
                 sec, cfg=cfg, remote=remote, limit=12)
@@ -1740,7 +1890,7 @@ def _market_top_gen(cfg: dict) -> tuple[dict, dict, str]:
         # 与漂移检测同一条原则（那次它把首屏卡成了白屏）。
         # 但要把原因带出去，否则前端分不清「没数据」与「数据说不落后」。
         return {}, {}, f"世代信号计算失败（{type(e).__name__}）"
-    return out, by_line, ""
+    return out, by_line, _catalog_public_reason(why)
 
 
 def _cpa_runtime_commit(base: str, mgmt: str = "") -> str:
@@ -1913,10 +2063,11 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
         })
 
         # 创建 Prober
-        prober = Prober(
+        prober = _create_prober_for_job(job,
             cfg_snapshot=cfg,
             proxy=_resolve_proxy(str(job.opts.get("proxy") or "")),
-            gap=_clamp(job.opts, "gap", 1.5),
+            # gap=None（前端留空）走 Prober 的自适应起点；填了数字即地板。
+            gap=_clamp(job.opts, "gap", None),
             timeout=_clamp(job.opts, "timeout", 120),
             probe_context=bool(job.opts.get("probe_context", True)),
             # 能力开关探测（codex 的 websockets、compat 的
@@ -1931,6 +2082,11 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
             max_model_attempts=_clamp(job.opts, "max_model_attempts", 10),
             reuse_profile_verdict=bool(
                 job.opts.get("reuse_profile_verdict", True)),
+            # 段前置闸（2026-10-09）。全量重探是这道闸收益最大的路径：
+            # 100+ 站 × 4 段，大半的段在站方目录里根本没有对应协议。
+            # 手动勾选优先；判不出来时仍探全部四段（fail-open）。
+            sections_hint=job.opts.get("sections"),
+            prescan_sections=bool(job.opts.get("prescan_sections", True)),
             on_event=job.emit,
         )
 
@@ -1951,11 +2107,11 @@ def run_job_full_redetect(job: Job, cfg_path: str) -> None:
         def progress_cb(current, total, site, stats):
             # current=0 是占位调用，只记起始不记完成
             if current == 0:
-                job.mark_unit_start(site)
+                job.mark_unit_start(site, unit_id=stats.get("_unit_id"))
                 return
             # 先记完成再发事件 —— snapshot 读的是 unit_done，顺序反了
             # 会让本次事件对应的进度晚一轮才反映出来。
-            job.mark_unit_done(site)
+            job.mark_unit_done(site, unit_id=stats.get("_unit_id"))
             job.emit("progress", {
                 "msg": f"探测进度：{current}/{total}",
                 "current": current,
@@ -2490,28 +2646,34 @@ class Handler(BaseHTTPRequestHandler):
         buf = bytearray()
         while True:
             line = self.rfile.readline(65536)
-            if not line:
-                raise ValueError("chunked 请求体意外结束")
-            # chunk-size 后可跟 `;ext`，取分号前那一段
+            if not line or not line.endswith(b'\r\n'):
+                raise ValueError("chunked 长度行不完整")
             size_txt = line.split(b";", 1)[0].strip()
-            try:
-                size = int(size_txt, 16)
-            except ValueError as e:
-                raise ValueError("chunked 长度字段非法") from e
+            # int(..., 16) 也接受负号、加号、0x 和下划线；这些不是合法帧长度。
+            # 必须在 read(size) 前拒绝，尤其不能让 read(-1) 绕过正文上限。
+            if not re.fullmatch(rb"[0-9a-fA-F]+", size_txt):
+                raise ValueError("chunked 长度字段非法")
+            size = int(size_txt, 16)
             if size == 0:
-                # 读掉 trailer（可能若干行，直到空行）
+                trailer_bytes = 0
                 while True:
-                    t = self.rfile.readline(65536)
-                    if not t or t in (b"\r\n", b"\n"):
+                    trailer = self.rfile.readline(65536)
+                    if not trailer or not trailer.endswith(b'\r\n'):
+                        raise ValueError("chunked trailer 不完整")
+                    trailer_bytes += len(trailer)
+                    if trailer_bytes > self._MAX_BODY:
+                        raise ValueError("chunked trailer 过大")
+                    if trailer == b'\r\n':
                         break
                 break
-            if len(buf) + size > self._MAX_BODY:
+            if size > self._MAX_BODY - len(buf):
                 raise ValueError("请求体过大（上限 8MB）")
             chunk = self.rfile.read(size)
-            if len(chunk) < size:
+            if len(chunk) != size:
                 raise ValueError("chunked 请求体被截断")
             buf += chunk
-            self.rfile.read(2)      # 尾随 CRLF
+            if self.rfile.read(2) != b'\r\n':
+                raise ValueError("chunked 数据帧缺少 CRLF")
         return bytes(buf)
 
     def _body(self) -> dict:
@@ -2617,8 +2779,16 @@ class Handler(BaseHTTPRequestHandler):
         # 带版本号的资源可以长缓存；其余一律 no-store。
         # index.html 自己**永远** no-store —— 它是版本号的载体，缓存了它
         # 就等于缓存了旧版本号，整套版本化失效。
-        versioned = (rel != "index.html"
-                     and "v=" in urllib.parse.urlparse(self.path).query)
+        # 只有版本号**等于当前内容哈希**才算 versioned（2026-10-12 容器实测修）。
+        # 原来只判 `"v=" in query`：`?v=deadbeefdead` 这种根本不存在的版本号
+        # 也拿到 200 + 一年 immutable。后果是任何一层缓存里残留的旧版本号 URL
+        # 都可能把一份陈旧 app.js 钉上一年 —— 与新 index.html 的 JSON 契约
+        # 错配，正是现场「源码里根本不存在的错误字符串」那类问题的来源形态。
+        # 不匹配时仍回当前内容（旧 URL 要能工作），只是降级成 no-store。
+        _q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        _want = (_q.get("v") or [""])[0]
+        versioned = (rel != "index.html" and bool(_want)
+                     and _want == self._asset_version(full))
         self.send_response(200)
         self.send_header("Content-Type", ctype + ("; charset=utf-8" if "text" in ctype or "javascript" in ctype else ""))
         self.send_header("Content-Length", str(len(data)))
@@ -2663,6 +2833,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route.startswith("/static/"):
             self._static(route[len("/static/"):])
+            return
+        # 浏览器会自动请求 /favicon.ico，且**不带 token**。它原来落到下面的
+        # 鉴权分支，于是每次打开页面都在控制台留一条红色 401 ——
+        # 一条永远存在、与功能无关的错误，会让真正的问题极难被发现
+        # （用户报的「一堆错误 / 黑屏」里就有它的份）。
+        #
+        # 回 204 而不是放行去读文件：web/ 下根本没有图标文件，放行只会把 401
+        # 换成 404，控制台照样报错。204 是「这个资源没有内容」的标准答复，
+        # 浏览器不报错也不重试。页面侧另有一道 `<link rel="icon" href="data:,">`
+        # 让它压根不发这个请求 —— 两侧都要，见本文件顶部那段的说明。
+        if route == "/favicon.ico":
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
 
         if not self._authed():
@@ -2766,6 +2950,9 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/bulk-apply":
                 # 批量管理：落盘 + 推送，必须 confirm
                 self._api_bulk_apply(body)
+            elif route == "/api/orphan-settle":
+                # 孤儿在途预留的人工核销：必须带核对依据，不自动放行
+                self._api_orphan_settle(body)
             else:
                 self._json(404, {"error": f"未知路由 {route}"})
         except CapacityError as e:
@@ -2883,6 +3070,53 @@ class Handler(BaseHTTPRequestHandler):
         self._output_context = {"request": getattr(self, "_output_context", {}),
                                 "config": cfg}
         return raw, cfg
+
+    def _api_orphan_settle(self, body: dict) -> None:
+        """人工核销一条孤儿在途预留。
+
+        为什么需要这个接口（2026-10-13 本机实测）
+        --------------------------------------
+        现场：探测 `calls=0`，日志只有
+        `probe_policy_code=orphaned_inflight`，账本里 9 条预留卡在
+        `phase=reserved`，占死 9 个 provider 的 `inflight` —— 而这些
+        provider 的 `stopped` 是**空**（没被判死），照样一个请求都发不出去。
+
+        成因：容器重启（`pull_policy: always` 每次 `up -d` 都重建）→ 任务
+        只在内存 → 在途预留无人结算 → 那 9 条**一条结算凭证都没有**（请求
+        发出后、签名结算前进程被杀）→ `_replay` 无从恢复 → `_is_live` 靠
+        进程内存判活，重启后必然为空 → 永久 `orphaned_inflight`。
+
+        为什么不做自动 TTL 清理：`test_policy_restart_recovery` 的
+        `test_no_evidence_retired_owner_remains_unresolved_without_ttl`
+        刻意钉死「没有 TTL 自愈」（时钟推到 10**12 仍然阻塞）。那道
+        fail-closed 是对的 —— 请求可能真发出去并计了费，自动当作没发生会
+        掩盖真实用量，还可能让同一次请求被重复发送。
+
+        所以这里要求操作员**先核对**原请求到底有没有执行，再把结论如实
+        写进账本：`outcome` 只接受 `executed` / `not-executed`，并且必须
+        附 `note` 说明依据（会落进审计留痕）。没有「跳过核对」的取值。
+        """
+        from cpa_probe.probe_policy import get_policy
+
+        reservation = str(body.get("reservation") or "").strip()
+        outcome = str(body.get("outcome") or "").strip()
+        note = str(body.get("note") or "").strip()
+        if not body.get("confirm"):
+            # 与写回、批量、调优同一道闸：核销会改账本，必须显式确认。
+            self._json(400, {"error": "需要 confirm=true 才执行核销",
+                             "error_code": "confirm_required"})
+            return
+        ok, detail = get_policy().settle_orphan(
+            reservation, outcome=outcome, operator_note=note)
+        if not ok:
+            self._json(400, {"error": detail, "error_code": "orphan_settle_rejected"})
+            return
+        # 审计：谁核的无法从 HTTP 层可靠得知（令牌共享），所以记下结论与依据
+        # 本身 —— 这条日志与账本里的 job_stops.reason 互为印证。
+        logger.warning("孤儿预留人工核销：%s… outcome=%s 依据=%s",
+                       reservation[:12], outcome, note[:120])
+        self._json(200, {"ok": True, "detail": detail,
+                         "orphans": get_policy().orphaned_reservations()})
 
     def _api_routes(self) -> None:
         """既有上游路由清单，按 (段, 网址) 分组 —— 批量管理面板的数据源。
@@ -3082,8 +3316,16 @@ class Handler(BaseHTTPRequestHandler):
             proxy=type(self).drift_proxy or None)
 
         from cpa_probe.probe_policy import get_policy
+        _policy = get_policy()
+        _summary = _policy.summary()
+        # 孤儿在途的**明细**（2026-10-13 加）。原来只给计数，界面能说
+        # 「N 个未结算请求」却说不出是哪些站 —— 而要核对就必须知道。
+        # 只在真有孤儿时查明细：这一步会读结算凭证库，没必要每次都付。
+        if _summary.get("orphaned_inflight_count"):
+            _summary = {**_summary, "orphans": _policy.orphaned_reservations()}
         self._json(200, {
-            "probe_policy": get_policy().summary(),
+            "boot_id": BOOT_ID,
+            "probe_policy": _summary,
             "config_path": type(self).cfg_path,
             "lines": raw.count("\n") + 1,
             "bytes": len(raw.encode("utf-8")),
@@ -3147,16 +3389,83 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, out)
 
     def _api_diag(self, body: dict) -> None:
+        """兼容旧同步诊断；显式 async=True 时创建只读诊断任务。"""
+        _validate_body(body)
+        if "async" in body and not isinstance(body["async"], bool):
+            raise ValueError("async 必须是布尔值")
+        if body.get("async") is not True:
+            self._diag_body(body)
+            return
+        parsed = cp.parse_lines(f"{body.get('url') or ''},{body.get('key') or ''}")
+        if not parsed.valid:
+            why = parsed.invalid[0].error if parsed.invalid else "url 或 key 为空"
+            self._json(400, {"error": f"解析不了：{why}"})
+            return
+        request = copy.deepcopy(body)
+        job = Job(secrets.token_hex(10), [parsed.valid[0]], {"diagnostic": request})
+        job.kind = "diag"
+        STORE.add_job(job)
+        context = {"request": request, "api-keys": [row.api_key for row in job.rows]}
+
+        def failed(exc):
+            try:
+                message = _public_with_context(str(exc), context)
+            except Exception:
+                message = "诊断失败，错误详情无法安全脱敏"
+            with job.lock:
+                job.state = "error"
+                job.error = message
+                job.finished = time.time()
+            logger.error("异步诊断失败 job=%s: %s", job.id, message)
+
+        def run():
+            with job.lock:
+                job.state = "running"
+            worker = copy.copy(self)
+            worker._diagnostic_job = job
+            response = {}
+            def capture(status, data):
+                response.update(status=status, data=data)
+            worker._json = capture
+            try:
+                worker._diag_body({**request, "async": False})
+                status = response.get("status")
+                data = response.get("data")
+                if status is None or not isinstance(data, dict):
+                    raise ValueError("诊断没有返回有效结果")
+                if status >= 400:
+                    raise ValueError(data.get("error") or "诊断失败")
+                safe = _public_with_context(data, {
+                    **context, "output": getattr(worker, "_output_context", {})})
+                with job.lock:
+                    job.result = safe
+                    job.state = "done"
+                    job.finished = time.time()
+            except Exception as exc:
+                failed(exc)
+
+        try:
+            threading.Thread(target=run, daemon=True).start()
+        except Exception as exc:
+            failed(exc)
+            self._json(503, {"error": job.error, "job_id": job.id,
+                             "kind": "diag", "state": "error", "boot_id": BOOT_ID})
+            return
+        self._json(202, {"job_id": job.id, "kind": "diag", "state": job.state,
+                         "boot_id": BOOT_ID, "poll_ms": 2000,
+                         "status_url": f"/api/job/{job.id}"})
+
+    def _diag_body(self, body: dict) -> None:
         """单站诊断：只跑画像梯，回答「这个站要什么头」。
 
         与 /api/probe 的区别是**意图不同**，不是参数不同：
           · /api/probe  为导入服务 —— 探完要生成方案、要写回
           · /api/diag   为排障服务 —— 只回答一个问题，不产生任何可写状态
 
-        所以它不建 Job、不进 STORE、不能被 /api/plan 引用。想导入的话，前端把
+        同步与异步诊断都不能被 /api/plan 引用。想导入的话，前端把
         结果预填回步骤①走正常流水线 —— 诊断与写回之间必须有人工确认这一跳。
 
-        同步返回（不走轮询）；实际请求必须经过站点授权与共享预算。
+        此主体由同步请求或只读诊断任务调用；实际请求仍须经过站点授权与共享预算。
         不能把固定的请求次数认定为安全阈值，策略拒绝时明确返回未实测。
         """
         res = cp.parse_lines(f"{body.get('url') or ''},{body.get('key') or ''}")
@@ -3170,9 +3479,9 @@ class Handler(BaseHTTPRequestHandler):
         secs = [want] if want in cp.SECTIONS else list(cp.SECTIONS)
 
         raw, cfg = self._load_cfg()
-        prober = Prober(
+        prober = _create_prober_for_job(getattr(self, "_diagnostic_job", None),
             proxy=_resolve_proxy(str(body.get("proxy") or "")),
-            gap=_clamp(body, "gap", 0.5),
+            gap=_clamp(body, "gap", None),
             timeout=_clamp(body, "timeout", 60),
             probe_context=False,       # 诊断不探上下文 —— 那是百万字符的大 body
             # 诊断也不探能力开关：它只回答「这个站要什么 header」，
@@ -3334,7 +3643,7 @@ class Handler(BaseHTTPRequestHandler):
             # 模型」是必须让人看见的结论。
             fp = Prober(
                 proxy=_resolve_proxy(str(body.get("proxy") or "")),
-                gap=_clamp(body, "gap", 0.5),
+                gap=_clamp(body, "gap", None),
                 timeout=_clamp(body, "timeout", 60),
                 probe_context=bool(body.get("probe_context", False)),
                 probe_capabilities=bool(
@@ -3428,7 +3737,15 @@ class Handler(BaseHTTPRequestHandler):
             "opts": job.opts,
             "entries": [{"headers": verdict.min_headers} for r in job.results
                         for verdict in r.sections.values()]}
-        if job.state in ("done", "error"):
+        snap["kind"] = getattr(job, "kind", "probe")
+        snap["boot_id"] = BOOT_ID
+        if snap["kind"] == "diag":
+            if job.state == "done" and isinstance(job.result, dict):
+                snap["result"] = job.result
+                snap["done_rows"] = 1
+            self._json(200, snap)
+            return
+        if job.state in ("done", "error", "cancelled"):
             snap["results"] = [
                 {"row": row_json(r.row),
                  "usable_sections": r.usable_sections,
@@ -3564,6 +3881,9 @@ class Handler(BaseHTTPRequestHandler):
         if not job:
             self._json(404, {"error": "任务不存在"})
             return
+        if getattr(job, "kind", "probe") == "diag":
+            self._json(409, {"error": "诊断任务不能直接写回，请通过投喂流程创建探测任务"})
+            return
         if job.state != "done":
             self._json(409, {"error": f"任务状态 {job.state}，还不能定方案"})
             return
@@ -3612,6 +3932,24 @@ class Handler(BaseHTTPRequestHandler):
         # 生产环境：启动异步任务，立即返回 task_id
         task = PlanTask(secrets.token_hex(10), body)
         STORE.add_plan_task(task)
+        error_context = {"config": cfg, "request": body, "opts": job.opts}
+
+        def _fail(exc, *, start_failed=False):
+            try:
+                safe = _public_with_context(
+                    {"error": str(exc), "traceback": traceback.format_exc(limit=8)},
+                    error_context)
+            except Exception:
+                # 脱敏失败也不把原异常或请求上下文输出到日志。
+                safe = {"error": "定档失败，错误详情无法安全脱敏",
+                        "traceback": "定档失败，错误详情无法安全脱敏"}
+            with task.lock:
+                task.state = "error"
+                task.error = safe["error"]
+                task.start_failed = start_failed
+                task.finished = time.time()
+            logger.error("异步定档异常 task=%s: %s", task.id, safe["traceback"])
+
         # 缓存键**不挂在 self 上**（2026-09-18）
         # ------------------------------------
         # 挂在 self 上就会随 keep-alive 活到后续请求里 —— 下一条
@@ -3630,13 +3968,15 @@ class Handler(BaseHTTPRequestHandler):
                             bool(job.opts.get("full_redetect")),
                             len(job.results))
             except Exception as exc:
-                with task.lock:
-                    task.state = "error"
-                    task.error = str(exc)
-                    task.finished = time.time()
-                logger.exception("异步定档异常")
+                _fail(exc)
 
-        threading.Thread(target=_run, daemon=True).start()
+        try:
+            threading.Thread(target=_run, daemon=True).start()
+        except Exception as exc:
+            _fail(exc, start_failed=True)
+            self._json(503, {"error": task.error, "plan_task_id": task.id,
+                             "state": "error"})
+            return
         self._json(202, {"plan_task_id": task.id, "state": "running"})
 
     def _api_plan_status(self, plan_task_id: str) -> None:
@@ -3861,10 +4201,7 @@ class Handler(BaseHTTPRequestHandler):
             preview, warnings = cp.rebuild_config_full(
                 cfg, write_plans, raw.splitlines(keepends=True))
             if blocked_new:
-                warnings.append(
-                    f"{blocked_new} 个 (凭据, 段) 组合原本不在 config.yaml 里，"
-                    f"且模型清单只是工具猜测 —— 界面已标成「不写入」并说明原因。"
-                    f"确知可用的话手填模型清单即可放行")
+                warnings.append(cp.writeback.blocked_plan_warning(list(all_plans.values())))
             # 覆盖之后再查同值：assign_priorities 保证站与站不同，但用户手工
             # 改 priority 是在它之后应用的 —— 改成邻站的值就同层了。同层按
             # weight 轮询是合法配置，但它取消的正是「不同网站不同优先级」，
@@ -4128,9 +4465,7 @@ class Handler(BaseHTTPRequestHandler):
                          + cp.priority_collisions(for_write)
                          # 同网址不同 priority 是阻断级错误，不是「可能是预期结果」
                          + cp.priority_split_within_host(for_write))
-            + ([f"{blocked_new} 个 (凭据, 段) 组合的模型清单只是工具猜测，"
-                f"而这个凭据原本没配那一段 —— 界面已标成「不写入」并说明原因。"
-                f"确知可用的话手填模型清单即可放行"] if blocked_new else []),
+            + ([cp.writeback.blocked_plan_warning(plans)] if blocked_new else []),
         })
 
     def _cpa_password_for(self, body: dict) -> str:
@@ -4175,6 +4510,7 @@ class Handler(BaseHTTPRequestHandler):
         # 实测单次失败耗时：优先用最近一次探测的样本，拿不到就用估值。
         # 两种情况都要在 attempt_why 里说清，别让估值看起来像实测。
         attempt_sec, attempt_why = cp.tuning.FALLBACK_ATTEMPT_SEC, ""
+        timing_evidence_sufficient = False
         with STORE.lock:
             jobs = list(STORE.jobs.values())
         for job in reversed(jobs):
@@ -4183,12 +4519,14 @@ class Handler(BaseHTTPRequestHandler):
             if results:
                 attempt_sec, attempt_why = cp.tuning.attempt_seconds_from_results(
                     results)
+                timing_evidence_sufficient = cp.tuning.retry_timing_evidence_sufficient(results, cfg)
                 break
         if not attempt_why:
             attempt_sec, attempt_why = cp.tuning.attempt_seconds_from_results({})
 
         advices, notes, facts = cp.tuning.advise(
-            cfg, attempt_sec=attempt_sec, attempt_why=attempt_why)
+            cfg, attempt_sec=attempt_sec, attempt_why=attempt_why,
+            timing_evidence_sufficient=timing_evidence_sufficient)
         pending = [a for a in advices if a.changed]
         tuning_id = ""
         diff = ""
@@ -4554,6 +4892,14 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": entry.get("validate_msg", "方案校验不通过"),
                              "error_code": "invalid_plan"})
             return
+        preview = entry.get("preview", entry.get("text"))
+        base_raw = entry.get("base_raw")
+        from cpa_probe.writeback import configuration_semantically_equal
+        if (isinstance(preview, str) and isinstance(base_raw, str) and
+                configuration_semantically_equal(preview, base_raw)):
+            self._json(400, {"error": "方案没有配置变更，请查看各段阻断原因或重新预览",
+                             "error_code": "no_configuration_changes"})
+            return
         try:
             task, created = STORE.claim_apply(entry)
         except CapacityError as e:
@@ -4768,6 +5114,16 @@ def _commit_apply(task, entry, body, cfg_path, cpa_url, mgmt, client_key,
                 task.result["error_code"] = "stale_config"
                 raise ValueError("配置已变化，队列中的旧方案已拒绝；请重新预览")
             preview = entry.get("preview", entry.get("text", ""))
+            from cpa_probe.writeback import configuration_semantically_equal
+            if configuration_semantically_equal(preview, raw):
+                task.result["error_code"] = "no_configuration_changes"
+                raise ValueError("方案没有配置变更，未写盘或重载")
+            from cpa_probe.writeback import validate_model_preview
+            model_ok, model_msg = validate_model_preview(
+                raw, preview, entry.get("plans", []))
+            if not model_ok:
+                task.result["error_code"] = "unverified_model_change"
+                raise ValueError(model_msg)
             # `_start_apply_task` 同时服务 bulk-apply 与 tuning-apply 两条路。
             # 两条路的预览 YAML 都来自用户已确认的 ops/调优方案，不涉及新写的
             # 跨段 priority 分配 —— 写盘那一刻与 bulk-preview 的语义相同，
@@ -4939,7 +5295,14 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
                     "已写盘，但**未触发 CPA 重载** —— " + result["reload_msg"])
                 result["push_msg"] = result["reload_msg"]
 
-        if result.get("reload_ok"):
+        if result.get("reload_ok") and not entry.get("plans"):
+            # 调优和路由批量管理只修改配置参数，没有新增上游验证目标。
+            result["verify_skipped"] = ("本次为配置参数调整，未指定上游验证目标；"
+                                        "写盘与 CPA 重载结果已单独确认，上游可用性未实测。")
+            result["verification_scope"] = "configuration_only"
+            result["verified"] = []
+            result["verify_passed"] = 0
+        elif result.get("reload_ok"):
             # 等 fsnotify 的 debounce 落地再验。
             #
             # 真正让新上游可被选中的是 reloadClients()，而它挂在 fsnotify
@@ -5046,6 +5409,11 @@ def _run_apply_tail(task: "ApplyTask", entry: dict, body: dict,
                 result["verified"] = verified
                 result["verify_failed"] = [v for v in verified if not v["ok"] and not v.get("skipped")]
                 policy_skips = [v for v in verified if v.get("skipped")]
+                # 通过数单独报，不让前端用「总数 − 失败数」倒推 ——
+                # verify_failed 排除了 skipped，那条减法会把未实测算成通过
+                # （2026-10-04 本机实测：22 项全跳过却显示 22/22 通过）。
+                result["verify_passed"] = sum(1 for v in verified if v["ok"])
+                result["verify_skipped_count"] = len(policy_skips)
                 if policy_skips:
                     result["verify_skipped"] = (f"{len(policy_skips)} 项上游未实测：自动网关生成验证已停止。"
                                                 "本次写盘与 CPA 管理重载结果单独报告。")

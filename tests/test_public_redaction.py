@@ -12,9 +12,29 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import server
+from cpa_probe import writeback
 
 
 class PublicRedactionTests(unittest.TestCase):
+    def test_yaml_redaction_preserves_plain_scalars_with_both_safe_loaders(self):
+        secret = "fixture-secret-long-1234567890"
+        source = (f"api-key: {secret}\napi-keys:\n  - {secret}\n"
+                  f'codex-api-key:\n  - api-key: "{secret}"\n')
+        masked = "fixtur...7890"
+        expected = (f"api-key: {masked}\napi-keys:\n  - {masked}\n"
+                    f'codex-api-key:\n  - api-key: "{masked}"\n')
+        loaders = [yaml.SafeLoader]
+        if hasattr(yaml, "CSafeLoader"):
+            loaders.append(yaml.CSafeLoader)
+        for loader in loaders:
+            with self.subTest(loader=loader.__name__), mock.patch.object(
+                    writeback, "_compose_yaml",
+                    side_effect=lambda text: yaml.compose(text, Loader=loader)):
+                result = writeback.redact_yaml_secrets(source)
+                self.assertEqual(result, expected)
+                self.assertNotIn(secret, result)
+                self.assertEqual(yaml.safe_load(result), yaml.safe_load(expected))
+
     def test_batch_output_does_not_serialize_yaml_for_every_metadata_string(self):
         payload = {"items": [{"status": "ok", "model": "fixture-model", "elapsed": i}
                              for i in range(300)]}

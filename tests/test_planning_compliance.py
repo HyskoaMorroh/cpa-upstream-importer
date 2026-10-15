@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cpa_probe import model_catalog as mc
 from cpa_probe import plan as pp
 from cpa_probe.parse import ParsedRow, SECTIONS
-from cpa_probe.pipeline import SectionVerdict
+from cpa_probe.pipeline import Attempt, SectionVerdict
 
 C = "codex-api-key"
 G = "gemini-api-key"
@@ -25,9 +25,20 @@ def verdict(section=C, models=None, catalog=None, **kwargs):
         **kwargs)
 
 
-def build(verdicts, remote, cfg=None, row=None, **kwargs):
+def build(verdicts, remote, cfg=None, row=None, attach_evidence=True, **kwargs):
     row = row or ParsedRow(1, "", "https://site.example/a", "fixture-key")
-    result = SimpleNamespace(sections={v.section: v for v in verdicts})
+    verdicts = copy.deepcopy(verdicts)
+    for v in verdicts:
+        if not attach_evidence:
+            continue
+        base = v.base_url or pp.base_for_section(row.bare, v.section)
+        # Explicit models represent successful probes in these offline fixtures.
+        # Catalog names alone never manufacture credential-local evidence.
+        v.attempts = [Attempt(
+            section=v.section, model=model, combo="baseline", status="200",
+            category="ok", action="accept", elapsed_ms=1, resp_model=model,
+            response_valid=True, successful_base_url=base) for model in v.models]
+    result = SimpleNamespace(row=row, sections={v.section: v for v in verdicts})
     ident = SimpleNamespace(claude_cloak_modes=["always"],
                             claude_fingerprint_profiles=["claude-code-cli"])
     with patch.object(mc, "remote_names", return_value=(remote, "")), \
@@ -35,6 +46,15 @@ def build(verdicts, remote, cfg=None, row=None, **kwargs):
             patch.object(pp, "_fallback_headers",
                          return_value={"originator": "fixture"}):
         return pp.build_plan(row, result, cfg or {}, **kwargs)
+
+
+def test_models_claim_without_successful_attempt_is_not_writable():
+    unproven = build([verdict(models=["gpt-6-astra"])], ["gpt-6-astra"],
+                     attach_evidence=False).sections[C]
+    assert unproven.highest_models == ["gpt-6-astra"]
+    assert not unproven.models and not unproven.writable
+    proven = build([verdict(models=["gpt-6-astra"])], ["gpt-6-astra"]).sections[C]
+    assert proven.models == ["gpt-6-astra"] and proven.writable
 
 
 def test_family_generation_not_suffix_buckets():
@@ -160,8 +180,8 @@ def test_build_probed_peers_and_provenance():
     v = verdict(models=["gpt-5.6"], catalog=["gpt-5.6-local"])
     before = copy.deepcopy(v)
     sp = build([v], ["gpt-5.6", "gpt-5.6-sol"]).sections[C]
-    assert set(sp.models) == {"gpt-5.6", "gpt-5.6-sol", "gpt-5.6-local"}
-    assert set(sp.highest_models) == set(sp.models)
+    assert sp.models == ["gpt-5.6"]
+    assert set(sp.highest_models) == {"gpt-5.6", "gpt-5.6-sol", "gpt-5.6-local"}
     assert sp.model_provenance == {
         "gpt-5.6": "verified", "gpt-5.6-sol": "inferred",
         "gpt-5.6-local": "inferred"}
@@ -210,14 +230,16 @@ def test_failed_and_lower_probe_fill_highest():
     """
     # 情形一：什么也没探到 → 只留目录最高代
     sp = build([verdict(models=[], catalog=["gpt-5.5"])], ["gpt-6", "gpt-6-sol"]).sections[C]
-    assert set(sp.models) == {"gpt-6", "gpt-6-sol"}
+    assert sp.models == []
+    assert set(sp.highest_models) == {"gpt-6", "gpt-6-sol"}
     assert set(sp.model_provenance.values()) == {"inferred"}
     assert not sp.catalog_stale
 
     # 情形二：gpt-5.5 是**实测通过**的 → 它与目录最高代并存
     sp = build([verdict(models=["gpt-5.5"], catalog=["gpt-5.5"])],
                ["gpt-6", "gpt-6-sol"]).sections[C]
-    assert set(sp.models) == {"gpt-5.5", "gpt-6", "gpt-6-sol"}
+    assert sp.models == ["gpt-5.5"]
+    assert set(sp.highest_models) == {"gpt-5.5", "gpt-6", "gpt-6-sol"}
     assert sp.model_provenance["gpt-5.5"] == "verified"
     assert sp.model_provenance["gpt-6"] == "inferred"
 
@@ -236,7 +258,8 @@ def test_proven_generation_exempts_only_its_own_generation():
     assert "gpt-5" not in sp.models, sp.models
     assert "gpt-5.6" in sp.models, sp.models
     # 实测那一代的同代变体照样补齐（用户「同等级系列全勾上」的要求）
-    assert "gpt-5.6-sol" in sp.models, sp.models
+    assert "gpt-5.6-sol" in sp.highest_models, sp.highest_models
+    assert "gpt-5.6-sol" not in sp.models
 
 
 def test_proven_exemption_keeps_verified_names_when_catalog_is_dead():
@@ -249,7 +272,8 @@ def test_proven_exemption_keeps_verified_names_when_catalog_is_dead():
     """
     v = verdict(models=["gpt-5.6"], catalog=["gpt-6"])
     sp = build([v], ["gpt-5.6", "gpt-6"]).sections[C]
-    assert {"gpt-5.6", "gpt-6"} <= set(sp.models), sp.models
+    assert {"gpt-5.6", "gpt-6"} <= set(sp.highest_models), sp.highest_models
+    assert sp.models == ["gpt-5.6"]
     assert sp.model_provenance["gpt-5.6"] == "verified"
 
 
@@ -396,8 +420,12 @@ def test_drop_disabling_lines_handles_both_excluded_shapes():
 def test_catalog_registration_not_probe_budget():
     names = ["gpt-6"] + [f"gpt-6-peer{i}" for i in range(20)]
     sp = build([verdict(catalog=names)], names).sections[C]
-    assert set(sp.models) == set(names)
+    assert set(sp.highest_models) == set(names)
+    assert sp.models == []
     assert all(v == "inferred" for v in sp.model_provenance.values())
+    verified = build([verdict(models=names, catalog=names)], names).sections[C]
+    assert set(verified.models) == set(names)
+    assert set(verified.model_provenance.values()) == {"verified"}
 
 
 def test_prior_lower_models_do_not_override_policy_or_mutate_config():
@@ -411,7 +439,7 @@ def test_prior_lower_models_do_not_override_policy_or_mutate_config():
     for models in (["gpt-5.5", "gpt-6"], []):
         sp = build([verdict(models=models, base_url="https://site.example/a/v1")],
                    ["gpt-6"], cfg, rebuild=True).sections[C]
-        assert sp.models == ["gpt-6"]
+        assert sp.models == (["gpt-6"] if models else ["gpt-5.5", "gpt-6"])
         assert isinstance(sp.models, list)
         assert cfg == before
 
@@ -423,7 +451,10 @@ def test_compat_independent_families_and_custom_names():
     sp = build([verdict(O, names)], names).sections[O]
     assert set(sp.models) == set(names[1::2])
     sp = build([verdict(O, catalog=["grok-4.6", "grok-5"])], []).sections[O]
-    assert sp.models == ["grok-5"]
+    assert sp.highest_models == ["grok-5"]
+    assert sp.models == []
+    verified = build([verdict(O, models=["grok-5"], catalog=["grok-4.6", "grok-5"])], []).sections[O]
+    assert verified.models == ["grok-5"]
 
 
 def test_compat_gemini_also_requires_highest_pro():
@@ -693,7 +724,7 @@ claude-api-key:
   - {api-key: d1, base-url: "https://four.example", priority: 900}
 """)
     advices, notes, _facts = tuning.advise(cfg, attempt_sec=2.0,
-                                          attempt_why="测试固定值")
+                                          attempt_why="测试固定值", timing_evidence_sufficient=True)
     by_key = {a.label: a for a in advices}
     # 顶层池 4 个而预算 3 —— 必须建议抬到 4，且判为 blocker
     assert by_key["max-retry-credentials"].want == 4, by_key["max-retry-credentials"].want
@@ -727,14 +758,13 @@ def test_advice_refuses_to_shrink_budget_when_window_is_too_small():
         "request-retry: 1\nmax-retry-credentials: 40\nmax-retry-interval: 8\n"
         "claude-api-key:\n" + rows)
     advices, notes, _f = tuning.advise(cfg, attempt_sec=2.9,
-                                       attempt_why="测试固定值")
+                                       attempt_why="测试固定值", timing_evidence_sufficient=True)
     joined = " ".join(notes)
     assert "冲突" in joined, notes
-    assert "压顶层池" in joined or "顶层凭据数压" in joined, notes
-    # 给出的那条建议必须说清代价，而不是默默压小
-    adv = next((a for a in advices if a.label == "max-retry-credentials"), None)
-    assert adv is not None and adv.want < 40, adv
-    assert "永远轮不到" in adv.why, adv.why
+    assert "不自动缩减顶层池" in joined, notes
+    # 冲突只诊断，不能在可写建议中截断顶层池或制造零预算。
+    assert not any(a.label in ("max-retry-credentials", "max-retry-interval")
+                   for a in advices)
 if __name__ == "__main__":
     tests = [(n, f) for n, f in list(globals().items()) if n.startswith("test_")]
     failed = 0

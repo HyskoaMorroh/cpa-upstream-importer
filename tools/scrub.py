@@ -34,6 +34,40 @@ import re
 import subprocess
 import sys
 
+
+def _force_utf8_stdout() -> None:
+    """把 stdout/stderr 钉成 UTF-8。**安全闸不能死在打印上。**
+
+    2026-10-11 实测：Windows 控制台默认 GBK（CP936），而第 298 行要打印
+    `⚠`（U+26A0）。于是
+
+        UnicodeEncodeError: 'gbk' codec can't encode character '\\u26a0'
+
+    在 `main()` 里抛出 —— 异常发生在**打印结构性检测结果的那一行**，于是：
+      · 第 2 层（`suspects()`，不依赖 DOMAIN_MAP 完整性的形态兜底）结果永远
+        看不到；
+      · 第 3 层（`tracked_never_scrub()`，在第 306 行调用）**根本执行不到**。
+    进程仍然非 0 退出，所以 CI 的 `set -e` 会拦住；但人在本机跑看到的是一个
+    崩溃栈，不是泄漏报告，而最该看的那两层从来没跑过。这正是「安全闸自己
+    静默降级」—— 比没有闸更坏，因为它看起来像已经检查过了。
+
+    为什么在脚本里改而不是让调用方设 PYTHONIOENCODING：这是一道发布前
+    自检闸，它的正确性不该依赖调用者记得设环境变量（实测经 wrapper 调用时
+    `PYTHONIOENCODING=utf-8` 并未生效）。`errors="replace"` 兜住极端终端，
+    宁可打出替代字符也不能中断检测。
+    """
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            # 终端不支持改编码时继续跑 —— 下面所有输出都另有 ASCII 前缀，
+            # 真正要紧的是**检测与退出码**，不是字形。
+            pass
+
 # 真实域名 -> 代号。顺序要紧：**长的在前**，否则 `cielo.example` 会先被
 # `cielo.example` 匹配掉，导致 `cielo-cpa.example` 里的子域前缀留在原地。
 
@@ -41,7 +75,7 @@ import sys
 #
 # 为什么必须外置：这张表按定义是一份**真实上游域名的明文清单**。原来它
 # 直接写在这里，于是本脚本本身成了仓库里最敏感的一个文件 —— 而它又被
-# 跟踪进了公开仓库。拼接写法（`"exam" + "ple.com"`）只躲得过 grep，
+# 跟踪进了公开仓库。拼接写法（`"foo" + ".invalid"`）只躲得过 grep，
 # 躲不过任何人打开文件看一眼，也躲不过 `python -c "import scrub; print(scrub.DOMAIN_MAP)"`。
 #
 # 现在表在 `tools/scrub-domains.local.py`，由 `.gitignore` 与
@@ -183,14 +217,21 @@ _PUBLIC_OK = re.compile(r"""
 # 而「信号被淹」与「假阴性」的后果一样：没人会逐行看 155 行输出。
 _NOT_A_HOST = re.compile(r"""
     # 文件名（`install.sh`、`app.js`、`healthcheck.sh`）
-      \.(?:sh|py|js|md|txt|ya?ml|json|conf|html|css|toml|service|example)$
+    #
+    # 2026-10-11 修：本行原为 `\.(?:sh|py|…)$`，而调用方用的是
+    # `_NOT_A_HOST.match(host)` —— `match` 从位置 0 锚定，于是这条要求整个
+    # 主机名**以 `.sh` 开头**，永远匹配不上。后果是这条白名单从写下那天起
+    # 一次都没生效：实测 8 个结构性命中里 7 个是 `healthcheck.sh`
+    # `bootstrap-mihomo.sh` 这类脚本文件名。噪音把真漏埋了。
+    # 加上 `[^\s]*` 前缀让它从头可匹配。
+      [^\s]*\.(?:sh|py|js|md|txt|ya?ml|json|conf|html|css|toml|service|example)$
     # 代码里的属性访问（`row.host`、`plan.section`、`logger.info`）
     | ^(?:row|plan|self|opts|cfg|args|req|res|ctx|node|elem|obj|val|key|url
         |api|app|win|doc|msg|err|out|buf|tmp|cur|prev|next|head|tail|body
         |meta|conf|stat|info|warn|debug|trace|fmt|str|int|list|dict|set
         |bool|float|bytes|logger|logging|server|subprocess|json|os|sys|re
         |time|path|host|entry|item|data|section|resp|sect|spec|verdict
-        |base-url|[a-z])\.
+        |base-url|band|tier|cap|row|col|ent|grp|pri|sp|v|r|g|t|[a-z])\.
     # 测试夹具与文档里的**虚构**站名。判据是「一眼看得出是编的」：
     #   · 单字母 / 编号站名（`a.com`、`s1.example.com`、`site1.com`）
     #   · 带角色后缀的（`site-low.com`、`relay-m.example.ai`）
@@ -207,13 +248,26 @@ _NOT_A_HOST = re.compile(r"""
 def suspects() -> dict[str, list[str]]:
     """{可疑主机名: [出现位置]}。形态判据，不依赖 DOMAIN_MAP。
 
-    `NEVER_SCRUB` 里的文件照样扫 —— 本脚本自己那张表按定义含真实域名，
-    而它**在 git 索引里**（2026-09-30 实测：`.gitignore` 列了它但
-    `git ls-files` 仍然有它，ignore 规则对已跟踪文件无效，且已推上公开
-    origin/main）。扫出来才能提醒「这个文件不该被跟踪」。
+    `NEVER_SCRUB` 里的文件**只在它仍被 git 跟踪时**才扫（2026-10-11 收紧）。
+
+    为什么原来无条件扫、现在要加条件
+    ------------------------------
+    那张本地对照表按定义就含真实域名，正确状态是「存在于工作区、不进仓库」。
+    无条件扫它等于每次都报 20 多行**预期之内**的命中，而真正要看的那一两行
+    真漏就埋在里面 —— 本轮实测：24 行输出里只有 1 行是真的
+    （一个测试文件的 docstring 里写了真实站名），其余全是对照表自己。
+    一道没人读得完的闸等于没有闸。
+
+    原来那个意图（提醒「这个文件不该被跟踪」）没有丢：它本来就是第 3 层
+    `tracked_never_scrub()` 的职责，那一层按**文件名**判定，不需要先扫出
+    命中。所以仍被跟踪时这里照样扫（给出具体行号便于处置），
+    没被跟踪时跳过（已经正确排除，报它只是噪音）。
     """
     hits: dict[str, list[str]] = {}
-    for p in targets() + sorted(NEVER_SCRUB):
+    scan = list(targets())
+    still_tracked = set(tracked_never_scrub())
+    scan += [p for p in sorted(NEVER_SCRUB) if p in still_tracked]
+    for p in scan:
         if not os.path.exists(p):
             continue
         try:
@@ -263,6 +317,9 @@ def scrub(text: str) -> tuple[str, int]:
 
 
 def main(argv: list[str]) -> int:
+    # 第一件事：把输出编码钉死。见 `_force_utf8_stdout` —— 不做这一步，
+    # 第 2、3 层检测在 Windows 上永远不会执行。
+    _force_utf8_stdout()
     apply = "--apply" in argv
     if apply and not DOMAIN_MAP and not LABEL_MAP:
         print("未加载本地域名对照表，拒绝 --apply；未修改任何文件。")

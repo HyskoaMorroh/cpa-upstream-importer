@@ -196,6 +196,7 @@ def main() -> int:
     refs = sorted(set(re.findall(r"\$\('#([A-Za-z0-9_-]+)'\)", js)))
     ids = set(re.findall(r'id="([A-Za-z0-9_-]+)"', html))
     ids |= set(re.findall(r'id="([A-Za-z0-9_-]+)"', js))   # JS 动态生成的
+    ids |= set(re.findall(r"\.id\s*=\s*['\"]([A-Za-z0-9_-]+)['\"]", js))
     missing = [r for r in refs if r not in ids]
     truthy(f"引用 {len(refs)} 个 id，全部有定义",
            not missing,
@@ -703,9 +704,10 @@ console.log(JSON.stringify(out));
            io.open(os.path.join(ROOT, "cpa_probe", "plan.py"),
                    encoding="utf-8").read(),
            "界面显示可写而落盘拒收 = 勾了没反馈")
-    truthy("前端按它显示「不写入」", "sp.write_blocked ? '不写入'" in js)
+    truthy("前端按阻止写入和不可写状态显示不可写入",
+           "if (sp.write_blocked || !sp.writable) return {cls: 'p-m', text: '不可写入'};" in js)
     truthy("被拦下的段不进「全勾」",
-           "if (sp.write_blocked) { blocked += 1; return; }" in js,
+           "if (!sectionPickAllowed(sp, sectionPickVerdict(p.line_no, sec))) { blocked += 1; return; }" in js,
            "勾了也写不进，界面上勾着就是在骗人")
     truthy("新增段在行内标出来", "new_section && !sp.write_blocked" in js,
            "它改变的是条目数而不只是某个字段，diff 里不显眼")

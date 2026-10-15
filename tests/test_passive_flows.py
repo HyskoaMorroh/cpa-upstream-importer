@@ -18,6 +18,7 @@ class PassiveFlowTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         env = patch.dict(os.environ, {
+            'IMPORTER_PROBE_MODE': 'passive',
             'IMPORTER_PROBE_POLICY_FILE': str(Path(self.temp.name) / 'no-policy.json'),
             'IMPORTER_BACKUP_DIR': self.temp.name,
             'IMPORTER_PROBE_LEDGER': str(Path(self.temp.name) / 'ledger.sqlite3'),
@@ -92,7 +93,7 @@ class PassiveFlowTests(unittest.TestCase):
         self.assertFalse(verdict.usable)
         self.assertTrue(verdict.probe_policy_code)
 
-    def test_final_websocket_restriction_reaches_the_plan(self):
+    def test_final_websocket_bare_403_job_stop_reaches_the_plan(self):
         from unittest.mock import MagicMock
         from cpa_probe.pipeline import SectionVerdict, CandidateResult
         from cpa_probe import model_catalog
@@ -102,20 +103,22 @@ class PassiveFlowTests(unittest.TestCase):
                                usable=True, models=['gpt-6'], category='可用')
         sock = MagicMock()
         crlf = bytes((13, 10))
+        # A bare 403 stops this job; only explicit restrictions are permanent.
         sock.recv.side_effect = [b'HTTP/1.1 403 Forbidden' + crlf + b'Content-Length: 0' + crlf + crlf]
-        with patch.object(csp, 'cached_identity', return_value=csp.CpaIdentity()),                 patch.object(probe_policy, 'get_policy', return_value=engine),                 patch.object(client, 'get_policy', return_value=engine),                 patch.object(client.socket, 'create_connection', return_value=sock),                 patch.object(client.ssl, 'create_default_context') as tls:
+        with patch.object(csp, 'cached_identity', return_value=csp.CpaIdentity()),                 patch.object(probe_policy, 'get_policy', return_value=engine),                 patch.object(client, 'get_policy', return_value=engine),                 patch.object(client.socket, 'create_connection', return_value=sock) as connect,                 patch.object(client.ssl, 'create_default_context') as tls:
             tls.return_value.wrap_socket.return_value = sock
             prober = Prober(gap=0, timeout=1, workers=1)
             with patch.object(prober, '_stage1', return_value=prior),                     patch.object(prober, '_stage2'), patch.object(prober, '_stage4_swap'),                     patch.object(prober, '_stage4_context'):
                 verdict = prober._full_probe(row, 'codex-api-key')
-            self.assertEqual('provider_stopped', verdict.probe_policy_code)
+            connect.assert_called_once()
+            self.assertEqual('provider_job_stopped', verdict.probe_policy_code)
             result = CandidateResult(row=row)
             result.sections = {sec: SectionVerdict(sec) for sec in cp.SECTIONS}
             result.sections['codex-api-key'] = verdict
             with patch.object(model_catalog, 'remote_names', return_value=(['gpt-6'], '')):
                 plan = cp.build_plan(row, result, {}, bands={}, seen=cp.existing_fingerprints({}), probation=True)
         section = plan.sections['codex-api-key']
-        self.assertEqual('provider_stopped', section.probe_policy_code)
+        self.assertEqual('provider_job_stopped', section.probe_policy_code)
         self.assertFalse(section.recommended)
         self.assertFalse(section.reenable_fields)
 
@@ -140,6 +143,58 @@ class PassiveFlowTests(unittest.TestCase):
         self.assertEqual('skipped_policy', scope['verification_status'])
         self.assertIn('未实测', reason)
         self.assertFalse(scope['target_verified'])
+
+class PassiveModelPreservationTests(unittest.TestCase):
+    """Without probe evidence, an existing model list is the best record we have.
+
+    Rewriting it from市面 guesses silently replaces a list the operator built
+    from earlier real probes. Entries stay usable either way, so the damage is
+    invisible until a request routes to a model the site never offered.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        env = patch.dict(os.environ, {
+            'IMPORTER_PROBE_MODE': 'passive',
+            'IMPORTER_PROBE_POLICY_FILE': str(Path(self.temp.name) / 'absent.json'),
+            'IMPORTER_PROBE_LEDGER': str(Path(self.temp.name) / 'ledger.sqlite3'),
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        probe_policy.reset_policy_cache()
+        self.addCleanup(probe_policy.reset_policy_cache)
+
+    def test_passive_plan_keeps_the_configured_model_list(self):
+        import yaml
+        from cpa_probe.pipeline import SectionVerdict, CandidateResult
+        existing = yaml.safe_load("""
+codex-api-key:
+  - api-key: "synthetic-key"
+    base-url: "https://fixture.invalid/v1"
+    models:
+      - name: "gpt-6-astra"
+        alias: ""
+      - name: "gpt-6-sol"
+        alias: ""
+      - name: "gpt-5.6-terra"
+        alias: ""
+""")
+        row = cp.parse_lines('https://fixture.invalid,synthetic-key', allow_private=True).valid[0]
+        result = CandidateResult(row=row)
+        result.sections = {sec: SectionVerdict(sec) for sec in cp.SECTIONS}
+        for sec, verdict in result.sections.items():
+            verdict.base_url = row.base_for(sec)
+            verdict.category = '未实测'
+            verdict.probe_policy_code = 'passive'
+            verdict.probe_policy_reason = '未授权主动探测'
+        plan = cp.build_plan(row, result, existing, bands={},
+                             seen=cp.existing_fingerprints(existing), probation=True)
+        section = plan.sections['codex-api-key']
+        self.assertEqual(['gpt-6-astra', 'gpt-6-sol', 'gpt-5.6-terra'], section.models,
+                         'a passive plan must carry the configured list through unchanged')
+        self.assertEqual('prior', section.model_source)
+
 
 class PublicDefaultsTests(unittest.TestCase):
     """Shipped defaults must not carry one deployment's naming."""

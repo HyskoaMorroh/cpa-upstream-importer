@@ -10,14 +10,13 @@ CPA 的 `max-retry-credentials` 与本项目写的 `priority` 是**耦合**的�
 
 而本项目正是**决定顶层池大小的那一方**（`plan.assign_priorities` 定档、
 `writeback` 落盘）。人工核对必然漏：档位每次重探都可能变，注释不会自己更新。
-两个方向的漏都有确定后果，且互相矛盾 —— 这就是必须算而不是猜的原因：
+两个方向都存在风险，因此需要结合实测样本复核：
 
-  · 预算 **<** 顶层池 —— 有可用凭据却没机会试。预算耗尽后 CPA
+  · 正数预算 **<** 顶层池 —— 可能有可用凭据却没机会试。预算耗尽后 CPA
     `return lastErr` 原样透传（conductor_execution.go:325-330），
-    客户端看到最后那个上游的 403。用户明确要求「挂机时绝不该看到 403」。
-  · 预算 **>** 能在窗口内跑完的次数 —— 反向代理（Cloudflare 免费/Pro 的
-    源站读超时 120 秒，不可调）先掐断，客户端拿 524
-    `origin_response_timeout`，而 CPA 其实还在正常重试。
+    可能透传最后的上游错误。扩大预算不保证消除上游错误。
+  · 预算 **>** 按样本估算能在窗口内跑完的次数 —— 存在反向代理先超时的
+    风险；是否出现 524 等错误，取决于实际入口和请求耗时。
 
 `CPA配置修改需求.md` 建议把 `max-retry-credentials` 从 12 压到 4。那份建议的
 算术有一处**关键错误**，照做会直接制造上面第一种后果：
@@ -28,7 +27,7 @@ CPA 的 `max-retry-credentials` 与本项目写的 `priority` 是**耦合**的�
     当前 `request-retry: 1` → 只有一次轮间等待，退避总量是 8 秒而不是 88 秒。
 
 所以本模块不采纳那两个建议值，改为**从配置实际形态算**：读顶层池的真实
-大小、算最坏静默时长、与窗口比。算得出来的结论才跟得上档位变化。
+大小、估算完整预算静默时长、与窗口比。样本 P90 不是严格最坏上界。
 
 本模块只做计算与建议，不写盘 —— 写盘走 `writeback.global_tuning_diffs`，
 并且与其余写回一样要操作员在界面上确认。
@@ -38,7 +37,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .parse import host_of
+from .parse import host_of, _normalize_url
 
 # 反向代理的源站读超时。Cloudflare 免费/Pro 固定 120 秒且**不可从源站侧延长**
 # —— nginx 的 `proxy_read_timeout 600` 对它无效，那是 CF 边缘自己的计时器。
@@ -147,8 +146,10 @@ def tier_facts(cfg: dict) -> dict[str, TierFacts]:
         rows = [e for e in (cfg.get(section) or [])
                 if isinstance(e, dict) and _in_pool(section, e)]
         facts = TierFacts(section=section)
-        prios = [e.get("priority") for e in rows
-                 if isinstance(e.get("priority"), int)]
+        # 与 build_band 和 CPA 零值一致：省略 priority 的条目属于 0 档。
+        # 显式非法值仍跳过，不得与省略字段混为一谈。
+        prios = [e.get("priority", 0) for e in rows
+                 if isinstance(e.get("priority", 0), int)]
         if not prios:
             out[section] = facts
             continue
@@ -158,7 +159,7 @@ def tier_facts(cfg: dict) -> dict[str, TierFacts]:
         # （selector.go 权重相同时严格按数组序轮转）。
         seq: list[str] = []
         for e in rows:
-            if e.get("priority") != top:
+            if e.get("priority", 0) != top:
                 continue
             host = host_of(str(e.get("base-url") or ""))
             for _key in _entry_credentials(section, e):
@@ -181,7 +182,8 @@ def attempt_seconds_from_results(results) -> tuple[float, str]:
     """从探测结果里取「单次尝试要多久」。返回 (秒, 依据说明)。
 
     用**失败尝试**的耗时而不是全部：预算花在失败上，成功那次直接返回、
-    不消耗后续预算。取 90 分位而不是均值 —— 最坏情况才是与窗口相比的那个数。
+    不消耗后续预算。取 90 分位而不是均值，作为窗口规划的保守样本估计；
+    这不是耗时的严格上界，失败样本本身也不能证明成功容量。
 
     拿不到样本时返回 FALLBACK_ATTEMPT_SEC 并在说明里讲清那是估值。
     """
@@ -202,9 +204,45 @@ def attempt_seconds_from_results(results) -> tuple[float, str]:
     return samples[idx], f"{len(samples)} 次失败尝试的 90 分位"
 
 
+def retry_timing_evidence_sufficient(results, cfg: dict | None = None) -> bool:
+    """每个提供商分段需独立成功及失败耗时，生产入口还检查顶层凭据覆盖。"""
+    covered = set()
+    observed = False
+    for res in (results or {}).values():
+        for section, verdict in (getattr(res, "sections", None) or {}).items():
+            success = failure_timing = False
+            for att in getattr(verdict, "attempts", None) or []:
+                if getattr(att, "ok", False):
+                    success = True
+                elif (getattr(att, "elapsed_ms", 0) or 0) > 0:
+                    failure_timing = True
+            if success and failure_timing:
+                observed = True
+                row = getattr(res, "row", None)
+                endpoint, _ = _normalize_url(str(getattr(row, "bare", "")), allow_private=True)
+                covered.add((section, endpoint,
+                             str(getattr(row, "api_key", ""))))
+            elif getattr(verdict, "attempts", None):
+                return False
+    if cfg is not None:
+        required = set()
+        for section, facts in tier_facts(cfg).items():
+            for entry in cfg.get(section) or []:
+                if (not isinstance(entry, dict) or not _in_pool(section, entry)
+                        or entry.get("priority", 0) != facts.top_priority):
+                    continue
+                endpoint, _ = _normalize_url(str(entry.get("base-url") or ""), allow_private=True)
+                for key in _entry_credentials(section, entry):
+                    if not endpoint:
+                        return False
+                    required.add((section, endpoint, key))
+        return bool(required) and required <= covered
+    return observed
+
+
 def worst_case_seconds(*, budget: int, rounds: int, attempt_sec: float,
                        interval_sec: float) -> float:
-    """最坏静默时长。
+    """按给定单次耗时估算完整预算静默时长（样本 P90 不是严格上界）。
 
     形状（与 config.yaml 原注释算的那一版一致）：
 
@@ -214,11 +252,14 @@ def worst_case_seconds(*, budget: int, rounds: int, attempt_sec: float,
     这正是 `CPA配置修改需求.md` 算错的地方，见模块 docstring。
     """
     rounds = max(1, rounds)
+    if budget <= 0:
+        raise ValueError("CPA unlimited budget requires an explicit credential count")
     return rounds * budget * attempt_sec + (rounds - 1) * max(0.0, interval_sec)
 
 
 def advise(cfg: dict, *, attempt_sec: float | None = None,
            attempt_why: str = "",
+           timing_evidence_sufficient: bool = False,
            edge_window_sec: float = DEFAULT_EDGE_WINDOW_SEC,
            slow_site_margin_sec: float = DEFAULT_SLOW_SITE_MARGIN_SEC
            ) -> tuple[list[Advice], list[str], dict[str, TierFacts]]:
@@ -231,6 +272,7 @@ def advise(cfg: dict, *, attempt_sec: float | None = None,
     out: list[Advice] = []
 
     if attempt_sec is None:
+        timing_evidence_sufficient = False
         attempt_sec, attempt_why = FALLBACK_ATTEMPT_SEC, (
             f"无实测样本，按 {FALLBACK_ATTEMPT_SEC} 秒/次估")
     attempt_sec = max(0.1, float(attempt_sec))
@@ -254,19 +296,22 @@ def advise(cfg: dict, *, attempt_sec: float | None = None,
     usable = edge_window_sec - slow_site_margin_sec - (rounds - 1) * max(0, interval)
     fits = int(usable // (rounds * attempt_sec)) if usable > 0 else 0
 
+    if not timing_evidence_sufficient:
+        notes.append("重试调优证据不足：需要覆盖各顶层凭据及完整上游地址的成功样本和实测失败耗时。"
+                     "全失败或估算耗时只用于诊断，不生成重试预算或等待间隔写入建议")
     if need == 0:
         notes.append("四段都没有可计费凭据，重试预算无从计算 —— 跳过这一项")
     elif need <= fits:
         # 覆盖顶层池且跑得完 —— 这才是两个方向都成立的取值
-        if isinstance(cur_budget, int):
+        # CPA 中 0 表示尝试所有可用凭据，不能当作预算不足或自动改成有限值。
+        if timing_evidence_sufficient and type(cur_budget) is int and cur_budget > 0:
             out.append(Advice(
                 ("max-retry-credentials",), cur_budget, need,
                 f"顶层池最大的是 {driver.section}（{need} 个凭据，"
                 f"档位 {driver.top_priority}）。预算必须 >= 它，否则有可用凭据"
-                f"却没机会试，预算耗尽后 CPA 原样透传最后那个错误"
-                f"（conductor_execution.go:325-330）—— 挂机时客户端就会看到 403。"
+                f"却没机会试；预算耗尽可能返回最后一次上游错误。"
                 f"按{attempt_why}（{attempt_sec:.1f} 秒/次）算，{need} 个凭据"
-                f"最坏静默 {worst_case_seconds(budget=need, rounds=rounds, attempt_sec=attempt_sec, interval_sec=interval):.0f} 秒，"
+                f"按样本估算静默 {worst_case_seconds(budget=need, rounds=rounds, attempt_sec=attempt_sec, interval_sec=interval):.0f} 秒（不是严格上界），"
                 f"在 {edge_window_sec:.0f} 秒窗口内仍留 "
                 f"{edge_window_sec - worst_case_seconds(budget=need, rounds=rounds, attempt_sec=attempt_sec, interval_sec=interval):.0f} 秒余量",
                 "blocker" if cur_budget < need else "warn"))
@@ -277,27 +322,25 @@ def advise(cfg: dict, *, attempt_sec: float | None = None,
             f"⚠ 冲突：{driver.section} 顶层有 {need} 个凭据，而 "
             f"{edge_window_sec:.0f} 秒窗口（扣 {slow_site_margin_sec:.0f} 秒慢站余量"
             f"与 {(rounds - 1) * max(0, interval)} 秒轮间等待）只跑得完 {fits} 个。"
-            f"压预算会让多出来的凭据永远轮不到并透传 403；正确的解法是把"
-            f"该段每站的顶层凭据数压下来（其余降一档），让顶层池 <= {fits}。"
-            f"本项目的批量定档能做这件事 —— 这一项不自动改预算，交给你决定")
-        if isinstance(cur_budget, int) and cur_budget > fits:
-            out.append(Advice(
-                ("max-retry-credentials",), cur_budget, fits,
-                f"仅在你不打算压顶层池时才用这个值：把预算压到窗口跑得完的 "
-                f"{fits} 个，代价是另外 {need - fits} 个顶层凭据永远轮不到",
-                "warn"))
+            f"压预算可能使尚可用的凭据无法被尝试。"
+            f"需要复核上游实测耗时、重试轮数及入口窗口；"
+            f"不自动缩减顶层池，也不自动改预算")
+        if fits == 0:
+            notes.append("窗口无法容纳一次完整重试预算；0 在 CPA 中表示不限凭据数，"
+                         "不是零次尝试。保持配置，先核查网络、上游耗时和窗口条件")
 
     # ── ② 轮间等待：留着，但不能吃掉窗口 ──
     #
-    # 为什么不像 .md 说的压到 2：这一项为 0 或过小时，「所有候选都在冷却」
-    # 那一支会直接停止重试并原样透传（conductor_selection.go:977-982），
-    # 而普通 403 会让凭据冷却 30 分钟（conductor_cooldown.go:813-821，
-    # 硬编码不可配）。挂机场景下宁可等几秒也不要透传。
+    # CPA 的 0 表示不等待冷却，仍可能执行 request-retry 允许的不等待轮次。
+    # 不能把间隔改成 0 当成解决凭据尝试总耗时超窗的办法。
     #
     # 上限来自窗口：轮间等待与两轮尝试同时挤在同一个 120 秒里。
-    if isinstance(cur_interval, int) and rounds > 1 and need:
-        budget_for_calc = need if need <= fits else (
-            cur_budget if isinstance(cur_budget, int) else need)
+    if (timing_evidence_sufficient and type(cur_interval) is int
+            and rounds > 1 and need
+            and type(cur_budget) is int and cur_budget > 0
+            and rounds * max(need, cur_budget) * attempt_sec
+                < edge_window_sec - slow_site_margin_sec):
+        budget_for_calc = need if need <= fits else max(need, cur_budget)
         room = (edge_window_sec - slow_site_margin_sec
                 - rounds * budget_for_calc * attempt_sec)
         cap = int(max(0, room) // (rounds - 1))
@@ -306,15 +349,16 @@ def advise(cfg: dict, *, attempt_sec: float | None = None,
                 ("max-retry-interval",), cur_interval, cap,
                 f"两轮尝试要 {rounds * budget_for_calc * attempt_sec:.0f} 秒，"
                 f"加上 {slow_site_margin_sec:.0f} 秒慢站余量，轮间等待最多还能占 "
-                f"{cap} 秒。当前 {cur_interval} 秒会把最坏静默推过 "
-                f"{edge_window_sec:.0f} 秒窗口，客户端拿 524 而不是真实错误码",
+                f"{cap} 秒。按当前样本估算，{cur_interval} 秒等待可能使静默时长超过 "
+                f"{edge_window_sec:.0f} 秒窗口，有入口超时风险；P90 不是严格上界，"
+                f"是否出现 524 取决于实际入口和请求耗时",
                 "blocker"))
-        elif cur_interval <= 0:
+        elif cur_interval <= 0 and cap > 0:
             out.append(Advice(
                 ("max-retry-interval",), cur_interval, min(8, cap),
-                f"为 0 时「所有候选都在冷却」会直接停止重试并原样透传"
-                f"（conductor_selection.go:977-982），而普通 403 冷却 30 分钟。"
-                f"挂机时宁可等几秒也不要把 403 交给客户端；窗口还容得下 {cap} 秒",
+                f"当前不等待凭据冷却；request-retry 仍控制不等待轮次。"
+                f"在当前耗时模型下可增加少量冷却等待，窗口还容得下 {cap} 秒；"
+                f"这不保证上游请求成功，也不保证消除上游错误",
                 "warn"))
 
     # ── ③ 流式引导缓冲：这一项 .md 说得对 ──
@@ -366,10 +410,10 @@ def advise(cfg: dict, *, attempt_sec: float | None = None,
         if f.longest_same_host_run > MAX_SAME_HOST_RUN:
             notes.append(
                 f"⚠ {f.section} 顶层有 {f.longest_same_host_run} 个连续的同站凭据"
-                f"（{f.run_host}）。权重相同时轮询严格按数组顺序"
-                f"（selector.go:539-560），于是一次请求会连打这个站 "
-                f"{f.longest_same_host_run} 次 —— 实测这会触发站方前面 "
-                f"Cloudflare 的速率限制，返回 HTML 挑战页而不是真正的错误。"
+                f"（{f.run_host}）。这是根据当前配置的连续分布识别的风险："
+                f"若下游按数组顺序轮询且连续重试，可能集中请求同一站点。"
+                f"历史排查曾发现此类请求触发速率限制或 HTML 挑战页；"
+                f"本次体检未验证当前下游调度实现，也未实测该站是否触发限制。"
                 f"建议把该站顶层压到 {MAX_SAME_HOST_RUN} 个以内（其余降一档）")
 
     return out, notes, facts

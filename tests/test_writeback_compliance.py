@@ -1,4 +1,5 @@
 """Offline writeback contracts: synthetic YAML, fake HTTP and temporary files."""
+import copy
 import io
 import json
 import os
@@ -19,6 +20,9 @@ from cpa_probe.plan import ImportPlan, SectionPlan
 
 def plan(section="claude-api-key", key="fixture-key-a", base="https://unit.example/A",
          **kwargs):
+    # These fixtures represent successful individual model probes, not labels.
+    kwargs.setdefault("probe_usable", True)
+    kwargs.setdefault("verified_models", ["fixture-model", "old-model"])
     return SectionPlan(section, base, key, models=["fixture-model"],
                        model_source="probed", **kwargs)
 
@@ -243,44 +247,51 @@ claude-api-key: [{api-key: fixture-key-a, base-url: 'https://unit.example/A'}, {
         b = plan("openai-compatibility", key="fixture-key-b", priority=100,
                  headers={"X-Channel": "b"})
         b.models = ["other-model"]
+        b.verified_models = ["other-model", "old-model"]
+        # A verified replacement name cannot authorize removal of an unrelated
+        # existing model. Preserve it before testing the successful merge path.
+        blocked = rebuild(raw, copy.deepcopy(a), copy.deepcopy(b))["openai-compatibility"][0]
+        self.assertEqual(blocked["models"], [{"name": "old-model", "alias": "old-alias"}])
+        a.models.append("old-model")
+        b.models.append("old-model")
         rows = rebuild(raw, a, b)["openai-compatibility"]
-        # 2026-09-20 改契约：同一个 base-url 只写**一条** provider，不再按
-        # headers 差异拆成多条带哈希后缀的 provider（那会把同一个站在 CPA 里
-        # 注册成 N 个独立 provider，冷却 / 模型能力 / 执行路由各走各的）。
-        # 组内各 Key 探到的模型取并集，provider 级字段取 head（priority 最高
-        # 那把）的；没进方案的 Key 原样留在同一条 provider 下。
-        self.assertEqual(len(rows), 1)
-        row = rows[0]
-        self.assertEqual(row["name"], "fixture-provider")
-        by_key = {k["api-key"]: k for k in row["api-key-entries"]}
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(len({r["name"] for r in rows}), 3)
+        by_key = {k["api-key"]: (r, k) for r in rows for k in r["api-key-entries"]}
         self.assertEqual(set(by_key), {a.api_key, b.api_key, "fixture-key-unselected"})
-        self.assertEqual({m["name"] for m in row["models"]}, {"fixture-model", "other-model"})
-        self.assertIs(row["disable-cooling"], False)
-        self.assertEqual(by_key[a.api_key]["weight"], 0)
-        self.assertEqual(by_key[a.api_key]["proxy-url"], "http://proxy.example:8080")
-        self.assertEqual(by_key[b.api_key]["weight"], 2)
-        self.assertEqual(by_key["fixture-key-unselected"]["weight"], 3)
-        self.assertEqual(row["priority"], 100)
-        self.assertIn("custom", row)
+        for sp in (a, b):
+            row, key = by_key[sp.api_key]
+            self.assertEqual({m["name"] for m in row["models"]}, set(sp.models))
+            self.assertEqual(row["headers"], sp.headers)
+            self.assertIn("custom", row)
+        orphan, key = by_key["fixture-key-unselected"]
+        self.assertEqual(orphan["name"], "fixture-provider")
+        self.assertEqual(orphan["models"], [{"name": "old-model", "alias": "old-alias"}])
+        self.assertEqual(key["weight"], 3)
+        self.assertEqual(by_key[a.api_key][1]["weight"], 0)
+        self.assertEqual(by_key[a.api_key][1]["proxy-url"], "http://proxy.example:8080")
+        self.assertEqual(by_key[b.api_key][1]["weight"], 2)
+        self.assertEqual({r["priority"] for r in rows}, {100})
+        self.assertIs(by_key[a.api_key][0]["disable-cooling"], False)
 
     def test_compat_incremental_split_and_weight_zero(self):
         a = plan("openai-compatibility", weight=0, disable_cooling=False)
         b = plan("openai-compatibility", key="fixture-key-b", headers={"X-Channel": "b"})
         b.models = ["other-model"]
+        b.verified_models = ["other-model"]
         plans = [ImportPlan("unit.example", "***", sections={s.section: s}) for s in (a, b)]
         raw = "openai-compatibility: []\n"
         cfg = yaml.safe_load(wb.apply_diffs(raw, wb.build_diffs(raw, plans)))
         rows = cfg["openai-compatibility"]
-        # 2026-09-20 改契约：同 base-url 的 Key 合进同一条 provider（见上一个
-        # 用例的说明）。per-key 的 weight 仍逐把保留，模型取并集。
-        self.assertEqual(len(rows), 1)
-        row = rows[0]
-        by_key = {k["api-key"]: k for k in row["api-key-entries"]}
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len({r["name"] for r in rows}), 2)
+        by_key = {k["api-key"]: (r, k) for r in rows for k in r["api-key-entries"]}
         self.assertEqual(set(by_key), {a.api_key, b.api_key})
-        self.assertEqual(by_key[a.api_key]["weight"], 0)
-        self.assertNotIn("weight", by_key[b.api_key])
-        self.assertIs(row["disable-cooling"], False)
-        self.assertEqual({m["name"] for m in row["models"]}, {"fixture-model", "other-model"})
+        self.assertEqual(by_key[a.api_key][1]["weight"], 0)
+        self.assertNotIn("weight", by_key[b.api_key][1])
+        self.assertIs(by_key[a.api_key][0]["disable-cooling"], False)
+        for sp in (a, b):
+            self.assertEqual({m["name"] for m in by_key[sp.api_key][0]["models"]}, set(sp.models))
 
     def test_multiple_model_aliases_survive(self):
         raw = """claude-api-key:
@@ -335,14 +346,24 @@ openai-compatibility: [{api-key-entries: [{api-key: fixture-compat}]}]
                   'data: {"type":"response.failed"}\n\n')
         for body in bodies:
             with self.subTest(body=body), patch("cpa_probe.client.send", return_value=SimpleNamespace(status="200", body=body)):
-                ok, message = wb.verify_upstream("https://unit.example", "fixture-client", "codex-api-key", "fixture-model")
+                ok, message = wb.verify_upstream("https://unit.example", "fixture-client", "codex-api-key", "fixture-model", scope={"direct_target": True})
                 self.assertFalse(ok)
                 self.assertNotIn("fixture-client", message)
+
+    def test_unbound_gateway_skips_without_sending(self):
+        scope = {}
+        with patch("cpa_probe.client.send") as send:
+            ok, _ = wb.verify_upstream("https://unit.example", "fixture-client",
+                                      "claude-api-key", "fixture-model", scope=scope)
+        self.assertFalse(ok)
+        send.assert_not_called()
+        self.assertEqual(scope["policy_code"], "unbound_gateway")
+        self.assertFalse(scope["target_verified"])
 
     def test_verify_valid_result_is_gateway_scope(self):
         body = json.dumps({"model": "fixture-model", "content": [{"type": "text", "text": "result"}]})
         with patch("cpa_probe.client.send", return_value=SimpleNamespace(status="200", body=body)):
-            ok, message = wb.verify_upstream("https://unit.example", "fixture-client", "claude-api-key", "fixture-model")
+            ok, message = wb.verify_upstream("https://unit.example", "fixture-client", "claude-api-key", "fixture-model", scope={"direct_target": True})
         self.assertTrue(ok)
         self.assertIn("gateway", message)
 
@@ -427,7 +448,7 @@ openai-compatibility: [{api-key-entries: [{api-key: fixture-compat}]}]
     def test_verify_rejects_empty_content_shapes(self):
         for obj in ({"content": [{}]}, {"output": [{}]}, {"candidates": [{"content": {"parts": [{}]}}]}):
             with patch("cpa_probe.client.send", return_value=SimpleNamespace(status="200", body=json.dumps(obj))):
-                self.assertFalse(wb.verify_upstream("https://unit.example", "fixture-client", "claude-api-key", "fixture-model")[0])
+                self.assertFalse(wb.verify_upstream("https://unit.example", "fixture-client", "claude-api-key", "fixture-model", scope={"direct_target": True})[0])
 
     def test_partial_failure_does_not_restore_over_external_content(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -460,11 +481,11 @@ openai-compatibility: [{api-key-entries: [{api-key: fixture-compat}]}]
             version = wb.config_version(str(path))
             wb.write_local(str(path), "a: 2\n", expected_version=version)
             self.assertNotEqual(wb.config_version(str(path)), version)
-        scope = {}
+        scope = {"direct_target": True}
         response = SimpleNamespace(status="200", body='{"content":[{"type":"text","text":"result"}]}')
         with patch("cpa_probe.client.send", return_value=response):
             self.assertTrue(wb.verify_upstream("https://unit.example", "fixture-client", "claude-api-key", "fixture-model", scope=scope)[0])
-        self.assertEqual(scope, {"direct_target": True, "verification_scope": "direct_target", "target_verified": False})
+        self.assertEqual(scope, {"direct_target": True, "verification_scope": "direct_target", "target_verified": False, "model_identity_verified": False})
 
     def test_merge_alias_source_preserves_semantics(self):
         raw = """defaults: &defaults
@@ -484,6 +505,103 @@ claude-api-key:
         b = plan("openai-compatibility", key="fixture-key-b", base="https://unit.example/B")
         rows = rebuild("openai-compatibility: []\n", a, b)["openai-compatibility"]
         self.assertEqual(len({r["name"] for r in rows}), 2)
+
+    def test_split_names_do_not_depend_on_private_fields_and_skip_reserved(self):
+        # 拆组的触发条件必须是**结构性**的：模型集合互不包含。
+        # `models` 是 provider 级字段，CPA 的 OpenAICompatibilityAPIKey 只有
+        # api-key / weight / proxy-url（config_types.go:878-888），没有 per-key
+        # models —— 所以两把 Key 声明不同模型集时只能拆成两条 provider。
+        def generated_names(token):
+            a = plan("openai-compatibility", headers={"Authorization": token})
+            b = plan("openai-compatibility", key="fixture-key-b",
+                     headers={"Authorization": token + "-other"})
+            b.models = ["other-model"]
+            b.verified_models = ["other-model"]
+            raw = """openai-compatibility:
+  - name: compat-group-1
+    base-url: https://retained.example/v1
+    api-key-entries: [{api-key: retained-fixture}]
+    models: [{name: retained-model}]
+"""
+            rows = rebuild(raw, a, b)["openai-compatibility"]
+            return [r["name"] for r in rows if r["base-url"] != "https://retained.example/v1"]
+        first = generated_names("private-header-fixture-one")
+        self.assertEqual(first, generated_names("private-header-fixture-two"))
+        self.assertEqual(first, ["compat-group-2", "compat-group-3"])
+
+    def test_same_models_different_headers_never_split_one_site(self):
+        """headers 差异**不得**拆站 —— 用户第 4、7 条。
+
+        2026-09-20 实测形态：同一站各把 Key 探到的 headers 数量天然不同
+        （有的只有 user-agent 与 x-stainless-lang 两个，有的带完整 16 个
+        stainless 头），模型却完全一样，结果一个站被写成三条 provider、
+        每条一把 Key。同域名多把 Key 是彼此的备份，拆桶后冗余退化成单点。
+
+        2026-10-11 这条形态复发过一次（能力指纹把 headers 也序列化进去了），
+        且只有传真实 config.yaml 时 tests/test_edges.py ⑨⑩ 才会红 ——
+        合成配置里没有「多 Key 的 compat provider」，那两项自己跳过了。
+        所以这条用例用合成配置把同一个不变量直接钉住。
+        """
+        a = plan("openai-compatibility",
+                 headers={"user-agent": "ua-a", "x-stainless-lang": "js"})
+        b = plan("openai-compatibility", key="fixture-key-b",
+                 headers={"user-agent": "ua-b", "x-stainless-arch": "arm64",
+                          "x-stainless-os": "MacOS", "x-stainless-runtime": "node"})
+        rows = rebuild("openai-compatibility: []\n", a, b)["openai-compatibility"]
+        self.assertEqual(len(rows), 1, "同站同模型集不得因 headers 差异拆成多条")
+        keys = {k["api-key"] for k in rows[0]["api-key-entries"]}
+        self.assertEqual(keys, {a.api_key, b.api_key})
+        self.assertNotIn("compat-group", rows[0]["name"])
+
+    def test_capability_split_keeps_one_bucket_and_one_tier(self):
+        """能力真不同就拆 provider —— 但必须仍是**同一个桶、同一档**。
+
+        用户第 7 条禁止的是拆**桶**（同域名多把 Key 是彼此的备份，拆桶后
+        sub2api 只调度最小那个，冗余退化成单点），不是禁止拆 provider 行。
+        桶由 (渠道, 域名) 推导，与 provider 名无关 —— 见 rebuild_config_full
+        里 compat_groups 上方的说明。
+
+        而 `models` 是 provider 级字段：CPA 的 OpenAICompatibilityAPIKey 只有
+        api-key / weight / proxy-url（CLIProxyAPI
+        internal/config/config_types.go:878-888），没有 per-key models。
+        所以两把 Key 声明不同模型集时，**只能**拆成两条 provider —— 不拆就会
+        让其中一把凭空声称支持它没验过的模型。
+
+        这条用例钉的就是「拆行可以、拆桶不行」：拆出来的两条必须
+        base-url 逐字相同、priority 相同。tests/test_edges.py 的 ⑨⑩ 原来钉的是
+        「provider 总数不变」，那是比桶更强的要求，与上面的结构性约束冲突，
+        且只有传真实 config.yaml 才会红 —— 作者没用真实配置跑过。
+        """
+        raw = """openai-compatibility:
+  - name: incumbent-provider
+    base-url: https://unit.example/A
+    priority: 34
+    api-key-entries:
+      - api-key: fixture-key-incumbent
+    models: [{name: old-model}]
+"""
+        fresh = plan("openai-compatibility", key="fixture-key-fresh", priority=34)
+        fresh.models = ["old-model", "fixture-model"]
+        fresh.verified_models = ["old-model", "fixture-model"]
+        rows = rebuild(raw, fresh)["openai-compatibility"]
+        same = [r for r in rows if r["base-url"] == "https://unit.example/A"]
+        self.assertEqual(len(same), 2, "能力不同必须拆成两条 provider")
+        # 桶没被拆：同一个 (渠道, 域名)，base-url 逐字相同。
+        self.assertEqual({r["base-url"] for r in same}, {"https://unit.example/A"})
+        # 同一档：拆行不得制造第二个 priority 层级，否则低档那批退化成主备。
+        self.assertEqual({r["priority"] for r in same}, {34})
+        # 原 provider 保住身份（CPA 按 name 索引冷却与模型能力）。
+        incumbent = next(r for r in same if r["name"] == "incumbent-provider")
+        self.assertEqual([k["api-key"] for k in incumbent["api-key-entries"]],
+                         ["fixture-key-incumbent"])
+        self.assertEqual([m["name"] for m in incumbent["models"]], ["old-model"])
+        # 新 Key 带着自己验过的清单单独成行，名字不含私密字段。
+        fresh_row = next(r for r in same if r["name"] != "incumbent-provider")
+        self.assertEqual({k["api-key"] for k in fresh_row["api-key-entries"]},
+                         {"fixture-key-fresh"})
+        self.assertEqual({m["name"] for m in fresh_row["models"]},
+                         {"old-model", "fixture-model"})
+        self.assertTrue(fresh_row["name"].startswith("compat-group-"))
 
     def test_incremental_split_priorities_align(self):
         a = plan("openai-compatibility", priority=10)
@@ -506,7 +624,7 @@ claude-api-key:
             with self.subTest(section=section, expected=expected), patch(
                     "cpa_probe.client.send", return_value=SimpleNamespace(status="200", body=body)):
                 self.assertEqual(wb.verify_upstream("https://unit.example", "fixture-client",
-                                                   section, "fixture-model")[0], expected)
+                                                   section, "fixture-model", scope={"direct_target": True})[0], expected)
 
     def test_merge_keyword_is_not_the_merge_operator(self):
         self.assertTrue(wb.validate("defaults: &d {x: 1}\nvalue: {<<: *d, merge: ordinary}")[0])
@@ -555,7 +673,7 @@ claude-api-key:
     def test_network_exception_does_not_expose_credential(self):
         with patch("cpa_probe.client.send", side_effect=OSError("fixture-client")):
             ok, message = wb.verify_upstream("https://unit.example", "fixture-client",
-                                             "claude-api-key", "fixture-model")
+                                             "claude-api-key", "fixture-model", scope={"direct_target": True})
         self.assertFalse(ok)
         self.assertNotIn("fixture-client", message)
 

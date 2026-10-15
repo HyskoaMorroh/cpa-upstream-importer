@@ -69,7 +69,7 @@ def fetch_cpa_runtime_health(
     token = os.environ.get("CPA_MANAGEMENT_TOKEN") or management_token
 
     try:
-        logger.info(f"查询 CPA 运行时健康状态: {url}")
+        logger.info("查询 CPA 历史请求统计（不代表调度器健康状态）")
 
         # 构造请求头
         headers = {}
@@ -83,19 +83,35 @@ def fetch_cpa_runtime_health(
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(req, timeout=timeout) as resp:
             if resp.status != 200:
-                logger.warning(f"CPA 管理接口返回错误: {resp.status} - {url}")
+                logger.warning("CPA 管理接口返回错误: %s", resp.status)
                 return None
             raw_data = json.loads(resp.read().decode("utf-8", errors="replace"))
         if not isinstance(raw_data, dict):
             logger.warning(f"CPA 管理接口返回非对象：{type(raw_data).__name__}")
             return None
-        logger.debug(f"收到 CPA 运行时数据，providers: {list(raw_data.keys())}")
+        logger.debug("收到 CPA 历史请求统计，provider 数: %s", len(raw_data))
 
         # 解析为 AuthHealth 对象
         result = {}
         for provider, auths in raw_data.items():
+            if not isinstance(auths, dict):
+                raise ValueError("usage provider must contain credential statistics")
             result[provider] = {}
             for auth_key, stats in auths.items():
+                if not isinstance(stats, dict):
+                    raise ValueError("usage credential statistics must be an object")
+                for field in ("success", "failed"):
+                    value = stats.get(field, 0)
+                    if type(value) is not int or value < 0:
+                        raise ValueError("usage counters must be nonnegative integers")
+                buckets = stats.get("recent_requests", [])
+                if not isinstance(buckets, list) or any(
+                    not isinstance(bucket, dict) or any(
+                        type(bucket.get(field, 0)) is not int or bucket.get(field, 0) < 0
+                        for field in ("success", "failed")
+                    ) for bucket in buckets
+                ):
+                    raise ValueError("usage recent requests must contain valid counters")
                 health = AuthHealth(
                     success=stats.get("success", 0),
                     failed=stats.get("failed", 0),
@@ -111,14 +127,14 @@ def fetch_cpa_runtime_health(
         return result
 
     except urllib.error.HTTPError as e:
-        logger.warning(f"CPA 管理接口返回错误: {e.code} - {url}")
+        logger.warning("CPA 管理接口返回错误: %s", e.code)
         return None
     except urllib.error.URLError as e:
         # 超时也走这里（socket.timeout 被 URLError 包住），reason 里能看出来
-        logger.warning(f"无法连接到 CPA 管理接口: {url} - {e.reason}")
+        logger.warning("无法连接到 CPA 管理接口（%s）", type(e.reason).__name__)
         return None
     except (TimeoutError, OSError) as e:
-        logger.warning(f"CPA 管理接口请求失败: {url} - {e}")
+        logger.warning("CPA 管理接口请求失败（%s）", type(e).__name__)
         return None
     except (ValueError, KeyError, TypeError) as e:
         # JSON 解析失败或结构不符
@@ -132,7 +148,8 @@ def calculate_health_score(
     recent_buckets: List[Dict[str, int]]
 ) -> float:
     """
-    计算健康分数 = 可调度比例×60% + 活跃比例×40%
+    历史请求参考分 = 成功请求比例×60% + 有请求时间桶比例×40%。
+    api-key-usage 不返回 schedulable/status，不能据此声称真实调度健康。
 
     Args:
         success: 成功请求数
@@ -144,11 +161,11 @@ def calculate_health_score(
     """
     total = success + failed
 
-    # 可调度比例 = success / (success + failed)
+    # 历史成功比例不等于当前可调度比例。
     if total == 0:
-        schedulable_ratio = 0.0
+        success_ratio = 0.0
     else:
-        schedulable_ratio = success / total
+        success_ratio = success / total
 
     # 活跃比例 = 最近有请求的桶数 / 总桶数
     if not recent_buckets:
@@ -161,11 +178,11 @@ def calculate_health_score(
         active_ratio = active_count / len(recent_buckets)
 
     # 加权计算
-    health_score = schedulable_ratio * 0.6 + active_ratio * 0.4
+    health_score = success_ratio * 0.6 + active_ratio * 0.4
 
     logger.debug(
         f"健康分数计算: success={success}, failed={failed}, "
-        f"schedulable={schedulable_ratio:.2f}, active={active_ratio:.2f}, "
+        f"historical_success={success_ratio:.2f}, request_activity={active_ratio:.2f}, "
         f"score={health_score:.3f}"
     )
 
@@ -288,6 +305,9 @@ def match_auth_to_plan(
     }
 
     provider = section_to_provider.get(section)
+    # CPA v8.0.16 apiKeyUsageProviderKey 使用 compat_name 作为统计分组。
+    if section == "openai-compatibility":
+        provider = (getattr(plan, "provider_name", "") or "").strip().lower() or provider
     if not provider or provider not in runtime_health:
         return None
 
@@ -360,23 +380,23 @@ def get_domain_health_scores(
                 auth_health = match_auth_to_plan(plan, runtime_health, section)
                 if auth_health:
                     score = auth_health.health_score
-                    logger.debug(f"{domain} - {plan.api_key[:10]}...: 使用运行时分数 {score:.3f}")
+                    logger.debug("使用历史请求参考分 %.3f", score)
                 else:
                     # 回退: 从检测结果预测
                     historical_pri = _extract_historical_priority(cfg, section, plan)
                     score = extract_health_from_detection(plan, historical_pri)
-                    logger.debug(f"{domain} - {plan.api_key[:10]}...: 运行时未匹配，使用检测预测 {score:.3f}")
+                    logger.debug("运行时未匹配，使用检测预测 %.3f", score)
             else:
                 # 回退: 从检测结果预测
                 historical_pri = _extract_historical_priority(cfg, section, plan)
                 score = extract_health_from_detection(plan, historical_pri)
-                logger.debug(f"{domain} - {plan.api_key[:10]}...: 无运行时数据，使用检测预测 {score:.3f}")
+                logger.debug("无运行时数据，使用检测预测 %.3f", score)
 
             scores.append(score)
 
         # 域名健康分数 = 所有 KEY 的平均分
         domain_scores[domain] = sum(scores) / len(scores) if scores else 0.0
-        logger.info(f"域名 {domain} 健康分数: {domain_scores[domain]:.3f} (基于 {len(scores)} 个 KEY)")
+        logger.info("服务商参考分 %.3f（基于 %s 个凭据）", domain_scores[domain], len(scores))
 
     return domain_scores
 

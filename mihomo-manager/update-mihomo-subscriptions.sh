@@ -14,7 +14,7 @@
 #     └─ mihomo/                        mihomo 的配置目录，被容器挂载
 #         ├─ config.template.yaml       模板（进版本库/镜像，私密值一律 ${VAR}）
 #         ├─ config.yaml                实际配置（由模板生成，不进版本库）
-#         ├─ healthcheck.sh / .py       容器健康检查 + 出口降级（mihomo 容器用 .sh）
+#         ├─ healthcheck.sh / .py       只读 API 与代理出口健康检查，不切换出口（mihomo 容器用 .sh）
 #         └─ providers/                 订阅缓存，mihomo 自己写
 #
 # 适用范围（2026-09-27 更正）：本脚本只用于「宿主机目录挂载」式的老部署 ——

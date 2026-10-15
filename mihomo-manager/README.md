@@ -4,7 +4,7 @@
 
 ## 文件说明
 
-- **mihomo-subscriptions.conf**: 订阅配置文件（唯一需要编辑的）
+- **mihomo-subscriptions.conf**: 旧宿主挂载脚本流程使用的订阅配置文件。VPS 镜像部署在共享 `/opt/deploy/.env` 中填写 `MIHOMO_SUB_*`、`MIHOMO_SUBSCRIPTIONS` 和 `MIHOMO_SECRET`，不以此文件作为配置入口。
 - **bootstrap-mihomo.sh**: 由 mihomo-init 容器执行，把模板物化进共享卷
 - **mihomo/config.template.yaml**: 配置模板，全 `${ENV}` 占位符，无凭据
 - **mihomo/healthcheck.sh**: 给 **mihomo 容器**用的健康检查（纯 busybox）
@@ -32,26 +32,42 @@ mihomo-proxy 的 healthcheck 调的就是 `.sh`）。
 
 ### healthcheck.sh 做什么
 
-不只是判活，还会**改选路**：
+健康检查判活，并在代理出口不可用时降级到直连 —— 这个脚本**两个项目共用**
+（`cpa2sub2api` 与本项目），`cpa2sub2api` 依赖其中的可切换出口来绕开按 IP
+拦截的上游站点，所以降级能力不能去掉。
 
-1. 9090 API 有没有响应（没响应 = 进程坏了，退出 1 让 docker 重启）
-2. AUTO 组里有多少节点（节点数不是判据，只用于日志）
-3. 经 7890 真出一次网。通 → 若状态是 `DIRECT` 就切回 `AUTO`，退出 0
-4. 不通 → 调 `PUT /proxies/PROXY {"name":"DIRECT"}` 降级，再探直连；
-   直连通就退出 0（降级不算失败），直连也不通才退出 1
+1. 请求 9090 API 的 `/version`，拿不到 HTTP 状态行即判进程异常，退出非零。
+2. 读 `AUTO` 组的节点数，再经 7890 代理实际访问一次探测地址。节点数大于 0
+   不等于能出网，所以必须真发一次请求。
+3. 代理能出网：若上一轮处于 `DIRECT`，把 `MIHOMO_GROUP`（默认 `PROXY`）切回
+   `AUTO` 并更新状态文件；退出 0。
+4. 代理出不去：把该组切到 `DIRECT` 并记状态，然后试直连。直连可用即退出 0
+   —— 降级本身不算失败，报 `unhealthy` 会让 `depends_on` 的服务连不上，反而
+   放大故障。直连也不通才退出非零。
 
-第 4 步是关键：机场节点全挂时 mihomo **进程本身活得好好的**（端口在听、
-API 有响应、AUTO 组里还列着 59 个节点名），而 CPA 的 `proxy-url` 指着 7890，
-于是所有上游请求走进一个没有可用出口的代理里排队到超时 —— 表面现象是上游
-502/524，真因在这里。光把容器标成 `unhealthy` 解决不了，因为
-`restart: unless-stopped` 对 unhealthy **不重启**，选路也不会变。
+API 存活不代表代理出口可用。经代理那次探测会显式指定代理并清空
+`no_proxy` / `NO_PROXY`，避免绕过规则让直连成功掩盖代理故障。
 
-可调环境变量：`MIHOMO_API_HOST/PORT`、`MIHOMO_PROXY_HOST/PORT`、
-`MIHOMO_SECRET`、`MIHOMO_PROBE_URL`、`MIHOMO_STATE_FILE`、`MIHOMO_GROUP`。
-`MIHOMO_SECRET` 不设时脚本不带 `Authorization` 头 —— 只有 mihomo 侧也没设
-鉴权才切得动组，否则切换会拿到 401（脚本会在日志里报"切换 DIRECT 失败"）。
+<!-- 2026-10-13：本节曾被改写成「只读、不发 PUT、不切换 DIRECT/AUTO」，
+     并声称 MIHOMO_STATE_FILE / MIHOMO_GROUP「不再使用」。那与共用契约矛盾：
+     同一份脚本由共享 compose 的单个 mihomo 容器执行，而 cpa2sub2api 的
+     README 把「可切换的代理出口」写在第一行当核心用途。已按两项目共用的
+     基线恢复，并保留此后新增的 30 秒硬上限与 no_proxy 清除。 -->
 
-手动跑一次（排查用，会真的切组）：
+**对探测任务的影响**：降级把整条代理链路切成直连，此时上游看到的是本机真实
+出口 IP。本项目的「失败时试代理」依赖代理真的在代理，所以探测前应确认组选路
+（`GET /proxies/<组名>` 的 `now` 字段）与状态文件一致；处于 `DIRECT` 时
+`via-proxy` 处置等同直连，不能据此断定「挂代理也不通」。
+
+`restart: unless-stopped` **不会因为 unhealthy 自动重启容器**。
+
+shell 脚本使用系统 `timeout` 或 BusyBox `timeout`，总期限 30 秒，必要时再等待最多 2 秒强制结束，低于 Compose 的 40 秒上限。检查通过 `setsid` 建立独立进程组，结束后清理残留的网络请求子进程；缺少期限或进程组工具时直接失败。Python 脚本使用独立子进程，30 秒超时后终止并回收子进程，覆盖 DNS 阻塞与持续缓慢响应。
+
+shell 可调环境变量：`MIHOMO_API_HOST/PORT`、`MIHOMO_PROXY_HOST/PORT`、`MIHOMO_SECRET`、`MIHOMO_PROBE_URL`、`MIHOMO_STATE_FILE`（默认 `/tmp/mihomo-egress-state`）、`MIHOMO_GROUP`（默认 `PROXY`，即要切换的组名）。Python 对应使用完整 URL：`MIHOMO_API` 与 `MIHOMO_PROXY`，其余变量相同。`MIHOMO_SECRET` 必须与 mihomo API 鉴权一致；不配置时不发送 Authorization，此时同网络内任何容器都能切换出口，共享部署务必配置。API 密钥不会转发至出网探测地址。
+
+bootstrap 启动时会刷新挂载目录中的两份检查脚本。更新镜像后应重建 bootstrap 与代理服务，确保持久卷没有继续运行旧脚本。
+
+手动执行只读检查：
 
 ```bash
 docker compose exec mihomo sh /root/.config/mihomo/healthcheck.sh; echo rc=$?
@@ -99,14 +115,22 @@ VPS 只拉镜像，宿主上不放 mihomo 配置文件。mihomo 二进制、地�
 ### VPS 更换订阅
 
 1. 改 `/opt/deploy/.env` 里的 `MIHOMO_SUB_*` 或 `MIHOMO_SUBSCRIPTIONS`。
-2. 重跑 init，再重启代理：
+2. 重跑 init，先检查它成功退出，再更新代理：
 
    ```bash
    cd /opt/deploy
    docker compose up -d --force-recreate mihomo-init
-   docker compose logs mihomo-init        # 应看到「订阅或 MIHOMO_SECRET 已变化，按新订阅重建」
-   docker compose restart mihomo
+   docker compose logs mihomo-init        # 确认自举完成，无初始化错误
+   docker compose ps -a mihomo-init       # 确认退出码为 0
    ```
+
+   初始化失败时先修复错误，不要继续更新代理。确认成功后，如果仅更换订阅，执行 `docker compose restart mihomo`。如果同时修改了 `MIHOMO_SECRET`，或更新了镜像、健康检查脚本，则执行：
+
+   ```bash
+   docker compose up -d --force-recreate mihomo
+   ```
+
+   只重启旧容器不会重新读取 `.env` 中的密钥；当前健康检查从容器环境读取 `MIHOMO_SECRET`，必须通过重新创建同步。更新镜像前先执行 `docker compose pull mihomo-init mihomo`，再按上述顺序运行 init 和重建代理。这里的 `mihomo` 是共享部署服务名；独立 compose 使用 `mihomo-proxy`。共享代理重建会短暂影响两个项目，应先完成正在运行的探测和写回；保留共享卷，不要删除它。
 
 bootstrap 在卷里记着订阅相关变量（`MIHOMO_SUB_*`、`MIHOMO_SUBSCRIPTIONS`、
 `MIHOMO_SECRET`）的 sha256 指纹（`.bootstrap-fingerprint`，只存哈希）。指纹变了
@@ -118,8 +142,11 @@ bootstrap 在卷里记着订阅相关变量（`MIHOMO_SUB_*`、`MIHOMO_SUBSCRIPT
 
   ```bash
   MIHOMO_FORCE_REBUILD=1 docker compose up -d --force-recreate mihomo-init
-  docker compose restart mihomo
+   docker compose logs mihomo-init
+   docker compose ps -a mihomo-init
   ```
+
+   确认 init 成功退出后，再按上面的规则重启或重新创建代理。
 
   改完就把 `.env` 里的 `MIHOMO_FORCE_REBUILD` 清空。否则之后每次启动都会重建，
   探测结果每次都被冲掉。

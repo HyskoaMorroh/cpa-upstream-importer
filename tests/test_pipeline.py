@@ -11,8 +11,8 @@ Prober 的分支真的走对。
 假上游画像（每个对应一段真实踩过的坑）：
   good      四段全通，/models 目录含需过滤的杂项
   quota     403 + 预扣费额度失败 → 应立即收敛，不再试代理/加头
-  cfguard   基线 403 空正文 → 走代理才 200（验处置优先级：代理先于头）
-  identity  基线 401 → 补 UA 才 200（验 identity_combos 回退）
+  cfguard   基线 403 空正文 → 停止当前服务商，不继续代理回退
+  identity  明确客户端限制 → 停止当前服务商，不尝试身份回退
   swapper   200 但 model 字段被换 → 应判静默换模
   truncator 200 但 input_tokens 远小于发送量 → 上下文上限应按截断反推
   compatonly  只有 compat 段通，其余 404
@@ -28,6 +28,10 @@ import sys
 import threading
 import time
 import urllib.parse
+import tempfile
+from contextlib import contextmanager
+from functools import wraps
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -42,6 +46,28 @@ for _s in (sys.stdout, sys.stderr):
 
 import cpa_probe as cp  # noqa: E402
 from cpa_probe.pipeline import Prober  # noqa: E402
+
+
+@contextmanager
+def loopback_policy():
+    """Real policy, private ledger, explicit loopback-only test authorization."""
+    from cpa_probe.probe_policy import ProbePolicy
+    with tempfile.TemporaryDirectory(prefix="pipeline-policy-") as directory:
+        rule = dict(enabled=True, provider="loopback-fixture", max_requests=100000,
+                    max_requests_per_credential=100000, window_seconds=3600,
+                    min_interval_seconds=0)
+        engine = ProbePolicy({"version": 1, "sites": {"127.0.0.1": rule}},
+                             os.path.join(directory, "ledger.sqlite3"))
+        with patch("cpa_probe.probe_policy.get_policy", return_value=engine):
+            yield engine
+
+
+def isolated_policy(fn):
+    @wraps(fn)
+    def run(*args, **kwargs):
+        with loopback_policy():
+            return fn(*args, **kwargs)
+    return run
 
 _fail: list[str] = []
 _pass = 0
@@ -392,25 +418,9 @@ class ProxyMarkingProber(Prober):
 
 
 
+@isolated_policy
 def test_dead_section_shape_is_cached():
-    """站+段级不通的结论要缓存 —— 否则同主机多 Key 变成 N 次**串行**全量探测。
-
-    2026-09-05 修的 P1。`_shape` 只在 `v.usable` 为真时写入，于是段不通时
-    形态不入缓存 —— 门闩清空、gate 置位、等待的线程醒来，其中一个重新认领
-    又跑一遍完整 `_full_probe`（目录 + 基线 + 整梯画像 + 临时重试）。
-
-    因为门闩存在，这 N 次是**严格串行**的 —— 比没有门闩（至少能并行）更慢。
-    而这是多数情形而非边角：79 凭据实跑里 45 个是 0 段可用。
-
-    实测（5 个 Key 挂同一主机、四段全回 403 门禁）：81 次请求 → 33 次。
-
-    **类别划分是这条修复的关键**：
-      · 站+段级（门禁/WAF/IP封/边缘/死路/时段/客户端/反测活/限频）—— 缓存。
-        这些拒绝取决于请求形态、来源 IP、分组配置或时间，与用哪把 Key 无关
-      · 凭证级（鉴权/余额）—— **不缓存**。那是这把 Key 自己的属性，缓存它
-        会让同站其他 Key 继承别人的欠费结论
-      · 该重试的（临时/未知）—— 不缓存。缓存等于放弃重试
-    """
+    """真实策略接到 403 后停止同站请求，且不伪造其他凭据的实测结果。"""
     import json as _json
     import socket as _socket
     import threading as _threading
@@ -456,121 +466,46 @@ def test_dead_section_shape_is_cached():
             allow_private=True).valid
         eq("5 个 Key 同一主机", len({r.host for r in rows}), 1)
 
-        # ── ① 站+段级失败（门禁）：第 2..N 个 Key 零请求 ──
-        # workers=1（串行）而不是 4（2026-09-18）
-        # ------------------------------------
-        # 这条断言的前提是「第一把 Key 的结论**已经**落进负缓存」。`workers`
-        # 管的是**段间**并发，而 `probe()` 是按 Key 逐个调用的 —— 段间并发
-        # 时第一把 Key 的某一段可能还没出结论，第二把 Key 就已经开始探同一
-        # 段，于是它**合理地**发了一次请求（那时缓存里确实还没有结论）。
-        # 实测：全量套件里负载一高，就出现 got=15（一整把 Key 的四段都抢跑）。
-        #
-        # 这不是负缓存坏了 —— 串行时后 4 把必然零请求，那才是这条要锁的性质。
-        # 并发下「抢跑几把」是调度的函数，钉死为 0 等于在测线程调度。
+        # 明确客户端限制从目录发现阶段停止当前服务商。
         mode["body"] = _json.dumps(
             {"error": {"message": "This group is restricted to Claude Code"}})
         hits.clear()
         pr = _Prober(gap=0.0, timeout=20, probe_context=False, swap_samples=0,
                      probe_capabilities=False, workers=1)
-        results = [pr.probe(r) for r in rows]
+        # 仅重复同一凭据测试负缓存；下方余额测试仍保留不同凭据。
+        # 跨凭据隔离另由 test_probe_evidence_regressions 覆盖。
+        results = [pr.probe(rows[0]) for _ in rows]
         gated = len(hits)
 
-        first_key_calls = results[0].total_calls
-        rest = sum(r.total_calls for r in results[1:])
-        eq("第 1 个 Key 正常探测", bool(first_key_calls > 0), True)
-        # 允许**少量**漏出（2026-09-18）
-        # -----------------------------
-        # 首把 Key 的结论落进 `_dead_shape` 之后，后续 Key 该零请求。但
-        # 全链跑时机器负载高，本地假上游偶发连接失败 —— 那记成 `000`，
-        # 归「未知」类而**不进** `_dead_shape`（见 `_bump_fail_streak`：
-        # `000` 是「没拿到回答」，不构成「站方行为变了」的证据）。于是那把
-        # Key 会重探一次，这是**正确行为**而非负缓存失效。
-        #
-        # 真正要锁的是「负缓存有没有生效」：失效时后 4 把会跑满，合计与首把
-        # 同量级（实测失效形状 got=81，正常形状 got=16~55）。所以判据取
-        # 「漏出的请求数 < 首把 Key 的量」—— 既抓得住失效，又不把偶发连接
-        # 失败判成失败。
-        truthy("后 4 个 Key 基本零请求（负缓存生效）",
-               rest < first_key_calls,
-               f"后 4 把合计 {rest} 次，首把 Key 自己就 {first_key_calls} 次 —— "
-               f"负缓存没生效" if rest >= first_key_calls else "")
-        # 失败时把**实际状态码分布**一起报出来（2026-10-01 加）。
-        # 这条断言偶发失败过多次，而每次只有一个数字，无法判断是负缓存
-        # 真失效、还是本地假上游在高负载下回了 `000`（那会让该 Key 合理
-        # 重探一次，见上面那段）。两者的处置完全相反，所以现场必须带上
-        # 证据，否则下一次又要从头复现。
-        _codes: dict[str, int] = {}
-        for _r in results:
-            for _v in _r.sections.values():
-                for _a in (_v.attempts or []):
-                    _codes[_a.status] = _codes.get(_a.status, 0) + 1
-        truthy("总请求数不随 Key 数线性增长",
-               gated < first_key_calls * 2,
-               f"实测 {gated} 次，首个 Key 自己就 {first_key_calls} 次；"
-               f"状态码分布 {_codes}，逐 Key 请求数 "
-               f"{[r.total_calls for r in results]} —— 若分布里有 000，"
-               f"需结合连接错误与服务端日志判断原因，不能仅凭 000 归因")
-        # 结论要传下去，且说清是复用的
-        #
-        # 同理放宽（2026-09-18）：偶发 `000` 的那把 Key 会真探一次，它拿到的
-        # 类别自然是「未知」而不是复用的「门禁」—— 那是环境的产物。
-        # 判据改成「**至少多数**段走的是复用路径，且没有一把 Key 跑满」，
-        # 这样负缓存真的失效时（全部各自实测）仍然抓得住。
-        _reused = 0
-        _total = 0
-        for r in results[1:]:
-            for sec, v in r.sections.items():
-                _total += 1
-                eq(f"{sec} 复用后仍判不可用", v.usable, False)
-                if v.category == "门禁" and "复用" in (v.action or ""):
-                    _reused += 1
-        truthy("后 4 把多数段走复用路径且说清是复用的",
-               _reused >= _total * 0.75,
-               f"复用 {_reused}/{_total} —— 负缓存没把结论传下去，"
-               f"看起来像这些 Key 也实测过")
+        eq("403 限制仅发出一次目录请求", gated, 1)
+        eq("限制发现后不再发送生成请求", sum(r.total_calls for r in results), 0)
+        eq("限制后所有段不可用", all(not v.usable for r in results for v in r.sections.values()), True)
+        truthy("后续结果明确说明服务商已停止",
+               all(v.probe_policy_code == "provider_stopped" for r in results[1:] for v in r.sections.values()))
 
-        # ── ② 凭证级失败（余额）：**每把 Key 都要各自探** ──
+        # 余额正文仍是 HTTP 403，策略同样阻止换凭据继续请求。
         mode["body"] = _json.dumps(
             {"error": {"message": "insufficient balance, 剩余 $0.00"}})
         hits.clear()
         pr2 = _Prober(gap=0.0, timeout=20, probe_context=False, swap_samples=0,
                       probe_capabilities=False, workers=4)
-        res2 = [pr2.probe(r) for r in rows]
+        with loopback_policy():
+            res2 = [pr2.probe(r) for r in rows]
         per_key = [r.total_calls for r in res2]
         eq("余额类每把 Key 都判不可用",
            all(not v.usable for r in res2 for v in r.sections.values()), True)
-        truthy("余额类不被缓存（每把 Key 各自探）",
-               all(c > 0 for c in per_key),
-               f"各 Key 请求数 {per_key} —— 有 0 说明欠费结论被错误地"
-               f"传给了别的 Key")
+        truthy("403 余额响应停止同站后续凭据",
+               len(hits) == 1 and all(c == 0 for c in per_key),
+               f"各 Key 请求数 {per_key}")
     finally:
         srv.shutdown()
 
-    print(f"[OK] Dead shape: 站+段级失败缓存（5 Key {gated} 次请求，"
-          f"后 4 把零请求）、凭证级不缓存、复用结论说清来源")
+    print("[OK] 403 策略停止：目录证据真实，后续凭据与生成请求均停止")
 
 
+@isolated_policy
 def test_temp_failure_circuit_breaker():
-    """「临时」类连续同码失败要熔断 —— 否则一个挂掉的站吃掉半轮预算。
-
-    2026-09-16 现场量化（173 站、1144 次请求那一轮）：
-      · gorou.example 一个站吃掉 **420 次**请求（15 Key × 4 段 × 每段 7 次），
-        **全部 502，一次成功都没有**。全轮 568 次 502 里 418 次来自它。
-      · zulu.example（站方维护中）84 次全 405，同一形状。
-    两个站合计约占全轮请求的 44%，贡献的信息量却等于 4 段各探一次。
-
-    为什么 `_dead_shape` 接不住：`_HOST_LEVEL_FAIL` 故意排除「临时/未知」，
-    理由是「那两类本该重试」。这对**第一把 Key** 成立，对第 2..N 把不成立
-    —— 重试的价值在「这次不行下次可能行」，不在「换把 Key 问同一个已经
-    连拒 N 次的站+段」。
-
-    代价不只是慢：那轮总耗时 1650 秒，而 `/api/plan` 要在同一个 HTTP 请求里
-    重建整份配置，跑过 Cloudflare 的 100 秒回源窗口就变成 524 —— 现场快照里
-    692 个 priority 框全停在占位符「待定」，正是这么来的。
-
-    判据是**状态码**而不是类别：502 与 429 同归「临时」，但那是两种处境。
-    按码算连续，才能让真在抖的站（502/429 交替）继续享有重试。
-    """
+    """稳定 502 的重复请求收敛；任何 429 都触发真实策略停止。"""
     import socket as _socket          # noqa: F401  （与同文件其余用例同构）
     import threading as _threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -588,29 +523,7 @@ def test_temp_failure_circuit_breaker():
             self.rfile.read(int(self.headers.get("Content-Length", "0")))
             hits.append(self.path)
             if mode["alternate"]:
-                # 真在抖的站：不同**段**给不同码（502 / 429 交替），
-                # 同一个段在整轮里恒定。
-                #
-                # 为什么按段而不是按 Key 序号（2026-09-18 修 CI 连续失败）
-                # --------------------------------------------------------
-                # 熔断计数器 `_fail_streak` 的键是 `(host, section)`，而
-                # `probe()` 是一把 Key 内**四段串行**。原来按 Key 序号取模，
-                # 于是同一把 Key 的四段拿到同一个码之后，下一把 Key 的码
-                # 会给前面段的计数**续上**：
-                #
-                #   Key0(502): 段A=1 段B=1 段C=1 段D=1
-                #   Key1(429): 段A 从 (502,1) 变成 (429,1) —— 重置
-                #   Key2(502): 段A 从 (429,1) 变成 (502,1) —— 又重置
-                #
-                # 看起来永远到不了 3，但四段的探测耗时不同、幂等性与重试
-                # 次数也不同，某些调度下某一段会连续吃到同一个码（例如
-                # 该段比别的段慢半拍、落到下一把 Key 上），于是它的计数
-                # 2→3 触发熔断，后续 Key 一次都不探 —— 断言看到 0。
-                # 这就是 CI 上反复失败、本地重跑又偶尔通过的那条抖动。
-                #
-                # 按段交替后，每个 (host, section) 在整轮里看到的码恒定，
-                # 计数永远停在 1，不可能达到阈值 —— 测试要表达的
-                # 「站方在抖、不该熔断」被确定性地复现，不再依赖调度。
+                # 不同端点返回 502/429；目录的 429 必须立即停止。
                 code = 502 if "gemini" in self.path or "codex" in self.path else 429
             else:
                 code = mode["status"]
@@ -641,7 +554,8 @@ def test_temp_failure_circuit_breaker():
         hits.clear()
         pr = _Prober(gap=0.0, timeout=20, probe_context=False, swap_samples=0,
                      probe_capabilities=False, workers=4)
-        results = [pr.probe(r) for r in rows]
+        # 熔断针对相同凭据和请求上下文的重复尝试，不替其他账号作结论。
+        results = [pr.probe(rows[0]) for _ in rows]
         per_key = [r.total_calls for r in results]
 
         eq("稳定 502 全部判不可用",
@@ -685,26 +599,24 @@ def test_temp_failure_circuit_breaker():
                any("不再重复探测" in a or "复用" in a for a in brk),
                f"实得 {brk!r}")
 
-        # ── ② 502/429 交替：站方真在抖，**不该**熔断 ──
-        # workers=1 保证段串行执行，避免并发段共享同一 (host,section) 熔断
-        # 计数器时出现「某段连续看到相同码」的竞态。交替逻辑本身是对的；
-        # 只是 workers=4 并发时 4 个段的请求交错让熔断误触发（2026-09-17 修）
+        # 502/429 混合画像中，429 优先触发服务商停止。
         mode["alternate"] = True
         hits.clear()
         pr2 = _Prober(gap=0.0, timeout=20, probe_context=False, swap_samples=0,
                       probe_capabilities=False, workers=1)
-        res2 = [pr2.probe(r) for r in rows]
+        with loopback_policy():
+            res2 = [pr2.probe(r) for r in rows]
         per_key2 = [r.total_calls for r in res2]
-        truthy("交替状态码不熔断（每把 Key 各自探）",
-               all(c > 0 for c in per_key2),
-               f"各 Key 请求数 {per_key2} —— 有 0 说明把「在抖」误判成"
-               f"「稳定挂掉」，那会让恢复中的站再也探不到")
+        truthy("交替状态出现429后停止后续凭据",
+               len(hits) == 1 and all(c == 0 for c in per_key2),
+               f"各 Key 请求数 {per_key2}")
     finally:
         srv.shutdown()
 
     print(f"[OK] Circuit breaker: 稳定同码 {_Prober._FAIL_STREAK_LIMIT} 次后熔断"
-          f"（8 Key 合计 {sum(per_key)} 次请求）、交替码不熔断、结论说清来源")
+          f"（8 次重复合计 {sum(per_key)} 次请求）、429 停止后续请求、结论说清来源")
 
+@isolated_policy
 def main() -> int:
     # 端口交给 ThreadingHTTPServer 自己 bind（2026-09-05 修竞态）——
     # 见 tests/test_server.py 的 free_port docstring。
@@ -725,6 +637,7 @@ def main() -> int:
     # 这类「过程可见性」事件确实发出去了 —— 不发就等于用户看不到发生了什么。
     seen_events: list[tuple[str, dict]] = []
 
+    @isolated_policy
     def probe(profile: str, **kw):
         seen_events.clear()
         row = cp.parse_lines(f"{base}/{profile},sk-fake000111222333", allow_private=True).valid[0]
@@ -765,23 +678,20 @@ def main() -> int:
         r = probe("quota")
         eq("无可用段", r.usable_sections, [])
         v = r.sections["claude-api-key"]
-        eq("定性为余额", v.category, "余额")
-        eq("只试一次就收敛", len(v.attempts), 1)
+        eq("目录403后报告策略停止", any(v.probe_policy_code for v in r.sections.values()), True)
+        eq("目录已拒绝，不再进行模型生成", r.total_calls, 0)
         eq("没试代理", [a for a in v.attempts if a.combo == "via-proxy"], [])
         eq("没试补头", [a for a in v.attempts if a.combo.startswith("id:")], [])
 
         # ------------------------------------------------------------------
-        section("cfguard：403 空正文 → 代理救回")
+        section("cfguard：403 空正文 → 当轮停止并冷却")
         r = probe("cfguard")
-        eq("代理救回后四段可用", sorted(r.usable_sections), sorted(cp.SECTIONS))
-        v = r.sections["claude-api-key"]
-        eq("基线判为边缘", v.attempts[0].category, "边缘")
-        eq("需要代理", v.need_proxy, True)
-        eq("代理组合被记录",
-           any(a.combo == "via-proxy" and a.ok for a in v.attempts), True)
-        # 处置优先级：代理必须先于补头
-        combos = [a.combo for a in v.attempts]
-        eq("代理先于补头", combos.index("via-proxy") < len(combos), True)
+        eq("403 不产生可用段", r.usable_sections, [])
+        eq("目录403后不再进行模型生成", r.total_calls, 0)
+        eq("403 后不换代理绕过", any(a.combo.startswith("via-proxy")
+           for v in r.sections.values() for a in v.attempts), False)
+        eq("后续段说明策略停止", any(v.probe_policy_code
+           for v in r.sections.values()), True)
 
         # ------------------------------------------------------------------
         # 一级代理只认「IP封/边缘」，判「临时」的段够不到它；画像梯也救不了
@@ -809,57 +719,16 @@ def main() -> int:
            any(k == "proxy-rescued" for k, _ in seen_events), True)
 
         # ------------------------------------------------------------------
-        section("gatebroke：401 客户端 → 带身份后 402 余额（门票已过、凭据不行）")
-        r = probe("gatebroke")
-        v = r.sections["claude-api-key"]
-        eq("段仍不可用（Key 没钱）", v.usable, False)
-        eq("最终类别是凭据类，不是客户端", v.category, "余额")
-        eq("identity_proven 置位", v.identity_proven, True)
-        eq("记下了被接受的画像档", bool(v.profile_name), True)
-        # 最省档取**梯子里第一个通过的那档**，不写死档名（2026-09-18）：
-        # 假上游的判据是「带任何身份头就放行」，所以新加的 ctx-1m（只带
-        # 1m beta、不带 CLI 形态）就成了最省的那一档。改名或调档序时
-        # 这条断言不该跟着变 —— 它锁的语义是「取最省的」，不是「必须叫
-        # cc-min」。这里改用「该档的 tier 是所有非 baseline 档里最小的」。
-        _ladder = [p for p in cp.profiles.ladder("claude-api-key", None)
-                   if not p.is_baseline]
-        _hit = next((p for p in _ladder if p.name == v.profile_name), None)
-        truthy("最省档：取梯子里 tier 最小的那档（第一档就把 401 推成了 402）",
-               _hit is not None and _hit.tier == min(p.tier for p in _ladder),
-               f"实得 {v.profile_name!r}，梯子前两档="
-               f"{[p.name for p in _ladder[:2]]}")
-        eq("门票头写进 min_headers", bool(v.min_headers), True)
-        truthy("action 说清「身份已被接受、凭据不行」",
-               "已被站方接受" in (v.action or ""), f"实得 {v.action!r}")
-        truthy("发出 profile-gate-passed 事件",
-               any(k == "profile-gate-passed" for k, _ in seen_events), True)
-
-        # ------------------------------------------------------------------
-        section("identity：401 → 补标识头救回")
-        r = probe("identity")
-        eq("补头后可用", sorted(r.usable_sections), sorted(cp.SECTIONS))
-        v = r.sections["codex-api-key"]
-        eq("最终需要头", bool(v.min_headers), True)
-        # 头名按**小写**比较：HTTP 头名大小写不敏感，而画像表统一用小写
-        # （CPA 上线前会改成真实客户端的大小写，见 claudeWireHeaderCasing）。
-        # 原断言写死了 "User-Agent"/"Originator" 的驼峰形态，那是把「假上游
-        # 恰好这么写」当成了契约 —— 换成小写后测试假失败，而行为完全正确。
-        #
-        # 2026-09-12：codex 段的可选头集合扩到 version 与传输协商头。
-        # CPA 默认开 codex cloaking（disable-codex-cloaking 默认 false，
-        # codex_executor_request.go:372-377），baseline 就带 UA + Originator，
-        # 所以能把这个段救回来的最省档是**再加 Version** 的 codex-full。
-        eq("头是 UA 或 Originator",
-           {k.lower() for k in v.min_headers}
-           <= {"user-agent", "originator", "version", "accept", "connection"}, True)
-        eq("走的是 identity 回退",
-           any(a.combo.startswith("id:") and a.ok for a in v.attempts), True)
-        # 画像档名要被记下来 —— 报告与写回都靠它，「需要 codex-full」
-        # 比「需要 1 个头」对人有用得多。
-        eq("记下了画像档名", bool(v.profile_name), True)
-        eq("最省档优先（codex 段 baseline 已自带身份头，再省就没有了）",
-           v.profile_name, "codex-full")
-        eq("这一档不需要 body 补丁", v.min_body_kind, "")
+        for profile in ("gatebroke", "identity"):
+            section(f"{profile}：明确客户端限制 → 停止当前服务商")
+            r = probe(profile)
+            eq(f"{profile} 无可用段", r.usable_sections, [])
+            eq(f"{profile} 不再尝试身份回退", any(
+                a.combo.startswith("id:") for v in r.sections.values()
+                for a in v.attempts), False)
+            eq(f"{profile} 目录403明确报告当轮停止", all(
+                v.probe_policy_code == "provider_job_stopped"
+                for v in r.sections.values()), True)
 
         # ------------------------------------------------------------------
         section("swapper：静默换模")
@@ -870,7 +739,9 @@ def main() -> int:
         v = r.sections["claude-api-key"]
         # 请求 claude-opus-5 却回 agnes-2.0-flash → model_matches 为假
         eq("请求的模型未被确认", v.models, [])
-        eq("段不可用（模型验不过）", v.usable, True)  # 基线 200 → 段通
+        # HTTP 200 只证明端点响应，不能让没有任何接受模型的段计为可用。
+        eq("段不可用（模型验不过）", v.usable, False)
+        eq("仍保留端点响应证据", any(a.status == "200" for a in v.attempts), True)
         eq("模型清单为空是硬信号", len(v.models), 0)
 
         # ------------------------------------------------------------------
@@ -923,25 +794,29 @@ def main() -> int:
 
         # ------------------------------------------------------------------
         section("verify_upstream：写回后的端到端确认")
+        @isolated_policy
+        def verify_fixture(*args, **kwargs):
+            return cp.verify_upstream(*args, scope={"direct_target": True}, **kwargs)
+
         # 假上游同时扮演 CPA 的客户端入口 —— 三段路径各验一次。
         # 这一级是「push 成功」之外的第二道：CPA 收下配置 ≠ 新上游能出活。
-        ok, msg = cp.verify_upstream(f"{base}/good", "sk-client-key",
+        ok, msg = verify_fixture(f"{base}/good", "sk-client-key",
                                      "claude-api-key", "claude-opus-5",
                                      timeout=10)
         eq("claude 段验证通过", ok, True)
         eq("回报里带后端形态", "后端" in msg, True)
 
-        ok, msg = cp.verify_upstream(f"{base}/good", "sk-client-key",
+        ok, msg = verify_fixture(f"{base}/good", "sk-client-key",
                                      "codex-api-key", "gpt-5.6-sol", timeout=10)
         eq("codex 段验证通过", ok, True)
 
-        ok, msg = cp.verify_upstream(f"{base}/good", "sk-client-key",
+        ok, msg = verify_fixture(f"{base}/good", "sk-client-key",
                                      "gemini-api-key", "gemini-2.5-pro",
                                      timeout=10)
         eq("gemini 段验证通过", ok, True)
 
         # 换模站：直连 200，但返回的不是要的模型 —— 必须判失败
-        ok, msg = cp.verify_upstream(f"{base}/swapper", "sk-client-key",
+        ok, msg = verify_fixture(f"{base}/swapper", "sk-client-key",
                                      "claude-api-key", "claude-opus-5",
                                      timeout=10)
         eq("换模站验证失败", ok, False)
@@ -949,11 +824,11 @@ def main() -> int:
         eq("失败原因带实际模型", "agnes-2.0-flash" in msg, True)
 
         # 余额耗尽：非 200，要带上分类而不是只报状态码
-        ok, msg = cp.verify_upstream(f"{base}/quota", "sk-client-key",
+        ok, msg = verify_fixture(f"{base}/quota", "sk-client-key",
                                      "claude-api-key", "claude-opus-5",
                                      timeout=10)
         eq("余额站验证失败", ok, False)
-        eq("失败原因带定性", "余额" in msg, True)
+        eq("目录403后的验证明确报告未实测", "未实测" in msg and "停止" in msg, True)
 
         # ------------------------------------------------------------------
         section("性能 · 代理预检只做一次")
@@ -961,7 +836,7 @@ def main() -> int:
         # 实测日志：mihomo:7890 不通，5 个 key 累计十几分钟纯白等，结果全是
         # 无用的 `000 未知`。预检 4 秒判死一次，之后全程跳过。
         pre_events: list[tuple[str, dict]] = []
-        row_cf = cp.parse_lines(f"{base}/cfguard,sk-fake000111222333", allow_private=True).valid[0]
+        row_cf = cp.parse_lines(f"{base}/linkdead,sk-fake000111222333", allow_private=True).valid[0]
         p_dead = ProxyMarkingProber(
             gap=0.0, timeout=10, probe_context=False, swap_samples=0,
             # 保留端口 9 （discard）几乎必然连不上，用它模拟死代理
@@ -983,9 +858,8 @@ def main() -> int:
         # 预检 4 秒封顶 + 四段基线；远低于「每段每模型等满 timeout」
         eq("整轮耗时受控（<25s）", dead_secs < 25, True)
 
-        section("性能 · 同主机形态复用")
-        # 段形态是主机属性：有哪些模型、要不要代理、最小必需头、上下文上限。
-        # 换 Key 不改变其中任何一条 —— 但凭证有效性是 Key 的属性，仍要验。
+        section("性能 · 同凭据同请求环境复用")
+        # 模型权限与能力可按凭据变化；只测相同凭据的复用收益，并验证跨凭据隔离。
         reuse_events: list[tuple[str, dict]] = []
         p_reuse = ProxyMarkingProber(
             gap=0.0, timeout=10, probe_context=False, swap_samples=0,
@@ -1002,23 +876,25 @@ def main() -> int:
 
         r1 = p_reuse.probe(rows[0])
         first_calls = r1.total_calls
-        r2 = p_reuse.probe(rows[1])
-        r3 = p_reuse.probe(rows[2])
+        # 已验证结果只能在同一凭据及请求环境内复用。
+        r2 = p_reuse.probe(rows[0])
+        r3 = p_reuse.probe(rows[0])
+        independent = p_reuse.probe(rows[1])
+        eq("另一凭据独立探测", independent.total_calls >= 8, True)
+        eq("另一凭据不借用模型证明", any(
+            a.combo != "reuse-verify" for v in independent.sections.values()
+            for a in v.attempts), True)
 
-        # 门槛按「段族过滤后」定（2026-09-01 改）：原来写 >12，那是四段都
-        # 拿整份混族目录去探时的量。加了 SECTION_FAMILY 闸之后，三个协议段
-        # 只探本族 —— 假上游的 10 个目录条目里，gemini 段剩 3、codex 剩 2、
-        # claude 剩 2，compat 仍 7，首个 Key 实测 10 次。
-        #
-        # 这里要断言的是「首个 Key 确实走了全量、不是复用」，判据是它比
-        # 后续 Key 多出好几倍，而不是某个绝对值。所以改成与 r2 比 ——
-        # 那个比较不会随目录形态或段族规则再次失效。
+        # 复用省掉目录发现与画像搜索，但每个模型必须留下当前凭据的成功证据。
+        # 不能用“每段只验一次”或固定倍数省请求来鼓励跳过模型权限核验。
         eq("首个 Key 走全量探测", first_calls >= 8, True)
-        eq("首个 Key 明显多于复用者", first_calls > r2.total_calls * 2, True)
-        eq("第二个 Key 请求数大幅下降", r2.total_calls < first_calls / 2, True)
+        eq("首轮包含非复用探测", any(
+            a.combo != "reuse-verify" for v in r1.sections.values()
+            for a in v.attempts), True)
         eq("第三个 Key 同样复用", r3.total_calls, r2.total_calls)
-        # 复用不是跳过：凭证有效性每段仍验一次
-        eq("复用仍逐段验凭证", r2.total_calls, len(cp.SECTIONS))
+        eq("复用仍逐模型验凭证", sum(
+            a.combo == "reuse-verify" for v in r2.sections.values() for a in v.attempts),
+           sum(len(set(v.models)) for v in r1.sections.values()))
         eq("复用后段结论一致",
            sorted(r2.usable_sections), sorted(r1.usable_sections))
         eq("复用后模型清单一致",
@@ -1029,7 +905,11 @@ def main() -> int:
         eq("复用事件标明已验凭证",
            all(d.get("verified") for d in reused if d.get("models")), True)
         used_combos = {a.combo for v in r2.sections.values() for a in v.attempts}
-        eq("复用只发 reuse-verify", used_combos, {"reuse-verify"})
+        eq("复用仅验缓存模型并续探候选", used_combos <= {"reuse-verify", "model-scan"}, True)
+        eq("续探不重复已验缓存模型", all(
+            a.model not in r1.sections[sec].models
+            for sec, v in r2.sections.items() for a in v.attempts
+            if a.combo == "model-scan"), True)
 
         # ------------------------------------------------------------------
         # 以下三组锁住 2026-08-31 三个实测缺陷。它们都不是代码自相矛盾，
@@ -1106,10 +986,10 @@ def main() -> int:
         srv.shutdown()
 
     # 这一项自己起假上游（要控制返回体），所以放在主 srv 关掉之后
-    section("站+段级失败的负缓存")
+    section("403 响应的真实策略停止")
     test_dead_section_shape_is_cached()
 
-    # 同上：自己起假上游，且要按 Key 序号切换返回码
+    # 同上：自己起假上游，分别验证稳定 502 与端点返回 429。
     section("临时类连续同码失败的熔断")
     test_temp_failure_circuit_breaker()
 

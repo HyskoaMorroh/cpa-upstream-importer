@@ -362,9 +362,7 @@ def main() -> None:
     # 三条途径判据必须一致，否则同一份输入走 CLI 与走网页落盘结果不同。
     blocked_new = cp.mark_new_sections(cfg, plans)
     if blocked_new:
-        print(f"  {C_WARN}⚠{C_END} {blocked_new} 个 (凭据, 段) 组合原本不在 "
-              f"config.yaml 里，且模型清单只是工具猜测 —— 不写入。"
-              f"确知可用的话去网页端手填该段的模型清单（CLI 没有手填入口）")
+        print(f"  {C_WARN}⚠{C_END} {cp.writeback.blocked_plan_warning(plans)}")
 
     # 批量定档 —— 与网页端（server.py 的 /api/plan）同一个函数。
     #

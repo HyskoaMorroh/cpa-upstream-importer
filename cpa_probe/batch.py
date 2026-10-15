@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import concurrent.futures
+from collections import deque
 from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     from .pipeline import Prober, CandidateResult
@@ -44,6 +45,7 @@ class BatchProber:
         Args:
             rows: 站点列表（ParsedRow）
             progress_callback: 进度回调 (current, total, site_bare, stats)
+                stats 的 _unit_id 是任务内候选序号，仅供进度配对，不含凭据。
                 site_bare 是**脱敏**的站裸地址。绝不要往这里传含 api_key
                 的值 —— 它会一路进日志、JSON 响应和导出文件。
 
@@ -54,11 +56,11 @@ class BatchProber:
         total = len(rows)
         current = 0
 
-        def probe_one(row: ParsedRow) -> tuple[tuple[str, str], Any]:
+        def probe_one(unit_id: str, row: ParsedRow) -> tuple[tuple[str, str], Any]:
             # 探测前先调一次 callback 占位，触发 Job.mark_unit_start 记录起始。
             # current=0 是占位符，真实进度在 as_completed 循环里给。
             if progress_callback:
-                progress_callback(0, 0, row.bare, {})
+                progress_callback(0, 0, row.bare, {"_unit_id": unit_id})
             result = self._prober.probe(row)
             # 键必须含 api_key —— 只用 bare 会让同一个站的多个 Key 互相覆盖。
             # 实测那份配置里 foxtrot 与 relay-l 各有 15 个 Key，用 bare 做键
@@ -69,10 +71,24 @@ class BatchProber:
                 max_workers=self._max_workers,
                 thread_name_prefix="batch-probe") as executor:
 
-            futures = {executor.submit(probe_one, row): row for row in rows}
+            # 配置通常把同站的多个凭据放在一起。按主机轮转入队，避免首批
+            # 工作线程全部等待同一站的限速器，而其他站仍在队尾空等。
+            # 每个凭据仍完整探测，主机限速和策略账本保持不变。
+            host_rows = {}
+            for index, row in enumerate(rows):
+                host_rows.setdefault(row.host, deque()).append((f"candidate-{index}", row))
+            queues = deque(host_rows.values())
+            ordered_rows = []
+            while queues:
+                queue = queues.popleft()
+                ordered_rows.append(queue.popleft())
+                if queue:
+                    queues.append(queue)
+            futures = {executor.submit(probe_one, unit_id, row): (unit_id, row)
+                       for unit_id, row in ordered_rows}
 
             for future in concurrent.futures.as_completed(futures):
-                row = futures[future]
+                unit_id, row = futures[future]
                 try:
                     url, result = future.result()
                     results[url] = result
@@ -112,7 +128,7 @@ class BatchProber:
                     # 站名足够定位「刚完成哪个」，key 在这里没有任何用途。
                     if progress_callback:
                         progress_callback(
-                            current, total, row.bare, dict(self._stats)
+                            current, total, row.bare, {**self._stats, "_unit_id": unit_id}
                         )
 
                 except concurrent.futures.CancelledError:
@@ -138,7 +154,7 @@ class BatchProber:
                     current += 1
                     if progress_callback:
                         progress_callback(
-                            current, total, row.bare, dict(self._stats)
+                            current, total, row.bare, {**self._stats, "_unit_id": unit_id}
                         )
 
         return results
@@ -163,12 +179,17 @@ def entry_scope(section: str, base_url: str) -> str:
     查表还在用 host —— 这个函数把它们统一起来。
 
     生产配置 compat 段同 host 多路径 0 处，所以这是补闸而不是修事故。
+
+    2026-10-02 修正：上面「前三段的 base-url 除 `/v1` 外没有路径」
+    这个前提不成立 —— 中转站常用路径区分渠道（`/alpha/v1`、
+    `/beta/v1`）。同 host 同 Key 两条路径不同的配置因此坑在同一个键上，
+    后一条把前一条的 weight / proxy-url / headers / prefix 覆盖 ——
+    而 CPA 按完整 base-url 路由，活下来那条带的是另一个上游的参数。
+    所以四段统一用含路径的身份。同域定档（同类型同域同 priority）
+    是别的一层判据，不走这个函数。
     """
-    if section == "openai-compatibility":
-        from .writeback import compat_provider_key
-        return compat_provider_key(base_url)
-    from .parse import host_of
-    return host_of(base_url)
+    from .writeback import compat_provider_key
+    return compat_provider_key(base_url)
 
 
 
@@ -361,7 +382,7 @@ def existing_weights(cfg: dict) -> dict[tuple[str, str, str], int]:
             w = e.get("weight")
             if not isinstance(w, int):          # 缺失或非整数都当没写
                 continue
-            h = host_of(str(e.get("base-url") or ""))
+            h = entry_scope(section, str(e.get("base-url") or ""))
             k = str(e.get("api-key") or "")
             if h and k:
                 out[(section, h, k)] = w
@@ -416,7 +437,7 @@ def existing_proxies(cfg: dict) -> dict[tuple[str, str, str], str]:
             pu = str(e.get("proxy-url") or "").strip()
             if not pu:
                 continue
-            h = host_of(str(e.get("base-url") or ""))
+            h = entry_scope(section, str(e.get("base-url") or ""))
             k = str(e.get("api-key") or "")
             if h and k:
                 out[(section, h, k)] = pu
@@ -484,7 +505,7 @@ def existing_headers(cfg: dict) -> dict[tuple[str, str, str], dict[str, str]]:
         for e in cfg.get(section) or []:
             if not isinstance(e, dict):
                 continue
-            take(section, host_of(str(e.get("base-url") or "")),
+            take(section, entry_scope(section, str(e.get("base-url") or "")),
                  str(e.get("api-key") or ""), e.get("headers"))
 
     # compat 段的 headers 在 **provider 级**，组内所有 Key 共用同一份
@@ -527,7 +548,7 @@ def existing_prefixes(cfg: dict) -> dict[tuple[str, str, str], str]:
         for e in cfg.get(section) or []:
             if not isinstance(e, dict) or "prefix" not in e:
                 continue
-            h = host_of(str(e.get("base-url") or ""))
+            h = entry_scope(section, str(e.get("base-url") or ""))
             k = str(e.get("api-key") or "")
             if h and k:
                 out[(section, h, k)] = str(e.get("prefix") or "")
@@ -643,7 +664,7 @@ def existing_toggles(cfg: dict) -> dict[tuple[str, str, str], dict[str, bool]]:
             continue
         if e.get("websockets") is not True:
             continue
-        h = host_of(str(e.get("base-url") or ""))
+        h = entry_scope("codex-api-key", str(e.get("base-url") or ""))
         k = str(e.get("api-key") or "")
         if h and k:
             out.setdefault(("codex-api-key", h, k), {})["websockets"] = True
@@ -721,7 +742,7 @@ def existing_model_extras(cfg: dict) -> dict[tuple[str, str, str, str], dict]:
         for e in cfg.get(section) or []:
             if not isinstance(e, dict):
                 continue
-            take(section, host_of(str(e.get("base-url") or "")),
+            take(section, entry_scope(section, str(e.get("base-url") or "")),
                  str(e.get("api-key") or ""), e.get("models"))
 
     for prov in cfg.get("openai-compatibility") or []:
@@ -814,7 +835,7 @@ def existing_model_context(cfg: dict) -> dict[tuple[str, str, str, str], int]:
         for e in cfg.get(section) or []:
             if not isinstance(e, dict):
                 continue
-            take(section, host_of(str(e.get("base-url") or "")),
+            take(section, entry_scope(section, str(e.get("base-url") or "")),
                  str(e.get("api-key") or ""), e.get("models"))
 
     # compat 段的 models 在 provider 级，组内所有 Key 共用同一份

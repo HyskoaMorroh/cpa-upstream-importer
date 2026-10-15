@@ -53,7 +53,7 @@ h3{margin:26px 0 10px;font-size:1.08rem;color:var(--step)}
 h4{margin:18px 0 8px;font-size:.97rem;color:var(--dim)}
 p,li{color:var(--ink)}
 code{font-family:var(--mono);font-size:.89em;background:var(--accent-soft);
-  color:var(--accent);padding:2px 6px;border-radius:4px}
+  color:var(--accent);padding:2px 6px;border-radius:4px;overflow-wrap:anywhere}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;
   padding:18px 20px;margin:16px 0}
 .note{border-left:4px solid var(--accent);background:var(--accent-soft);
@@ -81,10 +81,10 @@ code{font-family:var(--mono);font-size:.89em;background:var(--accent-soft);
 table{width:100%;border-collapse:collapse;margin:15px 0;font-size:.9rem;
   display:block;overflow-x:auto}
 th,td{border:1px solid var(--line);padding:9px 11px;text-align:left;
-  vertical-align:top}
+  vertical-align:top;overflow-wrap:anywhere}
 th{background:var(--accent-soft);color:var(--accent);font-weight:600;
   white-space:nowrap}
-td code{white-space:nowrap}
+td code{white-space:normal;overflow-wrap:anywhere}
 .steps{counter-reset:s;list-style:none;padding:0;margin:16px 0}
 .steps>li{counter-increment:s;position:relative;padding:14px 16px 14px 56px;
   background:var(--card);border:1px solid var(--line);border-radius:11px;
@@ -116,10 +116,12 @@ footer{color:var(--dim);font-size:.85rem;text-align:center;padding-top:26px;
 </style>
 </head>
 <body>
+<section style="margin:24px;padding:20px;border:2px solid #e7a83e;border-radius:12px;background:#fff8e7;color:#263445"><h2>当前部署与验收边界</h2><p>共享 VPS 的实际配置在 /opt/deploy：.env、docker-compose.yml、nginx.conf 由两个项目共用。保留另一项目的服务、网络、卷与变量，不能把仓库模板整份覆盖到生产。</p><p>请按本页步骤填写变量、核对挂载并拉取镜像。另附长篇教程中的历史排障数据和旧命令不是当前验收结果。请求数下降、容器 healthy、目录列出模型都不能单独证明速度提升或真实可用。</p><p>CPA api-key-usage 是历史请求统计，不是当前可调度账号清单。下游 schedulable 恢复必须核验部署版本对应的专用接口或批量字段；普通账号 PUT 不能作为恢复成功证明。公开源码中 TLS 指纹仅对 Anthropic OAuth/SetupToken 生效，未指定模板可使用内置模板；API key 同名字段不代表生效。</p></section>
+<section style="margin:24px;padding:20px;border:2px solid #328bba;border-radius:12px;background:#eef8ff;color:#263445"><h2>读懂探测次数与耗时</h2><p>页面的“推理尝试”统计已记录的推理尝试，不包含模型目录等 HTTP 请求，也不包含发送前被策略拒绝的操作。显示 0 次时仍可能发生目录查询，需结合任务日志判断。</p><p>检测速度应分开看初始化、排队、目录查询、推理、定档和写回，并同时核对成功、失败及阻断数量。多线程任务不能按单项时间乘账号数估算；全部阻断的批次不能证明正常探测更快。请以同一镜像、相同配置与网络条件下的完整流程实测为准。</p></section>
 <button class="theme" id="themebtn" type="button">切换主题</button>
 <header><div class="inner">
   <h1>CPA 上游灌输 · 配置与使用教程</h1>
-  <p>默认被动分析；取得站方许可后按共享预算探测。保留配置分析、定档、预览与写回。</p>
+  <p>点探测即真实检测上游；同站串行、共享预算、站方拒绝即停手。保留配置分析、定档、预览与写回。</p>
 </div></header>
 
 <div class="wrap">
@@ -134,414 +136,307 @@ footer{color:var(--dim);font-size:.85rem;text-align:center;padding-top:26px;
     <li><a href="#nginx">配置 nginx.conf</a></li>
     <li><a href="#proxy">配置代理（复用 mihomo）</a></li>
     <li><a href="#deploy">部署与启动</a></li>
-    <li><a href="#probe-policy">主动探测许可与持久预算</a></li>
+    <li><a href="#probe-policy">探测模式与持久预算</a></li>
     <li><a href="#flow4">四个核心流程怎么用</a></li>
     <li><a href="#rules">模型选择与定档规则</a></li>
+    <li><a href="#speed-and-log">探测速度、节拍与可排查日志</a></li>
+    <li><a href="#stuck-and-substitute">两类「看着像站坏了」的卡点</a></li>
     <li><a href="#trouble">排错对照表</a></li>
   </ol>
 </div>
 
-<h2 id="what">1. 这个工具做什么</h2>
-<p>CPA（CLIProxyAPI）用一份 <code>config.yaml</code> 管理多个上游中转站。手工维护那份文件有三个难点：站点可不可用要逐个试、每个站支持哪些模型要逐个查、优先级要在几十个站之间统筹。这个工具把这三件事自动化。</p>
-
-<div class="card">
-<b>一次完整导入经过四步</b>
-<ol>
-  <li><b>解析</b> —— 把 <code>URL,密钥</code> 的文本解析成结构化条目，去重、校验格式。</li>
-  <li><b>策略检查</b> —— 未授权站点不发请求，明确显示“未实测”。获准的目录查询、生成、能力检查与握手共用 provider 及账号预算。</li>
-  <li><b>定档</b> —— 根据探测结果计算 priority、权重、前缀、代理、请求伪装等全部参数，生成写回方案。</li>
-  <li><b>写回</b> —— 行级编辑 <code>config.yaml</code>，保留原有注释与格式，写前备份、写后校验并通知 CPA 重载。</li>
-</ol>
-</div>
-
-<div class="note"><b>和 CPA / CPAMP 的关系</b>
-CPA 与 CPAMP 由其他作者维护，本项目不修改它们，只负责往 <code>config.yaml</code> 里写正确的数据。所以模型清单、请求形态这些会随 CPA 升级而变的东西，本项目都从 CPA 源码<strong>在线解析</strong>获取，不写死在代码里。</div>
-
-<h2 id="files">2. 文件分工：哪些上传 VPS，哪些只在本地</h2>
-<p>这一节最容易搞混。本项目目录里也有 <code>docker-compose.yml</code> / <code>.env</code> / <code>config.yaml</code>，但它们<strong>只是模板</strong>，不是 VPS 上实际执行的那份。</p>
-
-<table>
-<tr><th>文件</th><th>去向</th><th>作用</th></tr>
-<tr><td><code>upstream-importer/</code> 整个目录</td><td><span class="tag t-acc">构建镜像</span></td><td>源码。推到 GitHub 后由 CI 构建并推送 Docker Hub</td></tr>
-<tr><td><code>.env</code>（部署目录下的）</td><td><span class="tag t-ok">上传 VPS</span></td><td>令牌、密码、订阅地址等全部机密</td></tr>
-<tr><td><code>docker-compose.yml</code>（部署目录下的）</td><td><span class="tag t-ok">上传 VPS</span></td><td>服务编排：镜像、端口、挂载、依赖</td></tr>
-<tr><td><code>nginx.conf</code>（部署目录下的）</td><td><span class="tag t-ok">上传 VPS</span></td><td>反向代理、超时、限速、CSP</td></tr>
-<tr><td><code>config.yaml</code>（部署目录下的）</td><td><span class="tag t-ok">上传 VPS</span></td><td>CPA 的真实配置，被本工具读写</td></tr>
-<tr><td><code>upstream-importer/mihomo-manager/</code></td><td><span class="tag t-acc">打进镜像</span></td><td>代理引导脚本，不单独上传</td></tr>
-<tr><td>项目自带的 compose / .env / config.yaml</td><td><span class="tag t-warn">仅本地</span></td><td>本机调试模板，不上传</td></tr>
-</table>
-
-<div class="bad"><b>绝不能提交到 GitHub 的东西</b>
-真实 <code>config.yaml</code>、真实 <code>.env</code>、机场订阅地址、API 密钥、真实上游域名、个人路径、手工排查记录。仓库里已经用 <code>.gitignore</code> 与 <code>.dockerignore</code> 双重排除，提交前再跑一次 <code>python tools/scrub.py --check</code> 复核。</div>
-
-<h2 id="env">3. 配置 .env：逐项说明</h2>
-<p>VPS 上 <code>/opt/deploy/.env</code> 里与本工具相关的变量。<strong>没有默认值的必须填</strong>。</p>
-
-<table>
-<tr><th>变量</th><th>必填</th><th>说明</th></tr>
-<tr><td><code>IMPORTER_TOKEN</code></td><td><span class="tag t-warn">可选</span></td><td>前端登录令牌。不填时用 CPA 后台管理密码登录</td></tr>
-<tr><td><code>CPA_MANAGEMENT_PASSWORD</code></td><td><span class="tag t-bad">必填</span></td><td>CPA 管理密码。两个用途：前端登录、写回后通知 CPA 重载</td></tr>
-<tr><td><code>IMPORTER_UID</code> / <code>IMPORTER_GID</code></td><td><span class="tag t-warn">建议</span></td><td>容器运行身份。<strong>必须与 config.yaml 的属主一致</strong>，否则写回时 PermissionError</td></tr>
-<tr><td><code>PROBE_PROXY</code></td><td><span class="tag t-warn">可选</span></td><td>探测用代理。复用 mihomo 时填 <code>http://mihomo:7890</code></td></tr>
-<tr><td><code>IMPORTER_LOG_LEVEL</code></td><td><span class="tag t-warn">可选</span></td><td><code>DEBUG</code> / <code>INFO</code>（默认）/ <code>WARNING</code>。排错时用 DEBUG</td></tr>
-<tr><td><code>IMPORTER_LOG_TO_FILE</code></td><td><span class="tag t-warn">可选</span></td><td>填 <code>1</code> 时日志同时写文件，便于事后排查</td></tr>
-<tr><td><code>IMPORTER_MEMORY_LIMIT</code></td><td><span class="tag t-warn">可选</span></td><td>默认 1G。<strong>不要降到 512M</strong>：全量重探时会 OOM，表现为轮询突然无响应</td></tr>
-<tr><td><code>MIHOMO_SECRET</code></td><td><span class="tag t-bad">用代理时必填</span></td><td>mihomo 的 RESTful API 鉴权密钥</td></tr>
-<tr><td><code>MIHOMO_SUB_*</code></td><td><span class="tag t-bad">用代理时必填</span></td><td>机场订阅地址。<strong>等同凭据，绝不能提交</strong></td></tr>
-</table>
-
-<div class="codebox">
-  <div class="cap">/opt/deploy/.env —— 与本工具相关的部分</div>
-  <button class="copy" type="button">复制</button>
-<pre># 登录与写回（CPA_MANAGEMENT_PASSWORD 必填）
-CPA_MANAGEMENT_PASSWORD=填你的CPA后台密码
-IMPORTER_TOKEN=
-
-# 容器身份：必须和 config.yaml 的属主一致，否则写回会 PermissionError。
-# 查属主：  stat -c '%u:%g' /opt/deploy/config.yaml
+<h2 id="what">1. 从证据到配置</h2>
+<p>投喂台读取账号和现有配置，按协议探测、推荐模型与优先级，生成可核对的变更，再写回 CPA 配置。每一项结果都应说明依据；空白、待定或请求失败不能当作完成。</p>
+<div class="card"><h3>完整处理链</h3><p><span class="tag t-acc">解析账号</span> → <span class="tag t-warn">受预算约束的探测</span> → <span class="tag t-acc">定档与模型证据</span> → <span class="tag t-ok">预览差异</span> → <span class="tag t-ok">写回与读回</span> → <span class="tag t-warn">CPA 重载与业务验证</span></p></div>
+<div class="note"><b>证据分层</b>模型目录说明“存在候选”，请求成功说明“这个协议与凭据本次可用”，运行统计说明“历史健康状况”。三者不能相互代替，也不能仅凭模型名称宣称能力。</div>
+<h2 id="files">2. 共享部署与本地文件</h2>
+<p>VPS 实际运行目录为 <code>/opt/deploy</code>。外层配置与另一个项目共用；仓库内同名文件是独立模板。本地隔离测试副本只用于验收，不能整份替换共享生产配置。</p>
+<div class="card"><h3>部署关系图</h3><p><span class="tag t-acc">GitHub 已审核源码</span> → <span class="tag t-acc">CI / Docker Hub 镜像</span> → <span class="tag t-ok">VPS importer</span></p><p><span class="tag t-warn">私有 .env + compose + nginx</span> → importer ↔ <span class="tag t-ok">共享 CPA config.yaml</span></p><p>importer 与另一项目 → <span class="tag t-warn">已有 mihomo 服务及持久卷</span> → 上游</p></div>
+<table><tr><th>文件</th><th>处理方式</th></tr><tr><td>审核后的源码、公共 README、公共教程</td><td>提交 Git，由 CI 构建；不是整目录无筛选上传。</td></tr><tr><td>外层 .env、config.yaml、compose、nginx.conf</td><td>私下维护 VPS 实际副本；只调整本项目相关部分，保留另一项目的配置。</td></tr><tr><td>mihomo-manager 脚本</td><td>按镜像构建配置打包；订阅、密钥与实际代理配置独立保存。已有共享代理优先复用。</td></tr><tr><td>真实账号、MHTML、日志、备份、私人图文记录</td><td>仅本地受控保存，排除 Git 和镜像构建上下文。</td></tr></table>
+<div class="bad"><b>忽略规则不等于脱敏完成</b>提交前检查已跟踪文件及 diff，构建前检查 Docker 上下文。已跟踪的敏感文件不会因新增 .gitignore 自动消失。不要公开原始诊断输出或浏览器截图。</div>
+<h2 id="env">3. 填写环境变量</h2>
+<p>编辑外层私有 <code>/opt/deploy/.env</code>，保留已有键，只更新对应值，避免反复追加重复定义。口令在本地生成并私下保存，不粘贴到报告或命令历史。</p>
+<table><tr><th>变量 / 配置</th><th>填写与核对</th></tr><tr><td>外层 compose 的配置挂载源</td><td>当前使用 ./config.yaml；compose 位于 /opt/deploy 时对应 /opt/deploy/config.yaml。修改宿主机路径应调整 volume 的源文件，并确认与 CPA 读取源一致。当前外层 compose 不引用 CONFIG_PATH，在外层 .env 添加它不会改变挂载。</td></tr><tr><td>CONFIG_PATH（仓库独立模板）</td><td>仅独立 compose 用它指定宿主机配置绝对路径，例如 /opt/deploy/config.yaml；不要与外层部署混用。</td></tr><tr><td>IMPORTER_CONFIG / --config</td><td>镜像入口用 IMPORTER_CONFIG 指定容器内路径，当前为 /data/config.yaml，再传给 server.py --config。直接运行 Python 必须显式传 --config；它不会自动读取 .env 的 CONFIG_PATH。</td></tr><tr><td>IMPORTER_TOKEN</td><td>建议固定的随机强口令。留空可能生成临时口令并出现在私有日志中，不适合稳定运维。</td></tr><tr><td>CPA_MANAGEMENT_PASSWORD</td><td>外层部署使用的 CPA 管理明文口令；compose 必须映射为 importer 容器内 CPA_MANAGEMENT_TOKEN。不要填 bcrypt 哈希。</td></tr><tr><td>CPA_MANAGEMENT_TOKEN</td><td>仓库独立模板直接使用此变量；不要误以为外层同名变量一定生效。</td></tr><tr><td>CPA_UPSTREAM_URL</td><td>容器能够访问的 CPA 地址，例如 http://cli-proxy-api:8317；以实际网络服务名与端口为准。</td></tr><tr><td>IMPORTER_UID / IMPORTER_GID</td><td>确保容器用户拥有配置文件及写回所需目录权限。属主相同是常见办法，不是唯一办法；不能只检查数字是否相等。</td></tr><tr><td>IMAGE / PULL_POLICY</td><td>按外层 compose 的实际变量选择已验证镜像标签或 digest；独立模板默认 Docker Hub 镜像、always 拉取策略。</td></tr><tr><td>IMPORTER_PROBE_LEDGER</td><td>置于持久化可写备份卷；不可写会拒绝主动请求。</td></tr><tr><td>MIHOMO_SUB_* / MIHOMO_SECRET</td><td>新建独立代理才按模板配置订阅；复用共享代理时保留其现有订阅、控制器鉴权和网络配置。</td></tr></table>
+<h3>外层 .env 填写示例</h3>
+<p>下列仅为 importer 使用的条目。逐项合并到现有文件，替换占位口令，保留另一项目的全部变量。UID/GID 按配置文件及备份卷实际权限填写；首次创建备份卷后也需核对可写权限。</p>
+<div class="codebox"><div class="cap">私有 .env 示例：占位值必须替换</div><button class="copy" type="button">复制</button><pre>IMPORTER_TOKEN=REPLACE_WITH_RANDOM_IMPORTER_TOKEN
+CPA_MANAGEMENT_PASSWORD=REPLACE_WITH_CPA_PLAINTEXT_PASSWORD
 IMPORTER_UID=0
 IMPORTER_GID=0
-
-# 探测走代理（复用同栈的 mihomo 服务；不用代理就留空）
-PROBE_PROXY=http://mihomo:7890
-
-# 日志：排错期开 DEBUG + 落文件
+IMPORTER_PROBE_MODE=managed
+IMPORTER_PROBE_POLICY_FILE=/backups/probe-policy.json
+IMPORTER_PROBE_LEDGER=/backups/probe-policy.sqlite3
+CPA_SOURCE_CACHE_DIR=/backups/source-cache
 IMPORTER_LOG_LEVEL=INFO
-IMPORTER_LOG_TO_FILE=0
-
-# 内存上限。低于 1G 在全量重探时会 OOM，表现为轮询突然卡住。
-IMPORTER_MEMORY_LIMIT=1g
-
-# 代理订阅（等同凭据，绝不要提交到任何仓库）
-MIHOMO_SECRET=填一个随机长字符串
-MIHOMO_SUB_WOG=填模板第一项订阅地址
-MIHOMO_SUB_WOGB=填模板第二项订阅地址</pre>
-</div>
-
-<h2 id="compose">4. 配置 docker-compose.yml</h2>
-<p>VPS 的 <code>/opt/deploy/docker-compose.yml</code> 里加入本服务。<strong>端口只绑回环</strong>，外部访问一律经 nginx。</p>
-
-<div class="codebox">
-  <div class="cap">/opt/deploy/docker-compose.yml —— upstream-importer 服务段</div>
-  <button class="copy" type="button">复制</button>
-<pre>  upstream-importer:
-    image: 你的DockerHub用户名/cpa-upstream-importer:latest
+IMPORTER_LOG_TO_FILE=1
+IMPORTER_MEMORY_LIMIT=1G
+PROBE_PROXY=http://mihomo:7890</pre></div>
+<p>当前共享 compose 的 importer 镜像、CPA_UPSTREAM_URL 和 DRIFT_PROXY 是服务内固定值；外层 .env 新增 IMAGE、PULL_POLICY、CPA_UPSTREAM_URL 或 DRIFT_PROXY 不会覆盖它们。更换镜像 digest 或地址应修改对应服务字段。CPA_MANAGEMENT_PASSWORD 要与 CPA 当前明文管理口令一致，不能复制 secret-key 的哈希。</p>
+<h2 id="compose">4. 核对 compose 挂载与网络</h2>
+<p>外层服务名为 <code>upstream-importer</code>，仓库独立模板为 <code>cpa-upstream-importer</code>。命令必须对应所用文件。当前 VPS 只拉取已发布镜像，不上传私密源码、不执行源码构建，也不要用仓库模板覆盖共享主栈。编辑外层 .env 时修改已有条目，避免追加同名变量。确认配置挂载可读写，备份卷与账本持久化，CPA、nginx、mihomo 与 importer 之间网络可达。</p>
+<div class="card"><h3>源码规则缓存：更新失败时保留最近成功版本</h3><p>在 importer 服务的 <code>environment</code> 中设置 <code>CPA_SOURCE_CACHE_DIR: "${CPA_SOURCE_CACHE_DIR:-/backups/source-cache}"</code>，并保留现有 <code>/backups</code> 持久卷。共享主栈与独立模板均已配套此默认值；默认部署无需重复追加外层 .env。自定义路径时，修改已有变量并确认目标位于可写持久卷内。</p><p><span class="tag t-warn">离线回退 ≠ 最新规则</span> 每次启动仍尝试在线同步；失败后只读取与当前仓库引用和提取规则匹配的最近成功快照。页面应显示陈旧状态、年龄和失败原因。没有缓存、缓存损坏或规则不匹配时，应明确缺少证据，不能显示绿色一致。源码缓存不能代替模型实际探测。</p><p>在隔离环境中先在线同步一次，再检查断网回退与容器重建后的缓存保留。不要清空真实探测账本。直接运行源码时，需显式设置 <code>CPA_SOURCE_CACHE_DIR</code> 才开启磁盘缓存。</p></div>
+<div class="warn">使用 <code>config --quiet</code> 检查语法，避免普通 <code>config</code> 把展开后的密钥打印出来。仅更新 importer 时不要重建共享代理或另一项目；若本次同时更新代理初始化或健康检查脚本，请按下方<a href="#shared-proxy-upgrade">共享 mihomo 升级步骤</a>安排维护窗口。</div>
+<div class="codebox"><div class="cap">仅检查外层部署文件，不启动或修改服务</div><button class="copy" type="button">复制</button><pre>docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml config --quiet</pre></div>
+<h3>共享 compose 的 importer 配置片段</h3>
+<p>这是字段核对片段，合并到已有同名服务，保留原健康检查、资源限制、安全选项及依赖；不要新建重复 services 或覆盖整份共享文件。CPA 与 mihomo 须同在共享栈的 default 网络，备份卷沿用已有名称。</p>
+<div class="codebox"><div class="cap">只核对并合并 importer 服务字段</div><button class="copy" type="button">复制</button><pre>services:
+  upstream-importer:
+    image: swhesong/cpa-upstream-importer:latest
     pull_policy: always
-    # 与 config.yaml 属主一致，否则写回 PermissionError
-    user: "${IMPORTER_UID:-0}:${IMPORTER_GID:-0}"
     ports:
-      # 只绑回环：外部访问经 nginx，不直接暴露
       - "127.0.0.1:8765:8765"
+    user: "${IMPORTER_UID:-0}:${IMPORTER_GID:-0}"
     environment:
-      # 容器内 127.0.0.1 是容器自己，要用服务名
-      CPA_UPSTREAM_URL: "http://cli-proxy-api:8317"
-      CPA_MANAGEMENT_TOKEN: "${CPA_MANAGEMENT_PASSWORD}"
+      IMPORTER_HOST: "0.0.0.0"
+      IMPORTER_PORT: "8765"
+      IMPORTER_CONFIG: "/data/config.yaml"
+      IMPORTER_BACKUP_DIR: "/backups"
       IMPORTER_TOKEN: "${IMPORTER_TOKEN:-}"
+      CPA_UPSTREAM_URL: "http://cli-proxy-api:8317"
+      CPA_MANAGEMENT_TOKEN: "${CPA_MANAGEMENT_PASSWORD:-}"
+      IMPORTER_PROBE_MODE: "${IMPORTER_PROBE_MODE:-managed}"
+      IMPORTER_PROBE_POLICY_FILE: "${IMPORTER_PROBE_POLICY_FILE:-/backups/probe-policy.json}"
+      IMPORTER_PROBE_LEDGER: "${IMPORTER_PROBE_LEDGER:-/backups/probe-policy.sqlite3}"
+      CPA_SOURCE_CACHE_DIR: "${CPA_SOURCE_CACHE_DIR:-/backups/source-cache}"
       PROBE_PROXY: "${PROBE_PROXY:-http://mihomo:7890}"
-      DRIFT_PROXY: "${PROBE_PROXY:-http://mihomo:7890}"
-      IMPORTER_LOG_LEVEL: "${IMPORTER_LOG_LEVEL:-INFO}"
-      IMPORTER_LOG_TO_FILE: "${IMPORTER_LOG_TO_FILE:-0}"
-      IMPORTER_BACKUP_DIR: /backups
-      IMPORTER_PROBE_POLICY_FILE: /backups/probe-policy.json
-      IMPORTER_PROBE_LEDGER: /backups/probe-policy.sqlite3
+      DRIFT_PROXY: "http://mihomo:7890"
     volumes:
-      # :Z 是 SELinux 标签，CentOS/RHEL enforcing 下必须加
       - ./config.yaml:/data/config.yaml:Z
       - importer-backups:/backups:Z
-      - ./logs/upstream-importer:/var/log/upstream-importer:Z
-    depends_on:
-      cli-proxy-api:
-        condition: service_started
-      # 等代理就绪再起：否则启动头 40 秒走代理的探测会失败
-      mihomo:
-        condition: service_healthy
-        required: false
-    healthcheck:
-      test: ["CMD","python3","-c",
-             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8765/',timeout=5)"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
-    deploy:
-      resources:
-        limits:
-          memory: "${IMPORTER_MEMORY_LIMIT:-1g}"
-    cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
-    restart: unless-stopped
-
+    networks:
+      - default
 volumes:
-  importer-backups:</pre>
-</div>
-
-<div class="warn"><b>备份卷必须是独立卷</b>
-<code>IMPORTER_BACKUP_DIR</code> 指向的目录如果和 config.yaml 同一个挂载点，容器可能写不进去，备份就静默失败了 —— 而你只会在需要回滚时才发现。用命名卷（上面的 <code>importer-backups</code>）最稳。</div>
-
-<h2 id="nginx">5. 配置 nginx.conf</h2>
-<p>三件事决定前端会不会报 <code>Failed to fetch</code>：<strong>超时够不够长、缓冲关没关、限速够不够宽</strong>。</p>
-
-<div class="codebox">
-  <div class="cap">/opt/deploy/nginx.conf —— http 段先定义限速区</div>
-  <button class="copy" type="button">复制</button>
-<pre>http {
-    # 分四档：登录严、轮询松、写回中、总量兜底
-    limit_req_zone $binary_remote_addr zone=importer_auth:10m  rate=30r/m;
-    limit_req_zone $binary_remote_addr zone=importer_all:10m   rate=240r/m;
-    limit_req_zone $binary_remote_addr zone=importer_poll:10m  rate=20r/s;
-    limit_req_zone $binary_remote_addr zone=importer_write:10m rate=60r/m;
-    limit_conn_zone $binary_remote_addr zone=importer_conn:10m;
-    # 回 429 而不是默认 503：前端能区分「你太快了」与「服务挂了」
-    limit_req_status 429;
-
-    client_max_body_size 100M;
-}</pre>
-</div>
-
-<div class="codebox">
-  <div class="cap">/opt/deploy/nginx.conf —— server 段</div>
-  <button class="copy" type="button">复制</button>
-<pre>server {
-    listen 443 ssl http2;
-    server_name 你的域名;
-
-    # 证书路径按你的实际情况填
-    ssl_certificate     /etc/nginx/certs/fullchain.pem;
-    ssl_certificate_key /etc/nginx/certs/privkey.pem;
-
-    limit_conn importer_conn 64;
-    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'" always;
-    add_header X-Content-Type-Options "nosniff" always;
-
-    location / {
-        # 900 秒：全量重探要跑很久。600 不够，会被掐断成 Failed to fetch
-        proxy_connect_timeout 30;
-        proxy_send_timeout   900;
-        proxy_read_timeout   900;
-        send_timeout         900;
-
-        # 必须关缓冲：开着会把流式进度攒住，前端看起来像卡死
-        proxy_buffering off;
-        proxy_cache     off;
-
-        proxy_http_version 1.1;
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-
-        limit_req zone=importer_all burst=120 nodelay;
-        proxy_pass http://127.0.0.1:8765;
-    }
-
-    # 轮询单独放宽：它天然高频
-    location /api/job      { limit_req zone=importer_poll burst=40 nodelay; proxy_buffering off; proxy_read_timeout 900; proxy_pass http://127.0.0.1:8765; }
-    location /api/plan-status  { limit_req zone=importer_poll burst=40 nodelay; proxy_buffering off; proxy_read_timeout 900; proxy_pass http://127.0.0.1:8765; }
-    location /api/apply-status { limit_req zone=importer_poll burst=40 nodelay; proxy_buffering off; proxy_read_timeout 900; proxy_pass http://127.0.0.1:8765; }
-}</pre>
-</div>
-
-<div class="bad"><b>Cloudflare 橙云会在 nginx 之前掐断</b>
-反向代理与 Cloudflare 都可能有各自的回源超时。长任务应使用短请求提交、后台执行和状态轮询，不能只增加 nginx 超时。不要把关闭代理防护当作通用修复；先按错误码和请求耗时定位。</div>
-
-<h2 id="proxy">6. 配置代理（复用 mihomo）</h2>
-<p>很多中转站按出口 IP 拦截（Cloudflare 人机验证等）。本项目的镜像里自带 mihomo 二进制，可以直接起一个代理服务复用。</p>
-
-<div class="codebox">
-  <div class="cap">/opt/deploy/docker-compose.yml —— mihomo 服务段</div>
-  <button class="copy" type="button">复制</button>
-<pre>  mihomo-init:
-    image: 你的DockerHub用户名/cpa-upstream-importer:latest
-    user: "0:0"
-    entrypoint: ["/bin/sh","/app/mihomo-manager/bootstrap-mihomo.sh"]
-    environment:
-      MIHOMO_SECRET:   "${MIHOMO_SECRET}"
-      MIHOMO_SUB_WOG: "${MIHOMO_SUB_WOG}"
-      MIHOMO_SUB_WOGB: "${MIHOMO_SUB_WOGB}"
-      # 非空时强制重建配置；平时留空，按订阅指纹自动判断
-      MIHOMO_FORCE_REBUILD: "${MIHOMO_FORCE_REBUILD:-}"
-    volumes:
-      - mihomo-config:/mihomo-config
-    restart: "no"
-
-  mihomo:
-    image: 你的DockerHub用户名/cpa-upstream-importer:latest
-    # 服务名就是容器间的 DNS 名，所以 PROBE_PROXY 填 http://mihomo:7890
-    entrypoint: ["/usr/local/bin/mihomo","-d","/mihomo-config"]
-    volumes:
-      - mihomo-config:/mihomo-config
-    depends_on:
-      mihomo-init:
-        condition: service_completed_successfully
-    healthcheck:
-      test: ["CMD","sh","/mihomo-config/healthcheck.sh"]
-      interval: 60s
-      timeout: 15s
-      retries: 3
-      start_period: 40s
-    restart: unless-stopped
-
-volumes:
-  mihomo-config:</pre>
-</div>
-
-<div class="note"><b>验证代理真的通了</b>
-下面这条应当输出 <code>204</code>。输出别的或卡住，就是订阅地址、密钥或网络有问题 —— 先修这里，再谈探测。</div>
-
-<div class="codebox">
-  <div class="cap">在 VPS 上执行</div>
-  <button class="copy" type="button">复制</button>
-<pre>docker compose exec upstream-importer python3 -c "
-import urllib.request
-p='http://mihomo:7890'
-o=urllib.request.build_opener(urllib.request.ProxyHandler({'http':p,'https':p}))
-print(o.open('https://www.gstatic.com/generate_204',timeout=10).status)"</pre>
-</div>
-
-<h2 id="deploy">7. 部署与启动</h2>
-
-<ol class="steps">
-<li><b>确认 config.yaml 属主</b>
-  容器身份和它不一致，写回时会 PermissionError。
-  <div class="codebox"><button class="copy" type="button">复制</button>
-<pre>stat -c 'IMPORTER_UID=%u' /opt/deploy/config.yaml >> /opt/deploy/.env
-stat -c 'IMPORTER_GID=%g' /opt/deploy/config.yaml >> /opt/deploy/.env</pre></div>
-</li>
-<li><b>先备份现有配置</b>
-  工具自己会备份，但首次部署前手工留一份更踏实。
-  <div class="codebox"><button class="copy" type="button">复制</button>
-<pre>cp -a /opt/deploy/config.yaml /opt/deploy/config.yaml.bak-$(date +%Y%m%d-%H%M%S)</pre></div>
-</li>
-<li><b>拉镜像并启动</b>
-  <div class="codebox"><button class="copy" type="button">复制</button>
-<pre>cd /opt/deploy
-docker compose pull upstream-importer mihomo
-docker compose up -d upstream-importer mihomo
-# up -d 立刻返回，但服务写 stdout 要一两秒，所以等 3 秒再看日志
-sleep 3 && docker compose logs --tail=30 upstream-importer</pre></div>
-</li>
-<li><b>确认健康</b>
-  <div class="codebox"><button class="copy" type="button">复制</button>
-<pre>docker compose ps upstream-importer
-curl -s -o /dev/null -w 'HTTP %{http_code}  耗时 %{time_total}s\n' http://127.0.0.1:8765/</pre></div>
-  <span class="tag t-ok">预期</span> <code>HTTP 200</code>，耗时 1 秒以内。
-</li>
-<li><b>浏览器打开并登录</b>
-  访问你的域名。登录用 <code>IMPORTER_TOKEN</code>，没设就用 CPA 后台管理密码。
-</li>
-</ol>
-
-<h2 id="probe-policy">8. 主动探测许可与持久预算</h2>
-<div class="warn"><b>从旧版本升级</b>
-拉取新镜像后，默认不再自动向上游发探测请求。解析、配置分析、定档、预览和写回照常可用；界面会把没探测过的条目标成“未实测”，不再按它自动启用新条目。需要恢复主动探测的站点，按本节配置许可文件。</div>
-<div class="bad"><b>站方禁止测试时，不主动发送任何探针</b>
-公告中的“连续超过 10 次”没有给出可适用的统计窗口，不能推导出 9 次安全。改问候词、换 Key、代理或客户端画像都不是规避限制的办法。</div>
-<p>缺少许可文件时，默认被动分析。许可文件是 <code>/backups/probe-policy.json</code>，账本是 <code>/backups/probe-policy.sqlite3</code>，放在已有持久卷中。不要删除账本来恢复额度；不要对已有停止状态自动解封。</p>
-<div class="codebox"><div class="cap">有效且不会发起主动探测的初始策略</div><button class="copy" type="button">复制</button>
-<pre>{
-  "version": 1,
-  "sites": {}
+  importer-backups:</pre></div>
+<p>宿主机 config.yaml 必须预先存在且为文件，并与 CPA 的配置挂载指向同一文件。仅给 importer 挂所需文件；不要挂整个 /opt/deploy。SELinux 的卷标签须结合共享读取策略核对，不要为了排错反复重标记另一项目的目录。</p>
+<h2 id="nginx">5. 入口与轮询</h2>
+<p>宿主机 nginx 可指向已绑定的回环端口；容器 nginx 的 127.0.0.1 指向自己，通常应通过共同网络访问 importer 服务。核对路径转发、登录鉴权、CSP connect-src、请求体大小与轮询响应。</p>
+<p>长任务应快速返回任务标识，浏览器随后轮询进度。增大 nginx 超时不能修复 JavaScript 异常、401/403、CSP 阻止、后端 500、任务丢失或网络断开。先查看失败请求的状态码与脱敏错误类别，再调整对应配置。</p>
+<h3>宿主机 nginx 的同源入口</h3>
+<p>以下为独立入口示例。共享部署时，只将所需指令合并到现有、已配置 HTTPS 的 importer 专用 server 和 location 中，保留证书、访问控制、根路径已有的 limit_req 限流，以及现有 proxy_connect_timeout、proxy_read_timeout、proxy_send_timeout 设置；示例中的超时数值不应覆盖现有配置。已有登录鉴权、写回和轮询专用 location 也须保留，不要整块替换。根路径转发保留 API 路径，避免为前端另外拼接跨域地址。其他业务 server 块保持原样。</p>
+<div class="codebox"><div class="cap">宿主机 nginx：合并到已有 importer server</div><button class="copy" type="button">复制</button><pre>location / {
+    proxy_pass http://127.0.0.1:8765;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    client_max_body_size 16m;
+    proxy_connect_timeout 10s;
+    proxy_read_timeout 120s;
+    proxy_send_timeout 120s;
+    proxy_buffering off;
 }</pre></div>
-<p>需要主动测试时，先取得站方许可，再为准确的主机名配置以下字段；不支持通配符。这里不提供所谓“免封号”通用次数。</p>
-<table><tr><th>字段</th><th>含义</th></tr>
-<tr><td><code>enabled</code></td><td>是否明确启用主动探测，必须是真正的 JSON 布尔值</td></tr>
-<tr><td><code>provider</code></td><td>服务商分组；同服务的多个域名使用同一分组，不能借别名增加预算</td></tr>
-<tr><td><code>max_requests</code></td><td>站方许可范围内的 provider 总请求额度</td></tr>
-<tr><td><code>max_requests_per_credential</code></td><td>同一凭据的额度，不能覆盖 provider 总额度</td></tr>
-<tr><td><code>window_seconds</code></td><td>按站方许可确定的统计窗口，不能从公告自行猜测</td></tr>
-<tr><td><code>min_interval_seconds</code></td><td>按站方许可确定的最小间隔；只减速并不能保证安全</td></tr></table>
-<p>目录 GET、生成请求、能力检查、握手和重试都计数。自动重定向被拒绝，以免隐式追加请求。403、429 或明确禁测/封禁响应会停止整个 provider 的后续请求；账本错误也拒绝发送。未完成的预留不会靠重启自动清零。</p>
-<p>CPA 管理重载可以成功，同时上游仍然“未实测”。两者独立报告，不能把写回成功当成上游验证成功。</p>
-
-<h2 id="flow4">9. 四个核心流程怎么用</h2>
-
-<h3>① 投喂 → 写回（添加新账号）</h3>
-<ol class="steps">
-<li><b>粘贴账号</b> 每行一条 <code>URL,密钥</code>。URL 带不带 <code>/v1</code> 都行，工具会按段自动补。</li>
-<li><b>点「解析」</b> 看清有几条有效、几条被判无效以及原因。</li>
-<li><b>点「开始探测」</b> 进度条按站推进。每个站四个段分别探，实时显示请求数。</li>
-<li><b>核对方案</b> 分析后自动定档。重点看段判定、模型来源与 priority；“未实测”不是不可用，也不能作为自动启用的依据。更改勾选后会重算方案。</li>
-<li><b>点「生成预览」</b> 看 diff。<strong>这一步只读，不写盘</strong>。</li>
-<li><b>点「确认写回」</b> 写前备份 → 行级编辑 → 校验 → 通知 CPA 管理重载。未绑定实际目标的网关生成验证默认跳过，回执会明确显示“上游未实测”。</li>
+<p>若 nginx 在容器内，同网络下将 proxy_pass 改为 http://upstream-importer:8765；不能使用容器自身回环。已有 CSP 的 connect-src 应允许 'self'，并在浏览器网络面板核对请求确实同源。先执行 nginx -t，检查通过后再按既有运维流程重载 nginx；不要用重载来掩盖后端错误。</p>
+<h2 id="proxy">6. 复用 mihomo</h2>
+<p>保留已有共享 mihomo 的服务、订阅、控制器密钥和持久卷，确认 importer 使用正确的容器网络地址。仓库可选 mihomo profile 提供独立部署引导，不能因此在共享栈重复启动一套代理。</p>
+<p>通用连通性检查仅说明代理出口能访问那个测试地址；不能证明目标站点凭据、模型或协议可用。目标明确拒绝、限流或限制客户端时，应显示原因并遵守探测策略，不能靠换代理重置预算。</p>
+<h3>代理变量如何对应实际流量</h3>
+<div class="codebox"><div class="cap">共享代理地址：合并已有 .env 条目</div><button class="copy" type="button">复制</button><pre>PROBE_PROXY=http://mihomo:7890
+MIHOMO_SECRET=REPLACE_WITH_EXISTING_CONTROLLER_SECRET
+MIHOMO_SUBSCRIPTIONS=provider1=https://subscription.example/subscribe?token=REPLACE_ME</pre></div>
+<p>复用已有 mihomo 时，上面控制器密钥和订阅必须保留现有真实值，不要换成示例。订阅也可采用已有 MIHOMO_SUB_* 条目；二者同名时后者优先，不要同时新增重复 provider。密钥用于控制器鉴权，不是代理 URL 的密码；订阅 URL 只交给现有初始化服务，不能写进公开教程、日志或 Git。</p>
+<table><tr><th>位置</th><th>用途</th></tr><tr><td>PROBE_PROXY</td><td>importer 探测候选代理，可逗号分隔。共享服务地址通常是 http://mihomo:7890。</td></tr><tr><td>DRIFT_PROXY（compose environment）</td><td>源码规则同步所用代理；当前共享部署在服务内固定配置。</td></tr><tr><td>config.yaml 中 proxy-url</td><td>CPA 实际转发所用条目代理。必须从 CPA 容器可达，不能把 Windows 本机地址照抄到 VPS。</td></tr></table>
+<h3 id="config-example">config.yaml：先保留原配置，再审查方案差异</h3>
+<p>以下仅展示支持的 OpenAI 兼容段结构，不是完整 CPA 配置，不应直接投入生产。保留原配置的端口、管理鉴权、其他协议段和注释。占位模型需替换为该凭据实际验证通过的上游模型 ID。</p>
+<div class="codebox"><div class="cap">结构示例：由预览核对模型、凭据与代理</div><button class="copy" type="button">复制</button><pre>openai-compatibility:
+  - name: example-provider
+    base-url: "https://api.example.com/v1"
+    priority: 100
+    api-key-entries:
+      - api-key: "REPLACE_WITH_PRIVATE_UPSTREAM_KEY"
+        proxy-url: "http://mihomo:7890"
+    models:
+      - name: "REPLACE_WITH_VERIFIED_MODEL_ID"
+        alias: "REPLACE_WITH_CLIENT_MODEL_ALIAS"</pre></div>
+<p>name 标识提供方；base-url 填兼容接口基址；models.name 为上游实际 ID，alias 为客户端请求名。priority 是路由优先级，不代表模型高低档或能力评分；不要凭模型名称猜测定档。api-key-entries 内的 proxy-url 只作用于对应凭据，直连条目应按已有方案处理，不要给所有条目统一补代理。其他协议段字段位置不同，不可直接套用此片段。</p>
+<p>操作顺序：备份真实文件 → 用私有副本挂载测试 → 读取现有路由 → 完成探测与定档 → 逐条查看写回差异 → 执行写回 → 检查 CPA 重载与真实调用结果。待定、预算耗尽、断网、空白证据均不构成成功依据；不能靠手填示例 priority 或模型列表绕过验证。</p>
+<h2 id="deploy">7. 按 VPS 方式更新与核验版本</h2>
+<p>先保留私有配置备份，确认 CI 成功、标签或 digest 对应待验收提交。默认分支更新 latest；功能分支通常有独立标签。以下仅更新 importer，保留共享依赖。</p>
+<div class="codebox"><div class="cap">在 VPS 上执行；更新前核对外层 .env 的镜像配置</div><button class="copy" type="button">复制</button><pre>docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml pull upstream-importer
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml up -d --no-deps upstream-importer
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml ps upstream-importer
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml images upstream-importer</pre></div>
+<div class="bad"><b>健康检查不是业务验收</b>容器 healthy 只证明检查端点响应。还须核对实际镜像 digest、前后端版本一致性，并在真实网页完成下面四条流程。本地测试应使用真实配置的私有副本、真实账号与相同挂载方式，避免改坏生产基线。</div>
+<h2 id="probe-policy">8. 主动探测策略</h2>
+<p><code>IMPORTER_PROBE_MODE=managed</code> 为默认主动模式，不要求额外许可文件；<code>passive</code> 只解析和分析，不发上游请求。可选 <code>IMPORTER_PROBE_POLICY_FILE</code> 用于站点覆盖；一旦设置有效覆盖文件，未列出的站点不探测，格式错误则拒绝请求。</p>
+<p>目录查询、生成、能力检查、重试和代理请求共享预算；同站多 Key、重复任务、重启不会自动清除持久账本。明确拒绝或限流必须显示真实终态。不要发送问候、身份询问等无效测试文本，也不要把未实测改成通过。</p>
+<div class="card" id="provider-concurrency">
+<h3>任务并发与单站并发分别控制</h3>
+<p>站点覆盖规则可选填 <code>max_inflight</code>，取值为 1～64 的整数，控制同一 <code>provider</code> 同时占用的请求槽位。同服务的别名规则必须填写一致的限额。已有覆盖规则未填写时保持上限 1；明确填写 1 仍串行；系统托管规则默认上限为 4。</p>
+<p>同一凭据跨协议与别名仍串行，不同凭据才在共享上限内并行。页面任务并发数、主机限制、请求间隔、预算及停止状态共同约束实际请求；提高并发上限不会增加预算，也不能解除历史请求结果待核对的暂停。多实例共享账本时，无法证明归属的活动预约仍会暂停新请求。</p>
+<p>验收速度以整批任务各阶段的实际起止时间为准，同时核对真正发出请求的数量、成功数、失败数和策略阻断数。不要把并行请求耗时相加估计整批时间，也不要把很快结束的全阻断任务当作性能通过。</p>
+</div>
+<p>普通 403 / 429 停止该站本次任务，按 <code>Retry-After</code> 或默认 900 秒保持跨任务冷却。到期后新任务才能重新核实；显式禁测、封禁或指定客户端拒绝持续停止，不通过换 Key、代理或重启清除。页面没有已验证的手动取消接口。轮询中断时不要重复提交，先恢复同一任务状态；关闭或刷新页面不能视为取消后端任务。未完成项目不得标为成功。</p>
+<div class="card" id="ledger-recovery">
+<h3>探测中断后：先核对账本与结算凭证</h3>
+<p>“历史请求结果待核对”或“预约执行者未知”表示某次请求的最终结果仍不确定，相关上游暂停新的探测。刷新、重复提交或重启容器不会自动解除暂停。</p>
+<p><strong>成对持久化与备份：</strong>探测账本与同目录的结算凭证数据库一起保留；后者的文件名是在账本文件名后追加 <code>.settlements.sqlite3</code>。升级保留整个持久化目录，不要只迁移一个数据库，也不要删除、清空账本或改挂空目录。备份前停止新探测并等待运行任务结束，使用一致快照；SQLite 写入期间直接复制单个数据库文件可能遗漏尚未归并的数据。恢复使用同一时点的成对备份。</p>
+<ol>
+<li>在原实例查看原任务状态和脱敏日志，确认是否仍在执行；避免多个实例重复提交同一上游。</li>
+<li>核对强制终止、重启或迁移记录，检查原持久化目录和配套结算凭证是否完整挂载。</li>
+<li>有匹配的完整结算凭证时，系统读取策略账本并校验签名、预约与执行身份后恢复结算；校验失败继续暂停，应核对备份及存储完整性。</li>
+<li>凭证缺失时继续核对原实例日志、任务结果及上游请求或用量记录。等待很久、没有运行任务或容器已重启均不能证明旧请求没有执行。当前版本没有跳过核对的一键解锁，缺失结果的预约仍保持暂停。</li>
 </ol>
+<div class="warn"><b>恢复不等于探测通过</b>中断恢复不解除已确认的上游使用限制，不重置冷却或历史记录。旧版本缺少证据的限制标记按既有受控恢复规则处理，不应手工改成可用。结果未知不能计为探测、定档或写回成功；验收保留受影响范围和未完成原因，待实际执行及独立结果核对完成后再更新结论。</div>
+</div>
+<h2 id="flow4">9. 四条流程逐项验收</h2>
+<h3>① 添加账号：从投喂到写回</h3>
+<p>在投喂输入框粘贴账号文本，先点<strong>解析（零请求）</strong>，核对识别数量、重复项和协议归属。按上一节设置主动探测策略与预算，再点<strong>开始探测</strong>。等待任务结束，逐站查看参数来源、模型选择和定档结果；无法解释的待定或失败项先排查。</p>
+<p>确认需要的条目与模型后，点<strong>生成写回方案</strong>。逐项核对差异和校验结果；有有效变化且校验通过时，才点<strong>确认写回</strong>。最后分别查看本地写入、配置读回、CPA 重载和业务验证结果。某一项成功不代表其余环节已成功。</p>
+<h3>② 路由批量管理：先选范围，再看差异</h3>
+<p>展开<strong>路由批量管理</strong>，点<strong>重新读取</strong>取得当前配置。筛选并选择目标分组；“选中筛选结果”会选择当前筛选范围，操作前核对数量。按需要统一优先级、启用、停用或编辑分组参数，再点<strong>预览并写回这些改动</strong>。确认差异只涉及目标分组后，点本面板的<strong>确认写回</strong>并检查回执。删除有独立确认步骤，应单独核对目标。</p>
+<h3>③ 全局调优体检：逐项理解建议</h3>
+<p>展开<strong>全局调优体检</strong>，点<strong>开始体检</strong>。阅读当前值、建议值与原因，再检查生成的配置差异。有可应用方案时，核对后点本面板的<strong>确认写回</strong>；没有变化时无需写回。完成后检查回执并重新体检，确认实际配置与预期一致。</p>
+<h3>④ 全量重探：只检查现有配置时保持输入为空</h3>
+<p>保持投喂输入框为空，勾选<strong>全量重探</strong>，等待界面读取已有配置数量，再点<strong>开始探测</strong>并核对弹出的确认说明。如果同时输入新账号，任务范围会包含这些输入，不能再当成只检查现有配置。探测策略和预算仍然生效。</p>
+<p>任务结束后逐站检查终态，特别查看停用项、模型变化及代理和请求头的证据。接着依次完成<strong>生成写回方案 → 核对差异 → 确认写回 → 检查回执</strong>。已有任务未结束时，先通过<strong>接回任务</strong>恢复进度，避免重复提交；已确认写入后若重载失败，应处理重载结果，不要盲目重写同一方案。</p>
+<table><tr><th>流程</th><th>必须看到的证据</th><th>写回后再查</th></tr><tr><td>① 投喂 → 写回</td><td>解析数量与去重理由；协议探测终态；参数和依据；高低模型选择；定档；完整 diff。</td><td>只出现预览中的条目；原注释和无关配置保留；读回、CPA 重载、业务验证分别有结果。</td></tr><tr><td>② 路由批量管理</td><td>选择范围清楚；同类型同域名一致、不同域名区分；停用、代理和模型变更均可预览。</td><td>只改选定范围；关联域名约束正确；失败时有明确原因与恢复路径。</td></tr><tr><td>③ 全局调优体检</td><td>基于当前配置解释建议值、请求预算与回源时间；每项调整均有差异。</td><td>只修改已确认的全局键；未知字段、另一项目配置与已有注释保留。</td></tr><tr><td>④ 全量重探</td><td>包含已有停用项；每站有进度、终态、证据与写回方案；失败/预算不足不混成成功。</td><td>逐项审查重新启用和模型变更；完成预览、写回、读回、重载，并核对未成功项目仍有明确标记。</td></tr></table>
+<div class="warn"><b>不接受的结果</b>黑屏、空白参数、无法解释的默认勾选、定档失败、一直待定、轮询无响应、写回后无读回证据。遇到这些情况，当前方案不能视为可用配置。记录任务标识和错误类别，修复后从相应步骤复验。</div>
+<p>批量管理必须同时核对当前筛选范围、全部已选数量和筛选外已选数量。筛选后不要假设旧选择已消失；以预览中实际目标为准，发现非目标组先清除并重新选择。</p>
+<h2 id="rules">10. 模型与 priority 的判定</h2>
+<p>模型来源须标明目录、配置、权威名录或实测。版本按系列和代际理解，不能用字符串排序取一个最高名称。保留需求规定的最新与上一代同档变体，并排除 mini、flash、fast 等低档类别；计算档变体和协议归属需分别判定，不能跨段混入不支持的模型。</p>
+<p>最新代不可用时，应分别展示“最新目录候选”和“已验证的最高可用代际”，不能把候选写成已验证。目录缺失或探测受限应说明原因，不用空白或无依据的全选掩盖。</p>
+<p>策略预选与写回证据分开显示：最新代及上一代高端候选可以按策略预选，但没有对应协议的成功请求证据时，不能用候选替换已有模型列表。原模型和参数的保留原因应出现在结果或差异说明中；没有可用新证据就保留原记录。停止任务意味着停止继续安排请求，已经完成的证据仍保留，不能把中止标成探测成功。</p>
+<p>同类型同域名各 Key 共用 priority，不同域名需要区分。CPA 的排序语义应以实际实现核对；不能照搬其他项目方向相反的优先级数字。健康信息缺失须说明证据不足。停用项重新探测后，重新启用也应出现在预览中，由写回操作落实。</p>
+<h3 id="shared-proxy-upgrade">共享 mihomo：升级镜像后刷新初始化脚本</h3>
+<div class="warn"><b>两个项目一起受影响</b>先完成正在运行的探测和写回，再安排维护窗口。重新创建 mihomo 会同时短暂中断两个项目的代理连接。不要删除共享卷，不要另起同名代理。</div>
+<p>在 VPS 实际部署目录操作。仅更新 importer 不会刷新既有代理卷里的健康检查脚本；先重新运行初始化服务，确认成功后再更新代理和 importer。</p>
+<div class="codebox"><button class="copy" type="button">复制</button><pre>cd /opt/deploy
+docker compose pull upstream-importer mihomo-init mihomo
+docker compose up -d --force-recreate mihomo-init
+docker compose logs --tail=80 mihomo-init</pre></div>
+<p>确认初始化服务成功退出且日志显示自举完成后，再执行下一组命令。若初始化失败，先排查订阅、权限和镜像，不要继续重建代理。</p>
+<div class="codebox"><button class="copy" type="button">复制</button><pre>docker compose up -d --force-recreate mihomo
+docker compose up -d --no-deps upstream-importer
+docker compose ps mihomo upstream-importer</pre></div>
+<p><code>MIHOMO_IMAGE</code> 必须使用包含初始化脚本和代理二进制的本项目镜像。若单独固定了代理镜像版本，应同步更新。正常升级不要设置 <code>MIHOMO_FORCE_REBUILD=1</code>，它会重新生成代理配置。升级后分别检查两个项目的真实代理请求和 importer 的 CPA 管理连接；healthy 仅代表健康检查通过。实际共享配置文件保留在部署目录，不随源码提交。</p>
+<h2 id="speed-and-log">11. 探测速度、节拍与可排查日志</h2>
+<p>本章对应 2026-10-13 的一组改动。它们改变了默认行为，所以升级镜像后界面与日志的表现与旧版不同；逐项说明依据与验收方法。</p>
 
-<h3>② 路由批量管理</h3>
-<p>按域名分组展示所有已配置的上游，支持筛选后批量改 priority、批量启用/停用、批量删除。解决的是 CPAMP 前端逐条点的问题。</p>
-<div class="note"><b>同域名同优先级是硬规则</b>
-同一类型下，同一个域名的所有 Key 必须共享同一个 priority —— 它们互为备份，拆开会让调度退化成单点。批量面板会自动保持这条约束，手工改单条时也会提示。</div>
-
-<h3>③ 全局调优体检</h3>
-<p>读当前 config.yaml，按实际的站点分布给出可改项（重试次数、流式缓冲、冷却策略等），逐条说明依据，可一键写回。</p>
-
-<h3>④ 全量重探</h3>
-<p>对 config.yaml 的全部已有条目重新分析。未授权站点只检查静态配置和已有证据，不发请求、不自动重新启用；已授权站点仍受跨任务共享预算限制。</p>
-<div class="warn"><b>全量重探很慢</b>
-是否发请求由服务端许可决定，不由“全量”按钮决定。重复点击、新建任务、换 Key、协议或代理都不刷新预算。页面关闭并不代表后台任务被取消，请以任务状态为准。</div>
-
-<h2 id="rules">10. 模型选择与定档规则</h2>
-
-<h3>模型清单从哪来</h3>
-<p>来源按证据强度选择；权威名录和已有配置可以合并，不是四个互斥开关。被动模式不读取站方目录：</p>
+<div class="card" id="adaptive-gap">
+<h3>同站间隔改为自适应：留空即可</h3>
+<p>投喂页的「同站间隔」输入框<strong>默认留空</strong>，占位文字为「自适应」。留空时后端从一个乐观起点开始发请求，撞上限流再按阶梯退避并记住该站的节奏；填写数字则视为操作员指定的<strong>地板</strong>，自适应只会在它之上加，不会降到它以下。填 <code>0</code> 与留空不同：前者是「明确要求零间隔」，后者是「交给自适应」。</p>
+<p>旧版把这个框硬写为 <code>3</code>，而那个 3 秒来自某一个站的 bulk probe guard 实测值，被当成所有站的起始节拍，同时又因为「学到的值只升不降」而成为地板。代价在同域名多凭据场景下最明显：同一主机的多把 Key 会把每次请求都垫上 3 秒。</p>
 <table>
-<tr><th>层</th><th>来源</th><th>说明</th></tr>
-<tr><td>1</td><td>CPA 权威名录</td><td>从 CPA 项目在线拉取，与 CPA 实际认识的模型集合同源</td></tr>
-<tr><td>2</td><td>本地 config.yaml</td><td>站方特供型号只会在这层出现。需至少 2 个站在用才采纳，防手误外推</td></tr>
-<tr><td>3</td><td>本轮其他站目录</td><td>同批探测中别的站返回的目录</td></tr>
-<tr><td>4</td><td>内置兜底</td><td>前三层全空时的保底清单，会打 WARNING</td></tr>
+  <tr><th>输入</th><th>后端行为</th><th>适用情形</th></tr>
+  <tr><td>留空（默认）</td><td>乐观起点 + 撞限流阶梯退避 + 记住该站节奏</td><td>绝大多数情形</td></tr>
+  <tr><td>填数字</td><td>该值作为地板；正文里读不出阈值时<strong>不</strong>凭空放慢</td><td>已知站方节奏阈值，或要复现旧节拍</td></tr>
+  <tr><td>填 0</td><td>零间隔，仍受站点预算、账本与并发约束</td><td>确认过站方无限频时的临时压测</td></tr>
 </table>
-
-<h3>勾选规则</h3>
-<ul>
-  <li><span class="tag t-bad">不勾</span> 带 <code>mini</code> / <code>flash</code> / <code>fast</code> / <code>lite</code> / <code>nano</code> / <code>haiku</code> 的低档模型。</li>
-  <li><span class="tag t-ok">全勾</span> 同一代的所有变体。例如最新是 gpt-6 代，那么 <code>gpt-6-astra</code> 和 <code>gpt-6-sol</code> 都要勾上，不能只勾一个。</li>
-  <li><span class="tag t-acc">段隔离</span> codex 段只收 gpt 系、gemini 段只收 gemini 系、claude 段只收 claude 系；openai-compatibility 段可以多族并存。</li>
-  <li><span class="tag t-warn">档位择一</span> 同一基名的算力档只留最高：裸名 &gt; <code>-high</code> &gt; <code>-medium</code> &gt; <code>-low</code>。这样避免高低档同时出现。只有 <code>-low</code> 时保留它，否则该段会空。</li>
-  <li><span class="tag t-ok">两代并存</span> 最新代整体探不通、而次新代通时，两代都保留 —— 既不放弃最新，也不丢掉实际能用的。</li>
-</ul>
-
-<h3>定档（priority）</h3>
-<ul>
-  <li>同一类型 + 同一域名的所有 Key → <strong>相同 priority</strong>（它们互为备份）。</li>
-  <li>同一类型 + 不同域名 → <strong>必须不同 priority</strong>，算出来相同也会做微调区分。</li>
-  <li>健康分数参与排序：可调度比例与活跃比例共同决定名次，健康度高的 priority 更大。</li>
-  <li>原本在配置里被停用、但本次探测证明可用的站，会重新启用并补齐全部参数。</li>
-</ul>
-
-<h2 id="trouble">11. 排错对照表</h2>
-
-<table>
-<tr><th>现象</th><th>先查什么</th><th>怎么修</th></tr>
-<tr><td>页面空白 / 一直转圈</td><td>镜像版本是不是旧的</td><td><code>docker compose pull &amp;&amp; up -d</code>，强刷浏览器</td></tr>
-<tr><td><code>Failed to fetch</code></td><td>Cloudflare 是不是橙云</td><td>改灰云；或确认 nginx <code>proxy_read_timeout 900</code></td></tr>
-<tr><td>轮询无响应，刷新后恢复</td><td>容器是不是重启过</td><td>看 <code>docker compose logs</code>；内存上限别低于 1G</td></tr>
-<tr><td>写回报 PermissionError</td><td><code>IMPORTER_UID/GID</code></td><td>改成与 config.yaml 属主一致后重建容器</td></tr>
-<tr><td>写盘了但 CPA 没生效</td><td><code>CPA_MANAGEMENT_PASSWORD</code></td><td>确认已传进容器；工具靠它调 CPA 的重载接口</td></tr>
-<tr><td>全部站都探不通</td><td>代理通不通</td><td>跑第 6 节那条验证命令，应当回 204</td></tr>
-<tr><td>某站单独探不通</td><td>是否要求特定客户端</td><td>看该站的「客户端门禁」判定，工具会自动试画像梯</td></tr>
-<tr><td>模型格空白</td><td>定档是不是失败了</td><td>看第③步表头的错误提示，按提示处理后重新定档</td></tr>
-</table>
-
-<h3>需要我协助排查时，请提供</h3>
-<div class="codebox">
-  <div class="cap">仅在本地查看诊断信息。以下简单替换不构成完整脱敏，原始输出不要直接公开。</div>
-  <button class="copy" type="button">复制</button>
-<pre>cd /opt/deploy
-echo "=== 容器状态 ==="
-docker compose ps upstream-importer mihomo
-echo "=== 最近日志 ==="
-docker compose logs --tail=80 upstream-importer | sed -E 's#https?://[^ ]+#[URL]#g; s#sk-[A-Za-z0-9_-]+#[KEY]#g'
-echo "=== 镜像版本 ==="
-docker compose images upstream-importer
-echo "=== 健康检查 ==="
-curl -s -o /dev/null -w 'HTTP %{http_code} 耗时 %{time_total}s\n' http://127.0.0.1:8765/</pre>
+<div class="note"><b>自适应不等于无限制</b>节拍只是三道闸中的一道。账本预算、同服务商在途上限、页面并发数仍然生效；同一服务商的多把 Key 在账本层面始终串行（持久账本的在途位是单一字段），所以界面上同域名批次常显示「在飞 1 个」，这是预期行为而非卡住。</div>
 </div>
 
-<div class="ok"><b>另外，浏览器那边</b>
-按 F12 打开开发者工具，切到 Console 和 Network 两个标签，复现一次问题，把红色的报错行截图。前端的报错文案是专门写过的，通常直接说明了原因和处置办法。</div>
+<div class="card" id="rate-learning">
+<h3>限流信号的识别范围扩大</h3>
+<p>旧版只认正文里带 <code>bulk probe</code> 字样的「限频」。HTTP 429 被归入「临时」类、「限流」是另一类，两者都不会触发节奏学习。配合乐观起点后这个缺口会放大，所以现在三类信号都会喂给学习器：「限频」、「限流」、以及 HTTP 状态 429。</p>
+<p>「临时」类里真正的瞬时故障（状态 <code>000</code>、连接中断）<strong>不</strong>触发退避 —— 那不是「你太快了」，退避只会让一次偶发故障拖慢整批。</p>
+<p>正文里带确切阈值（例如「N 个模型 / W 秒」）时按阈值算平均间隔并留余量；读不出阈值时按固定阶梯爬一档，每撞一次升一级，升到上限即止。事件流里会出现 <code>rate-limit-learned</code>，其中 <code>source</code> 字段区分 <code>site-threshold</code>（读到站方阈值）与 <code>backoff-ladder</code>（没读到，按阶梯）。</p>
+</div>
 
-<footer>
-  本教程随代码更新。配置示例中的域名、密钥、订阅地址均为占位，请替换成你自己的。
-</footer>
+<div class="card" id="site-fact-reuse">
+<h3>站方属性跨凭据复用一次实测</h3>
+<p>静默换模与上下文窗口量的是<strong>站方自己的配置</strong>，不是某一把 Key 的属性。所以同一站、同一段、同一模型只实测一次，其余凭据复用该结论；事件流里对应 <code>swap-reused</code> 与 <code>context-reused</code>，措辞明写「复用本轮同站同段同模型的实测，未重复发请求」。</p>
+<p>上下文窗口这一项最贵 —— 每段数次大体积请求 —— 复用省下的请求最多。<strong>复用缓存只在一轮任务内有效</strong>，不落盘：站方随时可能改配置，跨任务复用等于把旧结论当新证据。</p>
+<div class="warn"><b>凭据相关的结论不复用</b>「这把 Key 能用哪些模型」仍然逐个凭据验证。同址不同凭据可能权限或渠道不同，一把 Key 的成功不能替另一把作证 —— 这条约束没有放宽。没测出数的结果（例如上游未统计 token 导致窗口不可信）也不入缓存，后续凭据仍可重试。</div>
+</div>
+
+<div class="card" id="cross-site-parallel">
+<h3>跨站并发按实际站数自适应</h3>
+<p>勾选「并行探测」时，前端<strong>不再</strong>固定下发跨站并发数，由后端按本批真实站数与上限取小。不同站之间没有互相等待的理由：节拍与预算都按站分桶，跨站并发对任一单站的请求频率没有影响。</p>
+<p>单个候选内部的分段并行度仍是 4（四段到顶）。关掉「并行探测」则退回完全串行，用于撞上「按账号而非按端点」限频的站。</p>
+<div class="note"><b>验收口径</b>速度要看整批的实际起止时间，并同时核对真正发出的请求数、成功数、失败数与策略阻断数。请求数下降不等于更快，全部被阻断的批次结束得最快但什么都没验证。推荐用持久账本里预约的时间跨度除以预约总数，得到「每次请求的实际成本」，再与站方的实测往返延迟比较：两者接近说明等待已被压掉，差距大说明时间花在自己的等待上。</div>
+</div>
+
+<div class="card" id="probe-log">
+<h3>探测过程落进日志（排查的前提）</h3>
+<p>旧版的事件流只存在于浏览器里：<code>IMPORTER_LOG_LEVEL=DEBUG</code> 与 <code>IMPORTER_LOG_TO_FILE=1</code> 全开时，一整轮探测在磁盘上也只留下一行汇总。浏览器一关、容器一换就什么都不剩，而部署方式是「VPS 只拉镜像」且 <code>pull_policy: always</code> 每次都会重建容器。现在每条事件同时写一条 DEBUG 日志，带任务号前缀便于在交织的日志里按任务分离。</p>
+<div class="codebox"><div class="cap">收集探测日志（在 /opt/deploy 执行）</div><button class="copy" type="button">复制</button><pre># 实时跟随（容器标准输出）
+docker compose logs -f --tail=200 upstream-importer
+
+# 导出最近一段到文件，便于附在排查记录里
+docker compose logs --no-color --since 30m upstream-importer > /tmp/importer-30m.log
+
+# 落盘日志（IMPORTER_LOG_TO_FILE=1 且挂了日志卷时）
+ls -la ./logs/upstream-importer/
+tail -n 300 ./logs/upstream-importer/importer-*.log
+
+# 只看探测判定（按任务号过滤，xxxxxxxx 换成实际前缀）
+grep -E '\[[0-9a-f]{8}\] (attempt|catalog|prescan|section-done|candidate-)' \
+  ./logs/upstream-importer/importer-*.log | tail -n 200</pre></div>
+<p>日志里的网址只保留可区分的词干，不写完整私有域名；凭据与 Authorization 不进日志。字段按白名单输出 —— 新增字段默认不记录，避免将来加字段时漏掉一次脱敏判断。日志目录通常是 bind-mount 出去的，这两条约束是必要的。</p>
+<div class="note"><b>这条日志能回答什么</b>每站每段「探了没有、发了几次、什么状态、被哪条策略挡住」。例如 <code>prescan ... status=blocked probe_policy_code=provider_stopped</code> 直接说明本轮一个请求都没发，原因是持久账本里的停止记录，而不是网络或凭据问题 —— 这类结论过去只能靠猜。</div>
+</div>
+
+<div class="card" id="legacy-evidence">
+<h3>旧版限制记录的有界复核</h3>
+<p>持久账本里的限制证据带分类器版本号。当判定逻辑本身发生语义变更时，版本号会递增，<strong>低于当前版本</strong>的证据不再单独构成永久封锁，可以走已有的有界复核路径；当前版本的证据语义不变，仍是永久结论。</p>
+<p>这解决的是一类具体情形：某条记录是在工具自身请求形态有缺陷时产生的，修正形态后同一个站实际可用，但旧记录仍在封死整站 —— 此时光升级镜像救不回来。复核<strong>不是放行</strong>：仍需显式任务作用域、仍受预算与冷却约束，仍要一次真实请求来确认，失败即回到停止状态。旧证据行本身不被删除或改写，审计链完整。</p>
+<div class="warn"><b>不要据此手工改写账本</b>复核由策略引擎在满足条件时自行发起。直接编辑或删除账本会破坏结算凭证的配对关系，使正在等待核对的预约无法恢复。确认某个服务商是否仍被停止，查账本里的停止状态与证据版本，不要以「换了 Key 还是不通」推断。</div>
+</div>
+
+<h2 id="stuck-and-substitute">12. 两类「看着像站坏了」的卡点</h2>
+<p>本章两件事都来自 2026-10-14 的本机实跑。它们的共同点是：界面显示站不可用，而站本身是好的 —— 真因在账本状态或站方的提示没被读懂。先按这两条排除，再去怀疑凭据和网络。</p>
+
+<div class="card" id="orphan-inflight">
+<h3>探测一次请求都不发：先看在途预留</h3>
+<p>症状：点检测后很快结束，<strong>推理尝试 0</strong>，日志里只有一行
+<code>probe_policy_code=orphaned_inflight</code>，界面提示「N 个未结算请求的持有者无法确认」。涉及的服务商<strong>没有被判死</strong>（停止状态是空的），但一个请求都发不出去。</p>
+<p>成因是容器在探测途中被重建。任务状态只在内存里，正在途的预留没有人结算；这类预留如果连签名结算凭证都没来得及写（请求已发出、结算前进程被杀），重启后的自动重放无从恢复，而判活依据是进程内的持有者登记表 —— 重启后必然为空。于是这些预留永久停在「归属无法核实」。</p>
+<p>这与部署方式直接相关：镜像配置是每次 <code>up -d</code> 都重建容器，所以<strong>正跑着全量重探时拉新镜像</strong>就会留下这类残留。</p>
+<table>
+  <tr><th>要确认的事</th><th>怎么看</th></tr>
+  <tr><td>有没有孤儿预留</td><td>界面提示文案，或 <code>/api/context</code> 的 <code>probe_policy.orphaned_inflight_count</code></td></tr>
+  <tr><td>是哪些、什么类型</td><td>同一处的 <code>probe_policy.orphans</code>：每条给出预留与服务商标识前缀、预留时间、请求类型、<strong>有没有结算凭证</strong></td></tr>
+  <tr><td>能不能自动恢复</td><td><code>has_settlement_payload</code> 为真表示本该被自动重放恢复；仍在列表里说明凭证校验没过（账本被换或文件损坏），那是另一类问题</td></tr>
+</table>
+<div class="warn"><b>没有「一键解锁」，这是刻意的</b>请求可能真的已经发到上游并计了费。自动按超时清理会掩盖真实用量，还可能让同一次请求被重复发送。所以必须先去核对原请求到底有没有执行 —— 查原实例日志、上游用量或调用记录 —— 再把结论如实记进账本。</div>
+<div class="codebox"><div class="cap">核销一条孤儿预留（先核对，再记账）</div><button class="copy" type="button">复制</button><pre># 1) 列出孤儿预留（只读，不改任何状态）
+curl -s -H "Authorization: Bearer $IMPORTER_TOKEN" \
+  http://127.0.0.1:8765/api/context | python3 -m json.tool | \
+  grep -A 20 '"orphans"'
+
+# 2) 核对那次请求到底有没有执行（原实例日志 / 上游用量记录）
+docker compose logs --no-color upstream-importer | grep -i '<预留前缀>'
+
+# 3) 按核对结论记账。outcome 只接受 executed 与 not-executed；
+#    note 必填，会写进审计留痕。
+curl -s -X POST -H "Authorization: Bearer $IMPORTER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"confirm":true,
+       "reservation":"<预留前缀>",
+       "outcome":"not-executed",
+       "note":"已核对原实例日志，该请求未到达上游"}' \
+  http://127.0.0.1:8765/api/orphan-settle</pre></div>
+<p>核销只释放被占住的在途位，<strong>不解除</strong>任何既有的服务商限制或冷却。记账结果会标成人工核对（与引擎自己的结算可区分），依据原文进审计留痕。缺 <code>confirm</code>、<code>outcome</code> 取值不对、没写依据、标识格式错，四种情况都会被拒绝。</p>
+</div>
+
+<div class="card" id="substitute-model">
+<h3>站方在失败正文里指名了另一个模型</h3>
+<p>有的中转站把某个协议段的模型换了名字，并把正确用法写在失败响应的正文里。实测遇到的一条（claude 段）：</p>
+<div class="codebox"><div class="cap">HTTP 400 的响应正文（站方自己的说明）</div><button class="copy" type="button">复制</button><pre>由于 claude 模型供应难以保证，上线 gpt-6-astra-cc-format 模型，
+支持 messages 格式，通过 claude --model 'gpt-6-astra-cc-format[1m]' 使用该模型</pre></div>
+<p>也就是说这个站的 claude 段<strong>没有真正的 claude 模型</strong>。工具现在会从这类正文里读出站方指名的名字（支持 <code>--model '名字'</code> 与「上线 某名字 模型」两种措辞），插队试一次，并在事件流里记一条 <code>站方指名改用 …</code>。</p>
+<p>两个边界值得知道：</p>
+<ul>
+<li><strong>只跟随一次。</strong>替代模型的响应里可能又提另一个名字，无限跟随会变成被正文牵着走的请求放大器。</li>
+<li><strong>只认正文里写出来的名字。</strong>不猜、不拼接；过短或含路径分隔符的一律丢掉。正文没点名就一发都不多打。</li>
+</ul>
+<div class="note"><b>名字里的方括号后缀是客户端语法，不是 HTTP 字段</b>上面那条里的 <code>[1m]</code> 是 claude 命令行的写法，由命令行翻译成请求头。实测把它原样写进请求的 <code>model</code> 字段仍然失败；真正起作用的是 <code>anthropic-beta</code> 里对应的那一项。工具会把已知后缀剥掉并交给画像梯补对应的头，所以写回配置里的模型名是<strong>不带后缀</strong>的那个。</div>
+<p>同一个段里不同模型可能返回<strong>不同的</strong>失败正文：一个说「换用某模型」，另一个说「请启用某能力」。两条都要读原文 —— 只看归类会把前者那句指示整个丢掉。排查时请对照事件流里每个模型各自的状态与正文摘要，而不是只看段级结论。</p>
+</div>
+
+<div class="card" id="retryable-vs-dead">
+<h3>429 与 503 不是「这个模型不可用」</h3>
+<p>这两种响应表示请求<strong>已经过了站方的门禁</strong>、转发到上游后遇到忙或限流。它们属于可重试类：同一个模型稍后或换一把凭据可能就通，所以不应据此把模型或段判死。</p>
+<p>与之相对，配额与门禁类的响应（例如明确说没有该模型、要求开通某能力、凭据无权）换时间重试没有意义，需要改模型名、补参数或联系站方。</p>
+<div class="warn"><b>收到 429 后账本会进入冷却</b>这是设计行为：收到限流就停手一段时间，避免把站打得更死。此时紧接着重跑会被账本挡住并提示剩余秒数 —— 那不是修复没生效，而是冷却还没过。复测前先确认冷却已清零（界面提示或 <code>/api/context</code> 的策略摘要），否则会把「冷却中」误读成「改动无效」。</div>
+</div>
+
+<h2 id="trouble">13. 根据证据排错</h2>
+<table><tr><th>现象</th><th>检查顺序</th></tr><tr><td>黑屏 / 页面空白</td><td>浏览器脚本错误、静态资源 HTTP 状态与版本、CSP、前后端接口一致性；先定位再判断是否需更新镜像。</td></tr><tr><td>Failed to fetch</td><td>Network 是否发出请求；登录与 401/403；CSP/CORS；nginx 502/504；后端异常；任务是否已创建。不是统一改 DNS 或增大超时。</td></tr><tr><td>轮询无响应</td><td>任务标识、轮询响应、容器重启/OOM 证据、请求路径与鉴权；避免盲目重复创建探测任务。</td></tr><tr><td>全部站失败</td><td>容器 DNS、共享代理网络、目标协议与凭据、预算账本；单一出口连通检查不能替代目标验证。</td></tr><tr><td>只允许特定客户端 / invalid codex request</td><td>分别核对协议路径、请求体、必要请求头与站点限制。明确拒绝后按策略停止，不以伪装重试掩盖。</td></tr><tr><td>参数空白 / 模型混乱</td><td>查看探测和定档各自终态、模型来源及过滤理由；未完成方案不要写回。</td></tr><tr><td>写回失败 / CPA 未生效</td><td>挂载路径与权限、预览基线是否变化、管理口令变量映射、读回内容及 CPA 重载响应。</td></tr></table>
+<p>协助排查时只提供镜像版本、任务阶段、HTTP 状态、脱敏错误类别与配置差异摘要。截图须去除真实域名、密钥、Authorization、Cookie、订阅和个人信息；简单正则替换不构成完整脱敏。原始 MHTML 和日志留在本地。</p>
+<section class="card"><h3>共享部署的 CPA 管理口令映射</h3><p>外层 <code>.env</code> 使用 <code>CPA_MANAGEMENT_PASSWORD</code>，映射到 importer 的 <code>CPA_MANAGEMENT_TOKEN</code>。同一部署中的 cpa2sub2api 使用 <code>CPA_MANAGEMENT_KEY</code>；共享 compose 的映射为 <code>${CPA_MANAGEMENT_KEY:-${CPA_MANAGEMENT_PASSWORD:-}}</code>。显式填写非空 KEY 时优先使用，否则复用 PASSWORD。两者均为空时必须补齐配置；不要填写 bcrypt 哈希，也不要将真实口令写入教程或提交记录。</p></section>
+<footer>本教程提供配置与验收方法，不宣称某次镜像已通过全部实测。示例均为公共服务名或占位信息。</footer>
 
 </div>
 
@@ -570,9 +465,13 @@ document.querySelectorAll('.copy').forEach(function (btn) {
       range.selectNodeContents(pre);
       sel.removeAllRanges();
       sel.addRange(range);
-      try { document.execCommand('copy'); done(); } catch (e) {
+      try {
+        if (!document.execCommand('copy')) throw new Error('copy denied');
+        done();
+      } catch (e) {
         btn.textContent = '请手动复制';
         setTimeout(function () { btn.textContent = '复制'; }, 1600);
+        return; // 保留选区，方便手动复制。
       }
       sel.removeAllRanges();
     }

@@ -34,6 +34,11 @@ class SyntheticPolicy:
         return probe_policy.Decision(allowed, '' if allowed else 'test_host_denied',
                                      '' if allowed else '测试不允许访问真实上游')
 
+    def admission_key(self, url, headers=None):
+        # Match the production provider gate without authorizing any request.
+        # check/reserve below still reject every non-synthetic destination.
+        return ('synthetic-policy', (urlsplit(url).hostname or '').lower())
+
     def reserve(self, url, headers=None):
         decision = self.check(url, headers)
         return probe_policy.Permit(decision.allowed, decision.code, decision.reason,
@@ -57,7 +62,9 @@ def main():
     client.get_policy = lambda: policy
     original_verify = writeback.verify_upstream
     def verify_direct_fixture(*args, **kwargs):
-        if args and policy.synthetic(args[0]):
+        # Legacy fixtures omit scope. Explicit scope also exercises binding
+        # refusal, so never rewrite the caller's binding declaration.
+        if args and policy.synthetic(args[0]) and 'scope' not in kwargs:
             scope = kwargs.setdefault('scope', {})
             scope['direct_target'] = True
         return original_verify(*args, **kwargs)

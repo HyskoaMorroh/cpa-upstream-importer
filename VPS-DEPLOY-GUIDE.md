@@ -275,3 +275,8 @@ cp /opt/deploy/config.yaml /root/backup/config.yaml.$(date +%Y%m%d)
 # 导出容器日志
 docker compose logs --no-color upstream-importer > /tmp/importer.log
 ```
+# 已有共享 mihomo 的升级注意事项
+
+如果本次更新包含代理初始化或健康检查脚本，仅拉取 importer 镜像不会刷新已有代理数据卷。请按 [README 的共享 mihomo 升级步骤](README.md#共享-mihomo-的镜像升级与初始化刷新) 操作：拉取 `upstream-importer`、`mihomo-init`、`mihomo` 对应镜像，强制重新创建 `mihomo-init`，确认初始化成功退出，再重新创建 `mihomo` 并更新 importer。固定了 `MIHOMO_IMAGE` 版本时也要更新该版本，且该镜像必须含本项目初始化脚本与代理二进制。
+
+两个项目共用代理，需先结束探测和写回并安排维护窗口；重建代理会使两个项目的代理连接同时短暂中断。保留共享数据卷和现有配置，正常升级不要设置 `MIHOMO_FORCE_REBUILD=1`。不要用仓库内的独立模板覆盖 `/opt/deploy` 的共享 `.env`、compose、nginx 或真实配置。升级后分别验证两个项目的代理业务及 importer 的 CPA 管理连接；容器 healthy 不能代替实际业务验证。

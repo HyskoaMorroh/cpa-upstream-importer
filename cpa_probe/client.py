@@ -19,6 +19,7 @@ import http.client
 import io
 import socket
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -29,15 +30,16 @@ READ_LIMIT = 4 * 1024 * 1024
 
 
 class Response:
-    __slots__ = ("status", "body", "elapsed_ms", "error", "policy_code")
+    __slots__ = ("status", "body", "elapsed_ms", "error", "policy_code", "retry_after")
 
     def __init__(self, status: str, body: str, elapsed_ms: int, error: str = "",
-                 policy_code: str = ""):
+                 policy_code: str = "", retry_after: str = ""):
         self.status = status
         self.body = body
         self.elapsed_ms = elapsed_ms
         self.error = error
         self.policy_code = policy_code
+        self.retry_after = retry_after
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"<Response {self.status} {len(self.body)}B {self.elapsed_ms}ms>"
@@ -62,15 +64,23 @@ def _policy_failure(t0: float) -> Response:
                     "policy_skip: policy unavailable", policy_code="policy_error")
 
 
-def _settle_policy(policy, permit, url, headers, status, body, error):
-    """Settle once, and surface terminal stops on this response, not the next."""
+def _settle_policy(policy, permit, url, headers, status, body, error, retry_after=""):
+    """Retry only ledger settlement; never reserve or send the request again."""
     try:
-        if policy.finish(permit, status, body, error) is False:
-            return "policy_error", "策略账本结算失败，已停止后续请求"
+        finish_args = {"retry_after": retry_after} if retry_after else {}
+        # SQLite's short lock timeout can expire while another provider commits.
+        # Keep the original permit and outcome, including restriction evidence.
+        # Settlement remains necessary after job cancellation or socket timeout.
+        for attempt in range(3):
+            if policy.finish(permit, status, body, error, **finish_args) is not False:
+                break
+            if attempt == 2:
+                return "policy_error", "策略账本结算失败，已保留占位并停止后续请求，需修复账本后核查恢复"
+            time.sleep(0.05 * (attempt + 1))
         check = getattr(policy, "check", None)
         if callable(check):
             decision = check(url, headers)
-            if decision.code in ("provider_stopped", "ledger_unavailable"):
+            if decision.code in ("provider_stopped", "provider_job_stopped", "provider_cooldown", "ledger_unavailable"):
                 return decision.code, decision.reason
     except Exception:
         return "policy_error", "策略账本不可用，已停止后续请求"
@@ -100,6 +110,67 @@ def _time_left(deadline: float) -> float:
     if left <= 0:
         raise TimeoutError("timeout")
     return left
+
+
+# System DNS may ignore socket timeouts. Bound outstanding resolver work even
+# when the OS resolver never returns; timed-out callers never start a socket.
+_DNS_SLOTS = threading.BoundedSemaphore(16)
+
+
+def _resolve_before(host, port, deadline):
+    slots = _DNS_SLOTS
+    if not slots.acquire(timeout=_time_left(deadline)):
+        raise TimeoutError("DNS resolution timeout")
+    ready = threading.Event()
+    outcome = {}
+
+    def resolve():
+        try:
+            outcome["addresses"] = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        except Exception as error:
+            outcome["error"] = error
+        finally:
+            slots.release()
+            ready.set()
+
+    worker = threading.Thread(target=resolve, name="probe-dns", daemon=True)
+    try:
+        worker.start()
+    except BaseException:
+        slots.release()
+        raise
+    if not ready.wait(_time_left(deadline)):
+        raise TimeoutError("DNS resolution timeout")
+    _time_left(deadline)
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["addresses"]
+
+
+def _connect_before(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+                    source_address=None, *, deadline):
+    host, port = address
+    addresses = _resolve_before(host, port, deadline)
+    last_error = None
+    for family, kind, proto, _, target in addresses:
+        _time_left(deadline)
+        sock = None
+        try:
+            sock = socket.socket(family, kind, proto)
+            sock.settimeout(_time_left(deadline))
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(target)
+            # HTTPSConnection uses this socket for TLS (and proxy CONNECT).
+            sock.settimeout(_time_left(deadline))
+            return sock
+        except OSError as error:
+            last_error = error
+            if sock is not None:
+                sock.close()
+    if last_error is not None:
+        raise last_error
+    raise OSError("DNS returned no usable address")
 
 
 class _DeadlineReader(io.RawIOBase):
@@ -132,13 +203,42 @@ class _DeadlineHTTPResponse(http.client.HTTPResponse):
 
 def _deadline_connection(connection_type, deadline: float, host, **kwargs):
     class DeadlineConnection(connection_type):
+        def connect(self):
+            super().connect()
+            # 连接阶段的短上限只管「连不上」，连上之后这次交换的剩余预算
+            # 要全额还回来 —— 否则大 body 的上下文探测（最大约 110 万字符）
+            # 会在发送途中被连接上限掐断。
+            try:
+                self.sock.settimeout(_time_left(deadline))
+            except (AttributeError, OSError):
+                pass
+
         def _tunnel(self):
             super()._tunnel()
             # CONNECT consumed part of the budget; TLS must not reuse it.
-            self.sock.settimeout(_time_left(deadline))
+            self.sock.settimeout(_time_left(connect_deadline))
 
-    kwargs["timeout"] = _time_left(deadline)
+    # 连接/握手单独设上限，不吃满调用方的总预算（2026-10-05）
+    # -------------------------------------------------------
+    # 原来这里直接写 `_time_left(deadline)`，于是 TCP 连接和 TLS 握手各自
+    # 都能用掉**整个** timeout。探测默认 timeout=120（server.py 的
+    # `_clamp(job.opts, "timeout", 120)`），所以一个 TCP 层直接挂住的死站
+    # 要等满 120 秒才判死。
+    #
+    # 叠加 probe_policy 的「同服务商一次只允许一个在飞」
+    # （probe_policy.py `_assess` 的 inflight 分支，由
+    # tests/test_probe_policy.py::test_multithread_instances_allow_only_one_inflight
+    # 锁住），同一个站的 N 把 Key 就是 N × 120 秒串行。
+    # 本机实测现场：10 把同站 Key 跑 1133 秒只完成 6 个，最慢单请求 141 秒。
+    #
+    # 没有任何合法上游需要 120 秒完成 TCP + TLS 握手，所以这一段单独封顶；
+    # 读取与发送仍由 `_DeadlineReader` 和上面的 connect() 用总预算兜着，
+    # 慢响应（首字延迟高、大 body）不受影响。
+    _CONNECT_TIMEOUT = 15.0
+    connect_deadline = min(deadline, time.monotonic() + _CONNECT_TIMEOUT)
+    kwargs["timeout"] = min(_time_left(deadline), _CONNECT_TIMEOUT)
     connection = DeadlineConnection(host, **kwargs)
+    connection._create_connection = partial(_connect_before, deadline=connect_deadline)
     connection.response_class = partial(_DeadlineHTTPResponse, deadline=deadline)
     return connection
 
@@ -216,6 +316,7 @@ def send(
     method: str = "POST",
     proxy: str | None = None,
     timeout: int = 120,
+    policy_wait=None,
 ) -> Response:
     """发请求；每次实际尝试单独授权，所有异常均转成 Response。
 
@@ -239,15 +340,30 @@ def send(
             permit = policy.reserve(url, headers)
         except Exception:
             return _policy_failure(t0)
+        # 只在尚未有任何 wire attempt 时等待临时许可；不重开已经消耗的
+        # GET 重试预算，更不能重放 POST。回调位于异常包装之外，让取消和
+        # 编排层等待超时原样返回给任务，而不是伪装成账本故障。
+        while (not permit.allowed and attempt == 0 and policy_wait is not None
+               and permit.code in ("minimum_interval", "inflight")):
+            policy_wait(policy, permit)
+            try:
+                permit = policy.reserve(url, headers)
+            except Exception:
+                return _policy_failure(t0)
         if not permit.allowed:
             return Response("000", "", int((time.monotonic() - t0) * 1000),
                             permit.reason, policy_code=permit.code)
+        if policy_wait is not None and attempt == 0:
+            # 排队有单独上限；HTTP 总期限从首次获准发送起计，不把排队耗时
+            # 变成刚获许可就超时的空请求。重试仍共享这个 HTTP 期限。
+            deadline = time.monotonic() + timeout
 
         status = "000"  # Actual wire status for finish(), even on read failure.
         raw = b""
         text = ""
         err = ""
         content_encoding = ""
+        retry_after = ""
         http_error = False
         retry = False
         policy_code = ""
@@ -258,6 +374,7 @@ def send(
                     req, timeout=_time_left(deadline)
                 ) as resp:
                     status = str(resp.status)
+                    retry_after = resp.headers.get("Retry-After", "")
                     content_encoding = resp.headers.get("Content-Encoding", "")
                     raw = _read_body(resp)
             except _RedirectBlocked as error:
@@ -269,6 +386,7 @@ def send(
                 # Header/body failures must not discard a 403/429 stop signal.
                 status = str(error.code)
                 http_error = True
+                retry_after = error.headers.get("Retry-After", "") if error.headers else ""
                 try:
                     with error:
                         content_encoding = error.headers.get("Content-Encoding", "")
@@ -299,7 +417,7 @@ def send(
             # Cover opener construction, response headers, body and decoding,
             # including a retry's failed attempt. Never reload another engine.
             settled_code, settled_reason = _settle_policy(
-                policy, permit, url, headers, status, text, err)
+                policy, permit, url, headers, status, text, err, retry_after)
             if settled_code:
                 policy_code, err = settled_code, settled_reason
                 retry = False
@@ -307,7 +425,7 @@ def send(
 
         if finish_failed:
             return _policy_failure(t0)
-        if policy_code == "provider_stopped":
+        if policy_code in ("provider_stopped", "provider_job_stopped", "provider_cooldown"):
             return Response(status, text, int((time.monotonic() - t0) * 1000),
                             err, policy_code=policy_code)
         if retry:
@@ -571,7 +689,8 @@ def ws_handshake(
             if len(parts) >= 2 and len(parts[1]) == 3 and parts[1].isdigit():
                 status = parts[1]
         settled_code, settled_reason = _settle_policy(
-            policy, permit, url, headers, status, result.body, result.error)
+            policy, permit, url, headers, status, result.body, result.error,
+            retry_after=result.retry_after)
         if settled_code:
             result.policy_code, result.error = settled_code, settled_reason
             finish_failed = settled_code in ("policy_error", "ledger_unavailable")
@@ -623,7 +742,8 @@ def _ws_error_body(sock, initial: bytes, deadline: float, started: float) -> Res
     except Exception as exc:
         body = bytes(data[:65536]).decode("utf-8", errors="replace")
         error = error or _safe_error(exc)
-    return Response(status, body, int((time.monotonic() - started) * 1000), error)
+    return Response(status, body, int((time.monotonic() - started) * 1000), error,
+                    retry_after=response.headers.get("Retry-After", ""))
 
 
 def _ws_handshake_once(
@@ -684,15 +804,24 @@ def _ws_handshake_once(
     req = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8", errors="replace")
 
     t0 = time.monotonic()
+    deadline = t0 + timeout
+
+    def remaining_timeout():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError()
+        return left
+
     sock = None
     buf = b""            # 在 try 之外初始化 —— 超时处置要按「已收多少字节」
                          # 区分「连不上」与「连上了但握手响应没读完」
     try:
-        sock = socket.create_connection((host, port), timeout=timeout)
+        sock = socket.create_connection((host, port), timeout=remaining_timeout())
         if scheme == "wss":
             ctx = ssl.create_default_context()
+            sock.settimeout(remaining_timeout())
             sock = ctx.wrap_socket(sock, server_hostname=host)
-        sock.settimeout(timeout)
+        sock.settimeout(remaining_timeout())
         sock.sendall(req)
         # 整次握手的**截止时间**，不是每次 recv 的超时（2026-09-05 修）。
         #
@@ -709,7 +838,7 @@ def _ws_handshake_once(
         # `codex_websockets_connection.go:32` 的 `dialer.HandshakeTimeout`
         # （同文件 :27 = 30 * time.Second），gorilla 那个字段覆盖整次握手
         # 而不是单次读。
-        deadline = time.monotonic() + timeout
+        # TCP、TLS 和发送已消耗同一预算，读取不能重新获得完整 timeout。
         # 上限 64KB —— 拒绝时站方可能回一整个 HTML 拦截页，头部本身没那么大。
         while b"\r\n\r\n" not in buf and len(buf) < 65536:
             left = deadline - time.monotonic()

@@ -523,6 +523,40 @@ def ladder(section: str, cfg: dict | None = None, *,
     return sorted(items, key=lambda p: (p.tier, p.name))
 
 
+def catalog_identity_headers(cfg: dict | None = None, *,
+                             source_identity=None) -> dict[str, str]:
+    """目录预扫用的「最小可用身份头」。
+
+    为什么需要单独一个函数而不是直接取 `ladder()[0].headers`：梯子是**探测
+    推理请求**用的，baseline 档（tier 0，无头）是它的起点；而目录端点对身份
+    的检查比推理松，实测同一主机（某聚合站，2026-10-09）：
+
+      · 裸 `x-api-key`                  -> 401 unauthorized client detected
+      · UA + 最小 anthropic-beta        -> 200 + supported_endpoint_types
+
+    也就是说 baseline 那一档在目录端点上必然 401，而 401 会把「站方只认特定
+    客户端」这本该是**有价值信息**的信号浪费掉。所以预扫固定取 cc-min 那一档
+    （第一档带 user-agent 的非 alt 档），并保留 x-app / anthropic-version ——
+    实测多带它们不会让通的站变不通。
+
+    返回值只含身份头，不含凭据：凭据由 `request.models_endpoint` 按段注入，
+    两处分开是为了不把 key 混进一个可能被记进事件的字典。
+    """
+    defaults = defaults_from_config(cfg, source_identity=source_identity)
+    for prof in ladder("claude-api-key", cfg, include_alt=False,
+                       source_identity=source_identity):
+        headers = prof.headers or {}
+        if headers.get("user-agent"):
+            out = dict(headers)
+            # x-app / anthropic-version 从 std 档借：cc-min 那档没有它们，
+            # 而站方门禁常把这三项当一个整体（实测 golf 缺 x-app 即 401）。
+            for name, value in _cc_headers(defaults, betas=_CC_BETAS_MIN,
+                                           std=True).items():
+                out.setdefault(name, value)
+            return out
+    return {}
+
+
 def families(section: str, cfg: dict | None = None) -> dict[str, list[Profile]]:
     """按客户端族分组，族内按 tier 升序。超集不变式只在族内检查。"""
     out: dict[str, list[Profile]] = {}

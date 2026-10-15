@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
+import logging
 import hashlib
 import json
 import re
@@ -27,6 +28,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -43,8 +45,9 @@ from .classify import has_error_envelope as _has_error_envelope
 from .classify import looks_like_html as _looks_like_html
 from .classify import time_window as _time_window
 from .classify import validate_success
-from .resources import HOST_LIMITER
-from . import client, fingerprint, model_catalog, profiles, request
+from .resources import HOST_LIMITER, PROVIDER_ADMISSION, AdmissionTimeout
+from . import client, fingerprint, model_catalog, profiles, request, section_gate
+from .probe_policy import policy_job_scope, policy_request_scope
 from .parse import SECTIONS, ParsedRow, base_for_section, host_of
 
 # 协议证据闸的机器码 → 给人看的话（2026-09-12）。
@@ -92,6 +95,8 @@ _SEED_FAMILIES: dict[str, tuple[str, ...]] = {
     "openai-compatibility": ("gpt", "claude", "gemini"),
 }
 
+
+logger = logging.getLogger(__name__)
 
 def _seed_models() -> dict[str, list[str]]:
     """按 `_SEED_FAMILIES` 从兜底名录里取每段的探测种子。
@@ -455,14 +460,7 @@ class SectionVerdict:
     # 随机 UUID，落进报告会让每次输出都不同）。非空表示 headers 表达不了，
     # claude 段要 fingerprint-profile，其余三段配置层无解。
     min_body_kind: str = ""
-    # 「门票已过、凭据不行」（2026-09-17）
-    # ---------------------------------
-    # 画像梯某一档把「客户端」拒绝推进成了**凭据类**拒绝（余额 / 鉴权）：
-    # 站方已经认了这个身份，只是这把 Key 没钱或无效。段仍不可用，但
-    # 「这个站要什么身份」已经实测出来 —— 写回必须带上，否则 CPA 用默认
-    # 形态转发，站方按同一条规则拒，客户端拿 401/503/499。
-    # 现场：golf.example claude 段 baseline 401「客户端」，cc-min 起全部
-    # 402「余额」；原逻辑取最严重类别报「客户端」，把这条证据丢了。
+    # 仅保留有成功响应证据支持的身份结论；失败状态变化不构成证明。
     identity_proven: bool = False
     # 分组的可调用时段（("09:00","18:00")）。「时段」类才有。
     time_window: tuple[str, str] | None = None
@@ -514,6 +512,9 @@ class SectionVerdict:
     #
     # 判死的段也要留着它：操作员人工接管时，这是唯一可选的候选清单。
     catalog: list[str] = field(default_factory=list)
+    model_scan_candidates: list[str] = field(default_factory=list)
+    model_scan_pending: list[str] = field(default_factory=list)
+    model_scan_pending_reason: str = ""
     successful_base_url: str = ""
     successful_proxy_url: str | None = None
     profile_id: str = ""
@@ -581,7 +582,7 @@ class Prober:
         self,
         *,
         proxy: str | None = None,
-        gap: float = 3.0,
+        gap: float | None = None,
         timeout: int = 120,
         probe_context: bool = True,
         probe_capabilities: bool = True,
@@ -592,6 +593,9 @@ class Prober:
         reuse_profile_verdict: bool = True,
         on_event: Callable[[str, dict], None] | None = None,
         cfg_snapshot: dict | None = None,
+        policy_wait_timeout: float | None = None,
+        sections_hint: list[str] | None = None,
+        prescan_sections: bool = True,
     ):
         # 现有 config.yaml 的快照。画像梯从它的 `claude-header-defaults` /
         # `codex.header-defaults` 派生真实的 UA 版本号与 X-Stainless 值
@@ -607,8 +611,18 @@ class Prober:
         self._cancelled = threading.Event()
         self._policy_local = threading.local()
         self.proxy = proxy
-        self.gap = gap
+        # gap=None（默认）走乐观起点，撞限流再退（见 _OPTIMISTIC_GAP 与
+        # _note_rate_limit 的阶梯退避）。显式给值视为操作员指令：那是本轮
+        # 的**地板**，自适应只会在它之上加，不会降到它以下。
+        self._gap_is_explicit = gap is not None
+        self.gap = self._OPTIMISTIC_GAP if gap is None else float(gap)
+        # 撞限流但正文里没有确切阈值时，按 _BACKOFF_LADDER 爬到第几档。
+        self._backoff_step: dict[str, int] = {}
         self.timeout = timeout
+        self.policy_wait_timeout = (max(60.0, float(timeout)) if policy_wait_timeout is None
+                                    else float(policy_wait_timeout))
+        if not 0 <= self.policy_wait_timeout <= 3600:
+            raise ValueError("policy_wait_timeout 必须在 0 到 3600 秒之间")
         self.probe_context = probe_context
         # 段专属能力开关的实测（codex 的 websockets、compat 的
         # support-prompt-cache-key）。每段最多 1 次额外请求，只在该段已判可用
@@ -630,6 +644,19 @@ class Prober:
         # 四段并行度。1 = 完全串行（老行为，出问题时的退路）。
         # 上限就是 4 —— 段数固定，再高没有意义。
         self.workers = max(1, min(int(workers), len(SECTIONS)))
+        # 要探的段。手动指定优先，零额外请求；未指定时由 `probe()` 里那次
+        # 目录预扫在候选级判定（见 section_gate）。手动选择是操作员的明确
+        # 意图，没有理由再发一次 GET 去推翻它。
+        #
+        # 只接受已知段名并按 SECTIONS 原序归一：前端表格与 CLI 输出都依赖
+        # 这个顺序。给出空列表等价于没有限定（fail-open），不是「一段都不探」。
+        self.sections_hint = self._normalize_sections(sections_hint)
+        # 候选级目录预扫开关。关掉即回到旧行为（每段各自 GET 目录），
+        # 留这个开关是为了万一遇到「同主机不同路径属不同上游」的站能自证。
+        self.prescan_sections = bool(prescan_sections)
+        # 预扫结果按 host 缓存：同一主机的多把 Key 返回同一份目录（2026-10-09
+        # 实测某聚合站 10 把完全一致），所以第 2 把起零请求复用。
+        self._section_preset: dict[str, list[str] | None] = {}
         self.on_event = on_event or (lambda kind, data: None)
         # 节流按 **host** 分开记。原来是全局一个时间戳，探 A 站要等 B 站的
         # gap —— 不同站之间没有任何理由互相等。反测活是站方行为，只对同站生效。
@@ -638,12 +665,12 @@ class Prober:
         # 命中后该站整站共用一个 gap 桶（不再按段分），因为那类 guard
         # 通常按账号/IP 全局计数，按段分桶会让瞬时并发变成 4 倍。
         self._host_gap: dict[str, float] = {}
-        # (host, section) -> 已学到的段形态。同一主机的第 2..N 个 Key 直接复用，
-        # 只补一次凭证确认。见 _reuse_shape 的说明。
-        self._shape: dict[tuple[str, str], SectionVerdict] = {}
+        # 以下证据缓存统一使用 _evidence_key。旧的 host 级缓存说明仅为历史背景：
+        # 同地址的不同凭据可能对应不同权限/渠道，不能共享模型、能力或失败证明。
+        self._shape: dict[tuple[str, str, str], SectionVerdict] = {}
         # (host, section) -> 门闩。表示「已有线程在学这个段的形态」。
         # 同主机多 Key 并发时防止重复做那 12 次昂贵探测。见 _probe_one_section。
-        self._inflight: dict[tuple[str, str], threading.Event] = {}
+        self._inflight: dict[tuple[str, str, str], threading.Event] = {}
         # (host, section) -> 整梯跑完全败。**门票是站+段的属性，与用哪个种子
         # 模型问它无关** —— 站方查的是 headers 与 body 形态，不看模型名。
         #
@@ -654,7 +681,31 @@ class Prober:
         #
         # 只缓存**失败**：成功的形态已经由 _shape 记着，而且成功时 _stage1
         # 直接 return，不会走到下一个种子。
-        self._profiles_failed: set[tuple[str, str]] = set()
+        self._profiles_failed: set[tuple[str, str, str]] = set()
+        # (host, section, model) -> 站方属性的实测结果，**与用哪把 Key 无关**。
+        # 2026-10-13 本机实测加；省掉同域名多凭据的重复劳动。
+        #
+        # 为什么这两项可以跨凭据复用，而 `_shape` 不行
+        # -------------------------------------------
+        # `_shape` 的键含 api_key（见 `_evidence_key`），理由写在那里：同址
+        # 不同凭据可能权限/渠道不同，一把 Key 能用哪些**模型**不能替另一把
+        # 作证。这个理由对下面两项不成立 —— 它们量的不是「这把 Key 能不能
+        # 用」，而是**站方自己的配置**：
+        #   · 静默换模（_stage4_swap）：站方 weighted-round-robin 会不会把
+        #     请求悄悄路由到别的模型。那是站方路由表的属性，换 Key 不变。
+        #   · 上下文上限（_stage4_context → _bisect）：站方给这个模型配的
+        #     窗口有多大。同样是站方配置，换 Key 不变。
+        # 两项都已经按模型分键（`v.context_model` 的注释明写「只对这个模型
+        # 有效，别外推」），这里只是把「别外推到其他模型」扩成「可以外推到
+        # 同站同段同模型的其他凭据」。
+        #
+        # 为什么值得（实跑量化，10 把同域名 Key）：429 次尝试里
+        # swap-sample 84 次 + ctx-* 56 次 = 140 次（33%）是这两项，而其中
+        # 只有第一把 Key 的那 14 次是新信息，其余 126 次在重问同一个问题。
+        #
+        # 缓存只在**一轮任务内**有效（Prober 实例级，不落盘）：站方随时可能
+        # 改配置，跨任务复用等于把旧结论当新证据。
+        self._site_model_facts: dict[tuple[str, str, str], dict] = {}
         # (host, section) -> 站+段级的失败结论。**与用哪把 Key 无关**的那一类。
         #
         # 为什么需要（2026-09-05 修）：`_shape` 只在 `v.usable` 时写入，
@@ -669,7 +720,7 @@ class Prober:
         # （鉴权 / 余额）是这把 Key 自己的属性，缓存它会让同站的其他 Key
         # 错误地继承别人的欠费结论 —— 那正是原来「只在 usable 时缓存」
         # 想避免的事，但它把两类一起排除了。
-        self._dead_shape: dict[tuple[str, str], SectionVerdict] = {}
+        self._dead_shape: dict[tuple[str, str, str], SectionVerdict] = {}
         # (host, section) -> (状态码, 连续失败次数)。「临时 / 未知」类的熔断计数。
         #
         # 为什么 _dead_shape 不够（2026-09-16 现场量化）
@@ -701,7 +752,7 @@ class Prober:
         #
         # 只在**状态码相同**时累计：502 与 429 交替出现说明站方真的在抖，
         # 那种情形继续重试是对的，计数会被重置。
-        self._fail_streak: dict[tuple[str, str], tuple[str, int]] = {}
+        self._fail_streak: dict[tuple[str, str, str], tuple[str, int]] = {}
         self._lock = threading.RLock()
         self._proxy_state: bool | None = None   # None=未检 True/False=预检结果
         # 代理预检专用锁。不复用 _lock —— 预检要占最多 4 秒，
@@ -737,6 +788,112 @@ class Prober:
                 return dict(entry)
         return {}
 
+    def _normalize_sections(self, hint: object) -> list[str] | None:
+        """把外部给的段清单归一成 SECTIONS 原序；无法判定时返回 None。
+
+        为什么要归一而不是直接用：段名来自 HTTP 请求体，可能是任意形状
+        （字符串、嵌套、未知段名）。未知段名如果被当成合法值传下去，会变成
+        「探了一段不存在的段」—— 既不报错也不出结果，比直接拒绝更难查。
+
+        空列表 / 全不可识别 -> None（等于不限定，探全部四段）。这是刻意的
+        fail-open：操作员多勾一个不存在的段，不该让整轮探测变成一段都不探。
+        """
+        if not hint:
+            return None
+        if isinstance(hint, str):
+            hint = [hint]
+        if not isinstance(hint, (list, tuple, set)):
+            return None
+        wanted = {str(x).strip() for x in hint if isinstance(x, str)}
+        ordered = [sec for sec in SECTIONS if sec in wanted]
+        return ordered or None
+
+    def _prescan_sections(self, row: ParsedRow) -> list[str] | None:
+        """候选级目录预扫：一次 GET 判定该上游具备哪些协议。
+
+        返回 None 表示无法判定，调用方必须探全部四段（fail-open）。
+        返回非空列表表示只探这些段。
+
+        为什么用 claude 形态发这次请求（2026-10-09 实测）
+        ------------------------------------------------
+        `{base}/v1/models` 就是 claude 段与 codex/compat 段共用的目录端点
+        （见 `request.models_endpoint`：claude 走 `/v1/models`，codex/compat
+        走 `/models`，而 base 对后两者已经带 `/v1`），差别只在请求头。实测
+        同一主机：
+
+          · 裸 `x-api-key`                -> 401 unauthorized client detected
+          · x-api-key + claude-cli UA     -> 200，带 supported_endpoint_types
+
+        所以这次预扫必须带最省的身份头，否则会把「站方只认特定客户端」误读成
+        「目录不可用」，进而退回全段探测 —— 白白丢掉闸门收益。
+
+        代理：只在直连拿不到时才试一次代理，且结果同样按 host 缓存。
+        """
+        host = host_of(row.bare)
+        if host in self._section_preset:
+            return self._section_preset[host]
+        if self.sections_hint:
+            # 手动指定时不跑预扫，但仍然缓存下来，避免每把 Key 重复判断。
+            self._section_preset[host] = self.sections_hint
+            return self.sections_hint
+        if not self.prescan_sections:
+            return None
+
+        base = base_for_section(row.bare, "claude-api-key")
+        catalog: list[str] = []
+        endpoint_types: list[str] = []
+        for need_proxy in (False, True):
+            if need_proxy and not self.live_proxy:
+                break
+            url, headers = request.models_endpoint(
+                "claude-api-key", base, row.api_key,
+                entry_config=self._entry("claude-api-key", row.bare, row.api_key),
+                client_headers=self.client_headers, session_id=self.session_id)
+            # 最省档身份：UA + x-app + 最小 anthropic-beta。这三项是站方门禁
+            # 判定「是不是 Claude Code」时的最小集合（profiles 的 cc-min），
+            # 再多加只会让这次 GET 更像一次真正的客户端握手。
+            for name, value in profiles.catalog_identity_headers(
+                    self.cfg_snapshot, source_identity=self.source_identity).items():
+                headers.setdefault(name, value)
+            self._throttle(host, "claude-api-key")
+            try:
+                resp = self._send(url, headers=headers, body=b"", method="GET",
+                                  proxy=self.live_proxy if need_proxy else None,
+                                  timeout=min(self.timeout, 30),
+                                  request_kind="model_catalog")
+            except ProbePolicyStop as stop:
+                # 策略拒绝不是「这个站没有协议」的证据。记事件后 fail-open。
+                self.on_event("prescan-miss", {
+                    "host": host, "status": "blocked",
+                    "reason": stop.reason, "probe_policy_code": stop.code,
+                })
+                self._section_preset[host] = None
+                return None
+            except Exception as exc:  # noqa: BLE001
+                self.on_event("prescan-miss", {"host": host, "status": "error",
+                                               "reason": type(exc).__name__})
+                continue
+            if resp.status != "200":
+                self.on_event("prescan-miss", {"host": host, "status": str(resp.status)})
+                continue
+            catalog = request.parse_models_response("claude-api-key", resp.body)
+            endpoint_types = section_gate.endpoint_types_from_body(resp.body)
+            break
+
+        if not section_gate.catalog_hint_applies(endpoint_types, catalog):
+            # 目录读到了但没有可判定的信号 —— 同样 fail-open，不冒判死的风险。
+            self._section_preset[host] = None
+            self.on_event("prescan-miss", {"host": host, "status": "no-signal"})
+            return None
+        decided = section_gate.sections_for_catalog(catalog, endpoint_types)
+        self._section_preset[host] = decided
+        self.on_event("prescan", {
+            "host": host, "sections": decided or list(SECTIONS),
+            "catalog": len(catalog), "endpoint_types": endpoint_types,
+            "skipped": [s for s in SECTIONS if decided and s not in decided],
+        })
+        return decided
+
     def _base(self, row: ParsedRow, section: str) -> str:
         entry = self._entry(section, row.bare, row.api_key)
         return base_for_section(entry.get("base-url") or row.bare, section,
@@ -745,16 +902,63 @@ class Prober:
     def _evidence_key(self, section: str, base: str, key: str):
         entry = self._entry(section, base, key)
         context = json.dumps([key, entry, self.cfg_snapshot, self.proxy,
-                              self.client_headers, self.session_id],
+                              self.client_headers, self.session_id,
+                              getattr(getattr(self, "source_identity", None), "snapshot_id", "")],
                              sort_keys=True, default=str)
         return (base_for_section(base, section, declared_base=True), section,
                 hashlib.sha256(context.encode()).hexdigest())
 
-    def _policy_check(self, url: str, headers: dict) -> None:
+    def _wait_for_policy(self, policy, url, headers, deadline, decision=None) -> None:
+        delay = 0.05
+        reported = None
+        while True:
+            self._check_cancel()
+            if time.monotonic() >= deadline:
+                raise ProbePolicyStop(
+                    "policy_wait_timeout", "等待服务商许可超时，本轮未完成；账本和预留保持不变")
+            decision = decision if decision is not None else policy.check(url, headers)
+            if decision.allowed:
+                return
+            if decision.code not in ("minimum_interval", "inflight"):
+                raise ProbePolicyStop(decision.code, decision.reason)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProbePolicyStop(
+                    "policy_wait_timeout", "等待服务商许可超时，本轮未完成；账本和预留保持不变")
+            if reported != decision.code:
+                self.on_event("policy-wait", {"host": host_of(url), "code": decision.code,
+                                               "reason": decision.reason})
+                reported = decision.code
+            self._wait(min(delay, remaining))
+            delay = min(1.0, delay * 2)
+            decision = None
+
+    @contextmanager
+    def _provider_admission(self, url, headers, wire_timeout=0):
         from .probe_policy import get_policy
-        decision = get_policy().check(url, headers)
-        if not decision.allowed:
-            raise ProbePolicyStop(decision.code, decision.reason)
+        policy = get_policy()
+        budget = getattr(self, "policy_wait_timeout", max(60.0, float(getattr(self, "timeout", 60))))
+        # GET may have one transport retry. Include host pacing in the frozen
+        # predecessor allowance without changing any configured concurrency.
+        host = host_of(url)
+        gap = max(getattr(self, "gap", 0), getattr(self, "_host_gap", {}).get(host, 0))
+        allowance = budget + 2 * max(0, float(wire_timeout)) + gap + 1
+        key = policy.admission_key(url, headers)
+        try:
+            with PROVIDER_ADMISSION.slot(key, allowance, self._check_cancel,
+                                         getattr(self, "job_deadline", None)):
+                deadline = time.monotonic() + budget
+                if getattr(self, "job_deadline", None) is not None:
+                    deadline = min(deadline, self.job_deadline)
+                yield policy, deadline
+        except AdmissionTimeout:
+            raise ProbePolicyStop("policy_wait_timeout",
+                                  "服务商队列等待超时，本轮未完成；账本和预留保持不变")
+
+    @policy_job_scope
+    def _policy_check(self, url: str, headers: dict) -> None:
+        with self._provider_admission(url, headers) as (policy, deadline):
+            self._wait_for_policy(policy, url, headers, deadline)
 
     @staticmethod
     def _policy_verdict(row, section, stop):
@@ -763,12 +967,67 @@ class Prober:
                               probe_policy_code=stop.code,
                               probe_policy_reason=stop.reason)
 
+    @policy_job_scope
+    @policy_request_scope
     def _send(self, url: str, **kwargs):
-        self._policy_check(url, kwargs.get("headers") or {})
+        headers = kwargs.get("headers") or {}
         host = host_of(url)
-        with HOST_LIMITER.slot(host, max(self.gap, self._host_gap.get(host, 0)),
-                               self._check_cancel):
-            response = client.send(url, **kwargs)
+        # 节拍在服务商准入**之外**等（2026-10-13 本机实测调序）
+        # ----------------------------------------------------
+        # 原顺序是 PROVIDER_ADMISSION.slot → HOST_LIMITER.slot，而
+        # HostLimiter 的 gap 等待发生在它 yield 之前（resources.py:80-88），
+        # 也就是**在服务商准入槽内睡觉**。而 PROVIDER_ADMISSION 是按
+        # provider 的严格单路 FIFO（resources.py:137-142：只有 queue[0]
+        # 才放行），它存在的理由是账本 `providers.inflight` 只有一个字段、
+        # 同服务商一次只容一条在途预留（probe_policy.py:644）。
+        #
+        # 两者叠起来的后果：同域名的 N 把 Key 在整个 gap 期间互相阻塞 ——
+        # 10 把 golf.example 的 Key 实跑时前端常驻「在飞 1 个」，429 次
+        # 尝试耗 1913.8 秒，而该站实测 20 路并发零间隔全部 200（墙钟 1.40s）。
+        # 等待占 ~98%，且其中大部分时间账本在途位是**被一个正在睡觉的
+        # 请求占着**的。
+        #
+        # 调序后：节拍照旧按 (host) 维持站方要的最小间隔（一点没放松），
+        # 但等待发生在准入之前，不再占用账本在途位；轮到自己时才进准入、
+        # 立刻发请求、立刻结算、立刻释放。账本的单在途不变式完全不动 ——
+        # 这是纯粹的持有时间优化，不是放宽限额。
+        #
+        # 为什么不直接让账本容多条在途：`inflight` 同时承担结算所有权校验
+        # （_apply_result 的 `WHERE id=? AND inflight=?`）与孤儿检测
+        # （_is_live）。改成多在途要同时重做这三处的不变式，风险远大于收益。
+        gap = max(self.gap, self._host_gap.get(host, 0))
+        # 节拍期间仍要守截止时间（test_probe_wait_regressions 的
+        # `test_host_wait_expiry_prevents_wire_send` 钉的契约）。
+        # -------------------------------------------------------------
+        # 调序前这道闸是 `check_admission` 回调带的：它在准入槽内算出
+        # `deadline` 后传给 HostLimiter，于是节拍等待期间一旦超时就抛
+        # AdmissionTimeout，请求不会上线。节拍挪到准入之外后不能直接用
+        # 那个 deadline（它是准入槽内才算出来的），只传 `_check_cancel`
+        # 会**丢掉超时闸** —— 等满节拍后照样发出去。
+        #
+        # 所以这里按与 `_provider_admission` 相同的公式自己算一份：
+        # `policy_wait_timeout` 预算，再与任务级 `job_deadline` 取小。
+        # 节拍等待、准入排队、账本等待三段各自守同一个终点，叠加而非替换。
+        pacing_deadline = time.monotonic() + getattr(
+            self, "policy_wait_timeout", max(60.0, float(getattr(self, "timeout", 60))))
+        job_limit = getattr(self, "job_deadline", None)
+        if job_limit is not None:
+            pacing_deadline = min(pacing_deadline, job_limit)
+
+        def check_pacing():
+            self._check_cancel()
+            if time.monotonic() >= pacing_deadline:
+                raise AdmissionTimeout()
+        try:
+            with HOST_LIMITER.slot(host, gap, check_pacing):
+                with self._provider_admission(url, headers, kwargs.get("timeout", self.timeout)) as (policy, deadline):
+                    self._wait_for_policy(policy, url, headers, deadline)
+                    def wait_for_reservation(policy, denied):
+                        self._wait_for_policy(policy, url, headers, deadline, decision=denied)
+                    response = client.send(url, policy_wait=wait_for_reservation, **kwargs)
+        except AdmissionTimeout:
+            raise ProbePolicyStop("policy_wait_timeout",
+                                  "等待站点节拍时已超时，本轮未完成；账本和预留保持不变")
         if getattr(response, "policy_code", ""):
             raise ProbePolicyStop(response.policy_code, response.error)
         return response
@@ -804,6 +1063,10 @@ class Prober:
 
     def _throttle(self, host: str = "", section: str = "") -> None:
         """按 (host, section) 保持 gap 秒。不同主机、不同段互不等待。
+
+        当前发送边界还受 _send 的进程级 HOST_LIMITER 约束：同站跨段、
+        跨任务的实际请求仍保持全局 gap。下面分桶说明是局部节拍的历史
+        设计背景，不表示可以绕过现在的整站限速，也不能作为提速测量值。
 
         为什么按 host 而不是全局：gap 存在的理由是站方的 bulk probe guard
         （relay-b 实测低于 3 秒会触发），那是**站方**的限频。探 A 站时为 B 站
@@ -860,6 +1123,42 @@ class Prober:
     # 60 秒/次已经足够慢，再大不如让用户看到警告后自己决定。
     _MAX_LEARNED_GAP = 60.0
 
+    # 自适应节拍的乐观起点（2026-10-13 本机实测加）
+    # ------------------------------------------------
+    # `gap` 的默认 3.0 秒来自某个站（注释写的 relay-b）的 bulk probe guard
+    # 实测值，但它被当成**所有站**的起始节拍。代价在同域名多凭据场景下
+    # 直接爆炸：10 把 golf.example 的 Key 实跑 429 次尝试 × 3 秒
+    # ≈ 1287 秒纯睡，总墙钟 1913.8 秒 —— 等待占 ~98%。
+    #
+    # 而那个站对并发的实际容忍度（容器内实测，同一 Key、/v1/models）：
+    #     1 路   墙钟 1.47s   20/20 200
+    #     4 路   墙钟 1.36s   全 200
+    #    10 路   墙钟 1.42s   全 200
+    #    20 路   墙钟 1.40s   全 200     ← 零间隔，20 个全成功
+    #    串行 12 次零间隔   墙钟 15.8s   全 200
+    # 也就是说这个站根本没有 bulk probe guard，3 秒地板全是自己造的。
+    #
+    # 不能简单把默认值调小：`_note_rate_limit` 学到的值走
+    # `max(self.gap, forced)`，只能**向上**加，所以 gap 既是起点又是地板；
+    # 把地板压到 0.15 秒后，撞上真有 guard 的站（relay-b 那种）就没有
+    # 保护了。所以改成双层：
+    #   · `self.gap` 退化成「学到证据前的乐观起点」，默认 0.15 秒；
+    #   · 撞限流 / 429 / Retry-After 时 `_host_gap[host]` 记下退避值，
+    #     此后该站按学到的值走（原有逻辑不变，仍只升不降）；
+    #   · `--gap` 显式给值时视为操作员指令，直接作为该轮地板，不被
+    #     乐观起点覆盖（见 `__init__` 里的 `self._gap_is_explicit`）。
+    #
+    # 为什么起点不取 0：HTTP keep-alive 与 TLS 复用之外，连续零间隔对
+    # 任何站都是最可疑的形态；0.15 秒已经让 429 次尝试的纯睡从 1287 秒
+    # 降到 64 秒，而仍保持「不是一瞬间全部打出去」。
+    _OPTIMISTIC_GAP = 0.15
+
+    # 撞限流后的退避阶梯。学不到确切阈值（正文里没有 N/W 数字）时按这个
+    # 爬：0.15 → 1 → 3 → 8 → 20，每撞一次升一档，升到 _MAX_LEARNED_GAP 止。
+    # 为什么要阶梯而不是一步跳到 3 秒：多数 429 是瞬时拥塞，不是节奏阈值；
+    # 一步跳满会把一次偶发 429 变成整轮慢 20 倍。
+    _BACKOFF_LADDER = (1.0, 3.0, 8.0, 20.0)
+
     def _note_rate_limit(self, host: str, excerpt: str) -> bool:
         """从限频正文里学出该站的探测节奏，返回是否学到了新值。
 
@@ -873,26 +1172,53 @@ class Prober:
         为什么换代理不是解法：站方数的是「**这个 IP** 在 60 秒里问了几个
         不同模型」。换到代理出口后同样的节奏立刻又触发一次，只是白烧一次
         请求并把代理 IP 也搭进去。见 _PROXY_POINTLESS 里「限频」那条。
+
+        没有确切阈值时的阶梯退避（2026-10-13 加，只在自适应模式下）
+        ------------------------------------------------------------
+        原实现只认 `_RATE_HINT` 那一种正文；读不出数字就返回 False，什么都
+        不做。那是**刻意**的契约（test_full_redetect 的 `test_rate_limit_learned`
+        钉着「没有阈值的限频正文不学 —— 不能凭空放慢」），在旧的 3 秒地板下
+        完全成立：读不出阈值也已经够慢了。
+
+        把地板降到 `_OPTIMISTIC_GAP` 之后这个缺口才变危险 —— 真有 guard 的
+        站会被一路 0.15 秒硬打。所以阶梯**只在没有显式 gap 时**启用：
+          · `gap=None`（前端留空 / 未指定）→ 自适应，读不出阈值就爬阶梯；
+          · 显式给了 `gap`（命令行 --gap、前端填了数字）→ 维持原契约，
+            读不出阈值一律不学。操作员已经给了节奏，不替他猜。
         """
+        host_key = host or ""
         m = self._RATE_HINT.search(excerpt or "")
-        if not m:
+        learned = None
+        if m:
+            try:
+                n_models, window = int(m.group(1)), int(m.group(2))
+            except ValueError:
+                n_models = window = 0
+            if n_models > 0 and window > 0:
+                # 平均间隔 + 10% 余量。站方计的是滑动窗口，贴着阈值走仍会偶发命中。
+                learned = min(window / n_models * 1.1, self._MAX_LEARNED_GAP)
+        if learned is None and self._gap_is_explicit:
+            # 操作员指定了节奏，且正文里没有可读的阈值 —— 不凭空放慢。
             return False
-        try:
-            n_models, window = int(m.group(1)), int(m.group(2))
-        except ValueError:
-            return False
-        if n_models <= 0 or window <= 0:
-            return False
-        # 平均间隔 + 10% 余量。站方计的是滑动窗口，贴着阈值走仍会偶发命中。
-        learned = min(window / n_models * 1.1, self._MAX_LEARNED_GAP)
         with self._lock:
-            prev = self._host_gap.get(host)
+            prev = self._host_gap.get(host_key)
+            if learned is None:
+                # 自适应模式且正文里没有阈值：按阶梯爬一档。爬的是**这个站**
+                # 自己的档位，不影响其他站。已经学到确切阈值时，阶梯只会在
+                # 它之上继续爬，不会把它降下来（下面的 prev >= learned 判定）。
+                step = self._backoff_step.get(host_key, 0)
+                if step >= len(self._BACKOFF_LADDER):
+                    return False
+                self._backoff_step[host_key] = step + 1
+                learned = min(self._BACKOFF_LADDER[step], self._MAX_LEARNED_GAP)
             if prev is not None and prev >= learned:
                 return False
-            self._host_gap[host] = learned
+            self._host_gap[host_key] = learned
         self.on_event("rate-limit-learned", {
-            "host": host, "models": n_models, "window": window,
-            "gap": round(learned, 1), "was": round(prev or self.gap, 1),
+            "host": host_key, "models": int(m.group(1)) if m else 0,
+            "window": int(m.group(2)) if m else 0,
+            "gap": round(learned, 2), "was": round(prev if prev is not None else self.gap, 2),
+            "source": "site-threshold" if m else "backoff-ladder",
         })
         return True
 
@@ -950,7 +1276,7 @@ class Prober:
         if section == "codex-api-key":
             body["stream"] = True
         resp = self._send(
-            url,
+            url, request_kind="inference",
             headers=headers,
             body=_encode(body),
             proxy=proxy,
@@ -1032,7 +1358,16 @@ class Prober:
         # 限频：从正文里学出该站的探测节奏，下一次请求起自动放慢。
         # 放在事件之后 —— 学习本身会发自己的事件，顺序上「先看到撞了什么、
         # 再看到学到了多少」更好读。
-        if category == "限频":
+        #
+        # 2026-10-13：触发面从「只有 `限频`」扩到三类节奏信号。原来只认
+        # `bulk probe` 字样（classify.py:95），而 429 在 classify.py:274
+        # 归「临时」、`限流` 是另一类 —— 两者都是「你太快了」的信号，却都
+        # 不会触发学习。配合乐观起点（_OPTIMISTIC_GAP）这个缺口会放大成
+        # 「一路 0.15 秒硬打到底」，所以必须一起喂给学习器。
+        #
+        # 用 `att.status == "429"` 而不是只看 category：「临时」类还包含
+        # 真正的瞬时故障（000、连接中断），那些不该让节拍退避。
+        if category in ("限频", "限流") or att.status == "429":
             self._note_rate_limit(host_of(base), att.excerpt)
         return att
 
@@ -1213,6 +1548,8 @@ class Prober:
         probe_models = order_all[:self._BASELINE_MODELS]
         spare = order_all[self._BASELINE_MODELS:self._BASELINE_MODELS
                           + self._BASELINE_SKIPS]
+        # 站方指名的替代模型只跟随一次 —— 见下面 substitute-model 那段说明。
+        substitute_tried = False
         for model in probe_models:
             att = self._call(section, base, row.api_key, model, combo="baseline")
             v.attempts.append(att)
@@ -1255,6 +1592,44 @@ class Prober:
                     probe_models.append(spare.pop(0))
             else:
                 seen.append((att.category, att.action))
+
+            # 站方在正文里**指名替代模型**（2026-10-14 本机实测加）
+            # ------------------------------------------------
+            # 现场（alfa.example claude 段）：`claude-opus-5-5` 回 400，
+            # 正文是一句完整使用说明「…上线 gpt-6-astra-cc-format 模型，
+            # 支持 messages 格式，通过 claude --model
+            # 'gpt-6-astra-cc-format[1m]' 使用该模型」。
+            #
+            # 那条正文既不命中 `betas.wanted` 的任何一项（含 `[1m]` 但不含
+            # 「1m 上下文」），classify 也只能归「未知」—— 于是画像梯不跑、
+            # spare 不补，这一发额度白费。配合另一发 `claude-opus-4-7` 回
+            # 503，`_BASELINE_MODELS = 2` 用尽，整段判「未实测」，而站方
+            # 点名的那个模型**一次都没试过**。目录里也有它，只是排序在
+            # claude 族之后，`spare` 的 3 个名额够不到。
+            #
+            # 站方自己写出来的名字是最强的证据 —— 比我们按目录排序猜的任何
+            # 候选都准。所以插到队首立刻试，并把 `[1m]` 这类后缀翻译成
+            # 对应的 beta 头（实测后缀写进 model 字段无效，只有头起作用）。
+            #
+            # 不消耗基线额度：这一发不是「又猜一个」，而是按站方指示重打。
+            # 只认一次（`substitute_tried`）：站方可能在替代模型的响应里再
+            # 提另一个名字，无限跟随会变成被正文牵着走的请求放大器。
+            #
+            # beta 不在这里补：替代模型那一发若仍被 400 挡（正文点名要
+            # 1m），`_try_profiles` 的 `id:ctx-1m` 档与 `_retry_with_betas`
+            # 会接手 —— 后者取顶档 headers 作基底补 beta，是既有且实测走通
+            # 的路径（`claude-opus-4-7` 正是靠 `id:ctx-1m` 把 400 变 503）。
+            # 在这里另造一条注入路径只会多一个变量。
+            if not substitute_tried:
+                alt_model, _alt_betas = betas.substitute_model(att.excerpt or "")
+                if alt_model and alt_model not in probe_models:
+                    substitute_tried = True
+                    self.on_event("substitute-model", {
+                        "section": section, "host": host_of(base),
+                        "requested": model, "offered": alt_model,
+                        "why": "站方在失败正文里指名了替代模型，按它的指示重打",
+                    })
+                    probe_models.append(alt_model)
 
             if att.ok:
                 v.category, v.action = att.category, att.action
@@ -1363,9 +1738,12 @@ class Prober:
             # 而 betas.py 的 docstring 正是这么承诺的：
             # 「补上再打一次就通，没有任何理由让用户去手填」。
             #   正文点名要 beta —— 2026-09-05 加。见下方长注释。
-            if (att.category in ("客户端", "WAF", "门禁", "IP封", "边缘", "鉴权")
-                    or att.status in ("401", "403", "503")
-                    or betas.wanted(att.excerpt or "")):
+            # 明确的模型无渠道响应不因 403/503 再跑相同模型的画像梯。
+            # 留给下一模型候选；正文明确要求 beta 时仍保留协议恢复入口。
+            if (betas.wanted(att.excerpt or "")
+                    or (not _model_specific_dead_end(att)
+                        and (att.category in ("客户端", "WAF", "门禁", "IP封", "边缘", "鉴权")
+                             or att.status in ("401", "403", "503")))):
                 if self._try_profiles(row, section, base, model, v):
                     return v
 
@@ -1528,7 +1906,8 @@ class Prober:
         # 结论却按「整梯已试过全败」写。`_shape` / `_dead_shape` 在
         # 2026-09-12 修过同一个坑，`_profiles_failed` 当时漏改。
         from .batch import entry_scope
-        pkey = (entry_scope(section, row.bare), section)
+        # 失败结论同样可能取决于凭据和请求环境，不能跨账号复用。
+        pkey = self._evidence_key(section, row.bare, row.api_key)
         if self.reuse_profile_verdict:
             with self._lock:
                 already_failed = pkey in self._profiles_failed
@@ -1540,23 +1919,7 @@ class Prober:
                 return False
 
         tried = 0
-        # 「门票已过」的第一档（2026-09-17，2026-09-18 扩展判据）
-        # ------------------------------------------------------
-        # 判据是**拒绝性质的转变**，而不是命中某几个固定类别：
-        # 某一档把「门禁类拒绝」推进成了「非门禁类拒绝」，就说明这个档
-        # 带的东西被站方认了 —— 继续加形态也只会得到同一个回答。
-        #
-        # 原来是 `att.category in ("余额", "鉴权")`，只认凭据类。实测
-        # alfa.example（claude 段）时露了缺口：带上 1m 门票后站方不再回
-        # `400 "1m 上下文已经全量可用，请启用 1m 上下文后重试"`，而是回
-        # `503 Service Unavailable`（站方上游此刻不可用）。门票**确实过了**，
-        # 但 503 属「临时」，不在那份白名单里，于是一条证据都没有记下来 ——
-        # 写回不带门票，CPA 转发时又被同一道门禁拒。
-        #
-        # 新判据对**所有站**通用：只看「基线是不是被门禁拦住的」以及
-        # 「这一档是否不再被同一类门槛拦住」。_GATE_CATEGORIES 是门禁族
-        # （客户端 / 门禁 / 反测活 / WAF / 边缘 / 限频），它们表达的都是
-        # 「你这个请求的样子不对」；离开这一族就意味着形状已经被接受。
+        # 保留失败性质变化供诊断，但鉴权失败或 503 不能证明画像被接受。
         _GATE = ("客户端", "门禁", "反测活", "WAF", "边缘", "限频", "IP封")
         _CRED = ("余额", "鉴权")
         base_gated = bool(v.attempts) and v.attempts[0].category in _GATE
@@ -1577,7 +1940,7 @@ class Prober:
                         att.category in _CRED
                         or (base_gated and att.category not in _GATE)):
                     gate_hit = (prof, hdrs, patch, att)
-                    self.on_event("profile-gate-passed", {
+                    self.on_event("profile-failure-observed", {
                         "section": section, "host": host_of(base),
                         "profile": prof.name, "tier": prof.tier,
                         "then": att.category, "status": att.status,
@@ -1608,20 +1971,12 @@ class Prober:
         if self._retry_with_betas(row, section, base, model, v, tried):
             return True
 
-        # 整梯没有一档 200，但有一档把「客户端」推成了「余额 / 鉴权」——
-        # 门票已经实测出来，只是凭据不行。把身份写进 verdict，并把最终类别
-        # 改成凭据类：处置是「换把 Key / 充值」，不再是「换请求形态」。
-        # 段仍 usable=False；写回带 headers + cloak/fingerprint-profile，
-        # 这把 Key 恢复后 CPA 直接能用，不必再探一次。
+        # 未得到成功响应时只报告观察到的错误，不将试用画像变成写回证据。
         if gate_hit is not None:
             prof, hdrs, patch, att = gate_hit
-            v.min_headers = dict(hdrs)
-            v.profile_name = prof.name
-            v.min_body_kind = _body_kind(prof)
-            v.identity_proven = True
             v.category, v.action = att.category, (
-                f"{att.action}（身份 {prof.name} 已被站方接受，凭据不行）")
-            self.on_event("profile-gate-only", {
+                f"{att.action}（尝试身份 {prof.name} 后仍失败，身份尚未验证）")
+            self.on_event("profile-failure-only", {
                 "section": section, "host": host_of(base),
                 "profile": prof.name, "then": att.category,
             })
@@ -1772,8 +2127,51 @@ class Prober:
 
         拿不到目录不是失败 —— 返回空列表，调用方回落到种子模型。
         """
-        url, headers = request.models_endpoint(section, base, row.api_key)
-        proxy = self.live_proxy if need_proxy else None
+        entry = self._entry(section, base, row.api_key)
+        if entry:
+            base = entry["base-url"]
+        url, headers = request.models_endpoint(
+            section, base, row.api_key, declared_base=bool(entry),
+            entry_config=entry, client_headers=self.client_headers,
+            session_id=self.session_id)
+        # 身份头也要带（2026-10-12 本机实测补）
+        # ------------------------------------
+        # `models_endpoint` 只放凭据，不放身份头。主机预扫（`_sections_for_host`）
+        # 早就知道这不够、自己补了 `profiles.catalog_identity_headers`；而**这里**
+        # 的分段目录请求没补 —— 同一个站、同一把 Key，预扫 200、分段 401。
+        #
+        # 那个 401 的正文是 `unauthorized client detected`，`classify` 归「客户端」，
+        # `probe_policy.finish` 升级成 `provider_restriction` 全站永久停止，
+        # 而 `_apply_result` 的作用域修正只认 `kind == "inference"`（目录请求的
+        # kind 是 `model_catalog`，不在豁免内，这是 `test_catalog_restriction_scope`
+        # 钉死的刻意契约）。于是一次目录 401 把整台主机判死：实测 10 把同主机
+        # Key × 4 段全部 `attempts=0`、界面「0 次推理尝试 · 未勾选任何项」，
+        # 正是第 7 条禁止的「一个 KEY 拖垮全部」。
+        #
+        # 实测门禁就是**完整 UA 字符串**（同一把 Key、同一 URL、直连与过代理
+        # 结果一致，与代理无关）：
+        #   · 裸 Bearer / 裸 x-api-key / Bearer+curl UA   -> 401
+        #   · User-Agent: node                            -> 401
+        #   · User-Agent: claude-cli/1.0.0（截断）        -> 401
+        #   · User-Agent: claude-cli/1.0.0 (external, cli) -> 200 + 真实目录
+        # 四段的目录端点都认这一组头；gemini 段无此协议的站仍是 404
+        # （`Invalid URL`，与预扫判定一致），带不带身份头都一样 —— 所以补头
+        # 不会把「没有这个协议」误读成「有」。
+        #
+        # 用 setdefault 而不是覆盖：站点自配 headers（entry_config）与
+        # client_headers 已在 `models_endpoint` 里合并过，它们的优先级更高。
+        #
+        # `source_identity` 用 getattr 取：若干测试用 `object.__new__(Prober)`
+        # 造只带必要字段的桩（见 test_probe_evidence_regressions 的
+        # CatalogRequestShapeTests），直接取属性会 AttributeError。身份头在
+        # 没有源码快照时回落内置常量（profiles.defaults_from_config 自己处理
+        # None），所以缺它不影响这里要的那几个头。
+        for name, value in profiles.catalog_identity_headers(
+                self.cfg_snapshot,
+                source_identity=getattr(self, "source_identity", None)).items():
+            headers.setdefault(name, value)
+        # 目录与生成请求使用同一个来源配置，不把必需代理或请求头留到 POST 才加。
+        proxy = (self.live_proxy if need_proxy else None) or entry.get("proxy-url") or None
         seen: list[str] = []
         token = ""
 
@@ -1785,10 +2183,21 @@ class Prober:
             if token:
                 sep = "&" if "?" in url else "?"
                 page_url = f"{url}{sep}pageToken={urllib.parse.quote(token)}"
-            resp = self._send(
-                page_url, headers=headers, body=b"", method="GET",
-                proxy=proxy, timeout=min(self.timeout, 30),
-            )
+            try:
+                resp = self._send(
+                    page_url, headers=headers, body=b"", method="GET",
+                    proxy=proxy, timeout=min(self.timeout, 30),
+                    request_kind="model_catalog",
+                )
+            except ProbePolicyStop as stop:
+                if stop.code != "recovery_catalog_skipped":
+                    raise
+                self.on_event("catalog-miss", {
+                    "section": section, "host": host_of(base),
+                    "status": "unverified", "reason": stop.reason,
+                    "probe_policy_code": stop.code,
+                })
+                return []
             if resp.status != "200":
                 if page == 0:
                     # 与 catalog 事件同一套载荷约定：不重复 host。
@@ -1861,8 +2270,23 @@ class Prober:
         try:
             from .model_catalog import rank_models
             ranked = rank_models([m for m in catalog if m not in preferred])
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 —— 兜底保留，但不再静默
             # 排序只是「先验哪个」的优化，排不动不该让整轮探测失败。
+            #
+            # 但**不能静默**（2026-10-12 修）：退回字母序正是上面 docstring
+            # 点名的「勾了 gpt-5.6 却没勾 gpt-5.6-sol」的病根 —— 字母序靠前的
+            # 旧款先验完、配额用尽，同世代新变体轮不到。一次 import 失败或
+            # rank_models 里的任何异常，原来都会无声地复现那个重大失误，
+            # 日志一个字都没有。记 WARNING 并发事件，让它在流水里可见。
+            logger.warning("模型排序失败，本段退回字母序验证（可能漏掉同世代"
+                           "新变体）：%s: %s", type(exc).__name__, exc)
+            try:
+                self.on_event("rank-fallback", {
+                    "section": section, "reason": type(exc).__name__,
+                    "why": "模型排序失败，按字母序验证；同世代变体可能验不到",
+                })
+            except Exception:  # noqa: BLE001 —— 事件回调不能反过来打断探测
+                pass
             ranked = [m for m in catalog if m not in preferred]
         for m in preferred + ranked + SEED_MODELS[section]:
             # 段族闸：三个协议段只探本族。聚合站目录三族混报，不过这道闸
@@ -1877,23 +2301,43 @@ class Prober:
     # ---------- ② 模型发现 ----------
 
     def _stage2(self, row: ParsedRow, v: SectionVerdict) -> None:
-        """把段内还没验过的模型补齐到 max_models。
+        """优先补验最高族候选，再按发现配额探测其它候选。
 
         目录已经在 `_stage0_catalog` 拿过并缓存在 `v.catalog`，这里不再重复
         GET —— 重复问同一个目录端点纯属浪费，且会撞节流。
 
         compat 段留空 = 注册 0 个模型，所以这一步对 compat 是硬要求。
         """
-        found = list(v.models)
-        order = self._probe_order(v.section, v.catalog, exclude=found)
+        from .model_catalog import newest_generation_per_line, topup_to_market_top, remote_names
+        found = list(dict.fromkeys(v.models))
+        eligible = self._probe_order(v.section, v.catalog, exclude=found)
+        declared = [m for m in dict.fromkeys(found + v.catalog)
+                    if model_fits_section(v.section, m) and model_allowed(m)]
+        family = newest_generation_per_line(declared)
+        remote, _ = remote_names()
+        family, _, _ = topup_to_market_top(v.section, family, remote=remote, proven=found)
+        family = [m for m in family
+                  if model_fits_section(v.section, m) and model_allowed(m)]
+        v.model_scan_candidates = list(dict.fromkeys(family))
+        # A successful discovery quota is not evidence for the rest of a family.
+        # Cover selected peers first, while retaining the existing request budget.
+        # Reuse verification already used this exact credential/base/profile.
+        # Its completed failures must not be retried as if they were untested.
+        completed = {a.model for a in v.attempts
+                     if a.section == v.section and a.combo in {"reuse-verify", "model-scan"}}
+        order = [m for m in dict.fromkeys([m for m in family if m not in found] + eligible)
+                 if m not in completed]
+        v.model_scan_pending = [m for m in family if m not in found and m not in completed]
+        v.model_scan_pending_reason = ""
 
         attempted = 0
         for model in order:
-            if len(found) >= self.max_models:
-                break
+            if len(found) >= self.max_models and model not in v.model_scan_pending:
+                continue
             # 尝试次数也要有上限 —— found 只数成功的，而目录可能有几百项
             # 且全部验不过。见 MAX_MODEL_ATTEMPTS_PER_SECTION 的说明。
             if attempted >= self.max_model_attempts:
+                v.model_scan_pending_reason = "本段补验请求预算已用完，剩余候选尚未验证"
                 self.on_event("model-scan-capped", {
                     "section": v.section, "host": host_of(v.base_url),
                     "attempted": attempted, "accepted": len(found),
@@ -1901,12 +2345,18 @@ class Prober:
                 })
                 break
             attempted += 1
-            att = self._call(
-                v.section, v.base_url, row.api_key, model, combo="model-scan",
-                proxy=self.live_proxy if v.need_proxy else None,
-                **self._profile_kwargs(v, row.api_key),
-            )
+            try:
+                att = self._call(
+                    v.section, v.base_url, row.api_key, model, combo="model-scan",
+                    proxy=self.live_proxy if v.need_proxy else None,
+                    **self._profile_kwargs(v, row.api_key),
+                )
+            except ProbePolicyStop as stop:
+                v.model_scan_pending_reason = stop.reason
+                raise
             v.attempts.append(att)
+            if model in v.model_scan_pending:
+                v.model_scan_pending.remove(model)
             # 必须走 _accept，不要在这里自己判 model_matches。
             #
             # 2026-08-31 实测：原来这里写的是
@@ -1918,17 +2368,36 @@ class Prober:
             # 这是同一个坑的第二次：wave 1 修过 _stage1 绕过 model_matches，
             # 现在换成 _stage2 绕过错误体检查。所以接受与否只留一个入口。
             if att.ok and self._accept(v, model, att):
-                found.append(model)
+                if model not in found:
+                    found.append(model)
+                # Preserve completed evidence even if the next call is stopped.
+                v.models = list(found)
 
         v.models = found
 
     # ---------- ④a 静默换模 ----------
 
     def _stage4_swap(self, row: ParsedRow, v: SectionVerdict) -> None:
-        """单次测不出来 —— weighted-round-robin 下换模是间歇性的。"""
+        """单次测不出来 —— weighted-round-robin 下换模是间歇性的。
+
+        跨凭据复用（2026-10-13）：换模是**站方路由表**的属性，不是凭据的
+        属性，所以同站同段同模型只实测一次，其余凭据取 `_site_model_facts`
+        里的结论。见那个字段旁边的说明与量化。
+        """
         if not v.models or self.swap_samples < 2:
             return
         model = v.models[0]
+        cache_key = (host_of(v.base_url), v.section, model)
+        with self._lock:
+            cached = self._site_model_facts.get(cache_key, {}).get("swap")
+        if cached is not None:
+            v.swap = dict(cached)
+            self.on_event("swap-reused", {
+                "section": v.section, "host": host_of(v.base_url), "model": model,
+                "rate_pct": v.swap.get("rate_pct"),
+                "why": "换模是站方路由属性，同站同段同模型本轮已实测，未重复发请求",
+            })
+            return
         samples: list[dict] = []
         for _ in range(self.swap_samples):
             att = self._call(
@@ -1939,6 +2408,8 @@ class Prober:
             v.attempts.append(att)
             samples.append(att.as_sample())
         v.swap = fingerprint.swap_rate(samples)
+        with self._lock:
+            self._site_model_facts.setdefault(cache_key, {})["swap"] = dict(v.swap)
         if v.swap.get("swap"):
             self.on_event("swap", {"section": v.section,
                                    "host": host_of(v.base_url), "model": model,
@@ -1957,10 +2428,36 @@ class Prober:
         if not self.probe_context or not v.models:
             return
         model = v.models[0]
+        # 跨凭据复用（2026-10-13）：窗口大小是**站方给这个模型配的**，不是
+        # 凭据的属性。这一项最贵 —— 每段 4-6 次最大约 110 万字符的大 body
+        # 请求（见界面上的「高级：请求预算」说明），10 把同域名 Key 实跑
+        # 时 56 次 ctx 请求里只有 ~6 次是新信息。
+        cache_key = (host_of(v.base_url), v.section, model)
+        with self._lock:
+            cached = self._site_model_facts.get(cache_key, {}).get("context")
+        if cached is not None:
+            v.max_context_length = cached["limit"]
+            v.context_model = model
+            v.context_untrusted = cached["untrusted"]
+            self.on_event("context-reused", {
+                "section": v.section, "model": model, "limit": cached["limit"],
+                "untrusted": cached["untrusted"],
+                "why": "窗口是站方对该模型的配置，同站同段同模型本轮已实测，未重复发请求",
+            })
+            return
         limit, untrusted = self._bisect(row, v, model)
         v.max_context_length = limit
         v.context_model = model          # 只对这个模型有效，别外推
         v.context_untrusted = untrusted
+        # 只缓存**测出了数的**结果。`limit is None` 表示这一次没能得出可信
+        # 上限（例如上游回 `input_tokens: 10` 这类没统计的值，被
+        # `_MIN_TRUSTED_CONTEXT` 挡掉 —— 见 test_context_limit_lower_bound）。
+        # 那不是一个站方事实，而是「这次没测出来」；缓存它会让后续凭据连
+        # 重试的机会都没有，而重试正是这类失败该得到的待遇。
+        if limit is not None:
+            with self._lock:
+                self._site_model_facts.setdefault(cache_key, {})["context"] = {
+                    "limit": limit, "untrusted": untrusted}
         if limit:
             self.on_event("context", {"section": v.section, "model": model,
                                       "limit": limit, "untrusted": untrusted})
@@ -2000,6 +2497,7 @@ class Prober:
             # 「开了可能全废 / 不开可能全废」的开关，判据同样是实打一次。
             self._probe_mid_system(row, v)
 
+    @policy_job_scope
     def _probe_websockets(self, row: ParsedRow, v: SectionVerdict) -> None:
         """codex 段：`{base}/responses` 换成 wss 发一次握手。
 
@@ -2044,9 +2542,17 @@ class Prober:
         # （applyCodexWebsocketHeaders 也会带 UA / x-codex-beta-features）。
         headers.update({k: val for k, val in (v.min_headers or {}).items()
                         if val and k.lower() != "content-type"})
-        self._policy_check(ws_url, headers)
-        resp = client.ws_handshake(ws_url, headers=headers,
-                                   timeout=min(self.timeout, 30))
+        with self._provider_admission(ws_url, headers, min(self.timeout, 30)) as (policy, deadline):
+            def check_admission():
+                self._check_cancel()
+                if time.monotonic() >= deadline:
+                    raise AdmissionTimeout()
+            host = host_of(ws_url)
+            with HOST_LIMITER.slot(host, max(self.gap, self._host_gap.get(host, 0)),
+                                   check_admission):
+                self._wait_for_policy(policy, ws_url, headers, deadline)
+                resp = client.ws_handshake(ws_url, headers=headers,
+                                           timeout=min(self.timeout, 30))
         if getattr(resp, "policy_code", ""):
             v.websockets = None
             v.websockets_note = "未实测：" + resp.error
@@ -2453,7 +2959,7 @@ class Prober:
 
     # ---------- 形态复用 ----------
 
-    def _bump_fail_streak(self, key: tuple[str, str],
+    def _bump_fail_streak(self, key: tuple[str, str, str],
                           v: SectionVerdict) -> None:
         """记一次「临时 / 未知」失败；连续同码达阈值就提升为站+段级结论。
 
@@ -2554,90 +3060,90 @@ class Prober:
     def _reuse_shape(
         self, row: ParsedRow, section: str, shape: SectionVerdict
     ) -> SectionVerdict:
-        """同主机的第 2..N 个 Key：套用已学到的段形态，只验凭证本身。
+        """复用同一 _evidence_key 的请求画像，逐模型建立当前结果的证据。
 
-        为什么可以复用：段的形态是**主机**的属性 ——
-          · 这个站在这一段上有哪些模型      （站方的渠道配置）
-          · 要不要走代理                    （站方的边缘防护）
-          · 最小必需标识头                  （站方的 UA/Originator 校验）
-          · 上下文窗口上限                  （站方给这个模型的容量）
-          · 有没有静默换模                  （站方的路由行为）
-        换一个 Key 不会改变其中任何一条。实测日志：5 行全是 relay-i.example，
-        却把 4 段从头到尾各探 5 遍 —— 36 次 × 5 = 180 次请求，其中
-        144 次在重复求证同一件事。
-
-        为什么仍要发一次请求：**凭证有效性是 Key 的属性，不是主机的**。
-        同一个站的 5 个 Key 完全可能一个欠费、一个被封、三个正常。所以
-        每段仍打一次基线（带上已学到的 headers 与代理），只是不再重跑
-        模型目录扫描、换模采样、上下文二分 —— 那三步问的都是主机的事。
-
-        代价从 36 次降到 4 次（每段 1 次），且判定精度不降：凭证坏了照样
-        当场发现，只是不再为同一个主机重复学习同一套形态。
+        缓存包含凭据、精确来源、配置、代理和任务身份。即使画像命中，
+        一个模型成功也不能证明其它模型成功；每个拟写入模型都要复验。
+        容量及能力仅能在上述完整缓存身份内复用，不能视为主机通用属性。
         """
-        base = base_for_section(row.bare, section)
+        base = self._base(row, section)
         v = SectionVerdict(section=section, base_url=base)
-        # 目录是**主机**的属性（站方声明有哪些模型），与 Key 无关 —— 直接
-        # 沿用，不重新 GET。放在所有分支之前：底下有三个提前 return，
-        # 判死的段也要带着候选清单回去给操作员人工接管用。
+        # 目录仅作候选展示，不构成模型实测成功证据。
         v.catalog = list(shape.catalog)
 
         if not shape.models:
-            # 主机在这一段本就没有可信模型 —— 换 Key 也不会变出模型来。
-            # 直接沿用结论，一次请求都不必发。
-            v.usable = shape.usable
+            # 没有实测模型的缓存不能变成可写入结论。
+            v.usable = False
             v.category, v.action = shape.category, shape.action
             self.on_event("shape-reused", {"section": section, "host": row.host,
                                            "verified": False,
-                                           "reason": "该段无可信模型，无需逐 Key 复验"})
+                                           "reason": "同凭据缓存无可信模型，不生成可写入模型"})
             return v
 
-        probe_model = shape.models[0]
-        att = self._call(
-            section, base, row.api_key, probe_model,
-            combo="reuse-verify",
-            proxy=self.live_proxy if shape.need_proxy else None,
-            **self._profile_kwargs(shape, row.api_key),
-        )
-        v.attempts.append(att)
-        v.category, v.action = att.category, att.action
+        successful = None
+        for probe_model in dict.fromkeys(shape.models):
+            self._check_cancel()
+            try:
+                att = self._call(
+                    section, base, row.api_key, probe_model,
+                    combo="reuse-verify",
+                    proxy=self.live_proxy if shape.need_proxy else None,
+                    **self._profile_kwargs(shape, row.api_key),
+                )
+            except ProbePolicyStop as stop:
+                v.probe_policy_code, v.probe_policy_reason = stop.code, stop.reason
+                v.action = stop.reason
+                break
+            v.attempts.append(att)
+            v.category, v.action = att.category, att.action
+            if not att.ok:
+                continue
+            if not fingerprint.model_matches(probe_model, att.resp_model):
+                self.on_event("shape-reuse-abort", {
+                    "section": section, "host": row.host,
+                    "reason": f"复验时请求 {probe_model} 却回 {att.resp_model}，改走全量探测",
+                })
+                return self._full_probe(row, section)
+            v.models.append(probe_model)
+            if att.identity_verified:
+                v.identity_verified_models.append(probe_model)
+            successful = att
 
-        if not att.ok:
-            # 这个 Key 在这一段不通（欠费 / 被封 / 权限不同）。
-            # 不回退到全量探测：形态已知，失败原因就是凭证本身。
+        if successful is None:
             self.on_event("shape-reused", {"section": section, "host": row.host,
                                            "verified": True, "ok": False,
-                                           "reason": f"{att.category} — {att.action}"})
+                                           "reason": f"{v.category} — {v.action}"})
             return v
 
-        if not fingerprint.model_matches(probe_model, att.resp_model):
-            # 同主机换 Key 后开始换模 —— 站方可能按 Key 分渠道。
-            # 这种情况形态不能复用，退回全量探测。
-            self.on_event("shape-reuse-abort", {
-                "section": section, "host": row.host,
-                "reason": f"复验时请求 {probe_model} 却回 {att.resp_model}，"
-                          f"该 Key 渠道与首个 Key 不同，改走全量探测",
-            })
-            return self._full_probe(row, section)
-
-        # 凭证有效且模型对得上 —— 套用主机形态
+        # 模型及客户端身份均由当前逐模型响应确定，不复制缓存名单。
+        att = successful
         v.usable = True
-        v.models = list(shape.models)
-        v.need_proxy = shape.need_proxy
+        if not v.probe_policy_code:
+            v.category, v.action = att.category, att.action
+        v.need_proxy = shape.need_proxy or bool(att.proxy)
+        v.successful_base_url = att.successful_base_url or base
+        v.successful_proxy_url = att.proxy
+        v.source_snapshot_id = shape.source_snapshot_id
         v.min_headers = dict(shape.min_headers)
         v.profile_name = shape.profile_name
         v.min_body_kind = shape.min_body_kind
         v.time_window = shape.time_window
         v.swap = dict(shape.swap)
-        v.max_context_length = shape.max_context_length
-        v.context_model = shape.context_model
+        v.max_context_length = (shape.max_context_length
+                                if shape.context_model in v.models else None)
+        v.context_model = shape.context_model if shape.context_model in v.models else ""
         v.context_untrusted = shape.context_untrusted
-        # 能力开关也是**主机**的属性（站方支不支持 WS / 认不认
-        # prompt_cache_key），与 Key 无关 —— 沿用，不再各探一次。
-        # 这与 need_proxy / min_headers / max_context_length 同一条理由。
+        # 调用方的完整缓存身份一致，才允许沿用该凭据的能力结果。
         v.websockets = shape.websockets
         v.websockets_note = shape.websockets_note
         v.prompt_cache_key = shape.prompt_cache_key
         v.prompt_cache_note = shape.prompt_cache_note
+        if not v.probe_policy_code:
+            try:
+                self._stage2(row, v)
+            except ProbePolicyStop as stop:
+                v.probe_policy_code, v.probe_policy_reason = stop.code, stop.reason
+                v.action = stop.reason
         self.on_event("shape-reused", {"section": section, "host": row.host,
                                        "verified": True, "ok": True,
                                        "models": len(v.models)})
@@ -2645,6 +3151,7 @@ class Prober:
 
     # ---------- 编排 ----------
 
+    @policy_job_scope
     def _full_probe(self, row: ParsedRow, section: str) -> SectionVerdict:
         """一个段的完整探测。首个 Key 走这条，之后复用它的形态。
 
@@ -2659,9 +3166,10 @@ class Prober:
             v = self._stage1(row, section)
             if v.usable:
                 self._stage2(row, v)
-                self._stage4_swap(row, v)
-                self._stage4_context(row, v)
-                self._stage5_capabilities(row, v)
+                if v.models:
+                    self._stage4_swap(row, v)
+                    self._stage4_context(row, v)
+                    self._stage5_capabilities(row, v)
         except ProbePolicyStop as stop:
             v = v or self._policy_local.verdict
             if v is None:
@@ -2672,6 +3180,10 @@ class Prober:
             v.action = (v.action + "；" if v.action else "") + stop.reason
         finally:
             self._policy_local.verdict = None
+        if v is not None and v.usable and not v.models:
+            v.usable = False
+            v.category = "校验失败"
+            v.action = "没有模型通过身份与内容校验" + ("；" + v.action if v.action else "")
         return v
 
     # 哪些失败类别是「站 + 段」级的 —— 换一把 Key 结论不变。
@@ -2709,6 +3221,7 @@ class Prober:
     #     当初刻意排除它们的理由
     _FAIL_STREAK_CATEGORIES = frozenset({"临时", "未知"})
 
+    @policy_job_scope
     def _probe_one_section(self, row: ParsedRow, section: str) -> SectionVerdict:
         """探一个段。probe() 的工作单元，串行与并行共用同一份逻辑。
 
@@ -2746,8 +3259,12 @@ class Prober:
         # 用 `row.bare`（原始裸地址）而不是 `row.base_for(section)`：
         # 后者是 ParsedRow 才有的派生方法，而这里只需要「同一个上游」这个
         # 身份，`bare` 已经带着路径了。少依赖一个方法也让调用方更好替身。
-        key = (entry_scope(section, row.bare), section)
+        # 目录权限、模型权限、上下文和能力均可能按 Key 分组；缓存身份必须
+        # 包含凭据、精确来源、配置、客户端头、代理及来源快照。
+        # HOST_LIMITER 和策略账本仍按原有 host/provider 共享，不放松限额。
+        key = self._evidence_key(section, row.bare, row.api_key)
         while True:
+            self._check_cancel()
             with self._lock:
                 shape = self._shape.get(key)
                 if shape is not None:
@@ -2795,9 +3312,13 @@ class Prober:
             # 等认领者出结果。超时兜底：认领者若卡在长 timeout 上，
             # 等待方不该被无限期拖住 —— 醒来重判，那时要么有形态可复用，
             # 要么门闩已清空，由本线程接手认领。
-            gate.wait(timeout=self.timeout + 30)
+            # 短等待只检查取消，不夺取认领者的门闩，也不重复发请求。
+            gate.wait(timeout=0.1)
 
-        return self._reuse_shape(row, section, shape)
+        try:
+            return self._reuse_shape(row, section, shape)
+        except ProbePolicyStop as stop:
+            return self._policy_verdict(row, section, stop)
 
     def probe(self, row: ParsedRow) -> CandidateResult:
         """探一个候选的四段。
@@ -2811,23 +3332,62 @@ class Prober:
         为什么这一步收益最大：原来四段共享一个 gap 桶且串行，单站 56 次请求
         要 55 x 3s = 165 秒纯睡。拆桶 + 并行后，四段各自睡自己的，
         墙钟时间取四段里最慢的那一段，而不是四段之和。
+
+        上述是局部并行设计背景；当前 _send 的进程级 HOST_LIMITER 仍约束
+        同站实际发送间隔。实际耗时需包含该间隔、策略等待和上游响应时间。
         """
         res = CandidateResult(row=row)
         self.on_event("candidate-start", {"host": row.host, "key": row.masked()})
+
+        # 段前置闸（2026-10-09）。默认路径：一次目录 GET 判定该站具备哪些
+        # 协议，只探其中通过闸的段；操作员手动指定时零请求直接采用。
+        # 任何不确定都返回 None，这里 `or list(SECTIONS)` 即回落到旧行为。
+        # 判定失败**不是**「这个站不可用」，只是「这次没省下请求」。
+        try:
+            target_sections = self._prescan_sections(row) or list(SECTIONS)
+        except Exception as exc:      # noqa: BLE001
+            # 预扫自身的异常绝不能影响探测本身：它只是一次优化。
+            self.on_event("prescan-miss", {"host": row.host, "status": "error",
+                                           "reason": type(exc).__name__})
+            target_sections = list(SECTIONS)
+        if len(target_sections) < len(SECTIONS):
+            self.on_event("section-gate", {
+                "host": row.host, "probe": target_sections,
+                "skipped": [s for s in SECTIONS if s not in target_sections],
+                "why": "目录预扫判定该站无此协议，未发请求",
+            })
+        # 被闸挡掉的段仍要出现在结果里（前端表格与 CLI 都按四段渲染），
+        # 但要标成「未实测 + 原因」，不能留成空白 —— 空白的段正是现场
+        # 「一堆空白项/待定」的来源之一。
+        skipped: dict[str, SectionVerdict] = {}
+        for sec in SECTIONS:
+            if sec in target_sections:
+                continue
+            v = SectionVerdict(section=sec, base_url=base_for_section(row.bare, sec))
+            # `summary()` 由 category + action 拼出，不要另加字段 —— 多一个
+            # 字段只会与它不同步，而界面读的是 summary()。
+            v.category = "未实测"
+            v.action = ("目录预扫判定该站未声明这一协议，本轮未发请求；"
+                        "要强制探测可在投喂时手动勾选该段")
+            skipped[sec] = v
+            res.sections[sec] = v
 
         if self.workers > 1:
             # 结果按 SECTIONS 原序回填 —— 前端表格与 CLI 输出都依赖这个顺序，
             # 不能让完成先后决定展示顺序。
             with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=min(self.workers, len(SECTIONS)),
+                    max_workers=min(self.workers, len(target_sections)),
                     thread_name_prefix="probe-sec") as ex:
                 futs = {ex.submit(self._probe_one_section, row, sec): sec
-                        for sec in SECTIONS}
+                        for sec in target_sections}
                 done: dict[str, SectionVerdict] = {}
                 for fut in concurrent.futures.as_completed(futs):
                     sec = futs[fut]
                     try:
                         done[sec] = fut.result()
+                    except concurrent.futures.CancelledError:
+                        self.cancel()
+                        raise
                     except Exception as e:      # noqa: BLE001
                         # 一段炸了不该拖垮另外三段。记成不可用并带上原因，
                         # 让它照常走「不可用」那条展示路径。
@@ -2839,19 +3399,27 @@ class Prober:
                         self.on_event("section-error",
                                       {"section": sec, "host": row.host,
                                        "error": str(e)})
-            for sec in SECTIONS:
-                v = done[sec]
-                res.sections[sec] = v
-                self.on_event("section-done", {"section": sec, "host": row.host,
-                                               "usable": v.usable,
-                                               "summary": v.summary()})
+                    # 单段完成立即通知；不必等待同站最慢的一段才能显示进展。
+                    v = done[sec]
+                    self.on_event("section-done", {"section": sec, "host": row.host,
+                                                   "usable": v.usable,
+                                                   "summary": v.summary()})
+            for sec in target_sections:
+                res.sections[sec] = done[sec]
         else:
-            for section in SECTIONS:
+            for section in target_sections:
                 v = self._probe_one_section(row, section)
                 res.sections[section] = v
                 self.on_event("section-done", {"section": section, "host": row.host,
                                                "usable": v.usable,
                                                "summary": v.summary()})
+
+        # 被闸挡掉的段也要发一次 section-done：前端按这个事件计进度条，
+        # 少发会让进度永远停在 2/4（现场「定档轮询无响应」的同类表现）。
+        for sec, v in skipped.items():
+            self.on_event("section-done", {"section": sec, "host": row.host,
+                                           "usable": False,
+                                           "summary": v.summary()})
 
         self.on_event("candidate-done", {"host": row.host,
                                          "usable": res.usable_sections,

@@ -29,12 +29,16 @@
 from __future__ import annotations
 
 import io
+import copy
+import tempfile
 import hashlib
 import json
 import os
 import re
 import time
-from dataclasses import dataclass, field
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from dataclasses import dataclass, field, asdict
 
 
 # CPA 源码里这几个文件是身份头的权威来源。路径相对仓库根。
@@ -151,6 +155,8 @@ class CpaIdentity:
     checked_at: float = 0.0
     expires_at: float = 0.0
     immutable: bool = False
+    stale: bool = False
+    refresh_failed_at: float = 0.0
     uncertainty: list[str] = field(default_factory=list)
     claude_header_defaults: dict[str, str] = field(default_factory=dict)
     cpamp_disable_semantics: dict = field(default_factory=dict)
@@ -348,44 +354,123 @@ def parse_body_rules(src: str, var: str = "body") -> list[dict]:
     scopes = []
     statement = []
     rules = []
+    returned_scopes: set[int] = set()
+    operations = {"SetBoolIfDifferent", "SetStringIfDifferent", "DeleteBytes",
+                  "SetBytes", "SetRawBytes", "SetIntIfDifferent"}
+    # Preserve complete argument expressions. A token window truncates values
+    # such as cached.ID and cannot distinguish typed JSON from raw JSON bytes.
+    def call_args(index):
+        if index + 1 >= len(tokens) or tokens[index + 1].group() != "(":
+            return None
+        depth, start, args = 0, index + 2, []
+        for j in range(index + 2, len(tokens)):
+            part = tokens[j].group()
+            if part == ")" and depth == 0:
+                args.append(src[tokens[start].start():tokens[j].start()].strip()
+                            if start < j else "")
+                return args, j
+            if part == "," and depth == 0:
+                args.append(src[tokens[start].start():tokens[j].start()].strip())
+                start = j + 1
+            elif part in ("(", "[", "{"):
+                depth += 1
+            elif part in (")", "]", "}"):
+                depth -= 1
+        return None
+
+    def opaque(reason, token, expression):
+        functions = [text for kind, text in scopes if kind == "function"]
+        function = functions[-1] if functions else ""
+        rules.append({"path": None, "op": "opaque", "value": expression,
+                      "conditions": {"entrypoint": function} if function in
+                      ("Execute", "ExecuteStream") else {},
+                      "unknown": [reason] + ([] if function in
+                      ("Execute", "ExecuteStream") else ["helper:" + function]),
+                      "function": function, "line": src.count("\n", 0, token.start()) + 1})
+
     for i, token in enumerate(tokens):
         value = token.group()
+        # Whole-body transformations must contribute to semantic coverage even
+        # when their helper implementation is outside this source file.
+        if value == var:
+            j = i + 1
+            # An assignment LHS is an identifier list, not arbitrary adjacent
+            # identifiers (which could belong to the next statement).
+            while j + 1 < len(tokens) and tokens[j].group() == "," and re.fullmatch(
+                    r"[A-Za-z_]\w*", tokens[j + 1].group()):
+                j += 2
+            if j < len(tokens) and tokens[j].group() == ":":
+                j += 1
+            if j < len(tokens) and tokens[j].group() == "=":
+                end = j + 1
+                while end < len(tokens) and tokens[end].group() not in (";", "}"):
+                    if end > j + 1 and "\n" in src[tokens[end - 1].end():tokens[end].start()]:
+                        break
+                    end += 1
+                rhs = tokens[j + 1:end]
+                # Only a direct known setter call is already represented below.
+                direct = (len(rhs) >= 4 and rhs[1].group() == "." and
+                          rhs[2].group() in operations and rhs[3].group() == "(")
+                if not direct and rhs:
+                    opaque("unresolved-body-assignment", token,
+                           src[rhs[0].start():rhs[-1].end()])
         if value == "{":
             text = " ".join(statement)
             fn = re.search(r'\bfunc\s+(?:\([^)]*\)\s*)?(\w+)\s*\(', text)
             if fn:
                 scopes.append(("function", fn.group(1)))
+                returned_scopes.clear()
             else:
                 scopes.append(("guard", text))
             statement = []
             continue
         if value == "}":
             if scopes:
+                returned_scopes.discard(len(scopes))
                 scopes.pop()
             statement = []
             continue
         if value == ";":
             statement = []
             continue
-        if value in ("SetBoolIfDifferent", "SetStringIfDifferent", "DeleteBytes",
-                     "SetBytes", "SetRawBytes", "SetIntIfDifferent"):
-            tail = tokens[i + 1:i + 10]
-            args = [t.group() for t in tail]
-            if len(args) >= 5 and args[:3] == ["(", var, ","]:
+        if value == "return":
+            returned_scopes.add(len(scopes))
+        if value in operations:
+            call = call_args(i)
+            args = call[0] if call else None
+            if args and len(args) >= 2 and args[0] == var:
                 try:
-                    path = json.loads(args[3])
+                    path = json.loads(args[1])
                 except (ValueError, TypeError):
                     path = None
+                if not isinstance(path, str):
+                    opaque("dynamic-sjson-path", token, args[1])
                 if isinstance(path, str):
-                    raw = "" if value == "DeleteBytes" else (args[5] if len(args) > 5 else "")
-                    literal = (value == "DeleteBytes" or
-                               (len(args) > 6 and args[6] == ")" and
-                                (raw in ("true", "false") or raw.startswith('"'))))
+                    raw = "" if value == "DeleteBytes" else (args[2] if len(args) == 3 else "")
+                    try:
+                        parsed = json.loads(raw)
+                    except (ValueError, TypeError):
+                        parsed = None
+                    # The request consumer supports booleans and strings only.
+                    # Numeric/object/raw-byte values remain visible unknowns.
+                    literal = value == "DeleteBytes" or isinstance(parsed, (bool, str))
                     conditions = {}
                     unknown = []
+                    receiver = tokens[i - 2].group() if i >= 2 and tokens[i - 1].group() == "." else ""
+                    if receiver != ("sjson" if value in ("SetBytes", "DeleteBytes", "SetRawBytes") else "helps"):
+                        unknown.append("unverified-operation-receiver:" + receiver)
+                    if i < 3 or tokens[i - 3].group() != "=":
+                        unknown.append("non-direct-body-operation")
+                    end_call = call[1]
+                    if end_call + 1 < len(tokens) and tokens[end_call + 1].group() not in (";", "}") and "\n" not in src[tokens[end_call].end():tokens[end_call + 1].start()]:
+                        unknown.append("non-direct-body-operation")
+                    # Returns block only their current scope. An error guard
+                    # does not suppress setters on the normal sending path.
+                    if any(depth <= len(scopes) for depth in returned_scopes):
+                        unknown.append("preceding-return-control-flow")
                     if not re.fullmatch(r"[\w-]+(?:\.[\w-]+)*", path):
                         unknown.append("unsupported-sjson-path")
-                    if value not in ("SetBoolIfDifferent", "SetStringIfDifferent", "DeleteBytes"):
+                    if value not in ("SetBoolIfDifferent", "SetStringIfDifferent", "DeleteBytes", "SetBytes"):
                         unknown.append("unsupported-operation:" + value)
                     for kind, text in scopes:
                         if kind == "function":
@@ -412,7 +497,10 @@ def parse_body_rules(src: str, var: str = "body") -> list[dict]:
                         unknown.append("nonliteral:" + raw)
                     rules.append({"path": path, "op": "drop" if value == "DeleteBytes" else "set",
                                   "value": raw, "conditions": conditions,
-                                  "unknown": unknown})
+                                  "unknown": unknown,
+                                  "line": src.count("\n", 0, token.start()) + 1,
+                                  "function": next((text for kind, text in reversed(scopes)
+                                                    if kind == "function"), "")})
         # Keep only the current line for control prefixes, but retain multiline
         # function signatures. Strings/comments cannot introduce braces.
         if i and "\n" in src[tokens[i - 1].end():token.start()] and "func" not in statement:
@@ -427,8 +515,19 @@ def resolve_body_rules(rules: list[dict], *, stream: bool = False,
     context = {"support-prompt-cache-key": False, **(config or {}), "stream": stream,
                "entrypoint": "ExecuteStream" if stream else "Execute"}
     for rule in rules:
-        if rule["unknown"] or any(context.get(k) != v
-                                  for k, v in rule["conditions"].items()):
+        if any(context.get(k) != v for k, v in rule["conditions"].items()):
+            continue
+        if rule["unknown"]:
+            # An unresolved later rewrite invalidates an earlier proven final
+            # value. Helpers outside the selected entrypoint are not executed.
+            if not any(u.startswith("helper:") for u in rule["unknown"]):
+                if rule["path"] is None:
+                    force.clear()
+                    drop.clear()
+                else:
+                    force.pop(rule["path"], None)
+                    if rule["path"] in drop:
+                        drop.remove(rule["path"])
             continue
         path = rule["path"]
         if rule["op"] == "drop":
@@ -636,113 +735,428 @@ def _http_get(url: str, *, timeout: int = 15,
         return 0, f"{type(e).__name__}: {e}"
 
 
+# One process-wide bounded pool: timed-out socket readers cannot create an
+# unbounded queue or a new set of workers on every refresh.
+_SOURCE_EXTRACTOR_VERSION = 2
+_SOURCE_WORKERS = 6
+_source_pool = ThreadPoolExecutor(max_workers=_SOURCE_WORKERS,
+                                  thread_name_prefix="source-manifest")
+_source_slots = threading.BoundedSemaphore(_SOURCE_WORKERS)
+_source_lock = threading.RLock()
+_source_inflight = {}
+
+
+def _fetch_manifest_batch(requests, deadline, proxy):
+    pending, results = {}, {}
+    remaining_requests = iter(requests)
+    exhausted = False
+    while not exhausted or pending:
+        while not exhausted and len(pending) < _SOURCE_WORKERS:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                exhausted = True
+                break
+            if not _source_slots.acquire(timeout=remaining if not pending else 0):
+                break
+            try:
+                name, url = next(remaining_requests)
+            except StopIteration:
+                _source_slots.release()
+                exhausted = True
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _source_slots.release()
+                exhausted = True
+                break
+            try:
+                future = _source_pool.submit(_http_get, url,
+                                             timeout=remaining, proxy=proxy)
+            except Exception:
+                _source_slots.release()
+                raise
+            future.add_done_callback(lambda _: _source_slots.release())
+            pending[future] = name
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if not pending:
+            if exhausted:
+                break
+            continue
+        completed, _ = wait(pending, timeout=remaining,
+                            return_when=FIRST_COMPLETED)
+        if not completed:
+            break
+        for future in completed:
+            name = pending.pop(future)
+            try:
+                results[name] = future.result()
+            except Exception:
+                results[name] = (0, "source fetch failed")
+    for future in pending:
+        future.cancel()
+    return results
+
+
+def _remote_failure(ref, issue):
+    out = _parse_sources({}, source_root=f"github:{_RAW_BASE}@{ref}")
+    out.errors.append(issue)
+    out.uncertainty.append(issue)
+    out.immutable = False
+    out.expires_at = time.time() + _REMOTE_FAIL_TTL
+    return out
+
+
+# Last-good snapshots contain parsed public constants only. The persisted key is
+# a digest: proxy credentials, requested refs and exception text never reach disk.
+_last_good_cache = {}
+_partial_snapshot_cache = {}
+
+
+def _last_good_key(remote_key):
+    repos, _proxy, version, manifest = remote_key
+    return hashlib.sha256(repr((repos, version, manifest)).encode()).hexdigest()
+
+
+def _last_good_valid(ident):
+    return (ident.ok and not ident.stale and ident.immutable
+            and {"claude-betas", "codex-identity", "fingerprint", "cloak",
+                 "cpamp-enable-rules", "claude-header-defaults", "cpamp-disable"}.issubset(ident.coverage)
+            and set(ident.revisions) == set(SOURCE_MANIFEST)
+            and all(isinstance(v, str) and re.fullmatch(r"[0-9a-f]{40}", v)
+                    for v in ident.revisions.values())
+            and bool(re.fullmatch(r"[0-9a-f]{64}", ident.snapshot_id or "")))
+
+
+def _last_good_save(key, ident, *, _validator=_last_good_valid, _cache=None, _suffix="", _schema=1):
+    if _cache is None:
+        _cache = _last_good_cache
+    if not _validator(ident):
+        return
+    clean = copy.deepcopy(ident)
+    clean.source_root = ""
+    clean.errors = []
+    clean.uncertainty = []
+    with _source_lock:
+        _cache_put(_cache, key, clean)
+    directory = os.environ.get("CPA_SOURCE_CACHE_DIR", "")
+    if not directory:
+        return
+    temporary = None
+    try:
+        os.makedirs(directory, exist_ok=True)
+        payload = json.dumps({"schema": _schema, "key": key, "identity": asdict(clean)},
+                             ensure_ascii=False, allow_nan=False)
+        if len(payload.encode("utf-8")) > 2 * 1024 * 1024:
+            return
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                         prefix=".source-", delete=False) as handle:
+            temporary = handle.name
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, os.path.join(directory, key + _suffix + ".json"))
+        temporary = None
+    except (OSError, ValueError, TypeError):
+        pass  # Read-only volumes must not fail an otherwise successful refresh.
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _same_shape(value, default, depth=0):
+    if depth > 20:
+        return False
+    if isinstance(default, float):
+        return type(value) in (float, int) and value >= 0 and value < float("inf")
+    if type(value) is not type(default):
+        return False
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _json_value(v, depth + 1) for k, v in value.items())
+    if isinstance(value, list):
+        return all(_json_value(v, depth + 1) for v in value)
+    return True
+
+
+def _json_value(value, depth):
+    return depth <= 20 and (value is None or type(value) in (str, bool, int)
+                           or type(value) is float and -float("inf") < value < float("inf")
+                           or isinstance(value, (dict, list)) and _same_shape(value, type(value)(), depth))
+
+
+def _identity_collections_valid(data):
+    strings = lambda values: isinstance(values, list) and all(isinstance(v, str) for v in values)
+    mapping = lambda values: isinstance(values, dict) and all(isinstance(v, str) for v in values.values())
+    if not all(strings(data[key]) for key in (
+            "claude_betas_unconditional", "codex_body_drop", "claude_fingerprint_profiles",
+            "claude_cloak_modes", "s2a_system_prompts", "s2a_required_headers")):
+        return False
+    if not all(mapping(data[key]) for key in (
+            "claude_betas_conditional", "codex_body_force", "claude_header_defaults")):
+        return False
+    for shape in data["body_shape"].values():
+        if not (isinstance(shape, list) and len(shape) == 2
+                and mapping(shape[0]) and strings(shape[1])):
+            return False
+    for rules in data["body_rules"].values():
+        if not isinstance(rules, list):
+            return False
+        for rule in rules:
+            fields = {"path", "op", "value", "conditions", "unknown"}
+            if not (isinstance(rule, dict) and set(rule) in (fields, fields | {"function", "line"})
+                    and isinstance(rule["value"], str)
+                    and rule["op"] in ("set", "drop", "opaque") and isinstance(rule["conditions"], dict)
+                    and strings(rule["unknown"])):
+                return False
+            # Current parser records source locations and unresolved rewrites.
+            # Keep opaque evidence unknown; never restore it as an executable set.
+            if rule["op"] == "opaque":
+                if rule["path"] is not None or not rule["unknown"]:
+                    return False
+            elif not isinstance(rule["path"], str):
+                return False
+            if "function" in rule and not (isinstance(rule["function"], str)
+                    and type(rule["line"]) is int and rule["line"] > 0):
+                return False
+    return True
+
+
+def _last_good_load(key, *, _validator=_last_good_valid, _cache=None, _suffix="", _schema=1):
+    if _cache is None:
+        _cache = _last_good_cache
+    with _source_lock:
+        cached = _cache.get(key)
+        if cached is not None and _validator(cached):
+            return copy.deepcopy(cached)
+    directory = os.environ.get("CPA_SOURCE_CACHE_DIR", "")
+    if not directory:
+        return None
+    try:
+        with open(os.path.join(directory, key + _suffix + ".json"), "rb") as handle:
+            raw = handle.read(2 * 1024 * 1024 + 1)
+        if len(raw) > 2 * 1024 * 1024:
+            return None
+        payload = json.loads(raw)
+        data = payload.get("identity")
+        defaults = asdict(CpaIdentity())
+        if (type(payload.get("schema")) is not int or payload.get("schema") != _schema or payload.get("key") != key
+                or not isinstance(data, dict) or set(data) != set(defaults)
+                or not all(_same_shape(data[k], v) for k, v in defaults.items())
+                or not _identity_collections_valid(data)
+                or data["source_root"] or data["errors"] or data["uncertainty"]):
+            return None
+        ident = CpaIdentity(**data)
+        if _validator(ident):
+            return ident
+    except (OSError, ValueError, TypeError, AttributeError, RecursionError):
+        pass
+    return None
+
+
+def _partial_collections_valid(ident):
+    sections = set(_BODY_SHAPE_SOURCES)
+    if not set(ident.body_shape).issubset(sections) or not set(ident.body_rules).issubset(sections):
+        return False
+    for rules in ident.body_rules.values():
+        for rule in rules:
+            for key, value in rule["conditions"].items():
+                if key == "entrypoint":
+                    if value not in ("Execute", "ExecuteStream"):
+                        return False
+                elif key not in ("stream", "support-prompt-cache-key") or type(value) is not bool:
+                    return False
+    semantics = {"native_field": str, "native_disable_value": str, "compat_field": str,
+                 "compat_disable_value": bool, "enable_preserves_exclusions": bool}
+    return all(key in semantics and type(value) is semantics[key]
+               for key, value in ident.cpamp_disable_semantics.items())
+
+
+def _partial_snapshot_valid(ident):
+    """Partial body analysis is reusable evidence, never complete verification.
+
+    Only an unexpired, transport-complete immutable extraction qualifies. Its
+    original short TTL survives every disk restore and failed refresh.
+    """
+    capabilities = {"claude-betas", "codex-identity", "fingerprint", "cloak",
+                    "cpamp-enable-rules", "claude-header-defaults", "cpamp-disable"}
+    files = {f"file:{repo}:{path}" for repo, paths in SOURCE_MANIFEST.items() for path in paths}
+    bodies = {"body:" + section for section in _BODY_SHAPE_SOURCES}
+    now = time.time()
+    return (not ident.ok and not ident.errors and ident.stale is False
+            and ident.immutable is True
+            and all(type(v) in (int, float) and 0 < v < float("inf")
+                    for v in (ident.checked_at, ident.expires_at))
+            and ident.checked_at <= now < ident.expires_at
+            and ident.expires_at - ident.checked_at <= _REMOTE_FAIL_TTL
+            and ident.refresh_failed_at == 0
+            and _partial_collections_valid(ident)
+            and set(ident.coverage) == capabilities | files | bodies
+            and all(ident.coverage[k] == "covered" for k in capabilities | files)
+            and all(ident.coverage[k] in ("covered", "partial") for k in bodies)
+            and set(ident.revisions) == set(SOURCE_MANIFEST)
+            and all(isinstance(v, str) and re.fullmatch(r"[0-9a-f]{40}", v)
+                    for v in ident.revisions.values())
+            and isinstance(ident.snapshot_id, str)
+            and bool(re.fullmatch(r"[0-9a-f]{64}", ident.snapshot_id)))
+
+
+def _partial_snapshot_save(key, ident):
+    _last_good_save(key, ident, _validator=_partial_snapshot_valid,
+                    _cache=_partial_snapshot_cache, _suffix=".partial", _schema=2)
+
+
+def _partial_snapshot_load(key):
+    return _last_good_load(key, _validator=_partial_snapshot_valid,
+                           _cache=_partial_snapshot_cache, _suffix=".partial", _schema=2)
+
+
+def _last_good_fallback(key, failed):
+    partial = _partial_snapshot_load(key)
+    good = _last_good_load(key)
+    # Prefer the newest extracted evidence, preserving its coverage tier.
+    cached = max((item for item in (partial, good) if item is not None),
+                 key=lambda item: item.checked_at, default=None)
+    if cached is None:
+        return failed
+    cached.stale = True
+    cached.refresh_failed_at = time.time()
+    cached.errors = ["source refresh failed; using cached public snapshot"]
+    cached.uncertainty = ["cached source snapshot may be outdated"]
+    # checked_at/expires_at remain the original evidence timestamps. A stale
+    # retry window is tracked separately so old evidence never appears fresh.
+    cached._retry_after = time.time() + _REMOTE_FAIL_TTL
+    if cached is partial:
+        cached._retry_after = min(cached._retry_after, cached.expires_at)
+    return cached
+
+
 def extract_remote(*, ref: str = "main", timeout: int = 60,
                    proxy: str | None = None,
                    use_cache: bool = True, cpamp_ref: str = "main",
                    sub2api_ref: str = "main") -> CpaIdentity:
-    """Fetch the bounded manifest from public GitHub, pinning each repository.
+    """Fetch every manifest entry concurrently under one caller deadline.
 
-    A successful complete snapshot lives six hours; partial/failure results ten
-    minutes. No source is executed. Missing files and unresolved revisions stay
-    explicit. The shared fetch budget stops scheduling requests after timeout.
-
-    预算为什么是 60 秒（2026-09-15 实测定）
-    ------------------------------------
-    清单横跨三个仓库、14 个文件，外加每仓一次 commits 查询解析 revision，
-    共 17 次请求。实测单次 1.4–1.9 秒（直连 GitHub）→ 24–32 秒。
-
-    两次实测教训：
-      · 原默认 8 秒是两仓库时代的值。加 sub2api 后连 cpa 那一仓都跑不完 ——
-        `revisions` 只剩 cpa、cpamp 四个文件全 missing、`immutable=False`，
-        而失败缓存 10 分钟，界面上看不出原因。
-      · 改 45 秒 + 按仓平均分（15 秒/仓）仍不够：cpa 的 9 个文件要约 17 秒，
-        实测 21 个文件 missing、两仓报 deadline exceeded。
-
-    现在按**文件数加权**分配（见下面 `_weights`），60 秒下 cpa 得约 33 秒、
-    cpamp 约 17 秒、sub2api 约 7 秒，各自留 1.5 倍以上余量。
-
-    这个预算只在**缓存未命中**时付；命中时是 6 小时一次，代价可忽略。
-    拉不通的环境由 `_REMOTE_FAIL_TTL` 兜住，不会每次打开网页都重付。
+    Resolved revisions use immutable commits; unresolved branches are retained
+    only as invalid diagnostic snapshots.
+    Six process-wide workers bound concurrency, including readers that ignore
+    their socket timeout. Same-key cached refreshes share one result. Complete
+    snapshots live six hours; incomplete snapshots remain explicit failures.
     """
     from urllib.parse import quote, urlsplit
     now = time.time()
-    key = (_RAW_BASE, _CPAMP_RAW_BASE, _SUB2API_RAW_BASE,
-           ref, cpamp_ref, sub2api_ref, proxy)
-    entry = _remote_cache.get(key)
-    if use_cache and entry and now < entry.expires_at:
-        _remote_cache.update(at=entry.checked_at, ident=entry, ref=ref, ok=entry.ok)
-        return entry
-    sources, revisions, issues = {}, {}, []
-    # 每仓一份**独立**预算，且按**文件数**加权，不是平均分（2026-09-15）。
-    #
-    # 共享预算的失效方式：仓库按固定顺序遍历，排第一的 cpa 有 9 个文件，
-    # 它慢一点就把后两仓的额度吃光 —— 实测 timeout=25 时 cpamp 三个文件
-    # 全 missing、sub2api 整仓没进 revisions，而失败缓存 10 分钟，
-    # 界面上只看到「拉不到」，看不出是被前一仓饿死的。
-    #
-    # 平均分同样不够：45/3=15 秒给 cpa 的 9 个文件（每次 1.4–1.9 秒，
-    # 另加一次 commits 查询）必然超，实测 21 个文件 missing。
-    # 按文件数 +1（那次 commits 查询）加权后，各仓拿到与工作量匹配的额度。
-    _repos = (("cpa", _RAW_BASE, ref),
-              ("cpamp", _CPAMP_RAW_BASE, cpamp_ref),
-              ("sub2api", _SUB2API_RAW_BASE, sub2api_ref))
-    # +1 = 解析 revision 的那次 commits 查询
-    _weights = {r: len(SOURCE_MANIFEST[r]) + 1 for r, _b, _q in _repos}
-    _total_w = sum(_weights.values()) or 1
-    _budget = max(1, timeout)
-    for repo, base, requested in _repos:
-        deadline = time.monotonic() + _budget * _weights[repo] / _total_w
-        parsed = urlsplit(base)
-        if (parsed.scheme != "https" or parsed.netloc != "raw.githubusercontent.com"
-                or not re.fullmatch(r"/[\w.-]+/[\w.-]+", parsed.path)):
-            issues.append("unsupported public source repository")
-            continue
-        revision = requested
-        if not re.fullmatch(r"[0-9a-f]{40}", revision):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                # 只放弃**这一仓**，不终止整轮（2026-09-15）。
-                # 每仓有独立预算，本仓耗尽与其余仓无关；原来的 break
-                # 会让排在后面的仓库一个都拿不到，退回共享预算的老毛病。
-                issues.append(repo + ": revision deadline exceeded")
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    repos = (("cpa", _RAW_BASE, ref), ("cpamp", _CPAMP_RAW_BASE, cpamp_ref),
+             ("sub2api", _SUB2API_RAW_BASE, sub2api_ref))
+    key = (tuple(repos), proxy, _SOURCE_EXTRACTOR_VERSION,
+           tuple((r, tuple(paths)) for r, paths in SOURCE_MANIFEST.items()))
+    owner = True
+    flight = None
+    if use_cache:
+        with _source_lock:
+            entry = _remote_cache.get(key)
+            if (entry and now < getattr(entry, "_retry_after", entry.expires_at) and
+                    getattr(entry, "_remote_key", None) == key and
+                    getattr(entry, "_remote_revisions", None) == entry.revisions and
+                    (not entry.ok or (entry.immutable and
+                     set(entry.revisions) == set(SOURCE_MANIFEST) and all(
+                     re.fullmatch(r"[0-9a-f]{40}", r)
+                     for r in entry.revisions.values())))):
+                _remote_cache.update(at=entry.checked_at, ident=entry, ref=ref, ok=entry.ok)
+                return entry
+            flight = _source_inflight.get(key)
+            if flight is None:
+                flight = {"event": threading.Event(), "result": None}
+                _source_inflight[key] = flight
+            else:
+                owner = False
+        if not owner:
+            if flight["event"].wait(max(0.0, deadline - time.monotonic())):
+                return flight["result"]
+            return _last_good_fallback(_last_good_key(key),
+                                       _remote_failure(ref, "source refresh wait deadline exceeded"))
+    out = None
+    try:
+        sources, revisions, issues, revision_requests = {}, {}, [], []
+        for repo, base, requested in repos:
+            parsed = urlsplit(base)
+            if (parsed.scheme != "https" or parsed.netloc != "raw.githubusercontent.com"
+                    or not re.fullmatch(r"/[\w.-]+/[\w.-]+", parsed.path)):
+                issues.append(repo + ": unsupported public source repository")
                 continue
-            status, body = _http_get(
-                "https://api.github.com/repos" + parsed.path + "/commits/"
-                + quote(requested, safe=""), timeout=remaining, proxy=proxy)
+            if re.fullmatch(r"[0-9a-f]{40}", requested):
+                revisions[repo] = requested
+            else:
+                revision_requests.append((repo, "https://api.github.com/repos" +
+                                          parsed.path + "/commits/" + quote(requested, safe="")))
+        resolved = _fetch_manifest_batch(revision_requests, deadline, proxy)
+        for repo, _ in revision_requests:
+            status, body = resolved.get(repo, (0, ""))
             try:
                 revision = json.loads(body).get("sha", "") if status == 200 else ""
             except (ValueError, AttributeError):
                 revision = ""
-            if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision):
+                revisions[repo] = revision
+            else:
                 issues.append(repo + ": revision unresolved")
-                revision = requested
-        revisions[repo] = revision
-        for rel in SOURCE_MANIFEST[repo]:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                # 跳出本仓剩余文件，外层继续下一仓 —— 本仓预算耗尽
-                # 不该连累别的仓库。
-                issues.append(repo + ": source fetch deadline exceeded")
-                break
-            status, text = _http_get(f"{base}/{quote(revision, safe='')}/{rel}",
-                                     timeout=remaining, proxy=proxy)
-            if status == 200 and len(text.encode("utf-8")) <= _SOURCE_MAX_BYTES:
-                sources[(repo, rel)] = text
-    out = _parse_sources(sources, source_root=f"github:{_RAW_BASE}@{ref}")
-    out.revisions = revisions
-    out.snapshot_id = hashlib.sha256(
-        (out.snapshot_id + repr((key[:4], revisions))).encode()).hexdigest()
-    out.immutable = (len(revisions) == len(_REPO_BASES) and all(
-        re.fullmatch(r"[0-9a-f]{40}", r) for r in revisions.values()))
-    out.uncertainty.extend(issues)
-    if not out.immutable:
-        out.errors.append("remote snapshot revision is not pinned")
-    out.expires_at = now + (_REMOTE_TTL if out.ok else _REMOTE_FAIL_TTL)
-    if use_cache:
-        _cache_put(_remote_cache, key, out)
-        # Retain the old diagnostics keys used by existing callers/tests.
-        _remote_cache.update(at=now, ident=out, ref=ref, ok=out.ok)
-    return out
+                revisions[repo] = next(requested for name, _, requested in repos if name == repo)
+        requests = [((repo, rel), f"{base}/{quote(revisions[repo], safe='')}/{rel}")
+                    for repo, base, _ in repos if repo in revisions
+                    for rel in SOURCE_MANIFEST[repo]]
+        fetched = _fetch_manifest_batch(requests, deadline, proxy)
+        for name, (status, body) in fetched.items():
+            if status == 200 and len(body.encode("utf-8")) <= _SOURCE_MAX_BYTES:
+                sources[name] = body
+        if len(sources) != sum(map(len, SOURCE_MANIFEST.values())):
+            issues.append("source manifest incomplete or fetch deadline exceeded")
+        out = _parse_sources(sources, source_root=f"github:{_RAW_BASE}@{ref}")
+        out.revisions = revisions
+        out.snapshot_id = hashlib.sha256(
+            (out.snapshot_id + repr((key, revisions))).encode()).hexdigest()
+        out.immutable = (set(revisions) == set(SOURCE_MANIFEST) and all(
+            re.fullmatch(r"[0-9a-f]{40}", r) for r in revisions.values()))
+        out.uncertainty.extend(issues)
+        # No apparently covered parser result can hide a missing manifest file.
+        out.errors.extend(issues)
+        if not out.immutable:
+            out.errors.append("remote snapshot revision is not pinned")
+        out.expires_at = now + (_REMOTE_TTL if out.ok else _REMOTE_FAIL_TTL)
+        if use_cache:
+            good_key = _last_good_key(key)
+            if out.ok:
+                _last_good_save(good_key, out)
+            elif _partial_snapshot_valid(out):
+                _partial_snapshot_save(good_key, out)
+            else:
+                out = _last_good_fallback(good_key, out)
+        out._remote_key = key
+        out._remote_revisions = dict(out.revisions)
+        if use_cache:
+            with _source_lock:
+                _cache_put(_remote_cache, key, out)
+                _remote_cache.update(at=now, ident=out, ref=ref, ok=out.ok)
+        return out
+    except Exception:
+        # Do not preserve exception messages: transport exceptions may embed
+        # proxy credentials. Failed refreshes cannot destroy verified evidence.
+        out = _remote_failure(ref, "source refresh failed")
+        if use_cache:
+            out = _last_good_fallback(_last_good_key(key), out)
+            out._remote_key = key
+            out._remote_revisions = dict(out.revisions)
+            with _source_lock:
+                _cache_put(_remote_cache, key, out)
+        return out
+    finally:
+        if use_cache and owner:
+            with _source_lock:
+                flight["result"] = out or _remote_failure(ref, "source refresh failed")
+                flight["event"].set()
+                _source_inflight.pop(key, None)
 
 
 def remote_commit(*, ref: str = "main", timeout: int = 8,
@@ -964,12 +1378,43 @@ def _parse_sources(sources: dict, *, source_root: str) -> CpaIdentity:
 
 
 def source_status(ident: CpaIdentity) -> dict:
-    """Serializable evidence metadata; checked does not mean runtime verified."""
-    return {"partial": not ident.ok, "coverage": dict(ident.coverage),
-            "snapshot_id": ident.snapshot_id, "revisions": dict(ident.revisions),
+    """Public evidence metadata; never expose exception URLs or source paths."""
+    capabilities = ("claude-betas", "codex-identity", "fingerprint", "cloak",
+                    "cpamp-enable-rules", "claude-header-defaults", "cpamp-disable")
+    coverage = {key: ("covered" if ident.coverage.get(key) == "covered" else "missing")
+                for key in capabilities}
+    missing = [key for key, value in coverage.items() if value != "covered"]
+    # Publish only fixed section names and aggregate file counts, never raw paths.
+    body_coverage = {
+        section: (ident.coverage.get("body:" + section)
+                  if ident.coverage.get("body:" + section) in ("covered", "partial") else "missing")
+        for section in _BODY_SHAPE_SOURCES
+        if "body:" + section in ident.coverage}
+    missing.extend("body:" + section for section, value in body_coverage.items()
+                   if value != "covered")
+    file_states = [value for key, value in ident.coverage.items() if key.startswith("file:")]
+    file_coverage = {"total": len(file_states),
+                     "covered": sum(value == "covered" for value in file_states)}
+    file_coverage["uncovered"] = file_coverage["total"] - file_coverage["covered"]
+    # Raw errors/uncertainty can contain private repository URLs, refs and tokens.
+    errors = ([f"源码读取或解析存在 {len(ident.errors)} 项错误；请检查出网、代理及源码版本配置"]
+              if ident.errors else [])
+    if any(value != "covered" for value in body_coverage.values()):
+        errors.append("请求体源码核对尚未完整；请查看未覆盖的请求体分段，不能视为完整验证通过")
+    if file_coverage["uncovered"]:
+        errors.append(f"有 {file_coverage['uncovered']} 项源码文件尚未完整核对")
+    if ident.stale:
+        errors.append("源码刷新失败，当前沿用上次验证的缓存快照；该快照可能过期，不能视为最新源码验证通过")
+    return {"partial": not ident.ok, "coverage": coverage, "uncovered": missing,
+            "body_coverage": body_coverage, "file_coverage": file_coverage,
+            "snapshot_id": ident.snapshot_id if re.fullmatch(r"[0-9a-f]{64}", ident.snapshot_id or "") else "",
+            "revisions": {key: value for key, value in ident.revisions.items()
+                          if key in ("cpa", "cpamp", "sub2api") and re.fullmatch(r"[0-9a-f]{40}", value)},
             "checked_at": ident.checked_at, "expires_at": ident.expires_at,
-            "immutable": ident.immutable, "uncertainty": list(ident.uncertainty),
-            "errors": list(ident.errors)}
+            "immutable": ident.immutable, "stale": ident.stale,
+            "refresh_failed_at": ident.refresh_failed_at,
+            "uncertainty": ["仅完成有界静态源码核对；运行时及未来版本尚未验证"],
+            "errors": errors}
 
 
 # ---------------------------------------------------------------------------
@@ -1139,8 +1584,10 @@ def check(*, source_root: str = "", cfg: dict | None = None,
     转发行为，必须提示出来。
     """
     # ── 路径 1：本地源码 ──
+    identity_status = source_status(CpaIdentity())
     if source_root:
         ident, drifts = report(source_root)
+        identity_status = source_status(ident)
         if ident.claude_betas_unconditional:
             src_commit = ident.revisions.get("cpa", "")
             stale = _stale_drift(src_commit, runtime_commit)
@@ -1164,19 +1611,20 @@ def check(*, source_root: str = "", cfg: dict | None = None,
     # ── 路径 2：远程拉取 ──
     if allow_remote:
         ident = extract_remote(ref=remote_ref, proxy=proxy)
+        identity_status = source_status(ident)
         if ident.claude_betas_unconditional:
             drifts = compare(ident)
             revision = ident.revisions.get("cpa", "")
             src_commit = revision[:12] if re.fullmatch(r"[0-9a-f]{40}", revision) else ""
             stale = _stale_drift(src_commit, runtime_commit)
             if stale:
-                stale.note = ("下面的比对是按 GitHub 上的**最新源码**做的，而你"
+                stale.note = ("下面的比对是按已提取的**源码快照**做的，而你"
                               "运行的 CPA 是旧版本。要么升级 CPA，要么把 "
                               "CPA_SOURCE_REF 指到你实际用的那个 tag")
                 drifts.insert(0, stale)
             out = {
                 "checked": True,
-                "source": f"GitHub {remote_ref}（有界源码清单）",
+                "source": "远程源码身份快照（有界源码清单）",
                 "source_commit": src_commit,
                 "runtime_commit": runtime_commit,
                 "stale_binary": bool(stale),
@@ -1190,10 +1638,10 @@ def check(*, source_root: str = "", cfg: dict | None = None,
             # codex 文件拉不到属非致命，但要让人看见
             soft = [e for e in ident.errors if e.startswith("（非致命）")]
             if soft:
-                out["soft_errors"] = soft
+                out["soft_errors"] = ["部分非必需源码未读取成功，覆盖范围受限"]
             return out
         # 远程失败不静默 —— 拿不到就落到路径 3，但把原因带出去
-        remote_why = "；".join(ident.errors) or "未知原因"
+        remote_why = "源码身份核对未完成；请检查出网、代理及源码版本配置"
     else:
         remote_why = ""
 
@@ -1201,10 +1649,10 @@ def check(*, source_root: str = "", cfg: dict | None = None,
     drifts = compare_config(cfg)
     if cfg and isinstance(cfg.get("claude-header-defaults"), dict):
         out = {
+            **identity_status,
             "checked": True,
-            "source": "config.yaml 的 claude-header-defaults",
+            "source": "config.yaml（仅核对 claude-header-defaults）",
             "partial": True,
-            "uncovered": ["anthropic-beta 清单（只有源码里有）"],
             "drifts": _drift_json(drifts),
         }
         if remote_why:
@@ -1215,7 +1663,7 @@ def check(*, source_root: str = "", cfg: dict | None = None,
            "画像梯用的是内置常量（从 CPA 源码抄录），无法核对是否已过期")
     if remote_why:
         why = f"远程拉取失败（{remote_why}）；且 " + why
-    return {"checked": False, "why": why, "drifts": []}
+    return {**identity_status, "checked": False, "why": why, "drifts": []}
 
 
 def _main(argv: list[str]) -> int:

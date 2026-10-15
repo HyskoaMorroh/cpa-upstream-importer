@@ -11,6 +11,7 @@ const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
   (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmt = (n) => (n == null ? '—' : Number(n).toLocaleString('en-US'));
 
+
 // ── 模型规则（与后端 cpa_probe/model_catalog.py 逐条对齐）──
 //
 // 用户 2026-09-02 定的四条：
@@ -487,6 +488,42 @@ const SECTION_LABEL = {
   'openai-compatibility': 'compat',
 };
 
+// 全局兜底（2026-09-26；2026-10-11 从文件末尾前移到这里）。
+//
+// 任何渲染路径里的未捕获异常 / 未处理 rejection 都显示横幅 —— 页面绝不静默
+// 黑屏。`showBanner` 是函数声明，会被提升，所以在这里注册没问题；它还会在
+// `#globalbanner` 不存在时自己建出来，不依赖 index.html。
+//
+// 为什么必须在文件最前面注册（这才是修的东西）
+// ------------------------------------------
+// 本文件有 50 多条**顶层**语句形如 `$('#<id>').onclick = …`，在脚本解析期就
+// 执行。任何一个 id 在 index.html 里不存在，`$('#<id>')` 就是 null，赋值抛
+// TypeError，**脚本求值当场中止**：后面的语句不再执行，`boot()` 不会跑，
+// 而这两个兜底监听器原来写在文件**末尾**，于是它们自己也没来得及注册。
+// 结果就是「整页空白、没有任何提示」—— 用户报的黑屏，以及最难查的那一类，
+// 因为页面连错误横幅都给不出来。
+//
+// 前移之后：同样的失败仍会中止后续脚本，但横幅能弹出来，控制台也有栈，
+// 排查从「白屏猜谜」变成「看一行报错」。index.html/app.js 版本错配
+// （浏览器或 CDN 缓存了旧 app.js）正是最常触发这条路径的原因。
+if (typeof window !== 'undefined') {
+  window.addEventListener('error', (ev) => {
+  try {
+      const m = ev && (ev.message || (ev.error && ev.error.message));
+      if (!m) return;                      // 资源加载错误（img 等）不打扰
+      showBanner(`页面脚本异常：${m} —— 刷新页面可恢复；反复出现请截图控制台`, 'e');
+    } catch (_) { /* 忽略 */ }
+});
+  window.addEventListener('unhandledrejection', (ev) => {
+  try {
+      const r = ev && ev.reason;
+      const m = (r && r.message) || String(r);
+      showBanner(`后台操作失败：${m}`, 'e');
+      } catch (_) { /* 忽略 */ }
+  });
+}
+
+
 // 段序兜底（2026-09-19）
 // --------------------
 // 页面里多处裸取 `S.ctx.section_order`，而 `S.ctx` 由启动时那次
@@ -523,6 +560,7 @@ const SRC_TAG = {
   catalog: { t: '目录', c: 'p-w' },
   manual: { t: '手填', c: 'p-b' },
   seed: { t: '猜测', c: 'p-m' },
+  prior: { t: '原配置 · 本轮未验证', c: 'p-w' },
 };
 
 // 段专属能力开关这一格。三态各自一种措辞 —— 「实测不支持」与「未探测」
@@ -586,6 +624,7 @@ const S = {
   token: '',
   ctx: null,
   jobId: null,
+  probeSubmitting: false,
   cursor: 0,
   timer: null,
   results: null,
@@ -602,6 +641,8 @@ const S = {
   picks: null,          // Set("host\u0000section")，null = 尚未初始化
   reuseSaved: 0,        // 形态复用省下的请求数
   reuseSeen: null,      // 已计数过的 shape-reused 事件键（防重拉重复累加）
+  diagTaskId: '',
+  diagInputKey: '',
   diagYaml: null,       // 诊断结果的 YAML 片段 {段: 文本}。不进 HTML 属性
   keepOpen: '',         // 重渲染后要重新展开哪个 headers 编辑器（pk(host,sec)）
   parsedValid: 0,       // 上次解析出的有效行数。决定「开始探测」能不能点
@@ -612,6 +653,51 @@ const S = {
 // 同站同段的 15 个选择去重成 1 个，DOM 定位也只命中第一行。
 // 2026-09-02 现场：「全勾选」显示已勾 26 项，大量段勾不上。
 const pk = (rid, sec) => `${rid}\u0000${sec}`;
+
+// 标签页恢复只保存不含账号资料的句柄与行号；请求头、站点、密钥及方案正文均不落盘。
+function saveJobRecovery() {
+  try {
+    if (!S.jobId) { sessionStorage.removeItem('importer_job_recovery'); return; }
+    const needsEdits = !!S.recoveryNeedsEdits || Object.keys(S.overrides).length > 0
+      || Object.keys(S.forced).length > 0;
+    const selected = S.picks === null ? null : [...S.picks].filter(k =>
+      /^\d+\u0000[a-z][a-z0-9_-]*$/.test(k));
+    const task = !needsEdits && S.planTask && S.planTask.inputKey === planInputKey()
+      ? S.planTask.id : null;
+    sessionStorage.setItem('importer_job_recovery', JSON.stringify({
+      version: 1, jobId: S.jobId, selected, task,
+      byScore: $('#o_probation') ? !$('#o_probation').checked : false,
+      needsEdits, savedAt: Date.now(),
+    }));
+  } catch { /* 禁用存储时，同页重试仍有效。 */ }
+}
+
+function restoreJobRecovery() {
+  try {
+    const d = JSON.parse(sessionStorage.getItem('importer_job_recovery') || 'null');
+    if (!d) return false;
+    const handle = v => typeof v === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(v);
+    if (d.version !== 1 || !handle(d.jobId) || !Number.isFinite(d.savedAt)
+      || Date.now() - d.savedAt > 86400000 || d.savedAt > Date.now()
+      || typeof d.byScore !== 'boolean' || typeof d.needsEdits !== 'boolean'
+      || !(d.selected === null || (Array.isArray(d.selected) && d.selected.length <= 20000
+        && d.selected.every(k => typeof k === 'string' && /^\d+\u0000[a-z][a-z0-9_-]*$/.test(k))))
+      || !(d.task === null || handle(d.task))) {
+      sessionStorage.removeItem('importer_job_recovery'); return false;
+    }
+    S.jobId = d.jobId; S.cursor = 0;
+    S.picks = d.selected === null ? null : new Set(d.selected);
+    if ($('#o_probation')) $('#o_probation').checked = !d.byScore;
+    S.recoveryNeedsEdits = d.needsEdits;
+    S.planTask = d.task && !d.needsEdits ? { id: d.task, inputKey: planInputKey() } : null;
+    $('#p1').hidden = true; $('#p2').hidden = false;
+    $('#p2tag').textContent = '正在恢复原任务和完整日志，无需重新探测';
+    step(2); poll(0);
+    return true;
+  } catch { return false; }
+}
+
+window.addEventListener('pagehide', saveJobRecovery);
 
 // ── 主题：三套，存 localStorage（这个不含秘密，可持久） ──
 function applyTheme(t) {
@@ -674,6 +760,30 @@ async function api(path, opts = {}) {
     if (timer) clearTimeout(timer);
   }
   if (r.status === 204 && !txt.trim()) return {};
+  // 2xx 但响应体是空的 / 只有空白 —— 这不是「JSON 无效」，是**没拿到响应体**。
+  //
+  // 原来这里直接落进下面的 JSON.parse('')，`_proxyErrText('', 200)` 回空串，
+  // 于是抛出的消息字面上是「（HTTP 200，响应不是有效 JSON）」——
+  // 以一个全角括号开头、前面什么都没有。每个调用点都 `esc(e.message)` 原样
+  // 渲染，用户看到的就是这种没头没尾的提示，而真实原因（反代截断、上游
+  // 连接被中途掐断、容器正在重启）一个字都没提。
+  // 204 已经在上一行按「本来就没有内容」正常处理了，所以到这里的空体
+  // 一定是传输层问题，按 network 归类让调用方的重试/接续逻辑能认出它。
+  if (!txt.trim()) {
+    throw Object.assign(
+      new Error(`服务端返回 HTTP ${r.status} 但响应体是空的`
+        + '（通常是反向代理截断或上游连接中断）—— 请重试；'
+        + '反复出现请看容器日志'),
+      // 三个标记各有用处，缺一不可：
+      //   · invalidResponse —— 「这不是一个有效的应用响应」，原有契约
+      //     （tests/test_web_runtime.test.js 的空体用例）钉的就是它；
+      //   · network         —— 让轮询循环按**可重试**处理而不是硬失败。
+      //     反代截断是瞬时的，重试一次往往就好了；判成硬错会让一次抖动
+      //     直接终止整个定档/写回任务；
+      //   · emptyBody       —— 便于日志与排查时区分「体是空的」与
+      //     「体不是 JSON」，两者的处置完全不同。
+      { status: r.status, invalidResponse: true, network: true, emptyBody: true });
+  }
   let data;
   try { data = JSON.parse(txt); }
   catch {
@@ -707,8 +817,9 @@ function noteBootId(id) {
   if (S.bootId !== id) {
     S.bootId = id;
     S.bootChanged = true;
-    showBanner('服务已重启（boot_id 变化）—— 进行中的任务已丢失，请重新提交；'
-      + '若频繁出现，检查容器是否被 OOM 杀掉：docker inspect 看 OOMKilled / RestartCount', 'w');
+    showBanner('服务已重启（boot_id 变化）：进行中的任务已丢失。'
+      + '先核对探测账本和已写入配置；历史请求结果待核对时，重新提交不会解除阻塞。'
+      + '若频繁出现，检查容器的 OOMKilled / RestartCount。', 'w');
   }
 }
 
@@ -824,7 +935,9 @@ async function boot() {
   renderProbePolicy();
   applyResources();
   renderDrift();
+  syncSectionPicker();
   updateBudget();
+  restoreJobRecovery();
 }
 
 function renderProbePolicy() {
@@ -832,9 +945,47 @@ function renderProbePolicy() {
   if (!box) return;
   const policy = (S.ctx && S.ctx.probe_policy) || {};
   const count = Number.isInteger(policy.authorized_sites) ? policy.authorized_sites : 0;
-  box.textContent = policy.mode === 'restricted' && count > 0
-    ? `已配置 ${count} 个站点的主动探测许可；仍受共享预算、最小间隔和限制停手机制约束。未授权站点仅被动分析。`
-    : '默认被动检查：不发送上游探针。解析、配置分析、定档与写回预览仍可使用；未实测不代表不可用。';
+  if (policy.ledger_blocked) {
+    box.textContent = policy.reason || '探测账本不可写：请求未发送，请检查目录权限。';
+  } else if (policy.reservation_recovery_status === 'unresolved'
+      || Number(policy.orphaned_inflight_count) > 0) {
+    const unresolved = Number.isInteger(policy.orphaned_inflight_count)
+      && policy.orphaned_inflight_count > 0 ? `${policy.orphaned_inflight_count} 个` : '部分';
+    box.textContent = `${unresolved}未结算请求的持有者无法确认，历史请求结果待核对。`
+      + '相关服务商暂停新请求；请核对原执行实例及请求结果。'
+      + '重新提交不会解除阻塞；系统不会自动重发，也不代表上游未执行。';
+  } else if (policy.mode === 'managed') {
+    box.textContent = '受控主动探测：点击检测后会实际请求目标站点，无需另建站点许可文件。'
+      + '同站串行、共享预算与请求间隔；明确受限的站点停止，不影响其他站点。';
+  } else if (policy.mode === 'restricted' && count > 0) {
+    box.textContent = `已配置 ${count} 个站点的主动探测许可；受共享预算、最小间隔和限制停手机制约束。未授权站点仅分析。`;
+  } else if (policy.mode === 'passive') {
+    // 显式的仅分析模式：有人把策略文件里的站点全部 enabled:false。
+    box.textContent = policy.reason || '仅分析模式：不发送上游探测请求；分析结果不代表实测通过。';
+  } else {
+    // 没有 probe_policy 字段 —— /api/context 没取到或服务端版本更老。
+    // 不许替服务端宣布任何一种模式：声称「默认不发送」在受控主动探测
+    // 成为默认之后就是假话，而声称「会发送」同样没有依据。
+    box.textContent = '探测策略状态未知：没有取到服务端的 /api/context。'
+      + '请重新载入页面；在此之前不要据此判断是否会发送上游请求。';
+  }
+  if (!policy.ledger_blocked && Number.isInteger(policy.inflight_count) && policy.inflight_count > 0) {
+    box.textContent += ` 当前执行实例确认有 ${policy.inflight_count} 个请求尚未结算，同服务商后续请求等待其完成。`;
+  }
+}
+
+function probeCompletion(data) {
+  const calls = Number(data.calls) || 0;
+  const results = Array.isArray(data.results) ? data.results : [];
+  const skipped = results.reduce((count, result) => count
+    + Object.values(result.sections || {}).filter(v => v.probe_policy_code).length, 0);
+  if (calls === 0) {
+    return {title: '② 未完成实测', detail: '没有推理探测请求；配置或目录分析不代表通过。'};
+  }
+  if (skipped || data.done_rows < data.total_rows) {
+    return {title: '② 探测部分完成', detail: `${skipped} 个段受限或跳过，未测项不能视为通过。`};
+  }
+  return {title: '② 探测结束', detail: '请求已结束，是否可用以各段实测结果为准。'};
 }
 
 // ── 画像基线漂移 ──
@@ -882,6 +1033,23 @@ function renderDrift() {
   if (!box) return;
   const d = S.ctx && S.ctx.profile_drift;
   if (!d) { box.hidden = true; return; }
+  // Source-snapshot time is separate from the outer profile-drift cache TTL.
+  const now = Date.now() / 1000;
+  const checkedAt = Number(d.checked_at);
+  const expiresAt = Number(d.expires_at);
+  const hasTime = Number.isFinite(checkedAt) && checkedAt > 0;
+  const hasExpiry = Number.isFinite(expiresAt) && expiresAt > 0;
+  const age = hasTime ? `${Math.max(0, Math.floor((now - checkedAt) / 60))} 分钟前` : '核对时间未知';
+  const expiry = hasExpiry ? (now >= expiresAt ? '已过期，需重新核对' : '有效期内') : '有效期未知';
+  const missing = Array.isArray(d.uncovered) ? d.uncovered.filter(Boolean) : [];
+  const coverage = missing.length ? missing.join('、') : '覆盖范围未完整确认';
+  const reasons = [d.remote_failed, ...(Array.isArray(d.errors) ? d.errors : [])].filter(Boolean);
+  const identityStatus = `<div class="hint" style="margin-top:6px">源码身份快照：${esc(age)}；${esc(expiry)}；`
+    + `${d.immutable === true ? '固定提交' : '提交身份未完整确认'}。`
+    + `${d.stale ? '刷新失败，正在沿用历史缓存，不能视为最新源码验证通过。' : ''}`
+    + `${d.partial ? `未覆盖：${esc(coverage)}。` : ''}`
+    + `${reasons.length ? `核对受限：${esc([...new Set(reasons)].join('；'))}。` : ''}`
+    + `仅代表静态源码核对，运行时仍需实测。</div>`;
 
   // pending：后端把这个检查挪到后台线程了（远程模式要拉 GitHub，国内 VPS
   // 拉不通时单次 8 秒起）。首次打开网页时它还没算完 —— 显示进行中并稍后
@@ -897,7 +1065,7 @@ function renderDrift() {
 
   if (!d.checked) {
     box.className = 'note';
-    box.innerHTML = `<b>画像基线未核对。</b>${esc(d.why || '')}`;
+    box.innerHTML = `<b>画像基线未核对。</b>${esc(d.why || '未获得可用核对结果')}${identityStatus}`;
     box.hidden = false;
     return;
   }
@@ -916,13 +1084,11 @@ function renderDrift() {
   const stale = d.refreshing
     ? ` <span class="hint">（结论已过期，后台正在重新核对）</span>` : '';
 
-  if (!d.drifts.length) {
-    box.className = 'note g';
-    let t = `<b>画像基线一致</b>（依据：${esc(d.source)}${verText}）${stale}`;
-    if (d.partial) {
-      t += `。未覆盖：${esc((d.uncovered || []).join('、'))}`;
-    }
-    box.innerHTML = t;
+  if (!(d.drifts || []).length) {
+    const limited = d.stale || d.refreshing || d.partial || reasons.length || !hasTime || !hasExpiry || now >= expiresAt;
+    box.className = limited ? 'note w' : 'note g';
+    const title = limited ? '已核对范围内未发现画像漂移，结论受限' : '画像基线一致';
+    box.innerHTML = `<b>${title}</b>（依据：${esc(d.source || '来源未确认')}${verText}）${stale}${identityStatus}`;
     box.hidden = false;
     return;
   }
@@ -937,7 +1103,7 @@ function renderDrift() {
   box.innerHTML =
     `<b>画像基线漂移 ${d.drifts.length} 处</b>`
     + (warns.length ? `（${warns.length} 处需处理）` : '')
-    + `（依据：${esc(d.source)}${verText}）${stale}`
+    + `（依据：${esc(d.source || '来源未确认')}${verText}）${stale}${identityStatus}`
     + `<div style="margin-top:6px">${rows}</div>`
     + `<div class="hint" style="margin-top:6px">漂移意味着探测发的形态与 CPA `
     + `实际转发的不一致 —— 可能出现「探测通了但 CPA 不通」或反之。</div>`;
@@ -977,6 +1143,77 @@ $('#o_workers_auto').onclick = () => {
   }
 };
 
+// ── 段选择器（2026-10-09）──────────────────────────────────────────
+// 用户现场诉求：很多站明知只有 claude（或只有 codex）有模型，四段全探是
+// 纯浪费 —— 某聚合站实测 claude 段 9 档 + codex 7 + compat 7 +
+// gemini 4 = 27 档画像梯，而该站目录自报
+// `supported_endpoint_types:["anthropic","openai"]`，gemini 段一次都不该探。
+//
+// 两层：
+//   · 手动勾选 —— 零额外请求，直接按勾选的段探。人的判断优先。
+//   · 全不勾   —— 后端发一次 GET 目录按站方自报的协议判定（section_gate）。
+//
+// 为什么返回 undefined 而不是空数组：`[]` 传到后端会是「一段都不探」的
+// 字面意思，而这里想表达的是「不限定」。后端 `_normalize_sections` 把空值
+// 当不限定，两侧口径必须一致 —— 否则全不勾会变成一个请求都不发。
+const SECTION_CN = {
+  'gemini-api-key': 'gemini',
+  'codex-api-key': 'codex',
+  'claude-api-key': 'claude',
+  'openai-compatibility': 'compat',
+};
+
+function pickedSections() {
+  const picked = $$('.o_sec').filter((c) => c.checked).map((c) => c.value);
+  return picked.length ? picked : undefined;
+}
+
+// 段名 -> 预算估算用的短键。LADDER_LEN / SEEDS 用的是短键（gemini/codex/
+// claude/compat），而 DOM 与后端用的是段全名，这里只做一次映射，不让两套
+// 命名在别处互相渗透。
+const SECTION_BUDGET_KEY = {
+  'gemini-api-key': 'gemini',
+  'codex-api-key': 'codex',
+  'claude-api-key': 'claude',
+  'openai-compatibility': 'compat',
+};
+
+function syncSectionPicker() {
+  const row = $('#o_sections_row');
+  const why = $('#o_sections_why');
+  if (!row || !why) return;
+  const picked = $$('.o_sec').filter((c) => c.checked).map((c) => c.value);
+  row.classList.toggle('manual', picked.length > 0);
+  if (!picked.length) {
+    why.innerHTML = '自动判定：先发一次 <code>GET /v1/models</code>'
+      + '（带最省客户端身份），按站方自报的 <code>supported_endpoint_types</code>'
+      + ' 与目录里的模型族决定探哪几段。读不到目录就照常探全部四段，'
+      + '<b>不会因此把站判死</b>。';
+    return;
+  }
+  const names = picked.map((s) => SECTION_CN[s] || s);
+  const skipped = Object.keys(SECTION_CN)
+    .filter((s) => !picked.includes(s))
+    .map((s) => SECTION_CN[s]);
+  why.innerHTML = `手动指定：只探 <b>${names.map(esc).join(' / ')}</b>，`
+    + `不发目录预扫（零额外请求）。`
+    + (skipped.length
+      ? `<br><b>${skipped.map(esc).join(' / ')}</b> 段一个请求都不发，`
+        + `结果里标「未实测」而不是「死路」—— 不会被写成该站不可用。`
+      : '');
+}
+
+$$('.o_sec').forEach((c) => {
+  c.addEventListener('change', () => { syncSectionPicker(); updateBudget(); });
+});
+if ($('#o_sec_clear')) {
+  $('#o_sec_clear').onclick = () => {
+    $$('.o_sec').forEach((c) => { c.checked = false; });
+    syncSectionPicker();
+    updateBudget();
+  };
+}
+
 // ── 请求预算估算 ──
 // 每段画像档数写死在这里是有意的：它来自 profiles.py 的梯子长度，而那个
 // 不会随配置变。估的是**最坏情形**（四段全不通、走完整梯），因为用户要判断
@@ -994,10 +1231,19 @@ function updateBudget() {
   const caps = $('#o_caps') ? $('#o_caps').checked : false;
   const swap = parseInt($('#o_swap').value, 10) || 0;
 
-  // 最坏：四段全不通。baseline 每段每种子 1 次 + 画像梯
-  let worst = 0;
-  let best = 0;
-  for (const k of Object.keys(LADDER_LEN)) {
+  // 要探的段。手动勾选时只算那几段；全不勾时算四段 —— 自动判定的省量
+  // 取决于站方目录，估不出来，所以按上界报（宁可高估，不要让人以为更便宜）。
+  const picked = pickedSections();
+  const keys = picked
+    ? picked.map((s) => SECTION_BUDGET_KEY[s]).filter(Boolean)
+    : Object.keys(LADDER_LEN);
+  // 自动判定要先花一次目录 GET。手动指定时这次请求不发。
+  const prescan = picked ? 0 : 1;
+
+  // 最坏：选中的段全不通。baseline 每段每种子 1 次 + 画像梯
+  let worst = prescan;
+  let best = prescan;
+  for (const k of keys) {
     const seeds = SEEDS[k];
     worst += seeds;                                   // baseline
     worst += LADDER_LEN[k] * (reuse ? 1 : seeds);     // 画像梯
@@ -1005,32 +1251,50 @@ function updateBudget() {
   }
   // 通的段还要验模型 + 换模采样 + 上下文二分 + 能力开关
   //
-  // 能力开关按 1 次算而不是 4 次：codex 的 WS 握手与 compat 的
-  // prompt_cache_key 各只作用于自己那一段，四段合计 2 次；这里按段算平均，
-  // 取 1 是就近的高估（gemini / claude 段不发）。
+  // 能力开关按每段 1 次算：codex 的 WS 握手与 compat 的 prompt_cache_key
+  // 各只作用于自己那一段，四段合计 2 次；这里按段算平均，取 1 是就近的
+  // 高估（gemini / claude 段不发）。
   const perOkSection = attempts + (swap > 1 ? swap : 0) + (ctx ? 6 : 0)
     + (caps ? 1 : 0);
-  best += perOkSection * 4;
+  best += perOkSection * keys.length;
 
   const sites = (S.ctx && S.ctx.existing_count) || 0;
   const full = $('#o_full_redetect').checked;
   const n = full ? sites + 1 : 1;
   const workers = parseInt($('#o_max_workers').value, 10) || 1;
-  const gap = parseFloat($('#o_gap').value) || 0;
+  // 留空 = 自适应。估算时用后端的乐观起点（_OPTIMISTIC_GAP = 0.15s），
+  // 不要用 0 —— 否则这块会把墙钟估成「只剩响应时间」，而实际还有节拍。
+  // 撞限流后后端会按阶梯退避，那时真实耗时会高于这里的估算；估算本身
+  // 只用来判断「要等几分钟还是几十分钟」。
+  const gapField = $('#o_gap').value.trim();
+  const gap = gapField === '' ? 0.15 : (parseFloat(gapField) || 0);
 
-  // 耗时：每站的请求在四段间并行，同段内串行且受 gap 约束。
+  // 耗时：每站的请求在选中的段之间并行，同段内串行且受 gap 约束。
   // 粗估单站墙钟 = (单段最坏请求数) × (响应 1.5s + gap)
-  const perSection = Math.ceil(worst / 4);
+  //
+  // 除数用 keys.length 而不是写死 4：只探 1 段时并行度就是 1，用 4 去除
+  // 会把墙钟低估 4 倍 —— 而「预算估算」这块的全部用处就是让人判断要等多久。
+  const perSection = Math.ceil(worst / Math.max(1, keys.length));
   const perSite = perSection * (1.5 + gap);
   const mins = (n / Math.max(1, workers)) * perSite / 60;
 
   let txt = `：单站全不通约 ${worst} 次请求`
     + `，全通约 ${best} 次`;
+  if (picked) {
+    // 手动指定时报出省下多少 —— 这是用户做这个勾选的直接动机，
+    // 不说出来他就只能靠猜。基准是四段全探的最坏值。
+    let allWorst = 1;         // 自动判定那次目录 GET
+    for (const k of Object.keys(LADDER_LEN)) {
+      allWorst += SEEDS[k] + LADDER_LEN[k] * (reuse ? 1 : SEEDS[k]);
+    }
+    const names = picked.map((s) => SECTION_CN[s] || s).join('/');
+    txt += ` · 只探 ${names}：最坏比四段全探省 ${Math.max(0, allWorst - worst)} 次/站`;
+  }
   if (full && sites) {
     txt += ` · ${n} 个站 × ${workers} 并发 ≈ ${mins.toFixed(1)} 分钟`;
   }
   if (!reuse) {
-    const saved = Object.keys(LADDER_LEN)
+    const saved = keys
       .reduce((a, k) => a + LADDER_LEN[k] * (SEEDS[k] - 1), 0);
     txt += ` · 关掉画像复用多花 ${saved} 次/站`;
   }
@@ -1102,7 +1366,47 @@ function renderCpaHint() {
   }
 }
 
+function renderCatalogStatus() {
+  const anchor = $('#cfgmeta');
+  if (!anchor) return;
+  let box = $('#catalogstatus');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'catalogstatus';
+    box.className = 'note';
+    box.setAttribute('role', 'status');
+    anchor.parentNode.insertBefore(box, anchor.nextSibling);
+  }
+  const why = (S.ctx && S.ctx.market_top_gen_why) || '';
+  box.replaceChildren();
+  box.hidden = !why;
+  if (!why) return;
+  const detail = document.createElement('span');
+  detail.textContent = `模型名录：${why} 名录信息不代表模型实测通过。`;
+  box.appendChild(detail);
+  const refresh = document.createElement('button');
+  refresh.type = 'button';
+  refresh.textContent = '刷新名录状态';
+  refresh.onclick = async () => {
+    refresh.disabled = true;
+    try {
+      const ctx = await api('/api/context');
+      if (S.ctx) {
+        S.ctx.market_top_gen = ctx.market_top_gen;
+        S.ctx.market_top_gen_lines = ctx.market_top_gen_lines;
+        S.ctx.market_top_gen_why = ctx.market_top_gen_why;
+      }
+      renderCatalogStatus();
+    } catch {
+      detail.textContent = '名录状态读取失败，请稍后重试；现有参数与勾选保持不变。';
+      refresh.disabled = false;
+    }
+  };
+  box.appendChild(refresh);
+}
+
 function renderBands() {
+  renderCatalogStatus();
   const box = $('#bands');
   // S.ctx 缺失时不能用空对象假装有数据 —— 那样会把档位谱渲染成一堆 0，
   // 比报错更误导。这里直接说明「拿不到 ctx」，其余部分照常可用。
@@ -1147,7 +1451,7 @@ function renderBands() {
         <b>该段现在应该完全不可用</b>。层级隔离下下层一个都轮不到。</div>`;
     } else if (new Set(topHosts).size === 1) {
       warn = `<div class="tier warn">顶层只有 1 个站（${esc(topHosts[0])}）——
-        <b>单点</b>。它一挂整段立刻不可用，下层站一个都顶不上。</div>`;
+        <b>单点风险</b>。当前静态配置仅显示一个顶层候选；失效后能否切换下层站，需验证下游实际路由与重试行为。</div>`;
     }
 
     // 注释里提到却匹配不上任何站的短名 —— 静默漏判的可见化
@@ -1322,9 +1626,78 @@ $('#o_full_redetect').addEventListener('change', (e) => {
 
 // ── 单站诊断 ──
 // 与批量导入是两个不同的意图，所以不共用流水线：这里只回答「这个站要什么头」，
-// 不建 Job、不生成方案、不写回。想导入就点「填进上面」走正常流程 ——
+// 使用只读诊断任务，不创建可写方案。想导入就点「填进上面」走正常流程 ——
 // 诊断与写回之间必须有人工确认这一跳。
+async function fetchDiagnostic(body, box = $('#diagmsg')) {
+  // 输入签名只驻留内存，不把密钥写入浏览器持久存储。
+  const inputKey = JSON.stringify(body);
+  let taskId = S.diagInputKey === inputKey ? S.diagTaskId : '';
+  let pollMs = 2000;
+  const clearTask = () => {
+    if (S.diagTaskId === taskId) { S.diagTaskId = ''; S.diagInputKey = ''; }
+  };
+  const validResult = (result) => result && result.sections
+    && typeof result.sections === 'object' && !Array.isArray(result.sections);
+  if (!taskId) {
+    const first = await api('/api/diag', {
+      method: 'POST', body: { ...body, async: true },
+    });
+    if (!first || typeof first.job_id !== 'string' || !first.job_id) {
+      if (!validResult(first)) throw new Error('诊断未返回有效结果或任务 ID。');
+      return first; // 兼容仍返回同步结果的旧服务端。
+    }
+    if (first.kind && first.kind !== 'diag') throw new Error('服务端返回了错误的任务类型。');
+    taskId = first.job_id;
+    S.diagTaskId = taskId;
+    S.diagInputKey = inputKey;
+    pollMs = Math.max(500, Math.min(10000, Number(first.poll_ms) || 2000));
+  }
+  let failures = 0;
+  let attempt = 0;
+  for (;;) {
+    let state;
+    try {
+      state = await api(`/api/job/${encodeURIComponent(taskId)}`);
+      failures = 0;
+      attempt = 0;
+    } catch (error) {
+      const kind = classifyPollError(error, attempt++);
+      if (kind.kind === 'expired') {
+        clearTask();
+        throw new Error(`诊断任务 ${taskId} 已过期或服务已重启，原任务结果不可恢复。`);
+      }
+      if (kind.kind === 'auth') {
+        throw new Error(`登录失效，诊断任务 ${taskId} 未被取消；恢复登录后查询原任务。`);
+      }
+      if (kind.kind !== 'throttled' && ++failures >= 20) {
+        throw new Error(`诊断轮询中断，任务 ${taskId} 未被取消；本页重试将接回原任务。`);
+      }
+      box.textContent = `诊断任务 ${taskId} 状态查询暂不可用，稍后继续查询…`;
+      await new Promise(resolve => setTimeout(resolve, kind.wait || pollMs));
+      continue;
+    }
+    if (!state || (state.kind && state.kind !== 'diag')) {
+      throw new Error(`诊断任务 ${taskId} 的状态响应无效。`);
+    }
+    if (state.state === 'done') {
+      clearTask();
+      if (!validResult(state.result)) throw new Error('诊断已结束，但服务端没有返回完整结果。');
+      return state.result;
+    }
+    if (state.state === 'error' || state.state === 'cancelled') {
+      clearTask();
+      throw new Error(state.error || (state.state === 'cancelled' ? '诊断已取消。' : '诊断失败。'));
+    }
+    if (state.state !== 'pending' && state.state !== 'running') {
+      throw new Error(`诊断任务 ${taskId} 返回了未知状态。`);
+    }
+    box.textContent = `${state.phase_message || '后台诊断中…'} ${Number(state.elapsed) || 0} 秒（任务 ${taskId}）`;
+    await new Promise(resolve => setTimeout(resolve, pollMs));
+  }
+}
+
 $('#btndiag').onclick = async () => {
+  if ($('#btndiag').disabled) return;
   const url = $('#d_url').value.trim();
   const key = $('#d_key').value.trim();
   if (!url || !key) {
@@ -1338,13 +1711,10 @@ $('#btndiag').onclick = async () => {
 
   let d;
   try {
-    d = await api('/api/diag', {
-      method: 'POST',
-      body: {
-        url, key,
-        section: $('#d_section').value,
-        proxy: $('#d_proxy').checked ? 'http://mihomo:7890' : '',
-      },
+    d = await fetchDiagnostic({
+      url, key,
+      section: $('#d_section').value,
+      proxy: $('#d_proxy').checked ? 'http://mihomo:7890' : '',
     });
   } catch (e) {
     $('#diagmsg').innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
@@ -1352,10 +1722,10 @@ $('#btndiag').onclick = async () => {
     return;
   }
   btn.disabled = false;
-  // `total_calls` 缺字段时别渲染成 `undefined 次请求` —— 那看起来像
+  // `total_calls` 缺字段时别渲染成 `undefined 次推理尝试` —— 那看起来像
   // 统计出错，实际是前后端字段没对上。
   $('#diagmsg').textContent = typeof d.total_calls === 'number'
-    ? `${d.total_calls} 次请求` : '完成（后端未回请求计数）';
+    ? `${d.total_calls} 次推理尝试` : '完成（后端未回推理尝试计数）';
   renderDiag(d);
 };
 
@@ -1428,7 +1798,7 @@ function renderDiag(d) {
     return `<div style="margin-top:16px">`
       + `<div style="font-weight:650;margin-bottom:6px">`
       + `${esc(SECTION_LABEL[sec] || sec)}`
-      + `<span class="hint"> · ${esc(s.model)} · ${s.calls} 次请求</span></div>`
+      + `<span class="hint"> · ${esc(s.model)} · ${s.calls} 次推理尝试</span></div>`
       + rungs + concl + `</div>`;
   }).join('');
 
@@ -1442,9 +1812,8 @@ function renderDiag(d) {
     const rows = Object.entries(d.plan.sections).map(([sec, sp]) => {
       const v = (d.verdicts || {})[sec] || {};
       const st = SRC_TAG[sp.model_source] || { t: sp.model_source, c: 'p-m' };
-      const tag = sp.recommended ? '<span class="pill p-ok">建议写入</span>'
-        : (sp.writable ? '<span class="pill p-w">需人工确认</span>'
-                       : '<span class="pill p-m">不可写入</span>');
+      const status = planWriteStatus(sp, v);
+      const tag = `<span class="pill ${status.cls}">${esc(status.text)}</span>`;
       return `<tr>
         <td class="m"><b>${esc(SECTION_LABEL[sec] || sec)}</b></td>
         <td><span class="pill ${v.usable ? 'p-ok' : (CAT_PILL[v.category] || 'p-m')}">${
@@ -1458,7 +1827,9 @@ function renderDiag(d) {
                 : '<div class="warn">weight: 0 —— 当前策略不读 weight，仍参与轮询</div>')
             : (sp.weight != null ? `<div class="hint">weight ${sp.weight}</div>` : '')}</td>
         <td><span class="pill ${st.c}">${st.t}</span>
-          <div class="mlist">${esc((sp.models || []).join(', ')) || '—'}</div></td>
+          <div class="mlist">${esc((sp.models || []).join(', ')) || '—'}</div>
+          ${(sp.highest_models || []).some(m => !(sp.verified_models || []).includes(m))
+            ? `<div class="hint">最高族未验证候选：${esc((sp.highest_models || []).filter(m => !(sp.verified_models || []).includes(m)).join('、'))}。已有配置保留；新增未验证项不自动写入。</div>` : ''}</td>
         <td class="m">${sp.proxy_url ? esc(sp.proxy_url)
           : (v.need_proxy ? '<span class="pill p-w">需代理</span>' : '直连')}</td>
         <td class="m">${esc(Object.keys(sp.headers || {}).join(', ')) || '—'}</td>
@@ -1537,6 +1908,8 @@ function yamlHeaders(h, baseUrl) {
 
 // ── 探测 ──
 $('#btnprobe').onclick = async () => {
+  if (S.probeSubmitting) return;
+  const submit = $('#btnprobe');
   const fullRedetect = $('#o_full_redetect').checked;
 
   // 全量重探确认。文案按「有没有同时加新站」分开 —— 两种情形的影响面不同，
@@ -1550,8 +1923,8 @@ $('#btnprobe').onclick = async () => {
     }
     let msg;
     if (!newRows) {
-      msg = `只体检既有条目：重新探测 ${n} 个，按结果重新生成 `
-        + `headers / 代理 / 优先级 / 前缀。\n\n不会新增任何站。\n\n`
+      msg = `只体检既有条目：重新探测 ${n} 个，按实测结果更新 `
+        + `模型清单、headers、能力参数与代理；保留既有优先级与前缀。\n\n不会新增任何站。\n\n`
         + `写回前会给出完整 diff 供逐项确认。是否开始？`;
     } else {
       msg = `重新探测 ${n} 个既有条目，并与本次新增的 ${newRows} 行一起`
@@ -1560,37 +1933,76 @@ $('#btnprobe').onclick = async () => {
     if (!confirm(msg)) return;
   }
 
+  // 空字符串与 "0" 必须分开：前者是「没指定，交给自适应」，后者是
+  // 「操作员明确要求零间隔」。`parseFloat('') || 0` 会把两者压成同一个 0，
+  // 所以先留住原始字符串。
+  const gapRaw = $('#o_gap').value.trim();
+
   const body = {
     text: $('#input').value,
     opts: {
       probe_context: $('#o_ctx').checked,
       probe_capabilities: $('#o_caps').checked,
       proxy: $('#o_proxy').checked ? 'http://mihomo:7890' : '',
-      gap: parseFloat($('#o_gap').value) || 0,
+      // 同站间隔：留空 = 自适应（后端乐观起步 0.15s，撞限流按阶梯退避并
+      // 记住该站的节拍）。填了数字就是操作员指定的**地板**，自适应只会
+      // 在它之上加。2026-10-13 之前这里硬写 3 秒，而那 3 秒来自另一个站
+      // 的 bulk probe guard 实测值 —— 对 10 把同域名 Key 的实跑意味着
+      // 429 次尝试 × 3 秒 ≈ 1287 秒纯睡（总墙钟 1913.8 秒，等待占 ~98%），
+      // 而该站实测 20 路并发零间隔全部 200。
+      ...(gapRaw === '' ? {} : { gap: parseFloat(gapRaw) || 0 }),
       swap_samples: parseInt($('#o_swap').value, 10) || 0,
-      // 并行度。关掉时退回完全串行（老行为）—— 留这个开关是为了
-      // 万一撞上「按账号而非按端点」限频的站，能一键回到旧节奏。
+      // 并行度。关掉「并行探测」时退回完全串行（老行为）—— 留这个开关是
+      // 为了万一撞上「按账号而非按端点」限频的站，能一键回到旧节奏。
       // 并行不会放松任何站的限频：节流按 (host, section) 分桶，同段
-      // 之间仍严格保持 gap 秒。
+      // 之间仍严格保持节拍。
+      //
+      // workers 是**单个候选内部**的段并行度，四段到顶，所以 4 就是满值。
+      //
+      // candidate_workers 是**跨站**并行度，2026-10-13 起开着并行时不再
+      // 传 4：后端已经按真实站数自适应 `min(len(hosts), clamp(opts, 16))`
+      // （server.py 的 cand_workers），前端硬传 4 等于把那行的 16 压回 4。
+      // 代价在全量重探里最明显 —— 真实 config.yaml 有 17 个域名、173 个
+      // 凭据，4 并发时跨站这一层白等约四分之三。不同站之间没有任何理由
+      // 互相等：节流桶按站分，跨站并发对单站请求频率毫无影响。
       workers: $('#o_fast').checked ? 4 : 1,
-      candidate_workers: $('#o_fast').checked ? 4 : 1,
+      ...($('#o_fast').checked ? {} : { candidate_workers: 1 }),
       // 请求预算（高级设置）。做成参数而不是常量，是因为取舍与站群有关：
       // 聚合站多时该压低尝试数，站少而模型杂时该放宽。
       max_models: parseInt($('#o_max_models').value, 10) || 4,
       max_model_attempts: parseInt($('#o_max_attempts').value, 10) || 10,
       reuse_profile_verdict: $('#o_reuse_verdict').checked,
+      // 段前置闸（2026-10-09）。勾了段就只探那几段，一个额外请求都不发；
+      // 全不勾时传 undefined，后端用一次目录 GET 自动判定。
+      //
+      // 为什么不在全不勾时传空数组：`[]` 与 `undefined` 在后端是两种意思，
+      // 而「空数组 = 一段都不探」是个谁都不想要的结果。后端的
+      // `_normalize_sections` 也把空值当「不限定」，两侧口径一致。
+      sections: pickedSections(),
     },
     full_redetect: fullRedetect,
     max_workers: fullRedetect ? parseInt($('#o_max_workers').value, 10) || 30 : undefined,
   };
   let d;
-  try { d = await api('/api/probe', { method: 'POST', body }); }
-  catch (e) {
+  S.probeSubmitting = true;
+  submit.disabled = true;
+  try {
+    d = await api('/api/probe', { method: 'POST', body });
+    if (!d || typeof d.job_id !== 'string' || !d.job_id.trim()) {
+      throw new Error('服务端未返回有效探测任务 ID，未进入探测页面。');
+    }
+  } catch (e) {
     $('#parsemsg').innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
     return;
+  } finally {
+    S.probeSubmitting = false;
+    submit.disabled = false;
   }
 
   S.jobId = d.job_id; S.cursor = 0; S.picks = null;
+  S.planTask = null; S.recoveryNeedsEdits = false;
+  S.overrides = {}; S.forced = {};
+  saveJobRecovery();
   S.reuseSaved = 0; S.reuseSeen = null;
   $('#p1').hidden = true; $('#pparse').hidden = true; $('#p2').hidden = false;
   $('#stream').innerHTML = ''; $('#spin').hidden = false;
@@ -1599,7 +2011,7 @@ $('#btnprobe').onclick = async () => {
   poll();
 };
 
-// 轮询断了之后的出路。任务在服务端照常跑完，不该让用户重跑 293 秒。
+// 轮询断了之后先尝试接回，核实服务端状态，避免直接重复发起探测。
 function showResume() {
   const box = $('#p2resume');
   if (!box) return;
@@ -1612,9 +2024,9 @@ function showResume() {
     S.pollFails = 0;
     S.cursor = 0;
     $('#stream').innerHTML = '';
-    $('#spin').hidden = false;
-    $('#p2h').textContent = '② 探测中';
-    $('#p2tag').textContent = '已接回，正在重新拉取完整日志';
+    $('#spin').hidden = true;
+    $('#p2h').textContent = '② 正在重新连接';
+    $('#p2tag').textContent = '服务端任务状态待确认，正在重新拉取完整日志';
     poll();
   };
 }
@@ -1629,13 +2041,14 @@ function poll(delayMs) {
       const cls = classifyPollError(e, S.pollFails || 0);
       // 任务已不在服务端（容器重启 / 被淘汰）：重试毫无意义，说清并给出路。
       if (cls.kind === 'expired') {
+        S.jobId = null; S.planTask = null; saveJobRecovery();
         $('#spin').hidden = true;
         $('#p2h').textContent = '② 任务已过期';
         $('#p2tag').textContent = '服务端已找不到这个任务（服务重启或任务被淘汰）';
         $('#stream').insertAdjacentHTML('beforeend',
           `<div class="s5">任务已过期（服务重启?）：${esc(e.message)} ——
-           已完成的结果若已显示会保留；请重新发起探测。</div>`);
-        showBanner('探测任务已过期（服务重启?）—— 请重新发起探测', 'w');
+           已显示的结果会保留；先核对探测账本和已写入配置，再决定后续操作。历史请求结果待核对时，重新提交不会解除阻塞。</div>`);
+        showBanner('探测任务已过期：请先核对探测账本和已写入配置；不能据此判断上游请求未执行。', 'w');
         return;
       }
       // 限流（nginx 429 / 任务仓满 503）不是「无响应」：按 Retry-After 退避，
@@ -1650,34 +2063,50 @@ function poll(delayMs) {
       // 实测踩到：一次探测跑了 293 秒，中途轮询断了一下，UI 就永久停在
       // 「② 探测中」——转圈不停、不重试、不给出路，而后端其实已经跑完了。
       // 长任务下断连是常态：nginx 默认 60 秒读超时、笔记本休眠、切换网络
-      // 都会断。任务在服务端照常跑，前端没有理由因为一次失败就自我放弃。
+      // 都会断。断连期间无法确认服务端状态，保留重试以便恢复后核实。
       //
       // 401 例外：token 失效了，重试一万次也没用，直接让用户重新登录。
       if (e.status === 401) {
         $('#spin').hidden = true;
+        $('#st_eta').hidden = true;
+        $('#eta_detail').style.display = 'none';
         $('#p2h').textContent = '② 登录已失效';
-        $('#p2tag').textContent = '任务仍在服务端运行。重新登录后可用下面的按钮接回';
+        $('#p2tag').textContent = '服务端任务状态待确认；重新登录后可用下面的按钮接回';
         $('#stream').insertAdjacentHTML('beforeend',
-          `<div class="s5">凭据失效（401）。任务 ${esc(S.jobId)} 仍在跑，
-           重新登录后点「接回任务」即可继续看进度。</div>`);
+          `<div class="s5">凭据失效（401）。任务 ${esc(S.jobId)} 的服务端状态待确认，
+           已暂停自动重试；重新登录后点「接回任务」核实进度。</div>`);
         showResume();
         return;
       }
       S.pollFails = (S.pollFails || 0) + 1;
+      $('#spin').hidden = true;
+      $('#p2h').textContent = '② 连接中断';
+      $('#p2tag').textContent = `服务端任务状态待确认；${Math.ceil(cls.wait / 1000)}s 后自动重试（第 ${S.pollFails} 次失败）`;
+      $('#st_eta').hidden = true;
+      $('#eta_detail').style.display = 'none';
       $('#stream').insertAdjacentHTML('beforeend',
         `<div class="s4">  轮询第 ${S.pollFails} 次失败（${esc(e.message)}）——
-         任务仍在服务端跑，${S.pollFails >= 20 ? '已停止自动重试' : '继续重试'}</div>`);
+         服务端任务状态待确认，${S.pollFails >= 20 ? '已停止自动重试' : '继续重试'}</div>`);
       if (S.pollFails >= 20) {
-        // 连续 20 次（约 1 分钟）都不通，多半不是抖动。停下来给出路，
+        // 连续 20 次都不通后提供手动恢复；总耗时取决于请求超时和退避，
         // 而不是无限刷日志。
         $('#spin').hidden = true;
         $('#p2h').textContent = '② 轮询中断';
-        $('#p2tag').textContent = '任务可能仍在服务端运行 —— 用下面的按钮接回';
+        $('#p2tag').textContent = '服务端任务状态待确认；已停止自动重试，用下面的按钮接回';
         showResume();
         return;
       }
       poll(cls.wait);
       return;
+    }
+    const resumeBox = $('#p2resume');
+    if (resumeBox) resumeBox.hidden = true;
+    if (d.state === 'running' || d.state === 'queued') {
+      $('#spin').hidden = false;
+      $('#p2h').textContent = d.state === 'queued' ? '② 等待执行' : '② 探测中';
+      $('#p2tag').textContent = d.state === 'queued'
+        ? '任务已接通，等待执行；进度会自动更新'
+        : '任务正在运行；进度和完整日志持续更新';
     }
     S.pollFails = 0;          // 通了就清零，只关心**连续**失败
     if (d && d.poll_ms > 0) S.jobPollMs = Math.max(500, Math.min(10000, d.poll_ms));
@@ -1730,7 +2159,7 @@ function poll(delayMs) {
     if (d.in_flight != null && d.in_flight > 0) {
       let txt = `在飞 ${d.in_flight} 个`;
       if (d.slowest_host && d.slowest_age != null) {
-        txt += ` · 最慢站 ${esc(d.slowest_host)} 已跑 ${d.slowest_age}s`;
+        txt += ` · 最久工作单元 ${esc(d.slowest_host)} 已运行 ${d.slowest_age}s`;
       }
       det.textContent = txt;
       det.style.display = '';
@@ -1743,14 +2172,15 @@ function poll(delayMs) {
       // 面板本身**不隐藏** —— 那份流水日志是判定依据，用户要能回看
       // （哪个段在哪个 combo 上通的、403 出现几次）。只是不再假装在跑。
       $('#spin').hidden = true;
-      $('#p2h').textContent = '② 探测完成';
+      const completion = probeCompletion(d);
+      $('#p2h').textContent = completion.title;
       // done_rows 可能小于 total_rows —— 抛异常的候选进不了结果集
       // （server.py 的 lost 分支会逐条报原因）。原来这里只显示
       // 「71/79 (90%)」就切到第三步，看着像「没跑完就往下走」。
       // 差额必须当场说清是**失败**而不是**未跑**，否则用户只能猜。
       const missed = d.total_rows - d.done_rows;
       $('#p2tag').textContent =
-        `${d.calls} 次请求 · ${d.elapsed}s · 日志保留在下方可回看`;
+        `${d.calls} 次推理尝试 · ${d.elapsed}s · ${completion.detail} 日志保留在下方可回看`;
       if (missed > 0) {
         $('#p2tag').textContent += ` · ${missed} 个候选探测时抛异常`;
         $('#prog').classList.add('partial');
@@ -1785,6 +2215,7 @@ function poll(delayMs) {
       // error，界面会永远停在「探测中」。
       $('#spin').hidden = true;
       $('#p2h').textContent = '② 已停止';
+      $('#p2tag').textContent = '已接通服务端，确认任务已停止；保留已完成的结果';
       $('#p2').insertAdjacentHTML('beforeend',
         '<div class="warn">已按请求停止 —— 未完成的站没有结论，'
         + '已完成的结果保留在下方。</div>');
@@ -1796,6 +2227,7 @@ function poll(delayMs) {
     if (d.state === 'error') {
       $('#spin').hidden = true;
       $('#p2h').textContent = '② 探测出错';
+      $('#p2tag').textContent = '已接通服务端，确认任务出错；详见下方错误和部分结果';
       $('#p2').insertAdjacentHTML('beforeend',
         `<div class="err">探测出错<pre>${esc(d.error)}</pre></div>`);
       renderPartial(d);
@@ -1850,7 +2282,14 @@ function renderStream(events) {
     }
     if (e.kind === 'candidate-done') {
       return `<div class="hd">   可用段 [${esc((e.usable || [])
-        .map((s) => SECTION_LABEL[s]).join(' '))}] · ${e.calls} 次请求</div>`;
+        .map((s) => SECTION_LABEL[s]).join(' '))}] · ${e.calls} 次推理尝试</div>`;
+    }
+    if (e.kind === 'policy-wait') {
+      const phase = e.code === 'orphaned_inflight' ? '历史请求结果待核对：持有者无法确认，重新提交不会解除阻塞'
+        : e.code === 'inflight' ? '等待同服务商的当前请求完成'
+        : e.code === 'minimum_interval' ? '等待请求间隔' : '等待探测许可';
+      return `<div class="note">${esc(tag(e.host))} ${phase} · 未发送新请求`
+        + `${e.reason ? ' · ' + esc(e.reason) : ''}</div>`;
     }
     if (e.kind === 'proxy-precheck') {
       return e.ok
@@ -1926,19 +2365,17 @@ function renderStream(events) {
       return `<div class="s4">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
         + `画像梯跑完仍不通（试 ${e.tried} 档）</div>`;
     }
-    // 门票已过、凭据不行：某一档把「客户端」拒绝推进成了凭据类拒绝（余额/
-    // 鉴权），说明站方认了这个身份。必须显示 —— 这是「直连可用、经 CPA 不
-    // 可用」那条问题的现场证据，也是写回 cloak / fingerprint-profile 的依据。
-    if (e.kind === 'profile-gate-passed') {
-      return `<div class="s2">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
-        + `画像 ${esc(e.profile)}（档 ${e.tier}）过了客户端门禁，`
-        + `改判 ${esc(e.then)}${e.status ? ' · ' + esc(e.status) : ''}</div>`;
+    // 失败类别变化只提供诊断线索，不能证明画像身份可用。
+    if (e.kind === 'profile-failure-observed' || e.kind === 'profile-gate-passed') {
+      return `<div class="note">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `尝试画像 ${esc(e.profile)}（档 ${e.tier}）后仍失败，`
+        + `${esc(e.then)}${e.status ? ' · ' + esc(e.status) : ''}；身份尚未验证</div>`;
     }
-    // 整梯没有一档 200，但门票被证明过 —— 段仍不可用，写回照样带身份。
-    if (e.kind === 'profile-gate-only') {
+    // 兼容旧任务事件，但同样不把失败响应展示为写回身份的证据。
+    if (e.kind === 'profile-failure-only' || e.kind === 'profile-gate-only') {
       return `<div class="warn">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
-        + `整梯不通，但身份 ${esc(e.profile)} 已被站方接受（${esc(e.then)}）`
-        + ` —— 写回带 headers 与 cloak/fingerprint，换把 Key 即可用</div>`;
+        + `整梯未通过；尝试身份 ${esc(e.profile)} 后为 ${esc(e.then)}，身份尚未验证。`
+        + `未验证的画像不作为新增 headers 或身份配置的依据</div>`;
     }
     // 整梯全败后，正文点名要 beta 就补上重试。显示补了什么 —— 这一步会改
     // 落地的 anthropic-beta，操作员必须看得到凭什么改的。
@@ -1970,6 +2407,14 @@ function renderStream(events) {
       return `<div class="s4">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
         + `${pad(e.requested, 20)} 模型不收：${why}</div>`;
     }
+    // 站方在失败正文里指名替代模型（2026-10-14）。必须显示：它解释了
+    // 为什么清单里会出现一个不在目录排序前列的名字 —— 那不是工具猜的，
+    // 是站方自己写在 400 正文里的指示。
+    if (e.kind === 'substitute-model') {
+      return `<div class="s2">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section] || e.section, 8)} `
+        + `${pad(e.requested, 20)} 站方指名改用 <b>${esc(e.offered)}</b>`
+        + `${e.why ? ` —— ${esc(e.why)}` : ''}</div>`;
+    }
     if (e.kind === 'attempt') {
       const c = e.status === '200' ? 's2' : (e.status[0] === '4' ? 's4' : 's5');
       return `<div class="${c}">${esc(tag(e.host))} `
@@ -1998,9 +2443,24 @@ function renderStream(events) {
       return `<div class="s4">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
         + `静默换模 ${e.rate_pct}%（${esc(e.model)}）</div>`;
     }
+    // 站方属性跨凭据复用（2026-10-13）。必须显示，不能静默省掉 ——
+    // 否则第 2..N 把 Key 的日志里这一段凭空消失，看着像「漏探了」。
+    // 措辞点明「本轮已实测，未重复发请求」：那是省请求，不是跳过检测。
+    if (e.kind === 'swap-reused') {
+      return `<div class="note">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
+        + `静默换模 ${e.rate_pct != null ? esc(String(e.rate_pct)) + '%' : '—'}`
+        + `（${esc(e.model)}）· 复用本轮同站同段同模型的实测，未重复发请求</div>`;
+    }
     if (e.kind === 'context') {
       return `<div class="s2">${esc(tag(e.host))} ${pad(SECTION_LABEL[e.section], 8)} `
         + `上下文上限 ${fmt(e.limit)}${e.untrusted ? '（由截断反推）' : ''}</div>`;
+    }
+    if (e.kind === 'context-reused') {
+      // 这一项最贵（每段 4-6 次最大约 110 万字符的大 body 请求），所以
+      // 复用时更要说清省了什么 —— 用户看「请求预算」就是看这个。
+      return `<div class="note">${pad(SECTION_LABEL[e.section], 8)} `
+        + `上下文上限 ${fmt(e.limit)}${e.untrusted ? '（由截断反推）' : ''}`
+        + ` · 复用本轮同站同段同模型的实测，未重复发请求</div>`;
     }
     if (e.kind === 'context-declared') {
       // 上游在超限错误里**明说**了上限 —— 省掉整轮二分（最多 5 次百万字符
@@ -2057,6 +2517,40 @@ function renderStream(events) {
         + `${pad(SECTION_LABEL[e.section], 8)} `
         + `${e.usable ? '✓' : '✗'} ${esc(e.summary || '')}</div>`;
     }
+    // ── 段前置闸的三种事件（2026-10-09 加的后端能力，前端一直落兜底）──
+    // 不认它们时会显示成 `[prescan] {"host":"…"}` 的原始 JSON。而这三条
+    // 恰恰是「为什么某个段一次请求都没发」的唯一解释 —— 缺了它们，被闸掉的
+    // 段在界面上就是凭空消失，与「探测漏段」长得一模一样。
+    if (e.kind === 'prescan') {
+      const probe = (e.sections || []).map((s) => SECTION_LABEL[s] || s).join(' ');
+      const skipped = (e.skipped || []).map((s) => SECTION_LABEL[s] || s).join(' ');
+      const declared = (e.endpoint_types || []).join(',');
+      return `<div class="s2">${esc(tag(e.host))} 目录预扫 · 站方自报 `
+        + `[${esc(declared || '无')}] · 目录 ${e.catalog ?? '?'} 个模型 `
+        + `→ 探 [${esc(probe)}]`
+        + (skipped ? ` · 跳过 [${esc(skipped)}]` : '') + `</div>`;
+    }
+    if (e.kind === 'prescan-miss') {
+      // 预扫失败**不是**站不可用。这行必须把「只是没省下请求」说清楚，
+      // 否则看起来像判死依据。
+      const why = e.reason || e.probe_policy_code || '';
+      return `<div class="s4">${esc(tag(e.host))} 目录预扫未判定（${esc(e.status || '?')}`
+        + (why ? ` · ${esc(why)}` : '') + `）· 照常探全部四段</div>`;
+    }
+    if (e.kind === 'section-gate') {
+      const probe = (e.probe || []).map((s) => SECTION_LABEL[s] || s).join(' ');
+      const skipped = (e.skipped || []).map((s) => SECTION_LABEL[s] || s).join(' ');
+      return `<div class="s2">${esc(tag(e.host))} 段前置闸 → 探 [${esc(probe)}] · `
+        + `跳过 [${esc(skipped)}]`
+        + (e.why ? ` · ${esc(e.why)}` : '') + `</div>`;
+    }
+    if (e.kind === 'rank-fallback') {
+      // 后端模型排序失败、退回字母序（2026-10-12 加）。这必须可见：字母序
+      // 正是「勾了 gpt-5.6 却没勾 gpt-5.6-sol」的病根 —— 配额先被字母序靠前
+      // 的旧款吃掉，同世代新变体轮不到。不认这个事件它就落兜底成原始 JSON。
+      return `<div class="s4">${esc(tag(e.host || ''))} ${pad(SECTION_LABEL[e.section] || e.section || '', 8)} `
+        + `排序失败（${esc(e.reason || '')}），按字母序验证 —— 同世代变体可能验不到</div>`;
+    }
     // ── 全量重探路径的三种事件（run_job_full_redetect 发的）──
     // 漏了这三个分支它们会落到兜底，显示成 `[info] {"msg":"…"}` 的原始 JSON。
     // 而全量重探恰恰是最需要可读进度的场景（跑几分钟、几十个站）。
@@ -2101,7 +2595,9 @@ function renderResults(results) {
   $('#p3').hidden = false;
   step(3);
   bindResultEvents();
-  refreshPlan(true);
+  if (S.recoveryNeedsEdits) {
+    $('#pickstat').textContent = '原任务已恢复。刷新前的手工参数含可能敏感的内容，未存入浏览器；请重新填写并核对，再生成写回预览。';
+  } else refreshPlan(true);
   $('#p3').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
@@ -2374,7 +2870,7 @@ function siteCard(r) {
       <span class="h">${esc(host)}</span>
       <span class="pill p-m">${esc(r.row.key_masked)}</span>
       <div class="sp"></div>
-      <span class="hint">${r.total_calls} 次请求 · 可用 ${r.usable_sections.length}/4 段</span>
+      <span class="hint">${r.total_calls} 次推理尝试 · 可用 ${r.usable_sections.length}/4 段</span>
     </div>
     <div class="tw"><table>
       <thead><tr>
@@ -2580,12 +3076,7 @@ function bindResultEvents() {
     }
     const sel = e.target.closest('.sel');
     if (sel) {
-      // 勾选不再有任何前置条件 —— 勾了就是勾了。
-      //
-      // 这里曾拦「没模型不让勾」。后端补了种子兜底后空清单不可能出现，
-      // 而拦截的副作用是操作员点了没反应，只能从提示文字反推为什么。
-      // 模型清单的可信度由 model_source 在方案里标注（实测/目录/手填/猜测），
-      // 那是「看得见的告知」，比「点不动的勾选框」有用。
+      // 首轮方案之前可以记录选择意向；方案返回后统一按后端写入资格校验。
       const key = pk(sel.dataset.rid, sel.dataset.sec);
       if (!S.picks) {
         S.picks = new Set($$('#results .sel').filter((x) => x.checked)
@@ -2721,18 +3212,17 @@ function applyPickPreset(mode) {
     syncPickUI();
     return;
   }
-  // 「全勾」就是全勾 —— 不看判定状态。很多站不给测活却能用，按判定筛
-  // 等于把可用站扔掉。唯一不勾的是 duplicate（撞已有 Key，写进去是重复条目）。
+  // 全勾覆盖所有具备写入资格的段；停止或受限段不能通过预设绕过后端闸门。
   // 「只勾推荐项」保持按 recommended 筛，那才是让工具替你判断的入口。
   S.picks = new Set();
   const missing = [];
   let blocked = 0;
   S.plans.forEach((p) => {
-    Object.entries(p.sections).forEach(([sec, sp]) => {
+    Object.entries(p.sections || {}).forEach(([sec, sp]) => {
       if (sp.duplicate) return;
       // 落盘那层会拒掉的段不勾 —— 勾了也写不进，而界面上勾着就是在骗人。
       // 原因显示在「建议」列（recommend_reason）。
-      if (sp.write_blocked) { blocked += 1; return; }
+      if (!sectionPickAllowed(sp, sectionPickVerdict(p.line_no, sec))) { blocked += 1; return; }
       if (mode === 'rec' && !sp.recommended) return;
       if (mode === 'none') return;
       // 不再按「有没有模型」拦 —— 后端现在给每段都算出确定清单
@@ -2764,8 +3254,7 @@ function applyPickPreset(mode) {
         + (missing.length > 3 ? ` 等 ${missing.length} 段` : ''));
     }
     if (blocked) {
-      why.push(`${blocked} 段标为「不写入」（原本没配这一段且清单只是猜测 ——`
-        + `手填真实模型即可放行）`);
+      why.push(`${blocked} 段不具备写入资格（停止、受限或其他阻止原因，请查看各段说明）`);
     }
   }
   _pickWhy = why.join(' · ');
@@ -2800,26 +3289,55 @@ function schedulePlanRefresh() {
 // 于是「17 段异常无模型」闪一下就没了。改成单一渲染点。
 let _pickWhy = '';
 
+function sectionPickVerdict(rid, sec) {
+  const result = (S.results || []).find(r => String(r.row.line_no) === String(rid));
+  return (result && result.sections && result.sections[sec]) || {};
+}
+
+function sectionPickAllowed(sp, verdict = {}) {
+  return !!sp && !sp.duplicate && !sp.write_blocked && sp.writable !== false
+    && !sp.probe_policy_code && !verdict.probe_policy_code;
+}
+
 function syncPickUI() {
   // 首轮定档尚未给默认选择；没有人工勾选时保持 null，不能提前改成空集合。
   if (!S.picks) {
     $('#btnplan').disabled = true;
     return;
   }
+  const plansReady = Array.isArray(S.plans) && S.plans.length > 0;
+  const allowed = new Set();
+  if (plansReady) {
+    S.plans.forEach(p => Object.entries(p.sections || {}).forEach(([sec, sp]) => {
+      if (sectionPickAllowed(sp, sectionPickVerdict(p.line_no, sec))) allowed.add(pk(p.line_no, sec));
+    }));
+    const removed = [...S.picks].filter(key => !allowed.has(key));
+    removed.forEach(key => S.picks.delete(key));
+    if (removed.length) _pickWhy = `${removed.length} 项不具备写入资格，已取消选择；请查看各段说明。`;
+  }
   $$('#results .sel').forEach((el) => {
+    el.disabled = plansReady && !allowed.has(pk(el.dataset.rid, el.dataset.sec));
     el.checked = S.picks.has(pk(el.dataset.rid, el.dataset.sec));
     const tr = el.closest('tr');
-    if (tr) tr.classList.toggle('rec', el.checked);
+    if (tr) {
+      tr.classList.toggle('rec', el.checked);
+      const selection = tr.querySelector('.write-selection');
+      if (selection) selection.textContent = el.disabled ? '不可写入' : el.checked
+        ? (plansReady ? '已勾选写入' : '已选择，等待方案验证') : '未勾选，不写入';
+    }
   });
   const n = S.picks ? S.picks.size : 0;
-  const head = n ? `已勾选 ${n} 项写入` : '未勾选任何项';
+  const head = n ? (plansReady ? `已勾选 ${n} 项写入` : `已选择 ${n} 项，等待方案验证`) : '未勾选任何项';
   const stat = $('#pickstat');
   if (stat) {
     stat.innerHTML = _pickWhy
       ? `${esc(head)} · <span class="warn">${_pickWhy}</span>`
       : esc(head);
+    if (Array.isArray(S.plans)) {
+      stat.innerHTML += `<div class="hint">${esc(planEvidenceSummary(S.plans, S.results || []))}</div>`;
+    }
   }
-  $('#btnplan').disabled = n === 0;
+  $('#btnplan').disabled = !plansReady || n === 0;
 }
 
 // ── 方案 ──
@@ -2847,6 +3365,9 @@ function invalidatePlanPreview() {
 }
 
 async function refreshPlan(silent) {
+  // 恢复时省略的手工参数必须经用户显式生成预览确认；自动刷新不得解除此提示。
+  if (S.recoveryNeedsEdits && silent !== false) return null;
+  if (S.recoveryNeedsEdits) S.recoveryNeedsEdits = false;
   invalidatePlanPreview();
   if (_planInFlight) { _planRerun = true; return _planInFlight; }
   // 所有等待者都等到补算结束，再拿同一份最新结果；不能在 finally 里另起
@@ -2870,6 +3391,8 @@ async function refreshPlan(silent) {
 async function _refreshPlanOnce(silent) {
   let d;
   const requestKey = planInputKey();
+  // 断线只中断前端等待；相同输入再次点击时继续原后台任务。
+  if (S.planTask && S.planTask.inputKey !== requestKey) S.planTask = null;
   const body = {
     job_id: S.jobId,
     overrides: S.overrides,
@@ -2889,11 +3412,14 @@ async function _refreshPlanOnce(silent) {
   // 新流程： POST → 立即返回 plan_task_id → 每 2s 轮询 /api/plan-status
   // 每个 HTTP 请求都 < 1s，CF 超时彻底无关。
   // ──────────────────────────────────────────────────────────
-  let taskId = null;
+  let taskId = S.planTask ? S.planTask.id : null;
   try {
-    const init = await api('/api/plan', { method: 'POST', body });
+    const init = taskId ? { plan_task_id: taskId, state: 'running' }
+      : await api('/api/plan', { method: 'POST', body });
     if (init && init.plan_task_id && init.state === 'running') {
       taskId = init.plan_task_id;
+      S.planTask = { id: taskId, inputKey: requestKey };
+      saveJobRecovery();
     } else {
       d = init;
     }
@@ -2920,6 +3446,10 @@ async function _refreshPlanOnce(silent) {
     let misses = 0;
     for (;;) {
       await new Promise((r) => setTimeout(r, 2000));
+      if (requestKey !== planInputKey()) {
+        _planRerun = true;
+        return null;
+      }
       let poll;
       try {
         poll = await api('/api/plan-status', {
@@ -2943,6 +3473,7 @@ async function _refreshPlanOnce(silent) {
           return null;
         }
         if (cl.kind === 'expired') {
+          S.planTask = null;
           const meta = $('#planmeta');
           if (meta) {
             meta.innerHTML = `<div class="err">定档任务已不在服务端`
@@ -2970,16 +3501,21 @@ async function _refreshPlanOnce(silent) {
               + `${esc(e.message || '连接中断')}</div>`;
           }
           if (stat) {
-            stat.innerHTML = `<span class="err">定档轮询无响应 —— 刷新页面后重试</span>`;
+            stat.innerHTML = `<span class="err">定档连接中断 —— 点「生成写回方案」接续原任务</span>`;
           }
           return null;
         }
         if (cl.wait) await new Promise((r) => setTimeout(r, cl.wait));
         continue;
       }
-      if (!poll) continue;
+      if (!poll || !['running', 'done', 'error'].includes(poll.state)) {
+        if (stat) stat.innerHTML = '<span class="err">定档状态异常，未生成写回方案；可重试接续原任务</span>';
+        return null;
+      }
+      // 保留完成任务的句柄供刷新恢复；输入变化仍由 inputKey 守卫拒绝复用。
       if (poll.state === 'done') { d = poll.result; break; }
       if (poll.state === 'error') {
+        S.planTask = null;
         const msg = esc(poll.error || '定档后台异常');
         const meta = $('#planmeta');
         if (meta) meta.innerHTML = `<div class="err">定档失败：${msg}</div>`;
@@ -2992,10 +3528,12 @@ async function _refreshPlanOnce(silent) {
       if (stat) stat.innerHTML = `<span class="hint">定档计算中… ${Math.round(poll.elapsed || 0)}s</span>`;
     }
     if (!d) {
+      S.planTask = null;
+      saveJobRecovery();
       const meta = $('#planmeta');
-      if (meta) meta.innerHTML = `<div class="err">定档超时（>360s）</div>`;
+      if (meta) meta.innerHTML = `<div class="err">定档任务已结束，但服务端没有返回结果，不能生成写回方案。</div>`;
       const stat2 = $('#pickstat');
-      if (stat2) stat2.innerHTML = `<span class="err">定档超时，请重试</span>`;
+      if (stat2) stat2.innerHTML = `<span class="err">定档结果缺失，请重新生成方案并检查容器日志</span>`;
       return null;
     }
   }
@@ -3007,7 +3545,10 @@ async function _refreshPlanOnce(silent) {
   // 的 `{state:"running"}` 快照被当成定档结果缓存，再被 `/api/plan` 重放），
   // 这里就抛 TypeError 变成 unhandled rejection —— 界面没有任何错误提示，
   // 整张表永久停在占位符。宁可显式报错，也不要静默空白。
-  if (!d || typeof d !== 'object' || !Array.isArray(d.plans)) {
+  if (!d || typeof d !== 'object' || !Array.isArray(d.plans)
+      || typeof d.plan_id !== 'string' || !d.plan_id.trim()) {
+    S.planTask = null;
+    saveJobRecovery();
     const shape = d && typeof d === 'object'
       ? Object.keys(d).slice(0, 6).join(',') : typeof d;
     const meta = $('#planmeta');
@@ -3048,8 +3589,55 @@ function planWarnings(d) {
   const ws = Array.isArray(d.warnings) ? d.warnings : [];
   if (!ws.length) return '';
   return `<div class="note w"><b>定档提示 ${ws.length} 条</b>
-    —— 影响的是站与站的先后，不影响单个条目能否用
+    —— 包含定档、证据与写入限制，请结合下方逐项原因查看
     <div class="mlist">${ws.map((w) => `· ${esc(w)}`).join('<br>')}</div></div>`;
+}
+
+function planBlockedItems(d) {
+  const items = [];
+  for (const p of d.plans || []) {
+    const reasons = new Map(Object.entries(p.skipped || {}));
+    for (const [section, value] of Object.entries(p.sections || {})) {
+      if (!value || value.writable !== false) continue;
+      const why = [value.probe_policy_reason, value.write_blocked, value.skip_reason,
+        value.evidence_block].filter(Boolean);
+      reasons.set(section, [...new Set(why)].join('；') || reasons.get(section)
+        || '本项未满足写入条件，请返回探测结果查看证据。');
+    }
+    for (const [section, why] of reasons) {
+      items.push(`第 ${p.line_no || '?'} 行 · ${SECTION_LABEL[section] || section}：${why}`);
+    }
+  }
+  return items;
+}
+
+function planDiffView(d) {
+  const diffs = Array.isArray(d.diffs) ? d.diffs : [];
+  const replacement = diffs.some((x) => x.section === 'config.yaml');
+  if (typeof d.unified_diff === 'string') {
+    let added = 0, removed = 0, inHunk = false;
+    for (const line of d.unified_diff.split('\n')) {
+      if (line.startsWith('@@ ')) { inHunk = true; continue; }
+      if (line.startsWith('diff --git ')) { inHunk = false; continue; }
+      if (!inHunk) continue;
+      if (line.startsWith('+')) added++;
+      else if (line.startsWith('-')) removed++;
+    }
+    return {text: d.unified_diff, added, removed, replacement,
+      truncated: !!d.unified_diff_truncated, hasChanges: !!d.unified_diff.trim()};
+  }
+  // 兼容旧接口：整份替换文本不是“全部新增”，没有差异就不伪造增删计数。
+  if (replacement) {
+    return {text: diffs.map((x) => typeof x.text === 'string' ? x.text
+      : (x.lines || []).map((line) => String(line).replace(/\r?\n$/, '')).join('\n')).join('\n'),
+      added: null, removed: null, replacement: true, truncated: false,
+      hasChanges: diffs.length > 0};
+  }
+  const lines = diffs.flatMap((x) => (x.lines || []).map((line) =>
+    String(line).replace(/\r?\n$/, '')));
+  return {text: lines.map((line) => '+' + line).join('\n'),
+    added: lines.length, removed: 0, replacement: false, truncated: false,
+    hasChanges: lines.length > 0};
 }
 
 $('#btnplan').onclick = async () => {
@@ -3063,15 +3651,14 @@ $('#btnplan').onclick = async () => {
   S.previewPlanId = d.plan_id;
   S.previewInputKey = S.planInputKey;
 
-  const nLines = d.diffs.reduce((a, x) => a + x.lines.length, 0);
-  const skipped = d.plans.flatMap((p) =>
-    Object.entries(p.skipped).map(([s, why]) =>
-      `${p.host} · ${SECTION_LABEL[s] || s}：${why}`));
+  const view = planDiffView(d);
+  const skipped = planBlockedItems(d);
 
   $('#planmeta').innerHTML = `
     <div class="stat">
-      <span>插入 <b>${d.diffs.length}</b> 处</span>
-      <span>新增 <b>${nLines}</b> 行</span>
+      <span>${view.replacement ? '整份配置替换' : '配置差异'}</span>
+      ${view.added === null ? '<span>旧版接口未提供增删统计</span>'
+        : `<span>${view.truncated ? '已显示部分：' : ''}新增 <b>${view.added}</b> 行 · 删除 <b>${view.removed}</b> 行</span>`}
       <span>${fmt(d.lines_before)} → <b>${fmt(d.lines_after)}</b> 行</span>
     </div>
     <div class="note ${d.valid ? 'g' : 'b'}">${esc(d.validate_msg)}</div>
@@ -3079,26 +3666,32 @@ $('#btnplan').onclick = async () => {
     ${skipped.length ? `<div class="note">不写入 ${skipped.length} 项：
       <div class="mlist">${skipped.map(esc).join('<br>')}</div></div>` : ''}`;
 
-  $('#diffs').innerHTML = d.diffs.length ? d.diffs.map((x, i) => `
-    <div class="diff">
-      <div class="dh"><span class="pill p-ok">+${x.lines.length}</span>
-        <span class="m">${esc(x.section)}</span>
-        <span class="hint">← ${esc(x.host)} · 第 ${x.insert_at} 行后</span>
-        <button class="cp" data-i="${i}">复制</button></div>
-      <pre>${x.lines.map((l) => `<span class="a">+ ${esc(l)}</span>`).join('')}</pre>
-    </div>`).join('')
-    : `<div class="note w">无可写入条目 —— 没勾选，或全部不可用 / 已存在</div>`;
-
-  $$('#diffs .cp').forEach((b) => {
-    b.onclick = () => {
-      navigator.clipboard.writeText(d.diffs[+b.dataset.i].lines.join('\n')).then(() => {
-        b.textContent = '已复制'; b.classList.add('done');
-        setTimeout(() => { b.textContent = '复制'; b.classList.remove('done'); }, 1400);
-      });
+  // 后端已有 unified_diff；整份配置不能逐行伪装成新增。文本节点避免
+  // 为大配置创建数千个 span，也确保上游返回的 HTML 不作为页面执行。
+  const box = $('#diffs');
+  box.innerHTML = view.hasChanges
+    ? `<div class="diff"><div class="dh"><span>${view.replacement ? '替换差异预览' : '变更预览'}</span>
+        <span class="hint">已脱敏，仅供审阅；请通过写回按钮提交，不要把掩码复制到配置文件</span>
+        <button class="cp" type="button">${view.truncated ? '复制已显示差异' : '复制差异'}</button></div><pre></pre></div>`
+      + (view.truncated ? '<div class="note w">差异预览已截断，上方统计仅含已显示部分，不能视为完整审阅。</div>' : '')
+    : `<div class="note w">${skipped.length
+      ? `本次没有可提交的配置差异；${skipped.length} 项未写入，逐项原因见上方。原配置保持不变。`
+      : '配置没有实际差异，无需写回。'}可点击“返回探测结果与调整”查看每项实测和证据。</div>`;
+  if (view.hasChanges) {
+    box.querySelector('pre').textContent = view.text;
+    const button = box.querySelector('.cp');
+    button.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(view.text);
+        button.textContent = '已复制';
+      } catch {
+        button.textContent = '复制失败，请手动选择差异文本';
+      }
     };
-  });
+  }
 
-  $('#btnapply').disabled = !d.valid || !d.diffs.length;
+  $('#btnapply').disabled = !d.valid || !Array.isArray(d.diffs)
+    || !d.diffs.length || !view.hasChanges;
   $('#p3').hidden = true; $('#p4').hidden = false;
   step(4);
   $('#p4').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -3249,13 +3842,58 @@ function impactTable(sp) {
     <tbody>${rows}</tbody></table></div>`;
 }
 
+function planWriteStatus(sp, verdict = {}) {
+  const stopped = sp.probe_policy_code || verdict.probe_policy_code;
+  const reason = stopped && (sp.probe_policy_reason || verdict.probe_policy_reason);
+  const detail = reason ? `：${reason}` : '';
+  if (sp.model_source === 'prior') return {cls: 'p-w', text: '仅保留原配置 · 本轮未验证' + detail};
+  if (stopped) return {cls: 'p-w', text: '本轮探测受限或停止 · 不可写入' + detail};
+  if (sp.write_blocked || !sp.writable) return {cls: 'p-m', text: '不可写入'};
+  if (verdict.usable !== true || !(Number(sp.score) > 0)) {
+    return {cls: 'p-w', text: '本轮未验证可用 · 需人工确认'};
+  }
+  return sp.recommended
+    ? {cls: 'p-ok', text: '建议写入'}
+    : {cls: 'p-w', text: '需人工确认'};
+}
+
+function planEvidenceSummary(plans, results = []) {
+  const verdicts = new Map(results.map(r => [String(r.row.line_no), r.sections || {}]));
+  let tested = 0, catalog = 0, prior = 0, stopped = 0;
+  for (const plan of plans) {
+    for (const [section, sp] of Object.entries(plan.sections || {})) {
+      const verdict = (verdicts.get(String(plan.line_no)) || {})[section] || {};
+      const limited = !!(sp.probe_policy_code || verdict.probe_policy_code);
+      if (limited) stopped++;
+      if (sp.model_source === 'prior') prior++;
+      else if (sp.model_source === 'probed' && verdict.usable === true && !limited) tested++;
+      else if (sp.model_source === 'catalog') catalog++;
+    }
+  }
+  return `本轮实测可用 ${tested} 段 · 仅有目录 ${catalog} 段（不代表调用通过） · 仅保留原配置 ${prior} 段（本轮未验证） · 受限或停止 ${stopped} 段（可与保留项重叠）。勾选数不是探测成功数；实际改动以差异预览为准。`;
+}
+
 function fillPlanIntoRows(d) {
   if (!d || !Array.isArray(d.plans)) return;
   d.plans.forEach((p) => {
-    Object.entries(p.sections).forEach(([sec, sp]) => {
+    Object.entries(p.sections || {}).forEach(([sec, sp]) => {
       const tr = document.querySelector(
         `#results tr[data-rid="${cssq(p.line_no)}"][data-sec="${cssq(sec)}"]:not(.wrow)`);
       if (!tr) return;
+      const modelCell = tr.querySelector('.cats')?.parentElement;
+      if (modelCell) {
+        let pendingNote = modelCell.querySelector('.model-evidence-pending');
+        if (!pendingNote) {
+          pendingNote = document.createElement('div');
+          pendingNote.className = 'hint model-evidence-pending';
+          modelCell.appendChild(pendingNote);
+        }
+        const verified = new Set(sp.verified_models || []);
+        const pending = (sp.highest_models || []).filter(m => !verified.has(m));
+        pendingNote.textContent = pending.length
+          ? `最高族候选尚无当前身份验证证据：${pending.join('、')}。新候选不自动写入；已有配置保留。`
+          : '';
+      }
       const inp = tr.querySelector('.pi');
       const override = (S.overrides[p.line_no] || {})[sec] || {};
       const manual = Number.isFinite(override.priority) && override.priority > 0;
@@ -3383,9 +4021,8 @@ function fillPlanIntoRows(d) {
             + '这几个名字是本工具猜的，勾选前请确认</div>';
         }
         if (sp.model_source === 'prior') {
-          extra = '<div class="hint">沿用原清单：本次没探通、目录也读不到，'
-            + '这几个名字是原 config.yaml 里已经写着的（先前一轮的实测沉淀），'
-            + '没有被工具猜的「市面最新」覆盖 —— 但本次未验证</div>';
+          extra = '<div class="hint">保留原配置清单：这些模型名称来自原 config.yaml，'
+            + '本轮未验证，不代表曾经实测通过。请结合当前探测证据决定是否写入。</div>';
         }
         if (sp.new_section && !sp.write_blocked) {
           extra += '<div class="hint">原 config.yaml 里这个凭据没配这一段 ——'
@@ -3399,16 +4036,18 @@ function fillPlanIntoRows(d) {
         // 三态要与落盘一致：write_blocked 非空时这一段不会写入，界面必须
         // 说「不写入」而不是「建议写入」（上一版那道闸只在写盘层，界面
         // 照「没有闸」渲染，勾了写不进 —— 2026-09-03 现场）。
-        const cls = sp.write_blocked ? 'p-m'
-          : (sp.recommended ? 'p-ok' : (sp.writable ? 'p-w' : 'p-m'));
-        const tag = sp.write_blocked ? '不写入'
-          : (sp.recommended ? '建议写入'
-            : (sp.writable ? '需人工确认' : '不可写入'));
+        const result = (S.results || []).find(r => String(r.row.line_no) === String(p.line_no));
+        const status = planWriteStatus(sp, (result && result.sections[sec]) || {});
+        const cls = status.cls;
+        const tag = status.text;
+        const eligible = sectionPickAllowed(sp, (result && result.sections[sec]) || {});
+        const picked = eligible && S.picks && S.picks.has(pk(p.line_no, sec));
         // score 一直没显示，而关掉「试用期定档」后 priority 就是按它算的 ——
         // 看不到分数等于那个开关的依据不可见。
         const sc = (sp.score != null)
           ? `<span class="hint"> · 得分 ${sp.score}</span>` : '';
-        rsn.innerHTML = `<span class="pill ${cls}">${tag}</span>${sc}
+        rsn.innerHTML = `<span class="pill ${cls}">${esc(tag)}</span>${sc}
+          <div class="hint write-selection">${!eligible ? '不可写入' : picked ? '已勾选写入' : '未勾选，不写入'}</div>
           <div class="hint" style="margin-top:5px">${esc(sp.recommend_reason)}</div>
           <div class="hint">${esc(sp.priority_reason)}</div>`;
       }
@@ -3418,7 +4057,7 @@ function fillPlanIntoRows(d) {
         const wb = wrow.querySelector('.wbox');
         const html = (sp.duplicate
           ? `<div class="warn b">已存在：${esc(sp.duplicate_note)}</div>` : '')
-          + sp.warnings.map((w) =>
+          + (Array.isArray(sp.warnings) ? sp.warnings : []).map((w) =>
             `<div class="warn${/抢走|换模/.test(w) ? ' b' : ''}">${esc(w)}</div>`).join('')
           + impactTable(sp)
           + headerEditor(p.line_no, sec, sp);
@@ -3741,6 +4380,14 @@ $('#btnapply').onclick = async () => {
   // 统一等待任务终态并核对 local_written，不能把 HTTP 202 当作写盘成功。
   d = await awaitApplyReceipt(d, $('#applymsg'));
   if (!d) { btn.disabled = false; return; }
+  // 写盘已确认就结束本轮恢复；重载失败也不能恢复旧方案再次写入。
+  // 同时清除内存句柄，防止 pagehide 把已完成任务重新存回 sessionStorage。
+  if (d.local_written === true) {
+    S.jobId = null; S.planTask = null; S.planId = null;
+    S.previewPlanId = ''; S.previewInputKey = ''; S.planInputKey = '';
+    S.recoveryNeedsEdits = false;
+    saveJobRecovery();
+  }
   // 出错但已写盘时，pollApply 刚写进 #applymsg 的错误原文必须留着 ——
   // 无条件清空会把唯一一条真实失败信息擦掉，只剩下面那个绿色成功面板。
   if (d.state !== 'error') $('#applymsg').textContent = '';
@@ -3748,17 +4395,32 @@ $('#btnapply').onclick = async () => {
   let verifyHtml = '';
   if (Array.isArray(d.verified) && d.verified.length) {
     const bad = d.verify_failed || [];
+    // 「通过」必须数 ok 为真的项，不能用「总数 − 硬失败数」倒推。
+    // --------------------------------------------------------
+    // verify_failed 按服务端契约排除了 skipped（策略跳过的未实测项），
+    // 于是那条减法把未实测算成了通过。2026-10-04 本机真实容器实测：
+    // 22 项全部被 unbound_gateway 跳过，标题写「22/22 通过 —— 真打了一次
+    // 业务请求」，而同一面板 22 行全是「失败」。两处同时在说反话。
+    const passed = d.verified.filter((v) => v.ok);
+    const skipped = d.verified.filter((v) => v.skipped && !v.ok);
+    const allSkipped = skipped.length === d.verified.length;
     const rows = d.verified.map((v) => `<tr>
       <td class="m">${esc(v.host)}</td>
       <td class="m">${esc(SECTION_LABEL[v.section] || v.section)}</td>
       <td class="m">${esc(v.model)}</td>
-      <td><span class="pill ${v.ok ? 'p-ok' : 'p-b'}">${v.ok ? '通' : '失败'}</span>
+      <td><span class="pill ${v.ok ? 'p-ok' : (v.skipped ? 'p-m' : 'p-b')}">${
+        v.ok ? '通' : (v.skipped ? '未实测' : '失败')}</span>
         <div class="hint">${esc(v.msg)}</div></td>
     </tr>`).join('');
     verifyHtml = `
-      <div class="note ${bad.length ? 'b' : 'g'}">
-        <b>端到端验证：${d.verified.length - bad.length}/${d.verified.length} 通过</b>
-        —— 用 CPA 的客户端入口真打了一次业务请求，这才叫「能出活」
+      <div class="note ${bad.length ? 'b' : (allSkipped ? 'w' : 'g')}">
+        <b>端到端验证：${passed.length}/${d.verified.length} 通过${
+          skipped.length ? ` · ${skipped.length} 项未实测` : ''}${
+          bad.length ? ` · ${bad.length} 项失败` : ''}</b>
+        ${allSkipped
+          ? `—— 本次<b>没有发出任何业务请求</b>：这些条目都没有可绑定的上游与凭据，
+             配置已写盘，但「接进 CPA 后客户端能不能用」仍未验证`
+          : '—— 通过的那些用 CPA 的客户端入口真打了一次业务请求，这才叫「能出活」'}
         ${d.verify_key_src ? `<br><span class="hint">客户端 Key ${esc(d.verify_key_src)}
           —— 只在服务端使用，不会出现在页面或响应里</span>` : ''}
         ${bad.length ? `<br><b>失败项已写入 config.yaml。</b>
@@ -3821,6 +4483,7 @@ $('#btnapply').onclick = async () => {
 
 $('#btnrestart').onclick = () => {
   S.jobId = null; S.planId = null; S.plans = null;
+  S.planTask = null; S.recoveryNeedsEdits = false; saveJobRecovery();
   S.overrides = {}; S.forced = {}; S.cursor = 0; S.picks = null;
   S.reuseSaved = 0; S.reuseSeen = null;
   $('#input').value = '';
@@ -3953,7 +4616,8 @@ function bmStat() {
   // 选了也点不动」。2026-10-01 加闸：坏 group 按 0 条算，不拖垮整个面板。
   const off = t.reduce((n, g) => n
     + (Array.isArray(g.entries) ? g.entries.filter((e) => !e.enabled).length : 0), 0);
-  const ent = t.reduce((n, g) => n + g.entries.length, 0);
+  const ent = t.reduce((n, g) => n
+    + (Array.isArray(g.entries) ? g.entries.length : 0), 0);
   $('#bmstat').innerHTML =
       `<div><b>${t.length}</b><i>分组（段 × 网址）</i></div>`
     + `<div><b>${ent}</b><i>条目</i></div>`
@@ -3970,7 +4634,7 @@ function bmCard(g) {
   const dirty = edit !== undefined;
   const shown = dirty && edit.priority != null ? edit.priority : (pris.length ? Math.max(...pris) : '');
   const bad = dirty && edit.priority == null;
-  const rows = g.entries.map((e) => `
+  const rows = (Array.isArray(g.entries) ? g.entries : []).map((e) => `
     <div class="bm-row ${e.enabled ? '' : 'off'}">
       <span class="bm-dot ${e.enabled ? 'on' : 'off'}"></span>
       <code>${esc(e.api_key_masked)}</code>
@@ -3978,7 +4642,7 @@ function bmCard(g) {
       <span class="p">${e.priority === null ? '—' : e.priority}</span>
     </div>`).join('');
   const warn = g.split ? `
-    <div class="bm-warn"><b>档位分裂</b>：同一网址的 ${g.entries.length} 个条目
+    <div class="bm-warn"><b>档位分裂</b>：同一网址的 ${(g.entries || []).length} 个条目
       拿到了 ${pris.length} 个不同 priority（${pris.join(' / ')}）。
       CPA 按层级取最高那一桶，低档的实质是冷备 —— 高档几条会先被打光配额。
       勾选本组后点「统一优先级」即可对齐到 ${Math.max(...pris)}。</div>` : '';
@@ -3996,7 +4660,7 @@ function bmCard(g) {
       ${g.site_priorities.join(' / ')} 共 ${g.site_priorities.length} 个档位。
       这是**允许**的 —— 按类型分别比较，各段各排各的序；只是想提醒你
       层间相对顺位不一致。</div>` : '';
-  const allOff = g.entries.every((e) => !e.enabled);
+  const allOff = (g.entries || []).every((e) => !e.enabled);
   // 红框只给**真的违规**：段内档位分裂。跨段不同档不红（见 sitewarn 的说明）。
   return `
   <div class="bm-card ${on ? 'sel' : ''} ${g.split ? 'split' : ''} ${dirty ? 'edited' : ''}" data-k="${esc(k)}">
@@ -4004,7 +4668,7 @@ function bmCard(g) {
       <input type="checkbox" class="bmck" ${on ? 'checked' : ''} data-k="${esc(k)}">
       <span class="bm-sec ${BM_SEC_CLS[g.section] || ''}">${esc(BM_SEC_CN[g.section] || g.section)}</span>
       <span class="bm-host"><b>${esc(g.host)}</b>
-        <span>${esc(g.base_urls.join(' · '))}</span></span>
+        <span>${esc((g.base_urls || []).join(' · '))}</span></span>
       <span class="bm-cardacts">
         <button class="bm-mini ${allOff ? 'off' : 'on'}" data-act="toggle"
           title="${allOff ? '把本站全部条目重新启用' : '把本站全部条目停用'}">${allOff ? '启用' : '停用'}</button>
@@ -4038,12 +4702,12 @@ function bmFiltered() {
       // 网址、段名（英文与中文）都算命中面。
       const hay = (g.host + ' ' + g.section + ' '
                    + (BM_SEC_CN[g.section] || '') + ' '
-                   + g.base_urls.join(' ')).toLowerCase();
+                   + (g.base_urls || []).join(' ')).toLowerCase();
       if (!terms.every((t) => hay.includes(t))) return false;
     }
     if (mode === 'split') return g.split;
-    if (mode === 'off') return g.entries.some((e) => !e.enabled);
-    if (mode === 'on') return g.entries.every((e) => e.enabled);
+    if (mode === 'off') return (g.entries || []).some((e) => !e.enabled);
+    if (mode === 'on') return (g.entries || []).every((e) => e.enabled);
     if (mode === 'sel') return BM.sel.has(bmKey(g));
     return true;
   });
@@ -4053,16 +4717,22 @@ function bmRender() {
   const list = bmFiltered();
   $('#bmgrid').innerHTML = list.length
     ? list.map(bmCard).join('')
-    : '<div class="bm-empty">没有匹配的分组</div>';
-  const ent = list.reduce((n, g) => n + g.entries.length, 0);
-  const sp = list.filter((g) => g.split || g.site_split).length;
+    : ($('#bmfilter').value === 'split'
+      ? '<div class="bm-empty">当前筛选范围内，同协议同网址没有档位分裂。跨协议不同档是允许的，不属于分裂组。</div>'
+      : '<div class="bm-empty">没有匹配的分组</div>');
+  const ent = list.reduce((n, g) => n + (g.entries || []).length, 0);
+  const sp = list.filter((g) => g.split).length;
+  const cross = list.filter((g) => !g.split && g.site_split).length;
   $('#bmscope').innerHTML =
     `筛选出 <b>${list.length}</b> 组 · ${ent} 个条目`
-    + (sp ? ` · <span style="color:var(--bad)">${sp} 组分裂</span>` : '');
+    + (sp ? ` · <span style="color:var(--bad)">${sp} 组分裂</span>` : '')
+    + (cross ? ` · <span class="hint">${cross} 组跨段不同档（允许）</span>` : '');
   const sel = bmSelected();
-  const selEnt = sel.reduce((n, g) => n + g.entries.length, 0);
+  const selEnt = sel.reduce((n, g) => n + (g.entries || []).length, 0);
   $('#bmn').textContent = String(sel.length);
-  $('#bmn2').textContent = sel.length ? `（含 ${selEnt} 个条目）` : '';
+  const visibleSelected = list.filter((g) => BM.sel.has(bmKey(g))).length;
+  const hiddenSelected = sel.length - visibleSelected;
+  $('#bmn2').textContent = `（当前可见选中 ${visibleSelected} 组，隐藏选中 ${hiddenSelected} 组；总计 ${sel.length} 组 / ${selEnt} 个条目）`;
   // 操作栏**常驻**（原来是 `hidden = sel.length === 0`，用户 2026-09-13 截图里
   // 54 卡全未勾选 → 整条栏不渲染 → 看起来「这个面板根本没有批量功能」）。
   // 改成常驻 + 未选中时置灰，并把「为什么点不动」写在旁边。
@@ -4126,6 +4796,7 @@ function bmBusy(on) {
 }
 
 async function bmLoad() {
+  bmInvalidatePreview();
   $('#bmgrid').innerHTML = '<div class="bm-empty">读取中…</div>';
   bmBusy(true);
   try {
@@ -4234,11 +4905,37 @@ function bmOps(kind, arg) {
   return ops;
 }
 
+function bmInvalidatePreview() {
+  BM.previewEpoch = (BM.previewEpoch || 0) + 1;
+  BM.bulkId = '';
+  $('#bmpreview').hidden = true;
+  $('#bmapply').disabled = true;
+  return BM.previewEpoch;
+}
+
 async function bmPreview(kind, arg) {
+  const epoch = bmInvalidatePreview();
   const ops = bmOps(kind, arg);
   const msg = $('#bmmsg');
   if (!ops.length) {
-    msg.innerHTML = '<span style="color:var(--ink-3)">选中的组已经是目标状态，无需改动</span>';
+    // no-op 必须**醒目**并说清为什么，否则就是用户报的「点执行根本不生效」
+    // （2026-10-12 本机实跑定位）
+    // ------------------------------------------------------------------
+    // 现场链条：顶部统计醒目地显示「N 组跨段不同档」，用户据此选一组点
+    // 「统一优先级」，而「统一优先级」统一的是**组内**（同段 + 同网址）。
+    // 实测真实 config.yaml：`0 档位分裂` —— 组内本来全部一致，于是这个按钮
+    // 对全部 50 组都是 no-op。唯一的反馈是这行 `--ink-3` 低对比度灰字，
+    // 在面板下方，极易完全看不见。两个不同维度的数字摆在一起，再配一条
+    // 看不见的提示，结果就是「选了、点了、什么都没发生」。
+    //
+    // 处置：① 用 warn 配色 + 粗体，让它不可能被忽略；② 直接点出维度差异，
+    // 并指向真正能改跨段差异的入口（逐组改档输入框）。不改统计口径 ——
+    // 「跨段不同档」本身是合法状态（见 sitewarn 的说明），不该被当成待修项。
+    msg.innerHTML = '<span class="warn b">选中的组已经是目标状态，没有可改的内容。</span>'
+      + '<span class="hint">「统一优先级」只统一<b>组内</b>（同一段 + 同一网址）的档位，'
+      + '而顶部统计里的「跨段不同档」是<b>跨段</b>差异 —— 那是允许的状态，'
+      + '不由这个按钮处理。要调跨段档位，请改各组卡片上的档位输入框，'
+      + '再点「预览并写回这些改动」。</span>';
     return;
   }
   msg.textContent = '生成预览中…';
@@ -4248,6 +4945,11 @@ async function bmPreview(kind, arg) {
     // 而不是让用户对着一个沉默失败的按钮反复点。
     const d = await api('/api/bulk-preview',
                         { method: 'POST', body: { ops, revision: BM.revision } });
+    if (epoch !== BM.previewEpoch) return;
+    if (!d || typeof d.changed !== 'number' || !Number.isFinite(d.changed)
+        || d.changed < 0 || (d.changed > 0 && (typeof d.bulk_id !== 'string' || !d.bulk_id.trim()))) {
+      throw new Error('批量预览结果不完整，不能写回，请重新生成预览。');
+    }
     if (!d.changed) {
       msg.innerHTML = '<span style="color:var(--ink-3)">没有实际改动</span>';
       return;
@@ -4269,10 +4971,12 @@ async function bmPreview(kind, arg) {
     $('#bmdiff').textContent = d.diff
       + (d.diff_truncated ? '\n…（diff 过长已截断，完整改动以写回结果为准）' : '');
     $('#bmpreview').hidden = false;
+    $('#bmapply').disabled = false;
     msg.textContent = '';
     $('#bmpreview').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   } catch (e) {
     // 428 / 409 都是「你手里的清单过期了」，唯一出路是重新拉取。
+    if (epoch !== BM.previewEpoch) return;
     // 自动刷一次并让用户重选，比只报错更省一次来回。
     const stale = /revision|stale|过期|刷新/i.test(e.message || '');
     msg.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`
@@ -4384,7 +5088,7 @@ $('#bmgrid').addEventListener('click', (e) => {
   const g = BM.groups.find((x) => bmKey(x) === card.dataset.k);
   if (!g) return;
   if (btn.dataset.act === 'toggle') {
-    const allOff = g.entries.every((x) => !x.enabled);
+    const allOff = (g.entries || []).every((x) => !x.enabled);
     const d = BMD.get(bmdKey(g.section, g.host)) || { section: g.section, host: g.host };
     d.enabled = allOff;                    // 全停 → 全开；否则 → 全停
     if (typeof d.priority !== 'number') d.priority = undefined;
@@ -4445,9 +5149,9 @@ $('#bmpresets').addEventListener('click', (e) => {
 $('#bmunify').onclick = () => bmPreview('unify');
 $('#bmenable').onclick = () => bmPreview('enable');
 $('#bmdisable').onclick = () => bmPreview('disable');
-$('#bmcancel').onclick = () => { $('#bmpreview').hidden = true; BM.bulkId = ''; };
+$('#bmcancel').onclick = () => bmInvalidatePreview();
 $('#bmapply').onclick = async () => {
-  if (!BM.bulkId) return;
+  if (!BM.bulkId || $('#bmapply').disabled) return;
   const btn = $('#bmapply');
   const msg = $('#bmapplymsg');
   btn.disabled = true;
@@ -4467,8 +5171,8 @@ $('#bmapply').onclick = async () => {
   } catch (e) {
     msg.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
   } finally {
-    // 正常路径也要解禁：这个面板不像投喂流程那样切走，按钮留在原地
-    btn.disabled = false;
+    // 只有仍有效的预览允许重试；写回成功或取消后不能恢复旧入口。
+    btn.disabled = !BM.bulkId;
   }
 };
 
@@ -4496,7 +5200,15 @@ function bmPush() {
    重试行为，改错的两个方向都有确定后果（透传 403 / 524），而正确值取决于
    本工具自己写的 priority 档位 —— 每次重探都可能变。所以每条建议都带
    服务端算出来的判据原文，让人能复核而不是凭信任点确认。          */
-const TN = { id: '' };
+const TN = { id: '', previewEpoch: 0 };
+
+function tnInvalidatePreview() {
+  TN.previewEpoch = (TN.previewEpoch || 0) + 1;
+  TN.id = '';
+  $('#tnpreview').hidden = true;
+  $('#tnapply').disabled = true;
+  return TN.previewEpoch;
+}
 
 const TN_SEV = {
   blocker: { label: '必改', cls: 'b' },
@@ -4505,13 +5217,16 @@ const TN_SEV = {
 };
 
 async function tnRun() {
+  const epoch = tnInvalidatePreview();
   const btn = $('#tnrun');
   const basis = $('#tnbasis');
   btn.disabled = true;
   basis.innerHTML = '<span class="spin"></span> 读取配置并计算…';
   try {
     const d = await api('/api/tuning');
-    TN.id = d.tuning_id || '';
+    if (epoch !== TN.previewEpoch) return;
+    if (!d || !Array.isArray(d.advices)) throw new Error('调优结果不完整，不能写回，请重新体检。');
+    TN.id = typeof d.tuning_id === 'string' ? d.tuning_id.trim() : '';
 
     // 缺字段时显示「未知」而不是字面量 undefined —— 后者让操作员以为
     // 是计算结果，实际是前后端字段没对上。
@@ -4580,19 +5295,43 @@ async function tnRun() {
     // 却找不到也点不到任何执行按钮。这就是「选完选项点执行根本不生效」
     // 的另一半：按钮不存在，不是点了没反应。
     // 现在 diff 为空时照样放出按钮，只在 diff 位置说明「后端未回 diff」。
-    if (TN.id && pending.length) {
+    // 2026-10-11 再收一次：`TN.id` 也不该当显隐条件。
+    // -------------------------------------------------
+    // TN.id 只有一个来源 —— 上面那行的 `d.tuning_id`。后端改名、省略或把它
+    // 脱敏掉，TN.id 就是空串，于是**整块预览继续 hidden**，而 #tnbasis /
+    // #tntiers / #tnnotes / #tnlist 全都正常渲染了。用户读完一屏建议，
+    // 找不到任何按钮，连「N 处」计数都看不到（#tncnt 也在这块里）。
+    // 上一版注释治的是 `d.diff` 空值那一半，`TN.id` 这一半留着没动。
+    // 这个面板已经被后端字段改名坑过一次（`key` 改 `advice_key`，见下方
+    // advice 渲染处的兼容写法），所以不是假想风险。
+    //
+    // 新口径：只要有待改项就把预览放出来；缺 tuning_id 时按钮禁用，并在
+    // diff 位置说清「为什么不能写回、下一步做什么」。哑着比骗人好，
+    // 但让人看见比哑着好。
+    if (pending.length) {
       $('#tncnt').textContent = `${pending.length} 处`;
-      $('#tndiff').textContent = d.diff
-        ? d.diff + (d.diff_truncated ? '\n…（diff 过长已截断）' : '')
-        : '后端这次没有回 diff —— 仍可写回，但请写回后用「参考 · 当前档位谱」复核。';
       $('#tnpreview').hidden = false;
+      if (TN.id) {
+        $('#tndiff').textContent = d.diff
+          ? d.diff + (d.diff_truncated ? '\n…（diff 过长已截断）' : '')
+          : '后端这次没有回 diff —— 仍可写回，但请写回后用「参考 · 当前档位谱」复核。';
+        $('#tnapply').disabled = false;
+      } else {
+        $('#tnapply').disabled = true;
+        $('#tndiff').textContent =
+          '后端没有回 tuning_id（字段缺失或被脱敏）—— 这一轮无法写回。\n'
+          + '下面列出的待改项是真的，但执行需要 tuning_id 作为任务句柄。\n'
+          + '处置：点「重新体检」重试；反复如此就看容器日志里 /api/tuning 的响应体。';
+      }
     } else {
       $('#tnpreview').hidden = true;
     }
   } catch (e) {
+    if (epoch !== TN.previewEpoch) return;
+    TN.id = '';
     basis.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
   } finally {
-    btn.disabled = false;
+    if (epoch === TN.previewEpoch) btn.disabled = false;
   }
 }
 
@@ -4602,9 +5341,12 @@ async function tnPoll(taskId, first = {}) {
 }
 
 $('#tnrun').onclick = () => tnRun();
-$('#tncancel').onclick = () => { $('#tnpreview').hidden = true; TN.id = ''; };
+$('#tncancel').onclick = () => {
+  tnInvalidatePreview();
+  $('#tnrun').disabled = false;
+};
 $('#tnapply').onclick = async () => {
-  if (!TN.id) return;
+  if (!TN.id || $('#tnapply').disabled) return;
   const btn = $('#tnapply');
   const msg = $('#tnmsg');
   btn.disabled = true;
@@ -4624,7 +5366,7 @@ $('#tnapply').onclick = async () => {
   } catch (e) {
     msg.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
   } finally {
-    btn.disabled = false;
+    btn.disabled = !TN.id;
   }
 };
 
@@ -4655,19 +5397,3 @@ boot().catch((e) => {
   } catch (_) { /* 兜底本身不能再抛 */ }
 });
 
-// 全局兜底（2026-09-26）：任何渲染路径里的未捕获异常 / 未处理 rejection
-// 都显示横幅，并把卡在「计算中」的占位格换成原因 —— 页面绝不静默黑屏。
-window.addEventListener('error', (ev) => {
-  try {
-    const m = ev && (ev.message || (ev.error && ev.error.message));
-    if (!m) return;                      // 资源加载错误（img 等）不打扰
-    showBanner(`页面脚本异常：${m} —— 刷新页面可恢复；反复出现请截图控制台`, 'e');
-  } catch (_) { /* 忽略 */ }
-});
-window.addEventListener('unhandledrejection', (ev) => {
-  try {
-    const r = ev && ev.reason;
-    const m = (r && r.message) || String(r);
-    showBanner(`后台操作失败：${m}`, 'e');
-  } catch (_) { /* 忽略 */ }
-});

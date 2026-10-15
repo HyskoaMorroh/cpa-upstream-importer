@@ -108,5 +108,28 @@ class FirstPaintLatencyTests(unittest.TestCase):
         self.assertEqual(({}, {}), (top, by_line))
         self.assertTrue(why)
 
+    def test_nonempty_old_catalog_preserves_age_without_remote_details(self):
+        import server
+        reason = ('远程名录拉不通（https://private.example/?token=secret），'
+                  '已改用落盘的上次成功名录（8 天前，1 个模型）；'
+                  '该名录已超过 7 天，请尽快恢复出网或配置代理')
+        with patch.object(mc, 'remote_names_nonblocking', return_value=(['gpt-99'], reason)), \
+                patch.object(mc, 'latest_models', return_value=(['gpt-99'], 'fixture')):
+            top, by_line, why = server._market_top_gen({})
+        self.assertTrue(top)
+        self.assertTrue(by_line)
+        self.assertIn('8 天前', why)
+        self.assertIn('超过 7 天', why)
+        self.assertNotIn('private.example', why)
+        self.assertNotIn('secret', why)
+
+    def test_catalog_reason_never_exposes_arbitrary_remote_error(self):
+        import server
+        for reason in ('token=secret https://private.example', '后台 secret'):
+            why = server._catalog_public_reason(reason)
+            self.assertTrue(why)
+            self.assertNotIn('secret', why)
+        self.assertEqual('', server._catalog_public_reason(''))
+
 if __name__ == '__main__':
     unittest.main()

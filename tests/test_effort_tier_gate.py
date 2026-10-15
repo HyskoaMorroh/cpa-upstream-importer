@@ -1,6 +1,6 @@
 """算力档终检：同基名不许高低档并存（修改要求 3⑵③④）。
 
-现场（2026-09-30 本机实跑 accounts.txt，jianzhile.vip gemini 段）：
+现场（2026-09-30 本机实跑 accounts.txt，某聚合站 gemini 段）：
 方案里 `models` 同时含 `gemini-3.1-pro` 与 `gemini-3.1-pro-low` 并双双
 `recommended=True`。那正是要求③④ 点名要规避的「部分高、低模型同时存在，
 没有就高选择模型」。
@@ -46,6 +46,38 @@ class EffortTierGateTests(unittest.TestCase):
         kept = model_catalog.collapse_effort_tiers(
             ["gemini-3.1-pro-high", "gemini-3.1-pro-low"])
         self.assertEqual(kept, ["gemini-3.1-pro-high"])
+
+    def test_default_and_above_all_survive_together(self):
+        """默认档及以上**互不压制** —— 要求③「同级系列全勾」。
+
+        现场缺陷（2026-10-11 实测）：`_BARE_EFFORT_RANK` 原为 99，裸基名排在
+        一切具名档之上，于是
+            ["gemini-3.1-pro", "gemini-3.1-pro-high", "gemini-3.1-pro-low"]
+                -> ["gemini-3.1-pro"]
+        `-high` 被当「更低档」压掉了。可 `-high` 是站方**显式声明的更高推理
+        算力**，且 `gemini-3.1-pro-high` 本身就在 model_catalog.FALLBACK_MODELS
+        里 —— 项目自己的清单里有、流水线却把它删了。同一个病在
+        `-max` 压 `-high` 上也出现过。这与「勾了 gpt-5.6 却没勾 gpt-5.6-sol」
+        是同一类失误，只是换到了算力轴上。
+        """
+        kept = model_catalog.collapse_effort_tiers(
+            ["gemini-3.1-pro", "gemini-3.1-pro-high", "gemini-3.1-pro-low"])
+        self.assertEqual(kept, ["gemini-3.1-pro", "gemini-3.1-pro-high"])
+        # 算力旋钮留全了客户端才有的选；被压掉的只该是低于默认档的那些。
+        self.assertEqual(
+            model_catalog.collapse_effort_tiers(
+                ["gpt-6", "gpt-6-high", "gpt-6-max", "gpt-6-minimal"]),
+            ["gpt-6", "gpt-6-high", "gpt-6-max"])
+        # `-standard` 与裸基名同档，一样能压掉 `-low`。
+        self.assertEqual(
+            model_catalog.collapse_effort_tiers(
+                ["gemini-3.1-pro-standard", "gemini-3.1-pro-low"]),
+            ["gemini-3.1-pro-standard"])
+
+    def test_all_low_variants_survive_when_nothing_higher_exists(self):
+        """全是低档时无处可退 —— 必须全留，否则该段清空撞红线 2。"""
+        names = ["gemini-3.1-pro-low", "gemini-3.1-pro-minimal"]
+        self.assertEqual(model_catalog.collapse_effort_tiers(names), names)
 
     def test_lone_low_variant_survives(self):
         """某站只提供 -low 时必须保留 —— 否则该段清空，撞「严禁不勾选」。"""

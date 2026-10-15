@@ -68,18 +68,31 @@ class HostLimiter:
         self.condition = threading.Condition()
         self.active = {}
         self.started = {}
+        self.waiters = {}
 
     @contextmanager
     def slot(self, host: str, gap: float, check_cancel):
         with self.condition:
-            while True:
-                check_cancel()
-                wait = self.started.get(host, 0) + gap - time.monotonic()
-                if self.active.get(host, 0) < self.concurrency and wait <= 0:
-                    self.active[host] = self.active.get(host, 0) + 1
-                    self.started[host] = time.monotonic()
-                    break
-                self.condition.wait(timeout=min(max(wait, 0.01), 0.05))
+            ticket = object()
+            queue = self.waiters.setdefault(host, [])
+            queue.append(ticket)
+            try:
+                while True:
+                    check_cancel()
+                    wait = self.started.get(host, 0) + gap - time.monotonic()
+                    if (queue[0] is ticket and
+                            self.active.get(host, 0) < self.concurrency and wait <= 0):
+                        self.active[host] = self.active.get(host, 0) + 1
+                        self.started[host] = time.monotonic()
+                        break
+                    self.condition.wait(timeout=min(max(wait, 0.01), 0.05))
+            finally:
+                # Cancellation must remove its ticket, including a queue head,
+                # so another job cannot remain blocked behind an abandoned job.
+                queue.remove(ticket)
+                if not queue:
+                    del self.waiters[host]
+                self.condition.notify_all()
         try:
             check_cancel()
             yield
@@ -89,7 +102,64 @@ class HostLimiter:
                 self.condition.notify_all()
 
 
+class AdmissionTimeout(TimeoutError):
+    pass
+
+
+class ProviderAdmission:
+    """FIFO for local owners; queued time never consumes ledger wait time.
+
+    Each entrant freezes a finite queue deadline from predecessor budgets.
+    Later arrivals cannot extend that deadline. This does not reserve ledger
+    capacity or remove restrictions owned by other processes.
+    Slots are non-reentrant for the same provider on the owning thread.
+    """
+
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.queues = {}
+        self.owners = {}
+
+    @contextmanager
+    def slot(self, key, budget, check_cancel, deadline=None):
+        ticket = object()
+        with self.condition:
+            if self.owners.get(key) == threading.get_ident():
+                raise RuntimeError("Provider admission is not reentrant")
+            queue = self.queues.setdefault(key, [])
+            expires = time.monotonic() + sum(item[1] for item in queue) + budget
+            if deadline is not None:
+                expires = min(expires, deadline)
+            queue.append((ticket, budget))
+            try:
+                while True:
+                    check_cancel()
+                    if time.monotonic() >= expires:
+                        raise AdmissionTimeout()
+                    if queue[0][0] is ticket:
+                        self.owners[key] = threading.get_ident()
+                        break
+                    self.condition.wait(max(0, min(0.05, expires - time.monotonic())))
+            except BaseException:
+                queue[:] = [item for item in queue if item[0] is not ticket]
+                if not queue:
+                    self.queues.pop(key, None)
+                self.condition.notify_all()
+                raise
+        try:
+            check_cancel()
+            yield
+        finally:
+            with self.condition:
+                self.owners.pop(key, None)
+                queue[:] = [item for item in queue if item[0] is not ticket]
+                if not queue:
+                    self.queues.pop(key, None)
+                self.condition.notify_all()
+
+
 HOST_LIMITER = HostLimiter()
+PROVIDER_ADMISSION = ProviderAdmission()
 
 
 @dataclass

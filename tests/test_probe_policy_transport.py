@@ -5,10 +5,13 @@ from __future__ import annotations
 import gzip
 import io
 import os
+import sqlite3
 import sys
+import threading
 import unittest
 import urllib.error
 from types import SimpleNamespace
+from contextlib import closing
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -92,10 +95,32 @@ class PolicyTransportTests(unittest.TestCase):
 
     def test_terminal_restriction_is_exposed_on_that_response(self):
         engine = self.real_engine()
-        self.open.return_value = response(status=403, body=b"restricted")
+        self.open.return_value = response(status=403, body=b"account suspended")
         result = self.fetch()
         self.assertEqual("provider_stopped", result.policy_code)
         self.assertFalse(engine.check("https://fixture.invalid/v1/models", {}).allowed)
+
+    def test_http_plain_status_retains_retry_after_and_stops_current_job(self):
+        import cpa_probe.probe_policy as policy_module
+        for status in (403, 429):
+            with self.subTest(status=status), patch.object(policy_module.time, "time", return_value=1000.0):
+                engine = self.real_engine()
+                with patch.object(engine, "finish", wraps=engine.finish) as finish:
+                    self.open.return_value = response(status=status, body=b"temporary", headers={"Retry-After": "120"})
+                    result = self.fetch()
+                    self.assertEqual("provider_job_stopped", result.policy_code)
+                    self.assertEqual("120", finish.call_args.kwargs["retry_after"])
+                self.assertEqual(str(status), result.status)
+
+    def test_ws_plain_status_retains_retry_after_and_stops_current_job(self):
+        engine = self.real_engine()
+        self.socket.return_value.recv.side_effect = [
+            b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 4\r\n\r\nwait"]
+        with patch.object(engine, "finish", wraps=engine.finish) as finish:
+            result = client.ws_handshake("ws://fixture.invalid/socket", timeout=1)
+            self.assertEqual("provider_job_stopped", result.policy_code)
+            self.assertEqual("120", finish.call_args.kwargs["retry_after"])
+        self.assertEqual(("429", "wait"), (result.status, result.body))
 
     def test_failed_settlement_cannot_report_a_clean_success(self):
         engine = self.real_engine()
@@ -103,13 +128,114 @@ class PolicyTransportTests(unittest.TestCase):
         count = [0]
         def connect():
             count[0] += 1
-            if count[0] == 2:
+            if count[0] >= 2:
                 raise OSError("synthetic ledger failure")
             return original()
         with patch.object(engine, "_connect", side_effect=connect):
             result = self.fetch()
         self.assertEqual("policy_error", result.policy_code)
         self.assertNotEqual("200", result.status)
+
+    def test_transport_settlement_recovers_real_lock_without_resending(self):
+        engine = self.real_engine()
+        original = engine.finish
+        attempts = []
+        def finish(*args, **kwargs):
+            attempts.append((args, kwargs))
+            if len(attempts) == 1:
+                with closing(sqlite3.connect(engine._ledger_path)) as lock:
+                    lock.execute("BEGIN IMMEDIATE")
+                    return original(*args, **kwargs)
+            return original(*args, **kwargs)
+        with patch.object(engine, "finish", side_effect=finish):
+            result = self.fetch()
+        self.assertEqual("200", result.status)
+        self.assertEqual(2, len(attempts))
+        self.assertIs(attempts[0][0][0], attempts[1][0][0])
+        self.assertEqual(attempts[0], attempts[1])
+        self.open.assert_called_once()
+        self.assertTrue(engine.check("https://fixture.invalid/v1/models", {}).allowed)
+        for _ in range(4):
+            self.assertEqual("200", self.fetch().status)
+        self.assertEqual("provider_budget", self.fetch().policy_code)
+        self.assertEqual(5, self.open.call_count)
+
+    def test_transport_persistent_lock_keeps_reservation_and_stops(self):
+        engine = self.real_engine()
+        original = engine.finish
+        attempts = []
+        def finish(*args, **kwargs):
+            attempts.append(args)
+            with closing(sqlite3.connect(engine._ledger_path)) as lock:
+                lock.execute("BEGIN IMMEDIATE")
+                return original(*args, **kwargs)
+        with patch.object(engine, "finish", side_effect=finish):
+            result = self.fetch()
+            self.assertEqual(3, len(attempts))
+            self.assertEqual("ledger_unavailable", engine.check("https://fixture.invalid/v1/models", {}).code)
+            self.assertEqual("ledger_unavailable", self.fetch().policy_code)
+        self.assertEqual("policy_error", result.policy_code)
+        self.assertEqual(5, len(attempts))
+        self.assertTrue(all(args == attempts[0] for args in attempts))
+        self.open.assert_called_once()
+        self.assertTrue(engine.check("https://fixture.invalid/v1/models", {}).allowed)
+        self.assertEqual({}, engine._deferred_settlements)
+        for _ in range(4):
+            self.assertEqual("200", self.fetch().status)
+        self.assertEqual("provider_budget", self.fetch().policy_code)
+        self.assertEqual(5, self.open.call_count)
+
+    def test_cancelled_job_still_settles_original_restriction(self):
+        engine = self.real_engine()
+        original = engine.finish
+        from cpa_probe.pipeline import Prober
+        prober = object.__new__(Prober)
+        prober._cancelled = threading.Event()
+        attempts = []
+        self.open.return_value = response(status=429, body=b"wait", headers={"Retry-After": "120"})
+        def finish(*args, **kwargs):
+            attempts.append((args, kwargs))
+            if len(attempts) == 1:
+                prober.cancel()
+                with closing(sqlite3.connect(engine._ledger_path)) as lock:
+                    lock.execute("BEGIN IMMEDIATE")
+                    return original(*args, **kwargs)
+            self.assertTrue(prober._cancelled.is_set())
+            return original(*args, **kwargs)
+        with patch.object(engine, "finish", side_effect=finish):
+            result = self.fetch()
+        self.assertEqual("429", result.status)
+        self.assertEqual("provider_job_stopped", result.policy_code)
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertEqual("120", attempts[1][1]["retry_after"])
+        self.open.assert_called_once()
+
+    def test_cancelled_exhausted_settlement_replays_original_restriction(self):
+        engine = self.real_engine()
+        original = engine.finish
+        from cpa_probe.pipeline import Prober
+        prober = object.__new__(Prober)
+        prober._cancelled = threading.Event()
+        attempts = []
+        self.open.return_value = response(status=429, body=b"wait", headers={"Retry-After": "120"})
+
+        def finish(*args, **kwargs):
+            attempts.append((args, kwargs))
+            prober.cancel()
+            with closing(sqlite3.connect(engine._ledger_path)) as lock:
+                lock.execute("BEGIN IMMEDIATE")
+                return original(*args, **kwargs)
+
+        with patch.object(engine, "finish", side_effect=finish):
+            result = self.fetch()
+        self.assertEqual("policy_error", result.policy_code)
+        self.assertEqual(3, len(attempts))
+        self.assertTrue(prober._cancelled.is_set())
+        self.assertTrue(all(attempt == attempts[0] for attempt in attempts))
+        self.assertEqual("120", attempts[0][1]["retry_after"])
+        self.assertEqual("provider_job_stopped", engine.check("https://fixture.invalid/v1/models", {}).code)
+        self.assertEqual({}, engine._deferred_settlements)
+        self.open.assert_called_once()
 
     def test_ws_restriction_in_separate_body_packet_stops_provider(self):
         engine = self.real_engine()
@@ -437,6 +563,76 @@ class RedirectPolicyTests(unittest.TestCase):
                     self.assertEqual(len(engine.finished), 1)
                     self.assertEqual(engine.finished[0][1], str(status))
                     self.assertEqual(engine.active, set())
+
+
+class WebSocketDeadlineTests(unittest.TestCase):
+    def run_handshake(self, connect_cost, tls_cost, send_cost, read_cost):
+        clock = [0.0]
+        sock = MagicMock()
+        budgets = []
+
+        def spend(cost):
+            remaining = sock.gettimeout()
+            if cost >= remaining:
+                clock[0] += remaining
+                raise TimeoutError()
+            clock[0] += cost
+
+        def settimeout(value):
+            budgets.append(value)
+            sock.gettimeout.return_value = value
+
+        sock.settimeout.side_effect = settimeout
+
+        def connect(address, timeout):
+            settimeout(timeout)
+            spend(connect_cost)
+            return sock
+
+        def wrap(raw, **kwargs):
+            spend(tls_cost)
+            return raw
+
+        def recv(size):
+            spend(read_cost)
+            return b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
+
+        sock.sendall.side_effect = lambda data: spend(send_cost)
+        sock.recv.side_effect = recv
+        with patch.object(client.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(client.socket, "create_connection", side_effect=connect), \
+                patch.object(client.ssl, "create_default_context") as context:
+            context.return_value.wrap_socket.side_effect = wrap
+            result = client._ws_handshake_once("wss://fixture.invalid/socket", timeout=10)
+        return result, clock[0], budgets, sock
+
+    def test_tcp_tls_send_and_read_share_one_budget(self):
+        result, elapsed, budgets, sock = self.run_handshake(3, 3, 3, 3)
+        self.assertEqual(result.status, "000")
+        self.assertEqual(elapsed, 10)
+        self.assertEqual(budgets, [10, 7, 4, 1])
+        sock.close.assert_called_once()
+
+    def test_tls_cannot_restart_budget_after_slow_connect(self):
+        result, elapsed, _, sock = self.run_handshake(8, 4, 0, 0)
+        self.assertEqual(result.status, "000")
+        self.assertEqual(elapsed, 10)
+        sock.sendall.assert_not_called()
+        sock.close.assert_called_once()
+
+    def test_send_cannot_restart_budget_after_tls(self):
+        result, elapsed, _, sock = self.run_handshake(3, 4, 4, 0)
+        self.assertEqual(result.status, "000")
+        self.assertEqual(elapsed, 10)
+        sock.recv.assert_not_called()
+        sock.close.assert_called_once()
+
+    def test_fast_handshake_preserves_response(self):
+        result, elapsed, _, sock = self.run_handshake(1, 1, 1, 1)
+        self.assertEqual(result.status, "204")
+        self.assertFalse(result.error)
+        self.assertEqual(elapsed, 4)
+        sock.close.assert_called_once()
 
 
 if __name__ == "__main__":

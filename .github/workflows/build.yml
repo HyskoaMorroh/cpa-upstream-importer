@@ -210,6 +210,9 @@ jobs:
           #
           # 为什么不直接写 github.repository：那样 Docker Hub 上会变成
           # `<user>/owner/repo` —— Docker Hub 的命名空间只有一层，斜杠会被拒。
+          # 关闭 semver 的隐式 latest；仅下方默认分支 raw 规则可生成 latest。
+          flavor: |
+            latest=false
           images: |
             ghcr.io/${{ github.repository }}
             ${{ env.DOCKERHUB_READY == 'yes' && format('{0}/{1}', env.DOCKERHUB_USER, env.DOCKERHUB_REPO) || '' }}
@@ -225,24 +228,52 @@ jobs:
             org.opencontainers.image.description=批量导入 CPA 上游账号：探测 → 定档 → diff → 写回
             org.opencontainers.image.licenses=MIT
 
-      - name: 构建并推送
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: deploy/Dockerfile
-          platforms: ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ github.ref_name }}
-            VCS_REF=${{ github.sha }}
-            BUILD_DATE=${{ github.event.repository.updated_at }}
-            SOURCE_URL=${{ github.server_url }}/${{ github.repository }}
-          # 层缓存放在 GitHub Actions cache 里 —— 多架构构建很慢，
-          # 没缓存的话每次都要重新装依赖（armv7 上还要编 Rust）。
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      # The CLI needs the cache runtime exported explicitly (Docker GHA cache docs).
+      - name: Export GitHub cache runtime
+        uses: crazy-max/ghaction-github-runtime@v3
+
+      - name: Build with public provenance metadata
+        shell: python
+        env:
+          BUILD_PLATFORMS: ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}
+          BUILD_PUSH: ${{ github.event_name != 'pull_request' }}
+          BUILD_TAGS: ${{ steps.meta.outputs.tags }}
+          BUILD_LABELS: ${{ steps.meta.outputs.labels }}
+          BUILD_VERSION: ${{ github.ref_name }}
+          BUILD_REVISION: ${{ github.sha }}
+          BUILD_DATE: ${{ github.event.repository.updated_at }}
+        run: |
+          import json, os, subprocess
+          from pathlib import Path
+          # Runner-owned GITHUB_* variables cannot be overridden by step env.
+          # Buildx reads GITHUB_EVENT_PATH: restrict only the child process to a
+          # generated allowlist, preserving full provenance without profile data.
+          env = os.environ.copy()
+          source_url = env['GITHUB_SERVER_URL'] + '/' + env['GITHUB_REPOSITORY']
+          public = {'repository': {'full_name': env['GITHUB_REPOSITORY']},
+                    'ref': env['GITHUB_REF'], 'after': env['BUILD_REVISION']}
+          event_path = Path(env['RUNNER_TEMP'], 'build-event-public.json')
+          event_path.write_text(json.dumps(public), encoding='utf-8')
+          env['GITHUB_EVENT_PATH'] = str(event_path)
+          builder_id = source_url + '/actions/runs/' + env['GITHUB_RUN_ID']
+          args = ['docker', 'buildx', 'build', '--file', 'deploy/Dockerfile',
+                  '--platform', env['BUILD_PLATFORMS'],
+                  '--provenance', 'mode=max,builder-id=' + builder_id,
+                  '--cache-from', 'type=gha,version=2',
+                  '--cache-to', 'type=gha,version=2,mode=max']
+          for option, key in [('--tag', 'BUILD_TAGS'), ('--label', 'BUILD_LABELS')]:
+              for value in env[key].splitlines():
+                  if value.strip():
+                      args.extend([option, value.strip()])
+          for key, value in {'VERSION': env['BUILD_VERSION'],
+                             'VCS_REF': env['BUILD_REVISION'],
+                             'BUILD_DATE': env['BUILD_DATE'],
+                             'SOURCE_URL': source_url}.items():
+              args.extend(['--build-arg', key + '=' + value])
+          if env['BUILD_PUSH'].lower() == 'true':
+              args.append('--push')
+          args.append('.')
+          subprocess.run(args, env=env, check=True)
 
       - name: 镜像清单（确认多架构真的产出了）
         if: github.event_name != 'pull_request'

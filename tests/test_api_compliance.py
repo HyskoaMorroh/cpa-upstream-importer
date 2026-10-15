@@ -257,7 +257,7 @@ class ComplianceTests(unittest.TestCase):
     def test_apply_concurrent_confirmation_returns_same_task(self):
         raw = "codex-api-key: []\n"
         store = server.Store()
-        store.add_plan("p", {"preview": raw, "base_raw": raw,
+        store.add_plan("p", {"preview": raw + "request-retry: 1\n", "base_raw": raw,
                              "plans": [], "diffs": []})
         handlers = [handler(raw), handler(raw)]
         with patch.object(server, "STORE", store), \
@@ -437,6 +437,23 @@ claude-api-key:
             self.assertEqual(old.result["error_code"], "stale_queued_work")
             self.assertEqual(newer.state, "done")
 
+    def test_configuration_only_receipt_does_not_claim_missing_models(self):
+        for client_key in ("", "fixture-client"):
+            with self.subTest(has_client_key=bool(client_key)):
+                task = server.ApplyTask("fixture-task", {})
+                with patch.object(server, "reload_cpa", return_value=(True, "fixture")), \
+                        patch.object(server, "verify_upstream") as verify, \
+                        patch.object(server.time, "sleep"):
+                    server._run_apply_tail(task, {"preview": "{}", "plans": []}, {},
+                                           "", "http://127.0.0.1:8317",
+                                           "fixture-management", client_key)
+                self.assertEqual(task.state, "done")
+                self.assertEqual(task.result["verification_scope"], "configuration_only")
+                self.assertEqual(task.result["verify_passed"], 0)
+                self.assertIn("上游可用性未实测", task.result["verify_skipped"])
+                self.assertNotIn("没有可用模型", task.result["verify_skipped"])
+                verify.assert_not_called()
+
     def test_verified_scope_is_gateway_only_without_unique_route(self):
         section = SimpleNamespace(writable=True, models=["gpt-5"])
         plans = [SimpleNamespace(host="fixture.invalid", sections={"codex-api-key": section})]
@@ -520,6 +537,44 @@ codex-api-key:
                 server.run_job(new_job, str(path))
                 self.assertEqual(prober.call_args.kwargs["cfg_snapshot"], yaml.safe_load(raw))
                 self.assertEqual(server._clamp(new_job.opts, "candidate_workers", 16), 32)
+
+    def test_account_probe_admits_other_host_before_queued_credentials(self):
+        # 两个 worker 下，输入中相邻的同站凭据不能堵住后面的独立站点。
+        # 使用真实线程和事件控制完成顺序，不靠 sleep 猜测调度时机。
+        rows = [SimpleNamespace(host=host, api_key=f"fixture-key-{i}")
+                for i, host in enumerate(("a.invalid", "a.invalid", "a.invalid",
+                                          "b.invalid", "b.invalid"))]
+        other_host_started = threading.Event()
+        observed = []
+        observations_lock = threading.Lock()
+
+        def probe(row):
+            if row.host == "b.invalid":
+                other_host_started.set()
+                admitted = True
+            else:
+                admitted = other_host_started.wait(timeout=2)
+            with observations_lock:
+                observed.append((row.api_key, admitted))
+            return SimpleNamespace(row=row)
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "fixture.yaml"
+            path.write_text("{}\n", encoding="utf-8")
+            with patch.object(server, "Prober") as prober, \
+                    patch.object(server, "_resolve_proxy", return_value=None):
+                prober.return_value.probe.side_effect = probe
+                job = server.Job("fixture-account-fairness", rows,
+                                 {"candidate_workers": 2})
+                server.run_job(job, str(path))
+        self.assertEqual(job.state, "done")
+        self.assertEqual(job.workers, 2)
+        self.assertEqual([result.row for result in job.results], rows)
+        self.assertCountEqual([key for key, _ in observed],
+                              [row.api_key for row in rows])
+        self.assertTrue(all(admitted for _, admitted in observed),
+                        "Same-host credentials starved an independent host")
+        self.assertEqual(job.snapshot()["unit_done"], len(rows))
 
     def test_login_management_credential_reused_without_body_cred(self):
         h = handler()
@@ -633,7 +688,7 @@ codex-api-key:
 
     def test_confirmation_stays_responsive_while_commit_lock_is_held(self):
         store = server.Store()
-        entry = {"preview": "{}\n", "base_raw": "{}\n", "plans": []}
+        entry = {"preview": "request-retry: 1\n", "base_raw": "{}\n", "plans": []}
         store.add_plan("fixture-plan", entry)
         h = handler("{}\n")
         completed = threading.Event()
@@ -700,7 +755,7 @@ codex-api-key:
         store = server.Store()
         store.MAX_APPLIES = 1
         store.claim_apply({"preview": "{}"})
-        entry = {"preview": "{}", "base_raw": "{}"}
+        entry = {"preview": "request-retry: 1\n", "base_raw": "{}"}
         store.add_plan("fixture-plan", entry)
         h = handler("{}")
         with patch.object(server, "STORE", store), patch.object(server, "_start_apply_task") as start:

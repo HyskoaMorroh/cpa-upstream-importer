@@ -61,11 +61,17 @@ from .plan import ImportPlan, SectionPlan
 logger = logging.getLogger(__name__)
 
 
+def _compose_yaml(text: str):
+    """Use LibYAML's safe node parser when installed; preserve node marks."""
+    import yaml
+    return yaml.compose(text, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
+
+
 def _load_yaml(text: str):
     """Reject explicit duplicate keys before YAML merge expansion."""
     import yaml
 
-    class UniqueLoader(yaml.SafeLoader):
+    class UniqueLoader(getattr(yaml, "CSafeLoader", yaml.SafeLoader)):
         _merge_token = object()
 
         def flatten_mapping(self, node):
@@ -100,7 +106,7 @@ def _field_fragments(lines: list[str], omitted: set[str], indent: str) -> list[s
     """Keep untouched field text and its nested comments, using YAML boundaries."""
     import yaml
     text = textwrap.dedent("\n".join(x.rstrip("\r\n") for x in lines))
-    node = yaml.compose(text)
+    node = _compose_yaml(text)
     source = text.splitlines()
     if isinstance(node, yaml.SequenceNode):
         node = node.value[0]
@@ -144,17 +150,85 @@ def _semantic_equal(left, right) -> bool:
     return left == right
 
 
+def configuration_semantically_equal(left: str, right: str) -> bool:
+    """Formatting is not a configuration change; sequence order still matters."""
+    try:
+        return _semantic_equal(_load_yaml(left), _load_yaml(right))
+    except Exception:
+        return False
+
+
+def _restore_section_order(original_lines: list[str], section: str,
+                           body: list[str]) -> list[str]:
+    """Keep existing providers in place and append genuinely new providers.
+
+    Full rebuild renders selected records before retained records. Reconcile
+    those two sets against the source without discarding any rendered values.
+    Exact matches take precedence so duplicate credentials remain distinct.
+    """
+    import yaml
+    old = _source_records(original_lines, section)
+    generated = [section + ":"] + [line.rstrip("\r\n") for line in body]
+    fresh = _source_records(generated, section)
+    if not old or not fresh:
+        return body
+
+    def identity(row):
+        if section == "openai-compatibility":
+            keys = tuple(sorted(str(x.get("api-key", "")) for x in
+                                row.get("api-key-entries", []) if isinstance(x, dict)))
+            return (row.get("base-url"), row.get("name"), keys)
+        return (row.get("base-url"), row.get("api-key"))
+
+    remaining = list(range(len(fresh)))
+    matches = {}
+    # Reserve every exact match first. Otherwise an edited duplicate can steal
+    # an unchanged sibling's rendered row merely because their keys coincide.
+    for position, (row, _) in enumerate(old):
+        match = next((i for i in remaining if _semantic_equal(row, fresh[i][0])), None)
+        if match is not None:
+            matches[position] = match
+            remaining.remove(match)
+    for position, (row, _) in enumerate(old):
+        if position in matches:
+            continue
+        match = next((i for i in remaining if identity(row) == identity(fresh[i][0])), None)
+        if match is not None:
+            matches[position] = match
+            remaining.remove(match)
+    ordered = []
+    for position, (row, source_block) in enumerate(old):
+        match = matches.get(position)
+        if match is not None:
+            value, block = fresh[match]
+            ordered.append((value, source_block if _semantic_equal(row, value) else block))
+    ordered.extend(fresh[i] for i in remaining)
+    span = _section_span(original_lines, section)
+    if span and _semantic_equal([row for row, _ in old], [row for row, _ in ordered]):
+        return [line.rstrip("\r\n") for line in original_lines[span[0] + 1:span[1]]]
+
+    # YAML node ranges begin at the dash, so explicitly retain section preamble.
+    root = _compose_yaml("\n".join(line.rstrip("\r\n") for line in original_lines))
+    seq = next((v for k, v in root.value if k.value == section), None)
+    preamble = []
+    if span and isinstance(seq, yaml.SequenceNode) and seq.value and not seq.flow_style:
+        preamble = [line.rstrip("\r\n") for line in
+                    original_lines[span[0] + 1:seq.value[0].start_mark.line]]
+    return preamble + [line for _, block in ordered for line in block]
+
+
 def _source_records(lines: list[str], section: str) -> list[tuple[dict, list[str]]]:
     """Use YAML nodes for record boundaries, including flow and zero-indent lists."""
     import yaml
     text = "\n".join(line.rstrip("\r\n") for line in lines)
     cfg = _load_yaml(text) or {}
-    root = yaml.compose(text)
+    root = _compose_yaml(text)
     if not isinstance(root, yaml.MappingNode):
         return []
     seq = next((v for k, v in root.value if k.value == section), None)
     if not isinstance(seq, yaml.SequenceNode):
         return []
+    span = _section_span(lines, section)
     rows = cfg.get(section) or []
     result = []
     for row, node in zip(rows, seq.value):
@@ -164,6 +238,10 @@ def _source_records(lines: list[str], section: str) -> list[tuple[dict, list[str
         if (node.end_mark.column and end < len(lines) and
                 lines[end][:node.end_mark.column].strip()):
             end += 1
+        # Section-tail comments are emitted verbatim outside the replacement.
+        # A YAML node includes that trivia; copying it into a record duplicates it.
+        if span:
+            end = min(end, span[1])
         if (seq.flow_style or node.flow_style or
                 not re.match(r"^\s*-\s", lines[start]) or
                 "&" in lines[start] or "*" in lines[start]):
@@ -270,16 +348,37 @@ def learn_scoped_error_rules(cfg: dict, section: str) -> list:
 
 
 def _original_entry(cfg: dict, sp: SectionPlan) -> dict:
+    """这个方案对应的原条目。没有对应条目就返回空 dict。
+
+    compat 段的条目身份是 **provider**（base-url + name），不是单把
+    Key——`models` 在 provider 级，`api-key-entries` 里挂着多把 Key。
+    所以往已有 provider 里加一把新 Key 时，那个 provider 就是它的
+    原条目。原来这里要求 `sp.api_key` 必须已在 entries 里，于是新 Key
+    拿到空 dict：重建路径因此读不到原有的 `api-key-entries`，
+    把已注册的 Key 当成「本次未覆盖」删掉。
+
+    前三段仍按 (base-url, api-key) 匹配：那里一个条目就是一把 Key。
+    """
+    compat = sp.section == "openai-compatibility"
     matches = []
+    providers = []
     for row in cfg.get(sp.section) or []:
+        if not isinstance(row, dict):
+            continue
         if _source_identity(row.get("base-url", "")) != _source_identity(sp.base_url):
             continue
-        keys = ([k.get("api-key") for k in row.get("api-key-entries") or []]
-                if sp.section == "openai-compatibility" else [row.get("api-key")])
+        keys = ([k.get("api-key") for k in row.get("api-key-entries") or []
+                 if isinstance(k, dict)] if compat else [row.get("api-key")])
+        if not sp.provider_name or row.get("name") == sp.provider_name:
+            providers.append(row)
         if sp.api_key in keys:
-            if sp.provider_name and row.get("name") != sp.provider_name:
-                continue
             matches.append(row)
+    if len(matches) > 1 and sp.provider_name:
+        matches = [r for r in matches if r.get("name") == sp.provider_name]
+    # 既有 Key 优先精确定位；只有新 Key 才回落到唯一 provider。
+    # 同地址存在多种 provider 形态时不能按数组顺序猜测归属。
+    if not matches and compat:
+        matches = providers
     if len(matches) > 1:
         raise ValueError("Ambiguous source identity; select a unique provider")
     return copy.deepcopy(matches[0]) if matches else {}
@@ -424,6 +523,7 @@ def _prepare_source_plan(cfg: dict, sp: SectionPlan,
     """Rebuild prior data from exact source; never trust host-only carry tables."""
     old = _original_entry(cfg, sp)
     sp = copy.deepcopy(sp)
+    sp.source_block = list(source_block or [])
     sp.carry_lines = _dump_fields(
         {k: v for k, v in old.items() if k not in _RENDERED_KEYS}, "    ")
     if source_block:
@@ -469,12 +569,61 @@ def _prepare_source_plan(cfg: dict, sp: SectionPlan,
     return sp
 
 
+def _model_names_of(row: dict) -> set[str]:
+    """条目里声明的模型名集合。`models` 可能是 dict 列表也可能是裸字符串列表。"""
+    out: set[str] = set()
+    for m in row.get("models") or []:
+        if isinstance(m, dict):
+            name = str(m.get("name") or m.get("alias") or "").strip()
+        else:
+            name = str(m).strip()
+        if name:
+            out.add(name)
+    return out
+
+
+def _compat_row_capability(row: dict) -> str:
+    """compat provider 的「能力指纹」——**只**取模型名集合。
+
+    为什么只比模型名（2026-10-11 收窄，修一次真实回归）
+    --------------------------------------------------
+    这个指纹唯一的用途是判断「这几把 Key 能不能共用一条 provider」。而
+    `openai-compatibility` 段里能不能共用，由 CPA 的配置结构决定：
+
+      · `models` 是 **provider 级**字段。CPA 的 `OpenAICompatibilityAPIKey`
+        只有 api-key / weight / proxy-url 三个字段（CLIProxyAPI
+        internal/config/config_types.go:878-888），**没有** per-key 的
+        models。所以两把 Key 要声明不同模型集，只能拆成两条 provider ——
+        这是结构性约束，不是取舍。
+      · headers / prefix / disable-cooling / request-retry /
+        request-scoped-errors 同样是 provider 级，但它们**不决定路由到哪把
+        Key**，组内取 head（priority 最高那把）的值即可。
+
+    上一版把除 name / api-key-entries / priority / base-url 以外的字段**全部**
+    序列化进指纹，于是 headers 一差就拆。这正是 2026-09-20 修掉过的形态：
+    同一站各把 Key 探到的 headers 数量天然不同（有的只有 user-agent 与
+    x-stainless-lang 两个，有的带完整 16 个 stainless 头），模型却完全一样,
+    结果一个站被写成三条 provider、每条一把 Key。
+
+    实测回归（2026-10-11，真实 config.yaml）：给一个已有多把 Key 的 compat
+    provider 新增 1 把 Key，落盘变成
+
+        <原 provider 名>   base=<同一个 base-url>  keys=N    priority=P
+        compat-group-1     base=<同一个 base-url>  keys=1    priority=P
+
+    —— 同域名 Key 被拆进两个桶，而 diff 自己还报告 `merged_into=<原 provider>`。
+    这违反用户第 4 条（同网址 Key 同一 provider 同一档）与第 7 条（同域名多把
+    Key 是彼此的备份，必须同桶；拆桶后冗余退化成单点）。`tests/test_edges.py`
+    的 ⑨⑩ 钉的就是这件事，但合成配置里没有「多 Key 的 compat provider」，
+    那两项在默认跑法里自己跳过了 —— 只有传真实 config.yaml 才会红。
+    """
+    return json.dumps(sorted(_model_names_of(row)), ensure_ascii=True)
+
+
 def _compat_capability(sp: SectionPlan, old: dict | None = None) -> str:
     row = _load_yaml("\n".join(render_entry(
         sp, "", "  ", "", original_entry=old)))[0]
-    for key in ("name", "api-key-entries", "priority", "base-url"):
-        row.pop(key, None)
-    return json.dumps(row, sort_keys=True, ensure_ascii=True, default=str)
+    return _compat_row_capability(row)
 
 
 def _unselected_records(lines: list[str], section: str,
@@ -544,6 +693,14 @@ def _unselected_records(lines: list[str], section: str,
                     block[i] = f"{m.group(1)}priority: {new_pri}  # {note}{nl}"
                     hit = True
                     break
+                if not hit and section == "openai-compatibility":
+                    # Quoted/missing priorities must not leave retained keys in
+                    # a different site tier. Re-emit this mapping losslessly at
+                    # the data level when its scalar cannot be patched in place.
+                    old = dict(old, priority=new_pri)
+                    block = [field[:-2] + ln for ln in yaml.safe_dump(
+                        [old], allow_unicode=True, sort_keys=False).rstrip().splitlines()]
+                    hit = True
                 if hit:
                     if realigned is not None and host not in realigned:
                         realigned.append(host)
@@ -797,7 +954,7 @@ def _flow_section_span(lines: list[str], start: int) -> int | None:
         return None
     import yaml
     try:
-        root = yaml.compose("\n".join(x.rstrip("\r\n") for x in lines))
+        root = _compose_yaml("\n".join(x.rstrip("\r\n") for x in lines))
         if isinstance(root, yaml.MappingNode):
             for key, value in root.value:
                 if key.start_mark.line == start and isinstance(value, yaml.SequenceNode):
@@ -1191,10 +1348,10 @@ def _scrub_structural_secrets(text: str) -> str:
                 # 形态，于是 `api-key: sk-bare-1234`（裸值）在 diff 里变成
                 # `api-key: "sk-bar...7890"` —— 引号是凭空多出来的差异，
                 # 让人分不清「这行真的变了」还是「只是被脱敏了」。
-                # node.style 是 PyYAML 记下来的原始风格：None 表示裸标量。
+                # SafeLoader 的裸标量风格为 None，CSafeLoader 则为 ""。
                 masked = _short_mask(value)
                 edits.append((node.start_mark.index, node.end_mark.index,
-                              masked if node.style is None
+                              masked if node.style in (None, "")
                               else _yaml_str(masked)))
             if "://" in value:
                 try:
@@ -1214,7 +1371,7 @@ def _scrub_structural_secrets(text: str) -> str:
                     pass
 
     try:
-        root = yaml.compose(text)
+        root = _compose_yaml(text)
         if root is not None:
             collect(root)
     except Exception:
@@ -1465,6 +1622,78 @@ def _toggle_lines(sp: SectionPlan, field: str) -> list[str]:
     return out
 
 
+def _preserve_source_comments(source: list[str], rendered: list[str], indent: str) -> list[str]:
+    """Reuse unchanged fields verbatim; retain displaced comments as history."""
+    import collections
+    import yaml
+    if not source:
+        return rendered
+    old_text = "\n".join(line.rstrip("\r\n") for line in source)
+    new_text = "\n".join(rendered)
+    old_root, new_root = _compose_yaml(old_text), _compose_yaml(new_text)
+    old_node = old_root.value[0] if isinstance(old_root, yaml.SequenceNode) else old_root
+    new_node = new_root.value[0] if isinstance(new_root, yaml.SequenceNode) else new_root
+    if not isinstance(old_node, yaml.MappingNode) or not isinstance(new_node, yaml.MappingNode):
+        return rendered
+    old_value, new_value = _load_yaml(old_text), _load_yaml(new_text)
+    old = old_value[0] if isinstance(old_value, list) else old_value
+    new = new_value[0] if isinstance(new_value, list) else new_value
+    out = list(rendered)
+    # Work backwards so field offsets remain those of the original new_node.
+    for index in range(len(new_node.value) - 1, -1, -1):
+        key, _value = new_node.value[index]
+        if key.value not in old or not _semantic_equal(old[key.value], new[key.value]):
+            continue
+        pieces = _field_fragments(source, set(old) - {key.value}, "")
+        if not pieces:
+            continue
+        start = key.start_mark.line
+        end = (new_node.value[index + 1][0].start_mark.line
+               if index + 1 < len(new_node.value) else len(rendered))
+        prefix = rendered[start][:key.start_mark.column]
+        out[start:end] = [prefix + pieces[0]] + [" " * key.start_mark.column + line for line in pieces[1:]]
+
+    def comments(text):
+        # Token spans distinguish actual inline comments from quoted/plain scalar
+        # hashes and block-scalar data. Block headers can themselves have notes.
+        protected = bytearray(len(text))
+        for token in yaml.scan(text, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader)):
+            if isinstance(token, yaml.ScalarToken):
+                start, end = token.start_mark.index, token.end_mark.index
+                if token.style in ("|", ">"):
+                    newline = text.find("\n", start, end)
+                    start = end if newline < 0 else newline + 1
+                protected[start:end] = b"\1" * (end - start)
+        found = []
+        offset = 0
+        for line in text.splitlines(keepends=True):
+            for column, char in enumerate(line):
+                if (char == "#" and not protected[offset + column] and
+                        (column == 0 or line[column - 1].isspace())):
+                    found.append(line[column:].strip())
+                    break
+            offset += len(line)
+        return found
+
+    remaining = collections.Counter(comments("\n".join(out)))
+    displaced = []
+    for line in comments(old_text):
+        if remaining[line]:
+            remaining[line] -= 1
+        else:
+            displaced.append(line)
+    if displaced:
+        # Do not attach a removed model's note to a different model or execute
+        # commented-out configuration. Keep it inside its credential's history.
+        # Keep history inside the row, before a final block scalar: appending
+        # after that scalar can change its chomping value.
+        history = [indent + "# 原条目历史注释（字段已重写或移除，请结合本次差异复核）"]
+        out[1:1] = history + [indent + line for line in displaced]
+    if not _semantic_equal(_load_yaml("\n".join(out)), new_value):
+        raise ValueError("Comment preservation changed YAML values")
+    return out
+
+
 def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
                  extra_keys: list[str] | None = None,
                  key_lines: dict[str, list[str]] | None = None,
@@ -1603,8 +1832,14 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
                     continue
                 for old in aliases:
                     merged = copy.deepcopy(old)
+                    fresh_context = (bool(sp.max_context_length)
+                                     and model["name"] == sp.context_model)
+                    # 按名称汇总的历史容量不能覆盖各 alias 的独立原值；
+                    # 没有原值的 alias 也不能继承另一条的容量。只有本轮
+                    # 对该模型的新测量才同时更新它的 alias。
                     merged.update({k: v for k, v in model.items()
-                                   if k not in sp.prior_model_extras.get(model["name"], {})})
+                                   if k not in sp.prior_model_extras.get(model["name"], {})
+                                   and (k != "max-context-length" or fresh_context)})
                     if "alias" in old:
                         merged["alias"] = old["alias"]
                     restored.append(merged)
@@ -1673,6 +1908,9 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
                 # `cannot unmarshal !!str into map[string]string`；`null` 双侧
                 # 「合法」但 CPA 读出的 Headers 为空 —— 那个头静默消失。
                 out.append(f"{field}  {_yaml_header_name(k)}: {_yaml_str(v)}")
+        elif original_entry is not None and original_entry.get("headers") == {}:
+            # An explicitly empty mapping is distinct from an absent field.
+            out.append(f"{field}headers: {{}}")
         out.extend(_toggle_lines(sp, field))
         out.extend(_dump_fields(identity, field))
         for ln in sp.carry_lines:
@@ -1685,7 +1923,7 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
                 {"request-scoped-errors": sp.scoped_error_rules}, field))
         out.append(f"{field}models:")
         out.extend(model_lines(f"{field}  "))
-        return out
+        return _preserve_source_comments(sp.source_block, out, field)
 
     # 字段顺序与现有条目一致：api-key → base-url → prefix → priority → …
     # （实测 config.yaml 里 claude 段就是这个顺序，diff 看起来才像手写的）
@@ -1706,6 +1944,8 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
         for k, v in sp.headers.items():
             # 键也走 _yaml_str —— 见 compat 分支同一处的说明。
             out.append(f"{field}  {_yaml_header_name(k)}: {_yaml_str(v)}")
+    elif original_entry is not None and original_entry.get("headers") == {}:
+        out.append(f"{field}headers: {{}}")
     # 段专属能力开关（codex 的 websockets）。放在 headers 之后、carry 之前 ——
     # 与生产 config.yaml 的键序一致（实测两条 `websockets: true` 分别紧跟
     # base-url 与 headers）。
@@ -1754,7 +1994,7 @@ def render_entry(sp: SectionPlan, dash: str, field: str, stamp: str,
             {"request-scoped-errors": sp.scoped_error_rules}, field))
     out.append(f"{field}models:")
     out.extend(model_lines(f"{field}  "))
-    return out
+    return _preserve_source_comments(sp.source_block, out, field)
 
 
 def _ensure_sections(lines: list[str], plans: list[ImportPlan],
@@ -1817,8 +2057,24 @@ def build_diffs(raw: str, plans: list[ImportPlan]) -> list[Diff]:
     lines = raw.split("\n")
     stamp = datetime.datetime.now().strftime("%Y-%m-%d")
     cfg = _load_yaml(raw) or {}
+    mark_new_sections(cfg, plans)
     selected = [sp for p in plans for sp in p.sections.values() if sp.writable]
-    requires_rebuild = any(_original_entry(cfg, sp) for sp in selected)
+    requires_rebuild = any(sp.section == "openai-compatibility" for sp in selected)
+    merged_providers = set()
+    for sp in selected:
+        old = _original_entry(cfg, sp)
+        if not old:
+            continue
+        old_keys = {k.get("api-key") for k in old.get("api-key-entries") or []
+                    if isinstance(k, dict)}
+        if sp.section == "openai-compatibility" and sp.api_key not in old_keys:
+            if old.get("name"):
+                merged_providers.add(str(old["name"]))
+            old_models = {m.get("name") for m in old.get("models") or []
+                          if isinstance(m, dict)}
+            if set(sp.models).issubset(old_models):
+                continue  # 仅追加 Key 时保留原有纯插入路径及 provider 参数。
+        requires_rebuild = True
     requires_rebuild |= any(
         (span := _section_span(lines, sp.section)) is not None and
         _flow_section_span(lines, span[0]) is not None for sp in selected)
@@ -1826,10 +2082,15 @@ def build_diffs(raw: str, plans: list[ImportPlan]) -> list[Diff]:
         grouped = {}
         for p in plans:
             for sp in p.sections.values():
+                selected_sp = sp
+                old = _original_entry(cfg, sp) if sp.writable else {}
+                if sp.section == "openai-compatibility" and old and not _has_credential(old, sp):
+                    selected_sp = copy.deepcopy(sp)
+                    selected_sp.priority = old.get("priority", 0)
                 key = (sp.base_url, sp.api_key)
-                grouped.setdefault(key, ImportPlan(p.host, p.masked_key)).sections[sp.section] = sp
+                grouped.setdefault(key, ImportPlan(p.host, p.masked_key)).sections[sp.section] = selected_sp
         text, _ = rebuild_config_full(cfg, grouped, lines, only_owned=False)
-        return [Diff("config.yaml", 0, text.split("\n"), "", replace_all=True)]
+        return [Diff("config.yaml", 0, text.split("\n"), "", merged_into=", ".join(sorted(merged_providers)), replace_all=True)]
 
     # 段头缺失就先补出来。config.yaml 常常只有你实际用过的段 —— 缺 codex
     # 或 compat 段头是常态，不是异常。
@@ -2740,6 +3001,11 @@ def verify_upstream(
     actual = resp_model(resp.body)
     rid = resp_id(resp.body)
     backend = backend_of(rid)
+    # Semantic validity and model identity are separate evidence. Gemini's
+    # modelVersion is handled by resp_model; an omitted identity stays unknown.
+    identity_verified = bool(actual) and model_matches(model, actual)
+    if scope is not None:
+        scope.update(model_identity_verified=identity_verified)
 
     if not model_matches(model, actual):
         # 经 CPA 换模 —— 直连可能是好的，但客户端拿不到要的模型
@@ -2758,7 +3024,8 @@ def verify_upstream(
             "直连正常不代表接进 CPA 正常"
         )
 
-    return True, f"gateway · 200 · 后端 {backend}；未证明目标站点或凭据"
+    identity_note = "模型身份已核对" if identity_verified else "响应未提供模型身份，未核实模型身份"
+    return True, f"gateway · 200 · 后端 {backend}；{identity_note}；未证明目标站点或凭据"
 
 
 def _orphan_entry_lines(lines: list[str], span: tuple[int, int],
@@ -3215,6 +3482,100 @@ def is_new_section(cfg: dict, sp: SectionPlan,
     return have is not None and sp.section not in have
 
 
+def _model_names(entry: dict) -> list[str]:
+    return [str(m.get("name", "") if isinstance(m, dict) else m)
+            for m in entry.get("models") or []]
+
+
+def _has_credential(entry: dict, sp: SectionPlan) -> bool:
+    if sp.section == "openai-compatibility":
+        return any(isinstance(k, dict) and k.get("api-key") == sp.api_key
+                   for k in entry.get("api-key-entries") or [])
+    return bool(entry) and entry.get("api-key") == sp.api_key
+
+
+def model_change_block(cfg: dict, sp: SectionPlan) -> str:
+    """Only successful, credential-scoped evidence authorizes model changes."""
+    if getattr(sp, "model_evidence_block", ""):
+        return sp.model_evidence_block
+    old = _original_entry(cfg, sp)
+    before, after = set(_model_names(old)), set(sp.models)
+    existing = _has_credential(old, sp)
+    added = after - before if existing else after
+    removed = before - after if existing else set()
+    changed = added | removed
+    if not changed:
+        return ""
+    verified = set(getattr(sp, "verified_models", []) or [])
+    allowed_removals = set()
+    highest = set(getattr(sp, "highest_models", []) or [])
+    if (getattr(sp, "model_rebuild", False) and highest
+            and highest.issubset(verified) and highest.issubset(after)
+            and not getattr(sp, "model_scan_pending", [])
+            and not getattr(sp, "probe_policy_code", "")):
+        from . import model_catalog
+        if highest == set(model_catalog.newest_generation_per_line(list(highest))):
+            allowed_removals = set(model_catalog.policy_lower_models(list(before), list(highest)))
+    unproven = (added - verified) | (removed - allowed_removals)
+    if sp.probe_usable is not True or unproven:
+        detail = ("本轮未取得成功探测结果；" if sp.probe_usable is not True else "")
+        missing = sorted(unproven)
+        if missing:
+            detail += "缺少实测的模型：" + "、".join(missing) + "；"
+        return (detail + "模型清单变更缺少逐模型实测证据；保留原清单，不自动增删或替换。"
+                "目录、历史配置、推测及整段可用均不能替代每个变更模型的实测")
+    return ""
+
+
+def validate_model_preview(raw: str, preview: str,
+                           plans: list[ImportPlan]) -> tuple[bool, str]:
+    """Recheck actual bytes at commit, including previews cached before a fix.
+
+    Priority/tuning-only previews need no model evidence. A model addition or
+    replacement must match one credential's plan and its successful probes.
+    """
+    cfg, proposed = _load_yaml(raw) or {}, _load_yaml(preview) or {}
+    sections = [sp for p in plans for sp in p.sections.values()]
+    for section in _SECTION_KEYS:
+        for row in proposed.get(section) or []:
+            if not isinstance(row, dict):
+                continue
+            keys = ([k.get("api-key", "") for k in row.get("api-key-entries") or []
+                     if isinstance(k, dict)] if section == "openai-compatibility"
+                    else [row.get("api-key", "")])
+            for key in keys:
+                target = SectionPlan(section, row.get("base-url", ""), key,
+                                     models=_model_names(row))
+                target.provider_name = str(row.get("name", ""))
+                old = _original_entry(cfg, target)
+                if (_has_credential(old, target) and
+                        set(_model_names(old)) == set(target.models)):
+                    continue
+                matches = [sp for sp in sections if sp.section == section
+                           and sp.api_key == key
+                           and _source_identity(sp.base_url) ==
+                           _source_identity(target.base_url)]
+                if len(matches) != 1:
+                    return False, "模型清单变更没有唯一实测方案，请重新生成预览"
+                evidence = copy.copy(matches[0])
+                evidence.models = target.models
+                reason = model_change_block(cfg, evidence)
+                if reason:
+                    return False, reason
+    return True, "逐模型写回证据已核验"
+
+
+def blocked_plan_warning(plans: list[ImportPlan]) -> str:
+    """Summarize actual blocked sections without exposing credential identities."""
+    blocked = [sp for plan in plans for sp in plan.sections.values()
+               if getattr(sp, "write_blocked", False)]
+    policy = sum(bool(getattr(sp, "probe_policy_code", "")) for sp in blocked)
+    return (f"{len(blocked)} 个 (凭据, 段) 组合已标为「不写入」："
+            f"探测策略阻断 {policy} 个，其他写回证据不足 {len(blocked) - policy} 个。"
+            "请查看各段的具体原因；手填模型清单不能替代同凭据、同端点的逐模型成功证据，"
+            "也不能解除探测策略限制。")
+
+
 def mark_new_sections(cfg: dict, plans: list[ImportPlan]) -> int:
     """给每个方案打上 new_section / write_blocked，返回被拦下的段数。
 
@@ -3236,6 +3597,18 @@ def mark_new_sections(cfg: dict, plans: list[ImportPlan]) -> int:
             # 让复用同一批对象的调用方（测试、脚本）也拿到干净结果。
             sp.new_section = is_new_section(cfg, sp, owned)
             sp.write_blocked = ""
+            reason = model_change_block(cfg, sp)
+            if reason:
+                sp.write_blocked = reason
+                sp.model_evidence_block = reason
+                old = _original_entry(cfg, sp)
+                if old:
+                    sp.models = _model_names(old)
+                    sp.model_provenance = {
+                        m: "verified" if m in sp.verified_models else "inferred"
+                        for m in sp.models}
+                blocked += 1
+                continue
             is_new_entry = sp.section not in owned.get((host_of(sp.base_url), sp.api_key), set())
             if is_new_entry and getattr(sp, "probe_policy_code", ""):
                 sp.write_blocked = "未实测或已触发停止策略，不自动新增启用条目；请先核实站方许可与有效证据"
@@ -3248,8 +3621,8 @@ def mark_new_sections(cfg: dict, plans: list[ImportPlan]) -> int:
                     f"原本没配这一段，而本次模型清单是"
                     f"{_SRC_LABEL.get(sp.model_source, sp.model_source)}"
                     f"（站方目录没报过这一族、原配置里也没有）—— 不新增。"
-                    f"确知该站这一段可用的话，在模型格里手填真实清单，"
-                    f"它就会作为新条目写入")
+                    f"请填写准确模型名并完成逐模型实测，"
+                    f"取得成功证据后重新生成写回方案")
                 blocked += 1
     return blocked
 
@@ -3346,6 +3719,14 @@ def rebuild_config_full(
 
     # 1. 注释索引（按 (段, 键)）
     comments_map = _extract_entry_comments(original_lines)
+    # Record-internal comments are now retained with their exact credential.
+    # Do not also hoist the same text through the host-wide comment index.
+    for section, records in source_records.items():
+        internal = {line.strip() for _row, block in records for line in block
+                    if line.lstrip().startswith("#")}
+        for key, block in comments_map.get(section, {}).items():
+            comments_map[section][key] = [line for line in block
+                                         if line.strip() not in internal]
 
     # 1b. 原条目里 render_entry 不认识的字段（request-scoped-errors /
     #     excluded-models / websockets / fingerprint-profile / disabled…）。
@@ -3425,6 +3806,7 @@ def rebuild_config_full(
     added_unowned: list[str] = []
 
     sections_data: dict[str, list[SectionPlan]] = {s: [] for s in _SECTION_KEYS}
+    mark_new_sections(cfg, list(all_plans.values()))
     for (base_url, api_key), plan in all_plans.items():
         for sp in plan.sections.values():
             if not sp.writable:
@@ -3458,41 +3840,25 @@ def rebuild_config_full(
         warnings.append(
             f"{skipped_unowned} 个 (凭据, 段) 组合原本不在 config.yaml 里，"
             f"且本次探测没有实测依据（模型清单只是工具猜测）—— 已跳过。"
-            f"确知可用的话在结果表里手填模型清单，就会作为新条目写入")
+            "手填模型清单不能替代同凭据、同端点的逐模型成功证据；取得有效证据后重新预览")
     if added_unowned:
         shown = "、".join(added_unowned[:8])
         warnings.append(
             f"新增 {len(added_unowned)} 个原本不在 config.yaml 里的 (凭据, 段)："
             f"{shown}{'…' if len(added_unowned) > 8 else ''} —— "
-            f"这些段本次探测通过或由你手填，已按新档位一并计入定档与影响面")
+            f"这些段已通过写回证据核验，已按新档位一并计入定档与影响面")
 
-    # 3. compat 段按**归一化后的 base-url**（含路径）归并 —— 一个条目 =
-    #    一个上游站，多个 Key 挂在 api-key-entries 下。
-    #
-    #    键的选择见 compat_provider_key：不能用 host（同一主机可用路径挂多个
-    #    互不相干的上游，实测假上游 `.../good` 与 `.../gate`），也不能用原始
-    #    base_url（同一个 provider 的写法可能有尾斜杠 / `/v1` / scheme 之差，
-    #    分组会裂成两条，渲染出两个同站 provider —— CPA 按 name 索引冷却、
-    #    模型能力与执行路由，重名会让这三处对同一个 Key 命中两套配置，同一把
-    #    Key 还在轮询池里占两个位）。
-    #
-    #    2026-09-20：分组键里**不再**含 _compat_capability。那个函数把 headers /
-    #    models / request-scoped-errors 等序列化进去比较，而全量重探时同一站
-    #    的各把 Key 探到的 headers 数量不同（有的只有 user-agent 与
-    #    x-stainless-lang 两个，有的带完整 16 个 stainless 头），models 却完全
-    #    一样 —— 于是一个站被写成 xray.example-e61f676530 /
-    #    -0104b8b5bc / -3fbb883f42 三条 provider，每条一把 Key。这与本段开头
-    #    「一个条目 = 一个上游站」的约定相反，也违反用户第 4 条（同网址 Key
-    #    同一 provider 同一档）。现在同一 provider 身份的 Key 一律同组，
-    #    模型清单取组内并集（见下面 render 处），headers 等 provider 级字段
-    #    取组内 priority 最高那把（head）的。
-    compat_groups: dict[tuple[str, str], list[SectionPlan]] = {}
+    # CPA registers each credential against its own named provider's model list.
+    # Partition exact provider capabilities instead of inventing a model union.
+    # All partitions on the same channel/domain retain one priority; cpa2sub2api
+    # derives its bucket from (channel, domain), independently of provider name.
+    compat_groups: dict[tuple[str, str, str], list[SectionPlan]] = {}
     for sp in sections_data["openai-compatibility"]:
         old = _original_entry(cfg, sp)
         group_key = (compat_provider_key(sp.base_url),
-                     old.get("name", sp.provider_name))
+                     old.get("name", sp.provider_name), _compat_capability(sp, old))
         compat_groups.setdefault(group_key, []).append(sp)
-    for pkey, group in compat_groups.items():
+    for (pkey, _source_name, _capability), group in compat_groups.items():
         spellings = {sp.base_url for sp in group}
         if len(spellings) > 1:
             # 取 priority 最高那个的写法（下面 head 用的就是它），并说出来 ——
@@ -3529,7 +3895,12 @@ def rebuild_config_full(
             # 原样贴一遍 —— 否则同一个站出现两条 provider、同一把 Key 在
             # CPA 的轮询池里占两个位（2026-09-12 实测形态）。
             absorbed: set[tuple[str, str]] = set()
-            for (pkey, source_name), group in compat_ordered:
+            reserved_names = {
+                str(row.get("name", ""))
+                for row in cfg.get(section, []) if isinstance(row, dict)
+            } | {sp.provider_name for sp in sections_data[section]}
+            next_group_number = 1
+            for (pkey, source_name, capability), group in compat_ordered:
                 # head 取组内 priority 最高的那个，不是插入顺序的第一个 ——
                 # 组的其余成员只贡献 api-key，所以 head 的选择决定了整组用
                 # 哪一套 headers/priority/models。
@@ -3540,14 +3911,7 @@ def rebuild_config_full(
                     *(x.priority for x in sections_data[section]
                       if _host_of(x.base_url) == _host_of(head.base_url))
                 )
-                # 模型清单取组内并集（2026-09-20，配合分组键去掉 capability）：
-                # compat 的 models 块是 provider 级、全组共用。只写 head 的那份，
-                # 其余 Key 实测能用、head 没探到的模型就从清单里消失了。
-                # 顺序：head 的在前，其余按方案顺序追加，去重。
-                for g in group:
-                    for m in (g.models or []):
-                        if m not in head.models:
-                            head.models.append(m)
+                # Exact capability partitions never inherit another key model union.
                 old = _original_entry(cfg, head)
                 own_keys = {k["api-key"]: _dump_fields(
                     {f: v for f, v in k.items() if f != "api-key"}, field + "    ")
@@ -3561,56 +3925,53 @@ def rebuild_config_full(
                 # 「只勾了组里一把 Key」时另外几把全丢。
                 orphan_keys = ([k for k in own_keys if k not in planned_keys]
                                if keep_unplanned else [])
-                # 能力分裂的判据：这个 provider 里有**方案说要用另一套参数**
-                # 的 Key。
+                sibling_groups = sum(1 for p, n, c in compat_groups
+                                     if p == pkey and n == source_name)
+                # 逐字相等，**不是**超集。
                 #
-                # 不能拿「own_keys 有 group 之外的 Key」当判据（2026-09-12
-                # 修）：那一批里绝大多数是上面 orphan_keys 那种「本次没重探」
-                # 的 Key，它们会被原样并回同一条 provider，根本没有参数冲突。
-                # 按那个判据一分裂，provider 就被改名成
-                # `p.example.com-<hash>`，而 CPA 按 `name` 索引冷却
-                # （conductor_cooldown.go:73）、模型能力
-                # （api_key_model_capabilities.go:186）与执行路由 ——
-                # 改名等于把这三处的状态全部作废，实测形态是「勾了组里一把
-                # Key，落盘多出一条同站 provider」。
+                # 2026-10-11 一度改成「新集合涵盖旧集合就算保持能力」，想让
+                # 加 Key 并进原 provider。那是错的：原有 Key 没有新模型的
+                # 实测证据，并进去等于让它凭空声称支持没验过的模型，而
+                # `models` 是 provider 级字段（CPA 的 OpenAICompatibilityAPIKey
+                # 只有 api-key / weight / proxy-url，见 config_types.go:878-888），
+                # 一条 provider 下所有 Key 共享同一份清单。
+                # 契约见 tests/test_config_preservation_regressions.py 的
+                # `test_append_preserves_provider_without_retained_key_model_evidence`。
                 #
-                # 真正需要分裂的只有两种：
-                #   · 同一个 pkey 在本次方案里出现了**多种能力组合**
-                #     （compat_groups 的键第二维不同），那时同名会让两套
-                #     参数互相覆盖
-                #   · 全新 provider（old 为空）而同 host 下已经有别的组
-                #
-                # 2026-09-20：第一种已不存在 —— capability 不再进分组键，同一
-                # pkey 只会有一组（能力差异改为取模型并集）。`other_capabilities`
-                # 这里数的是同一 pkey 下不同 source_name 的组数，保留是为了
-                # 原文件里同站两个不同 name 的 provider 各自维持身份。
-                # 第二种照旧。哈希标签只由 pkey 决定，重建幂等。
-                other_capabilities = sum(
-                    1 for p, n in compat_groups if p == pkey)
-                split = (other_capabilities > 1 or
-                         not old and sum(1 for p, n in compat_groups
-                                         if _host_of(p) == _host_of(pkey)) > 1)
+                # 「同域名必须同桶」（用户第 7 条）并没有被拆 provider 破坏 ——
+                # 桶由 (渠道, 域名) 推导，与 provider 名无关（见本函数上方
+                # 注释）。拆出来的两条 base-url 与 priority 完全相同，
+                # 仍是同一个桶、同一档。
+                retains_old_capability = bool(old) and capability == _compat_row_capability(old)
+                # 拆的三种情形，各自独立 ——
+                #   ① 本次方案里同一 provider 身份出现了**多种**模型集合
+                #      （互不包含）。models 是 provider 级字段，CPA 没有
+                #      per-key models（config_types.go:878-888），所以这时
+                #      不拆就会让一把 Key 声明它不支持的模型。
+                #   ② 新集合**不涵盖**旧集合，且还有留守 Key 要带着旧集合。
+                #      并进去会把旧 Key 已声明的模型悄悄删掉。
+                #   ③ 全新 provider（old 为空）而同 host 下已有别的组。
+                # 单独一组且新集合涵盖旧集合时**不拆** —— 那是能力增长，
+                # 并进同一条 provider 并扩充 models 才对（用户第 4、7 条）。
+                split = sibling_groups > 1
+                split |= bool(old) and not retains_old_capability and bool(orphan_keys)
+                split |= not old and sum(1 for p, n, c in compat_groups
+                                         if _host_of(p) == _host_of(pkey)) > 1
                 if split:
-                    name = head.provider_name or _host_of(head.base_url)
-                    tag = hashlib.sha256(pkey.encode()).hexdigest()[:10]
-                    # 已经带着**同一个**后缀时不再追加（2026-09-12）
-                    # ------------------------------------------------
-                    # 重建必须语义幂等：同一份方案跑两遍要得到同一份配置。
-                    # 上一版无条件追加，于是第二遍把
-                    # `fixture-provider-753bdf4f14` 变成
-                    # `fixture-provider-753bdf4f14-753bdf4f14` —— provider
-                    # 每重建一次改一次名，而 CPA 按 `name` 索引冷却
-                    # （conductor_cooldown.go:73）与模型能力
-                    # （api_key_model_capabilities.go:186），等于每次重建
-                    # 都把这两处状态清零。
-                    #
-                    # 只剥「与本次算出的完全相同」的后缀，不按形态剥 ——
-                    # 某个 provider 的原名恰好以 10 位十六进制结尾时，
-                    # 按形态剥会把操作员写的名字改掉。
-                    if name.endswith("-" + tag):
-                        head.provider_name = name
-                    else:
-                        head.provider_name = name + "-" + tag
+                    # Names are public metadata: never derive them from a key,
+                    # endpoint, header, or a hash of private provider fields.
+                    while f"compat-group-{next_group_number}" in reserved_names:
+                        next_group_number += 1
+                    head.provider_name = f"compat-group-{next_group_number}"
+                    reserved_names.add(head.provider_name)
+                    next_group_number += 1
+                # Retained keys can join only unchanged provider capabilities.
+                if not retains_old_capability:
+                    orphan_keys = []
+                else:
+                    all_planned = {g.api_key for (p, n, c), gs in compat_groups.items()
+                                   if p == pkey and n == source_name for g in gs}
+                    orphan_keys = [k for k in orphan_keys if k not in all_planned]
                 extra = [g.api_key for g in group if g.api_key != head.api_key]
                 # 组内**没进方案**的 Key 也要保留（2026-09-03）。
                 #
@@ -3691,7 +4052,15 @@ def rebuild_config_full(
             if keep_unplanned and span:
                 touched = {(_source_identity(g.base_url), g.api_key)
                            for g in sections_data[section]} | absorbed
-                kept = _unselected_records(original_lines, section, touched, field)
+                host_tier = {
+                    _host_of(g.base_url): (
+                        max(1, *(x.priority for x in sections_data[section]
+                                 if _host_of(x.base_url) == _host_of(g.base_url))),
+                        "同渠道同域名能力分组保持同一档位")
+                    for g in sections_data[section]
+                }
+                kept = _unselected_records(original_lines, section, touched, field,
+                                           host_tier=host_tier)
                 if kept:
                     for line in kept:
                         out.append(line if line.endswith("\n") else line + "\n")
@@ -3806,6 +4175,7 @@ def rebuild_config_full(
     #
     # 在入口统一归一化而不是改那三处 extend：`render_section` 产出的 body
     # 本来就是裸行，两种来源在这里对齐，后面的逻辑不用再关心换行形态。
+    original_text = "".join(original_lines) if any(x.endswith("\n") for x in original_lines) else "\n".join(original_lines)
     original_lines = [x.rstrip("\r\n") for x in original_lines]
 
     out_lines: list[str] = []
@@ -3815,6 +4185,8 @@ def rebuild_config_full(
         # 段之前的内容（含其他全局键、注释、空行）原样输出
         out_lines.extend(original_lines[cursor:start])
         body = render_section(section)
+        if body is not None:
+            body = _restore_section_order(original_lines, section, body)
         if body is None:
             # 没有可写方案 —— **保留原条目**，不是删掉。
             # 删掉的后果是「这一段的站这次全部判重复」就把整段清空。
@@ -3882,7 +4254,12 @@ def rebuild_config_full(
             "以下段本次没有可写方案，原条目已原样保留："
             + "、".join(untouched))
 
-    return "\n".join(out_lines), warnings
+    rendered = "\n".join(out_lines)
+    if configuration_semantically_equal(original_text, rendered):
+        return original_text, warnings
+    if original_text.endswith("\n") and not rendered.endswith("\n"):
+        rendered += "\n"
+    return rendered, warnings
 
 
 def _comments_for(comments_map: dict, section: str, sp: SectionPlan,

@@ -250,10 +250,31 @@ _EFFORT_RANKS: dict[str, int] = {
     "high": 3, "max": 4, "ultra": 4,
 }
 
-# 裸基名的档序：高于一切具名档（站方默认档就是它的推荐档）。
+# 裸基名的档序：等同「标准档」，**不**高于显式的 `-high` / `-max` / `-ultra`。
+#
+# 为什么不是 99（2026-10-11 修一次实测缺陷）
+# ----------------------------------------
+# 原值 99 把裸基名排在一切具名档之上，于是
+#     collapse_effort_tiers(["gemini-3.1-pro", "gemini-3.1-pro-high",
+#                            "gemini-3.1-pro-low"])
+#         -> ["gemini-3.1-pro"]
+# —— `-high` 被当成「更低档」压掉了。可 `-high` 是站方**显式声明的更高
+# 推理算力**，它不可能比默认档低；而 `gemini-3.1-pro-high` 本身就在本文件
+# 的 `FALLBACK_MODELS` 里，等于项目自己的清单里有、流水线却把它删了。
+# 这正是要求③点名的「同级系列没全勾」那一类（与
+# 「勾了 gpt-5.6 却没勾 gpt-5.6-sol」同一个病，换到算力轴上）。
+#
+# 新口径：裸基名 = 标准档（2）。配合 `collapse_effort_tiers` 里「裸基名永不
+# 被压掉」这一条豁免，结果是
+#     裸 + -high + -low  ->  裸 + -high        （低档压掉，高档与默认档都留）
+#     裸 + -low          ->  裸                （要求④：就高选择）
+#     -high + -low       ->  -high
+#     只有 -low          ->  -low              （红线 2：严禁不勾选）
+# 既满足要求③「同级全勾」，也满足要求④「不许高低并存而不就高」。
+#
 # 必须定义在 `_effort_split` 之前 —— 它在函数体里被引用，而模块加载时
 # 就会执行到那一行的默认返回。
-_BARE_EFFORT_RANK = 99
+_BARE_EFFORT_RANK = 2
 
 # 末段后缀：只认**具名**算力档（`-high` / `-low` / `-medium` …）。
 #
@@ -276,10 +297,12 @@ _EFFORT_SUFFIX = re.compile(r"^(.*?)[-.](" + "|".join(_EFFORT_RANKS) + r")$")
 
 
 def _effort_split(name: str) -> tuple[str, int]:
-    """拆出 (基名, 算力档序)。没有具名算力后缀的返回 (原名, 最高档)。
+    """拆出 (基名, 算力档序)。没有具名算力后缀的返回 (原名, 标准档)。
 
-    裸基名视为**最高档**：`gemini-3.1-pro` 是站方默认档，不该被它自己的
-    `gemini-3.1-pro-low` 顶掉。具名档按 low < medium < high < max 排。
+    裸基名视为**标准档**（`_BARE_EFFORT_RANK`，见那里的说明）：它高于
+    `-low` / `-minimal`，但**不**高于站方显式声明的 `-high` / `-max` /
+    `-ultra`。`collapse_effort_tiers` 另有一条「裸基名永不被压掉」的豁免，
+    所以 `gemini-3.1-pro` 不会被它自己的 `-high` 顶掉，两者并存。
 
     只拆**一层**后缀，且只认 `_EFFORT_RANKS` 里的具名档：
       · `gemini-3.1-pro-preview-search` 的 `search` 不在档表里 → 整名原样
@@ -717,6 +740,28 @@ def _gen_supersedes(win: str, lose: str,
     return gw[1] > gl[1]
 
 
+def policy_lower_models(prior: list[str], highest: list[str]) -> list[str]:
+    """Return only known, strictly older generations superseded by highest.
+
+    Selection filtering alone cannot authorize deletion: unknown names and
+    same-generation tier variants must remain outside this policy exception.
+    """
+    winners = newest_generation_per_line(list(dict.fromkeys(highest)))
+    removed = []
+    for old in dict.fromkeys(prior):
+        old_gen = generation(series_and_version(old)[1])
+        if not family(old) or old_gen is None or old in highest:
+            continue
+        for new in winners:
+            new_gen = generation(series_and_version(new)[1])
+            if (generation_family(new) == generation_family(old)
+                    and new_gen is not None and new_gen > old_gen
+                    and old not in newest_generation_per_line([old, new], keep_low_tier=True)):
+                removed.append(old)
+                break
+    return removed
+
+
 def newest_generation_per_line(names: list[str], *,
                                keep_low_tier: bool = False) -> list[str]:
     """只留最高档：先按族比主版本，再按产品线比完整世代。
@@ -955,11 +1000,25 @@ def collapse_effort_tiers(names: list[str]) -> list[str]:
     阶段 C 的注释当时声称已修掉 gemini 段 `-high`/`-low` 并存，
     实际只覆盖了走那个函数的那条路径。
 
-    判据仍是**相对**的（与阶段 C 同一套理由，不重复展开）：
-      · 同基名有更高档 → 压掉低档；
-      · 某站只提供 `-low` → 原样保留（否则该段清空，撞红线 2）；
-      · 裸基名视为最高档（站方默认档不该被自己的 `-low` 顶掉）；
+    判据（2026-10-11 收紧为「只压低于默认档的」）
+    ------------------------------------------
+    压掉一个变体的唯一条件是：它的档序**严格低于站方默认档**
+    （`_BARE_EFFORT_RANK`），而这个基名下确实还有一个「默认档及以上」的
+    变体可用。于是：
+
+      · `-low` / `-minimal`（低于默认）在有默认档或更高档时被压掉
+        —— 要求④「不许高低并存而不就高」；
+      · 裸基名、`-standard`、`-high`、`-max`、`-ultra`（默认档及以上）
+        **一律保留**，彼此不互相压制 —— 要求③「所有相同等级系列的模型
+        全部都要勾选上」。`gpt-6` / `-high` / `-max` 是同一个模型的推理
+        算力旋钮，留全了客户端才有的选；
+      · 某站只提供 `-low` → 没有「默认档及以上」可退，原样保留
+        （否则该段清空，撞红线 2「严禁出现不勾选」）；
       · 版本号不是算力档（`claude-opus-5` 的 `5`），见 `_EFFORT_SUFFIX`。
+
+    上一版的判据是「压掉一切低于组内最高档的」，两处都判错：
+    `gemini-3.1-pro` 会把自己的 `-high` 压掉（裸基名当时排 99），
+    而 `-max` 又会把 `-high` 压掉 —— 两者都是要求③点名的「同级没全勾」。
     """
     src = [str(n) for n in (names or []) if n]
     by_base: dict[str, list[str]] = {}
@@ -971,9 +1030,11 @@ def collapse_effort_tiers(names: list[str]) -> list[str]:
     for _base, variants in by_base.items():
         if len(variants) < 2:
             continue
-        best = max(_effort_split(v)[1] for v in variants)
-        for v in variants:
-            if _effort_split(v)[1] < best:
+        ranks = [_effort_split(v)[1] for v in variants]
+        if not any(r >= _BARE_EFFORT_RANK for r in ranks):
+            continue        # 全是低档 —— 无处可退，全留
+        for v, rank in zip(variants, ranks):
+            if rank < _BARE_EFFORT_RANK:
                 drop.add(v)
 
     seen: set[str] = set()
@@ -1322,6 +1383,10 @@ def _http_json(url: str, *, timeout: int, proxy: str | None):
         return json.loads(resp.read().decode("utf-8", "replace"))
 
 
+# 同步名录拉取的单飞锁。见 `remote_names` 里的说明。
+_SYNC_FETCH_LOCK = threading.Lock()
+
+
 def remote_names(*, timeout: int = 8, proxy: str | None = None,
                  use_cache: bool = True) -> tuple[list[str], str]:
     """拉 CPA 权威名录里的全部模型 id。返回 (名字列表, 失败原因)。
@@ -1343,7 +1408,31 @@ def remote_names(*, timeout: int = 8, proxy: str | None = None,
         ttl = _TTL_OK if _cache["ok"] else _TTL_BAD
         if now - _cache["at"] < ttl:
             return list(_cache["names"]), _cache["why"]
+    if not use_cache:
+        # 强制刷新 / 隔离测试：要的就是一次独立的真实拉取，不进单飞。
+        return _remote_names_fetch(timeout=timeout, proxy=proxy,
+                                   use_cache=False, key=key, now=now)
+    # 单飞（2026-10-12）：冷缓存时同一批次的 4 个段线程会同时未命中，
+    # 原来各自起线程池打 GitHub（最长 12 s）、各自 os.replace 写磁盘缓存，
+    # 且 GitHub 不通时按 _TTL_BAD=600 每 10 分钟对整批重来一次。
+    # 拿到锁后**再查一次**缓存：等锁期间另一个线程很可能刚把它填好。
+    with _SYNC_FETCH_LOCK:
+        now = time.time()
+        if _cache.get("key") == key and _cache["names"] is not None:
+            ttl = _TTL_OK if _cache["ok"] else _TTL_BAD
+            if now - _cache["at"] < ttl:
+                return list(_cache["names"]), _cache["why"]
+        return _remote_names_fetch(timeout=timeout, proxy=proxy,
+                                   use_cache=True, key=key, now=now)
 
+
+def _remote_names_fetch(*, timeout: int, proxy: str | None, use_cache: bool,
+                        key, now: float) -> tuple[list[str], str]:
+    """真正的拉取 + 三层回退。从 `remote_names` 机械搬出，逻辑逐字未动。
+
+    拆出来只为让 `remote_names` 能在锁下做「再查一次缓存」而不缩进整段。
+    调用方负责缓存命中判断与单飞；这里永远执行一次真实拉取。
+    """
     def _names_of(data) -> list[str]:
         names: list[str] = []
         # 结构：{provider: [{id, object, ...}, ...]}。只取 id，provider 分组

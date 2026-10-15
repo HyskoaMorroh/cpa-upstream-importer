@@ -10,6 +10,68 @@ function sourceFunction(name) {
   assert.ok(m);
   return m[0];
 }
+function recoveryContext(storage = new Map()) {
+  const nodes = new Map();
+  const ctx = {
+    S: {jobId: 'job-fixture', cursor: 0, picks: new Set(['1\u0000codex']), overrides: {}, forced: {}},
+    sessionStorage: {getItem: k => storage.get(k), setItem: (k, v) => storage.set(k, v), removeItem: k => storage.delete(k)},
+    $: k => { if (!nodes.has(k)) nodes.set(k, {checked: true, hidden: true, textContent: ''}); return nodes.get(k); },
+    step() {}, poll() { ctx.polls = (ctx.polls || 0) + 1; },
+  };
+  vm.createContext(ctx);
+  for (const name of ['planInputKey', 'saveJobRecovery', 'restoreJobRecovery']) vm.runInContext(sourceFunction(name), ctx);
+  return {ctx, storage};
+}
+test('refresh restores the same safe job and input-bound planning task', () => {
+  const {ctx, storage} = recoveryContext();
+  ctx.S.planTask = {id: 'task-fixture', inputKey: ctx.planInputKey()};
+  ctx.saveJobRecovery();
+  const restored = recoveryContext(storage).ctx;
+  restored.S.jobId = null;
+  assert.equal(restored.restoreJobRecovery(), true);
+  assert.equal(restored.S.jobId, 'job-fixture');
+  assert.equal(restored.S.planTask.id, 'task-fixture');
+  assert.equal(restored.S.planTask.inputKey, restored.planInputKey());
+  assert.equal(restored.polls, 1);
+  assert.deepEqual([...restored.S.picks], ['1\u0000codex']);
+});
+test('a task with stale inputs is not restored after refresh', () => {
+  const {ctx, storage} = recoveryContext();
+  ctx.S.planTask = {id: 'stale-task', inputKey: 'different-input'};
+  ctx.saveJobRecovery();
+  assert.equal(JSON.parse(storage.get('importer_job_recovery')).task, null);
+});
+test('manual secrets never enter recovery storage and repeated refresh stays guarded', () => {
+  const {ctx, storage} = recoveryContext();
+  ctx.S.overrides = {headers: {'Authorization': 'synthetic-secret'}};
+  ctx.S.forced = {model: 'synthetic-model'};
+  ctx.S.planTask = {id: 'task-fixture', inputKey: ctx.planInputKey()};
+  ctx.saveJobRecovery();
+  assert.doesNotMatch(storage.get('importer_job_recovery'), /synthetic-secret|Authorization|synthetic-model/);
+  const restored = recoveryContext(storage).ctx;
+  assert.equal(restored.restoreJobRecovery(), true);
+  assert.equal(restored.S.planTask, null);
+  assert.equal(restored.S.recoveryNeedsEdits, true);
+  restored.saveJobRecovery();
+  assert.equal(JSON.parse(storage.get('importer_job_recovery')).needsEdits, true);
+});
+test('expired and invalid recovery records are removed without polling', () => {
+  for (const patch of [{savedAt: 0}, {jobId: 'https://invalid'}, {selected: ['secret']}, {task: '<bad>'}]) {
+    const {ctx, storage} = recoveryContext();
+    ctx.saveJobRecovery();
+    storage.set('importer_job_recovery', JSON.stringify({...JSON.parse(storage.get('importer_job_recovery')), ...patch}));
+    assert.equal(ctx.restoreJobRecovery(), false);
+    assert.equal(storage.has('importer_job_recovery'), false);
+    assert.equal(ctx.polls, undefined);
+  }
+});
+test('finishing or restarting without a job clears recovery', () => {
+  const {ctx, storage} = recoveryContext();
+  ctx.saveJobRecovery();
+  ctx.S.jobId = null;
+  ctx.saveJobRecovery();
+  assert.equal(storage.has('importer_job_recovery'), false);
+});
 async function tuning(diff, advices = [{item: 'request-retry', advice_key: 'request-retry', changed: true, current: 1, want: 2}]) {
   const nodes = new Map();
   const ctx = {
@@ -20,6 +82,7 @@ async function tuning(diff, advices = [{item: 'request-retry', advice_key: 'requ
       tiers: [], notes: [], problems: [], diff, advices})
   };
   vm.createContext(ctx);
+  vm.runInContext(sourceFunction('tnInvalidatePreview'), ctx);
   vm.runInContext(sourceFunction('tnRun'), ctx);
   await ctx.tnRun();
   return {ctx, nodes};
@@ -47,6 +110,75 @@ test('a real tuning preview remains actionable with its readable label', async (
   assert.equal(nodes.get('#tnpreview').hidden, false);
   assert.equal(ctx.TN.id, 'synthetic-preview');
   assert.match(nodes.get('#tnlist').innerHTML, /request-retry/);
+});
+test('a failed tuning refresh invalidates the previous actionable preview', async () => {
+  const {ctx, nodes} = await tuning('fixture diff');
+  ctx.api = async () => { throw new Error('fixture connection interrupted'); };
+  await ctx.tnRun();
+  assert.equal(ctx.TN.id, '');
+  assert.equal(nodes.get('#tnpreview').hidden, true);
+  assert.equal(nodes.get('#tnapply').disabled, true);
+  assert.match(nodes.get('#tnbasis').innerHTML, /connection interrupted/);
+});
+test('a cancelled tuning request cannot resurrect an actionable preview', async () => {
+  const {ctx, nodes} = await tuning('fixture diff');
+  let complete;
+  ctx.api = () => new Promise(resolve => { complete = resolve; });
+  const pending = ctx.tnRun();
+  ctx.tnInvalidatePreview();
+  complete({tuning_id: 'obsolete', advices: [{changed: true}]});
+  await pending;
+  assert.equal(ctx.TN.id, '');
+  assert.equal(nodes.get('#tnpreview').hidden, true);
+  assert.equal(nodes.get('#tnapply').disabled, true);
+});
+
+function bulkPreviewContext() {
+  const nodes = new Map();
+  const ctx = {
+    BM: {bulkId: 'previous-preview', revision: 'fixture-revision', sel: new Set()},
+    esc: value => String(value ?? ''),
+    $: key => {
+      if (!nodes.has(key)) nodes.set(key, {hidden: false, disabled: false,
+        innerHTML: '', textContent: '', scrollIntoView() {}});
+      return nodes.get(key);
+    },
+    bmOps: () => [{op: 'fixture'}],
+    api: async () => ({changed: 1, bulk_id: 'new-preview', diff: 'fixture diff'}),
+  };
+  vm.createContext(ctx);
+  for (const name of ['bmInvalidatePreview', 'bmPreview']) vm.runInContext(sourceFunction(name), ctx);
+  return {ctx, nodes};
+}
+test('bulk no-op selection invalidates an older writeback preview', async () => {
+  const {ctx, nodes} = bulkPreviewContext();
+  ctx.bmOps = () => [];
+  await ctx.bmPreview('enable', true);
+  assert.equal(ctx.BM.bulkId, '');
+  assert.equal(nodes.get('#bmpreview').hidden, true);
+  assert.equal(nodes.get('#bmapply').disabled, true);
+});
+test('an older bulk response cannot replace the latest preview', async () => {
+  const {ctx, nodes} = bulkPreviewContext();
+  let complete;
+  ctx.api = () => new Promise(resolve => { complete = resolve; });
+  const oldRequest = ctx.bmPreview('enable', true);
+  ctx.api = async () => ({changed: 2, bulk_id: 'latest-preview', diff: 'latest diff'});
+  await ctx.bmPreview('enable', false);
+  complete({changed: 1, bulk_id: 'obsolete-preview', diff: 'obsolete diff'});
+  await oldRequest;
+  assert.equal(ctx.BM.bulkId, 'latest-preview');
+  assert.equal(nodes.get('#bmdiff').textContent, 'latest diff');
+});
+test('a malformed bulk result never enables writing', async () => {
+  for (const response of [{changed: 1}, {changed: NaN, bulk_id: 'invalid'}, {changed: -1}]) {
+    const {ctx, nodes} = bulkPreviewContext();
+    ctx.api = async () => response;
+    await ctx.bmPreview('enable', true);
+    assert.equal(ctx.BM.bulkId, '');
+    assert.equal(nodes.get('#bmapply').disabled, true);
+    assert.equal(nodes.get('#bmpreview').hidden, true);
+  }
 });
 test('export timeout remains active while the response body is pending', async () => {
   const handler = source.slice(source.indexOf('    be.onclick = async () => {'), source.indexOf("\n  $('#pickrec').onclick"));
@@ -94,7 +226,7 @@ function applyPickContext(plans, extra = {}) {
     synced: 0,
   };
   vm.createContext(ctx);
-  vm.runInContext(sourceFunction('applyPickPreset'), ctx);
+  vm.runInContext(['sectionPickVerdict', 'sectionPickAllowed', 'applyPickPreset'].map(sourceFunction).join('\n'), ctx);
   return {ctx, nodes};
 }
 
@@ -122,13 +254,27 @@ test('a preset click with a plan still selects rows', () => {
   assert.equal(ctx.refreshed, 1, 'selecting must schedule a plan refresh');
 });
 
-test('policy banner defaults to passive when metadata is absent', () => {
+// Absent metadata means the banner knows nothing, so it must not announce a
+// mode. Claiming "no upstream requests by default" was true only while probing
+// was disabled by default; once managed probing became the default that same
+// sentence told the operator the opposite of what the server would do.
+test('policy banner reports an unknown state when metadata is absent', () => {
   const node = {textContent: ''};
   const context = {S: {ctx: {}}, $: () => node};
   vm.createContext(context);
   vm.runInContext(sourceFunction('renderProbePolicy'), context);
   context.renderProbePolicy();
-  assert.match(node.textContent, /被动/);
+  assert.match(node.textContent, /未知/);
+  assert.doesNotMatch(node.textContent, /默认被动|不发送上游探测请求；分析/);
+});
+
+test('an explicitly disabled policy still says analysis only', () => {
+  const node = {textContent: ''};
+  const context = {S: {ctx: {probe_policy: {mode: 'passive', authorized_sites: 0}}}, $: () => node};
+  vm.createContext(context);
+  vm.runInContext(sourceFunction('renderProbePolicy'), context);
+  context.renderProbePolicy();
+  assert.match(node.textContent, /仅分析/);
   assert.match(node.textContent, /不发送/);
 });
 

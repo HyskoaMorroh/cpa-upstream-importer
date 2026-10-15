@@ -30,6 +30,7 @@ import copy
 import io
 import os
 import sys
+from unittest.mock import patch
 
 import yaml
 
@@ -60,7 +61,9 @@ _pass = 0
 def eq(name: str, got, want) -> None:
     global _pass
     if got != want:
-        _fail.append(f"{name}\n      got  = {got!r}\n      want = {want!r}")
+        # 基线可能是真实部署配置；失败报告只列断言名，避免泄漏凭据。
+        _fail.append(name)
+        print(f"  FAIL  {name}", flush=True)
     else:
         _pass += 1
         print(f"  ok  {name}")
@@ -71,6 +74,13 @@ def section(title: str) -> None:
 
 
 MODELS = ["claude-opus-5", "claude-opus-4-8"]
+
+_original_topup = cp.model_catalog.topup_to_market_top
+
+
+def _shape_topup(section, models, *, cfg=None, remote=None, proven=None):
+    """形状夹具隔离其他站点名录；每个成功模型仍由 make_result 显式提供证据。"""
+    return _original_topup(section, models, cfg={}, remote=remote, proven=proven)
 
 
 def make_result(row, *, compat_ok=True, claude_ok=True,
@@ -108,9 +118,21 @@ def make_result(row, *, compat_ok=True, claude_ok=True,
             need_proxy=proxy,
             successful_proxy_url=prox, category="可用"),
     }
+    for verdict in res.sections.values():
+        if verdict.usable:
+            verdict.attempts = [
+                Attempt(section=verdict.section, model=model, combo="baseline",
+                        status="200", category="ok", action="accept",
+                        elapsed_ms=1, resp_model=model, response_valid=True,
+                        successful_base_url=verdict.base_url)
+                for model in verdict.models
+            ]
     return res
 
 
+@patch("cpa_probe.model_catalog.remote_names", new=lambda **_kwargs: (
+    ["claude-opus-5-5", "claude-sonnet-5-5", "gemini-3.1-pro"],
+    "测试固定名录，不访问网络"))
 def _dead_section_params() -> None:
     """判死的段只要拿到目录，方案里就得是完整参数 —— 不留待定。
 
@@ -139,42 +161,28 @@ def _dead_section_params() -> None:
     sp = plan.sections.get("claude-api-key")
     eq("目录来源的判死段进得了方案", bool(sp is not None), True)
     if sp:
-        # 两条产品线各自升到市面最高次版本（2026-09-30 更新期望）
-        # -------------------------------------------------------
-        # 原期望 `["claude-sonnet-5", "claude-opus-5-5"]` 内部不一致：
-        # sonnet 线留在 `-5`，opus 线却升到 `-5-5`，而两条线在 CPA 权威名录
-        # 里都有 `-5-5`。`topup_to_market_top` 现在两条线一起补齐，
-        # 结果是一致的 `['claude-opus-5-5', 'claude-sonnet-5-5']` ——
-        # 符合要求②「每种类型只选该类型最高级别模型」与要求③
-        # 「所有相同等级系列的模型全部都要勾选上」。
-        #
-        # 这条与 `newest_generation_per_line` 无关（它对同一输入回
-        # `['claude-opus-5', 'claude-sonnet-5']`，与改动前一致）；
-        # `-5-5` 来自远程名录的 topup 补齐。
-        eq("模型取自目录并各线补到最高次版本",
-           sp.models, ["claude-opus-5-5", "claude-sonnet-5-5"])
+        # Catalog completion preserves candidates, not write evidence.
+        eq("最高族候选完整保留", sp.highest_models,
+           ["claude-opus-5-5", "claude-sonnet-5-5"])
+        eq("无成功证据时不可写模型", sp.models, [])
         eq("标注来源是目录", sp.model_source, "catalog")
         eq("priority 是确定的整数", bool(isinstance(sp.priority, int)), True)
         eq("priority >= 1", sp.priority >= 1, True)
         eq("priority 有理由", bool(bool(sp.priority_reason)), True)
         eq("headers 非空（门票不能空着写进去）", bool(bool(sp.headers)), True)
-        eq("可勾选", bool(sp.writable), True)
+        eq("无证据不可写入", bool(sp.writable), False)
         eq("带警告说明它没跑通",
            bool(any("目录" in w or "未跑通" in w for w in sp.warnings)), True)
 
-    # 无目录、无手填 —— 这段该缺席，不能凭空编模型名
-    # 既无目录也无手填 —— 现在用种子模型兜底进方案（严禁参数未定，
-    # 所以宁可给种子也不留空档），但标注来源为 seed 且不建议写。
+    # Seed candidates remain visible for follow-up probes without write evidence.
     sp_seed = plan.sections.get("gemini-api-key")
     eq("无目录无手填的段也进方案", bool(sp_seed is not None), True)
     if sp_seed:
         eq("标注来源是种子", sp_seed.model_source, "seed")
-        eq("种子段可勾选", sp_seed.writable, True)
-        # 2026-09-29：跟上 09-28 裁定 —— 勾选闸与写入闸分开。
-        # 探测判死、目录与原配置都没有这一族 = 纯猜测，但**仍默认勾选**
-        # （规则 ③⑵④ 末句禁止「不勾选模型 / 待定 / 让用户手工选」）；
-        # 「低次品不能落盘」由 server.py 的 confirm_weak 闸在写回前拦一次。
-        eq("种子段默认仍勾选", sp_seed.recommended, True)
+        eq("种子段不可写入", sp_seed.writable, False)
+        eq("种子段不冒充实测推荐", sp_seed.recommended, False)
+        eq("种子段不产生可写模型", sp_seed.models, [])
+        eq("种子段保留补探候选", bool(sp_seed.highest_models), True)
         eq("种子段依据是最弱一档（写回时要确认）",
            sp_seed.evidence_tier, "weak")
         eq("种子段 priority 是确定整数",
@@ -311,16 +319,20 @@ class Harness:
         """跑一批输入，返回 (合并后的 cfg, plans, diffs, 增量)。
 
         `pick` 复刻服务端 /api/plan 的选择集：None = 默认（只写系统建议的段），
-        "all" = 用户点了「全勾」。判死段现在也进方案且 writable，所以
-        **必须**在这里剪一遍，否则测的就不是生产路径 —— server.py 的
+        "all" = 用户点了「全勾」。方案可保留不可用段供展示，但写回仍须
+        具备成功探测证据。这里复刻默认推荐选择，server.py 的
         selected=None 分支正是退到 recommended。
         """
         rows = cp.parse_lines(text).valid
         bands: dict = {}
         seen = cp.existing_fingerprints(self.cfg)
         pairs = cp.existing_pairs(self.cfg)
-        plans = [cp.build_plan(r, make_result(r, **kw), self.cfg, bands=bands,
-                               seen=seen, seen_pairs=pairs) for r in rows]
+        # 写回边界样本仅使用本次伪探测的模型证据；远端名录不能注入未探测模型。
+        with patch("cpa_probe.model_catalog.remote_names", new=lambda **_kwargs: (
+                kw.get("models") or MODELS, "测试固定名录，不访问网络")), \
+                patch("cpa_probe.model_catalog.topup_to_market_top", new=_shape_topup):
+            plans = [cp.build_plan(r, make_result(r, **kw), self.cfg, bands=bands,
+                                   seen=seen, seen_pairs=pairs) for r in rows]
         for_write = []
         for pl in plans:
             keep = {sec: sp for sec, sp in pl.sections.items()
@@ -372,33 +384,36 @@ def main() -> int:
     # ---------------------------------------------------------------- ①
     section("① 同站 100 个 Key")
     r = h.run("\n".join(f"https://big.example.com,sk-big{i:04d}aaaabbbbcc"
-                        for i in range(100)))
+                        for i in range(100)), models=["claude-opus-5", "claude-opus-5-xhigh",
+                                                    "claude-opus-5-thinking", "claude-opus-4-8"])
     eq("YAML 校验", r["yaml_ok"], True)
     eq("claude 段 100 条（每 Key 一条）", r["d_claude"], 100)
     eq("compat 段只 +1 个 provider", r["d_provider"], 1)
-    eq("compat diff 只 1 处", r["per_section"]["openai-compatibility"], 1)
+    eq("最终 YAML 仅改变成功的两段",
+       {k for k in set(cfg) | set(r["new"]) if cfg.get(k) != r["new"].get(k)},
+       {"claude-api-key", "openai-compatibility"})
+    for sec in cp.SECTIONS:
+        eq(f"100 Key 写回保留 {sec} 全部原条目",
+           r["new"].get(sec, [])[:len(cfg.get(sec, []))], cfg.get(sec, []))
+    expected_keys = [f"sk-big{i:04d}aaaabbbbcc" for i in range(100)]
+    eq("Claude 新条目准确覆盖全部输入 Key",
+       [e["api-key"] for e in r["new"]["claude-api-key"][h.n_claude:]],
+       expected_keys)
     prov = h.compat_by_base(r["new"], "big.example.com")
     eq("provider 唯一", len(prov), 1)
     eq("100 个 Key 全在 api-key-entries",
-       len(prov[0].get("api-key-entries") or []), 100)
-    # 本意是「100 把 Key 归并后模型不被写 100 遍」。2026-09-10 起实测清单也过
-    # 「就高」闸：MODELS = ["claude-opus-5", "claude-opus-4-8"] 同属产品线
-    # claude-opus，(5,0) 高于 (4,8)，故只留 5 那一代。
-    #
-    # 2026-09-16 改判据：原来断言 `_mn == ["claude-opus-5"]`（只剩一个名字），
-    # 而那条**只在自带最小样本下成立** —— 样本里没有 `-max` / `-xhigh` /
-    # `-thinking` 这类同代变体。传真实 config.yaml 进来就必然失败：那份配置里
-    # 有 7 个站在卖 `claude-opus-5-max`、2 个在卖 `-thinking`、2 个在卖 `-xhigh`，
-    # 而它们**本来就该留着** —— 用户 docx 第 3⑵ 条原话：「所有相同等级系列的
-    # 模型全部都要勾选上，检测的时候发现如勾选的了 gpt-5.6 却没有勾选
-    # gpt-5.6-sol 这种重大失误」。
-    #
-    # 所以正确判据是「**只淘汰更低世代**、同代变体共存」，不是「只剩一个」。
-    _mm = prov[0].get("models") or []
+       len((prov[0] if prov else {}).get("api-key-entries") or []), 100)
+    eq("compat Key 身份及顺序与输入完全一致",
+       [e["api-key"] for e in prov[0]["api-key-entries"]], expected_keys)
+    # 100 把 Key 合并后模型不重复；每个同代变体均有显式成功探测证据。
+    # 形状夹具隔离其他站点名录；未实测候选的拒写另有独立负例。
+    _mm = (prov[0] if prov else {}).get("models") or []
     _mn = [m.get("name") if isinstance(m, dict) else m for m in _mm]
     eq("模型清单不重复", len(_mn), len(set(_mn)))
     eq("低世代 claude-opus-4-8 被淘汰", "claude-opus-4-8" in _mn, False)
     eq("最高世代 claude-opus-5 在清单里", "claude-opus-5" in _mn, True)
+    eq("实测同代 xhigh 保留", "claude-opus-5-xhigh" in _mn, True)
+    eq("实测同代 thinking 保留", "claude-opus-5-thinking" in _mn, True)
     from cpa_probe import model_catalog as _mcg
     _gens = {_mcg.generation(_mcg.series_and_version(n)[1]) for n in _mn}
     # 规则 ④（2026-09-26）：线顶 claude-opus-5-5 没实测、claude-opus-5 实测通过 ——
@@ -478,19 +493,16 @@ def main() -> int:
                         for i in range(4)), compat_ok=False)
     eq("YAML 校验", r["yaml_ok"], True)
     eq("claude +4", r["d_claude"], 4)
-    # 2026-09-29：跟上 09-28 裁定。compat 段判死、站方目录也没报 —— 清单是
-    # 市面猜测，但仍默认勾选（规则 ③⑵④），所以新站这里**会**多出一个
-    # provider。低次品不落盘由 server.py 的 confirm_weak 闸在写回前拦。
-    eq("compat 判死也进配置（weak 闸负责把关，不靠这里少写）",
-       r["d_provider"], 1)
-    eq("compat 有 diff", r["per_section"].get("openai-compatibility", 0), 1)
+    # 不可用段缺乏成功探测证据，直接调用写回边界也必须阻止生成配置。
+    eq("compat 不可用时不进配置", r["d_provider"], 0)
+    eq("compat 不可用时无 diff", r["per_section"].get("openai-compatibility", 0), 0)
 
     section("⑦ claude 段不可用")
     r = h.run("\n".join(f"https://ncl.example.com,sk-ncl{i:04d}aaaabbbbc"
                         for i in range(4)), claude_ok=False)
     eq("YAML 校验", r["yaml_ok"], True)
-    # 同上：判死的 claude 段现在也默认勾选，4 把 Key 各一条。
-    eq("claude 段判死也进配置（weak 闸把关）", r["d_claude"], 4)
+    # 每把 Key 都必须具有对应协议与模型的成功证据。
+    eq("claude 段不可用时不进配置", r["d_claude"], 0)
     eq("compat +1", r["d_provider"], 1)
 
     # ---------------------------------------------------------------- ⑧
@@ -521,37 +533,97 @@ def main() -> int:
         pname = str(existing_prov.get("name"))
         pbase = str(existing_prov.get("base-url") or "")
         pn0 = len(existing_prov.get("api-key-entries") or [])
+        existing_probe_models = list(dict.fromkeys(
+            MODELS + [str(m["name"]) for m in existing_prov.get("models") or []
+                      if isinstance(m, dict) and m.get("name")]))
         # 用 provider 的 host 造输入 —— base_for 会按段补 /v1
         import re as _re
         phost = _re.sub(r"^https?://", "", pbase).split("/")[0]
 
         section(f"⑨ 撞已有 provider（{pname}）· 1 个新 Key")
-        r = h.run(f"https://{phost},sk-brandnew01aaaabbbbcc")
+        r = h.run(f"https://{phost},sk-brandnew01aaaabbbbcc", models=existing_probe_models)
         eq("YAML 校验", r["yaml_ok"], True)
         eq("走的是合并而非新建", bool(r["merged"]), True)
-        eq("provider 总数不变", r["d_provider"], 0)
         eq("merged_into 记了 provider 名",
            r["merged"][0].merged_into, pname)
         prov = h.compat_named(r["new"], pname)
         eq(f"{pname} 仍唯一", len(prov), 1)
-        eq("Key 数 +1", len(prov[0].get("api-key-entries") or []), pn0 + 1)
         eq("无重名 provider", h.no_dup_names(r["new"]), [])
-        # 现有 provider 的其他字段不能被动
-        eq("现有 models 未被改",
-           len(prov[0].get("models") or []),
-           len(existing_prov.get("models") or []))
+        # 不变式是「同一个桶、同一档」，**不是**「provider 总数不变」
+        # （2026-10-11 改）
+        # ----------------------------------------------------------
+        # 原来这里钉 `d_provider == 0` 与 `Key 数 == pn0 + 1`，即「一站一行
+        # provider」。那比用户第 7 条要求的更强，而且与 CPA 的结构冲突：
+        # `models` 是 provider 级字段（CPA 的 OpenAICompatibilityAPIKey 只有
+        # api-key / weight / proxy-url，见 CLIProxyAPI
+        # internal/config/config_types.go:878-888，**没有** per-key models），
+        # 所以新 Key 本轮实测到的清单与原 provider 不同时，并进同一行就等于
+        # 让原有 Key 凭空声称支持它没验过的模型。那条反向契约由
+        # tests/test_config_preservation_regressions.py 的
+        # `test_append_preserves_provider_without_retained_key_model_evidence`
+        # 钉着，两条断言直接互斥。
+        #
+        # 第 7 条禁止的是拆**桶**（同域名多把 Key 是彼此的备份，拆桶后
+        # sub2api 只调度最小那个）。桶由 (渠道, 域名) 推导，与 provider 名
+        # 无关 —— 见 writeback.rebuild_config_full 里 compat_groups 上方的
+        # 说明。所以拆行可以，拆桶与拆档不行。
+        #
+        # 这两项原来只在传真实 config.yaml 时才跑（合成配置没有「多 Key 的
+        # compat provider」，⑨⑩⑪ 自己打印「跳过」），所以这处矛盾长期
+        # 没被发现。现在改为逐项核对桶与档。
+        same_base = [e for e in (r["new"].get("openai-compatibility") or [])
+                     if isinstance(e, dict)
+                     and str(e.get("base-url") or "") == pbase]
+        eq("新 Key 落在同一个 base-url 下", bool(same_base), True)
+        eq("同一桶内只有一个 priority 层级",
+           sorted({e.get("priority") for e in same_base}),
+           [existing_prov.get("priority")])
+        _keys_now = {k.get("api-key") for e in same_base
+                     for k in (e.get("api-key-entries") or [])
+                     if isinstance(k, dict)}
+        eq("同桶 Key 数 +1", len(_keys_now), pn0 + 1)
+        # 现有 provider 的其他字段不能被动。
+        #
+        # models 是**例外**，锁的是「一个都不能少」而不是「数量不许变」
+        # （2026-10-05 改）：加 Key 时这一轮实测到的新模型要落盘 ——
+        # 要求文档第 8 点明写「添加账号（包含上述提到的所有参数更新）」，
+        # 而模型清单决定 CPA 往这个 provider 路由哪些模型，静默丢掉实测
+        # 结果就是「看着正常、实际永远不路由新模型」。
+        # 原来这里是数量相等，于是实测到比配置更新一代的模型（现场：
+        # 配置有 claude-opus-5，实测 model_source=probed 报出
+        # claude-opus-5-5）落盘后数量 2→3 就判失败。
+        # 配套契约见 tests/test_config_preservation_regressions.py 的
+        # CompatAppendKeyTests；「没证据别补市面猜测」由 plan.py 的证据闸
+        # 兜住（test_no_evidence_this_round_does_not_add_market_models），
+        # 那一轮 sp.models 等于原清单，落盘就是恒等变换。
+        _old_names = {m.get("name") for m in existing_prov.get("models") or []
+                      if isinstance(m, dict)}
+        # 整桶合起来看：原有模型一个都不能少。拆行后原模型留在原行、
+        # 新模型在新行，所以要取并集 —— 按单行判会把「拆行」误报成「丢模型」。
+        _new_names = {m.get("name") for e in same_base
+                      for m in (e.get("models") or [])
+                      if isinstance(m, dict)}
+        eq("现有 models 一个都没少", sorted(_old_names - _new_names), [])
         eq("现有 priority 未被改",
            prov[0].get("priority"), existing_prov.get("priority"))
 
         section(f"⑩ 撞已有 provider · 3 个新 Key")
         r = h.run("\n".join(f"https://{phost},sk-multi{i:04d}aaaabbbb"
-                            for i in range(3)))
+                            for i in range(3)), models=existing_probe_models)
         eq("YAML 校验", r["yaml_ok"], True)
         eq("仍是合并", bool(r["merged"]), True)
-        eq("provider 总数不变", r["d_provider"], 0)
-        prov = h.compat_named(r["new"], pname)
-        eq("Key 数 +3", len(prov[0].get("api-key-entries") or []), pn0 + 3)
         eq("无重名 provider", h.no_dup_names(r["new"]), [])
+        # 同 ⑨：桶与档是不变式，provider 行数不是。
+        same_base = [e for e in (r["new"].get("openai-compatibility") or [])
+                     if isinstance(e, dict)
+                     and str(e.get("base-url") or "") == pbase]
+        eq("同一桶内只有一个 priority 层级",
+           sorted({e.get("priority") for e in same_base}),
+           [existing_prov.get("priority")])
+        _keys_now = {k.get("api-key") for e in same_base
+                     for k in (e.get("api-key-entries") or [])
+                     if isinstance(k, dict)}
+        eq("同桶 Key 数 +3", len(_keys_now), pn0 + 3)
 
         # ------------------------------------------------------------ ⑪
         section("⑪ 已存在的 Key 再导一次 · 两层判重")
@@ -623,8 +695,17 @@ def main() -> int:
     for sec in cp.SECTIONS:
         res.sections[sec] = SectionVerdict(
             section=sec, usable=True, base_url=rows[0].base_for(sec),
-            models=seed[sec], category="可用")
-    plan = cp.build_plan(rows[0], res, cfg)
+            models=seed[sec], category="可用", attempts=[
+                Attempt(section=sec, model=model, combo="baseline", status="200",
+                        category="ok", action="accept", elapsed_ms=1,
+                        resp_model=model, response_valid=True,
+                        successful_base_url=rows[0].base_for(sec))
+                for model in seed[sec]])
+    with patch("cpa_probe.model_catalog.remote_names", new=lambda **_kwargs: (
+            [model for models in seed.values() for model in models],
+            "测试固定名录，不访问网络")), \
+            patch("cpa_probe.model_catalog.topup_to_market_top", new=_shape_topup):
+        plan = cp.build_plan(rows[0], res, cfg)
     for sec in cp.SECTIONS:
         eq(f"{sec} 方案带上主导 prefix",
            plan.sections[sec].prefix, cp.dominant_prefix(cfg, sec))
@@ -638,7 +719,7 @@ def main() -> int:
         got = [e for e in new2[sec] if isinstance(e, dict)
                and "pfxtest.example.com" in str(e.get("base-url", ""))]
         eq(f"{sec} 落盘条目带 prefix",
-           str(got[0].get("prefix") or ""), cp.dominant_prefix(cfg, sec))
+           str(got[0].get("prefix") or "") if got else None, cp.dominant_prefix(cfg, sec))
     comp = [e for e in new2["openai-compatibility"] if isinstance(e, dict)
             and "pfxtest.example.com" in str(e.get("base-url", ""))]
     # 期望值从**被测的那份文件**现算，不写死。
@@ -647,7 +728,7 @@ def main() -> int:
     # 断言就假失败 —— 与今天修掉的那批「基线钉在会变的文件上」同一类缺陷。
     _want_pfx = cp.dominant_prefix(cfg, "openai-compatibility")
     eq("compat 段新条目的 prefix 跟随该段主导值",
-       str(comp[0].get("prefix") or ""), _want_pfx)
+       str(comp[0].get("prefix") or "") if comp else None, _want_pfx)
     # prefix 参与 CPA 的五元组指纹，必须在算 fp 前定下来
     eq("prefix 进了指纹计算",
        cp.dedup_key("claude-api-key", api_key="k", base_url="https://x.com",
@@ -656,8 +737,28 @@ def main() -> int:
        True)
 
     section("原文件")
+    # 模拟客户端把未实测同代模型加入方案，独立验证服务端写回闸门。
+    gate_cfg = copy.deepcopy(cfg)
+    unverified = "claude-opus-5-thinking"
+    gate_cfg.setdefault("claude-api-key", []).append({
+        "api-key": "sk-fixture-catalog-only", "base-url": "https://catalog-only.example.com",
+        "models": [{"name": unverified, "alias": unverified}],
+    })
+    gate_raw = yaml.safe_dump(gate_cfg, allow_unicode=True, sort_keys=False)
+    gate_row = cp.parse_lines("https://unverified-target.example.com,sk-fixture-unverified-target").valid[0]
+    with patch("cpa_probe.model_catalog.remote_names", new=lambda **_kwargs: (
+            MODELS, "测试固定名录，不访问网络")):
+        gate_plan = cp.build_plan(gate_row, make_result(gate_row), gate_cfg)
+    gate_section = gate_plan.sections["claude-api-key"]
+    gate_section.models.append(unverified)
+    eq("未实测同代模型进入候选方案", unverified in gate_section.models, True)
+    eq("候选不会伪造成功证据", unverified in gate_section.verified_models, False)
+    gate_plan.sections = {"claude-api-key": gate_section}
+    gate_diffs = build_diffs(gate_raw, [gate_plan])
+    eq("含未实测模型的段禁止写回", len(gate_diffs), 0)
+    eq("拒绝写回后真实基线副本不变", apply_diffs(gate_raw, gate_diffs) == gate_raw, True)
     eq("config.yaml 逐字节未变",
-       io.open(cfg_path, encoding="utf-8").read(), raw)
+       io.open(cfg_path, encoding="utf-8").read() == raw, True)
     if _tmp:
         import shutil
         shutil.rmtree(_tmp, ignore_errors=True)

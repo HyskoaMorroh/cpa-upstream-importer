@@ -44,13 +44,31 @@ SUITES = ["test_probe.py", "test_server.py", "test_pipeline.py",
           "test_public_redaction.py", "test_recovery_catalog.py",
           "test_request_path_latency.py", "test_transient_connection.py",
           "test_release_gate.py", "test_probe_policy.py",
-          "test_probe_policy_transport.py", "test_passive_flows.py"]
+          "test_probe_policy_transport.py", "test_passive_flows.py",
+          "test_config_preservation_regressions.py", "test_job_lifecycle_regressions.py",
+          "test_ui_receipt_structure.py", "test_async_diag.py", "test_probe_evidence_regressions.py",
+          "test_probe_wait_regressions.py", "test_probe_scheduling.py", "test_deploy_runtime_contracts.py",
+          "test_managed_probe_defaults.py", "test_comment_roundtrip.py",
+          "test_bulk_stamp_idempotence.py", "test_model_write_evidence.py",
+          "test_host_limiter_fairness.py", "test_event_retention.py",
+          "test_dns_deadline.py", "test_model_dead_end_profiles.py",
+          "test_blocked_apply_regressions.py", "test_plan_model_attempt_evidence.py",
+          "test_runtime_health_regressions.py", "test_shape_reuse_evidence.py",
+          "test_provider_admission.py", "test_legacy_policy_recovery.py",
+          "test_policy_restart_recovery.py"]
+
+# New safety and status regressions run with the production policy engine.
+REGRESSION_SUITES = ["test_body_rule_boundaries.py","test_catalog_restriction_scope.py","test_catalog_single_flight.py","test_family_model_sweep.py","test_generation_write_guard.py","test_initialization_progress.py","test_mihomo_healthcheck_readonly.py","test_model_identity_boundary.py","test_plan_evidence_proposal.py","test_plan_json_model_evidence.py","test_ledger_failure_diagnostics.py","test_profile_failure_evidence.py","test_progress_identity.py","test_source_last_good.py","test_source_partial_snapshot.py","test_source_public_status.py","test_source_refresh_concurrency.py","test_tuning_evidence_safety.py","test_credential_scope_isolation.py","test_probe_pacing_adaptive.py","test_event_log_observability.py","test_classifier_version_recovery.py","test_substitute_model.py"]
+SUITES.extend(REGRESSION_SUITES)
 
 # 前端用例跑在 Node 上，`web/app.js` 的真实函数由 vm 直接取源码执行。
 # 它们原来只能手跑，于是「python tests/run.py 全绿」从来不包含前端 ——
 # 而现场报的「定档失败 Failed to fetch」「轮询无响应」「黑屏」全在这一层。
 # Node 缺失、超时或没有执行用例均为失败，发布闸不能部分验证却报全绿。
-NODE_SUITES = ["test_web_runtime.test.js", "test_recovery_web.test.js"]
+NODE_SUITES = ["test_web_runtime.test.js", "test_recovery_web.test.js",
+               "test_preview_contract.test.js", "test_poll_connection.test.js",
+               "test_ledger_recovery_web.test.js", "test_catalog_status_web.test.js",
+               "test_drift_status.test.js", "test_tutorial_copy.test.js"]
 
 
 def _run_node_suites() -> tuple[int, list[str], str]:
@@ -115,6 +133,10 @@ def _count_cases(out: str) -> int:
                 return int(line.split("·")[1].strip().split()[0])
             except (IndexError, ValueError):
                 pass
+        # 独立套件成功小结：`通过 7 项`；锚定整行避免累加单项进度。
+        m = re.fullmatch(r"通过\s+(\d+)\s+项", line.strip())
+        if m:
+            return int(m.group(1))
         # unittest: `Ran 42 tests in 0.161s`
         m = re.match(r"^Ran (\d+) tests? in ", line.strip())
         if m:
@@ -143,6 +165,9 @@ def main() -> None:
     # 子进程也要按 UTF-8 输出，否则它们自己先在 GBK 上崩
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
+    # Direct unittest entry points need both application and shared fixture imports.
+    env["PYTHONPATH"] = os.pathsep.join(
+        [os.path.dirname(HERE), HERE] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     # 真实 config.yaml 走**环境变量**而不是命令行位置参数。
     #
     # 2026-09-16 实测：原来写成 `cmd = [py, path] + ([cfg] if cfg else [])`，
@@ -159,8 +184,8 @@ def main() -> None:
         path = os.path.join(HERE, suite)
         # Policy tests exercise the real fail-closed engine. Legacy protocol
         # tests explicitly authorize synthetic fixtures, never real upstreams.
-        policy_suites = {"test_probe_policy.py", "test_probe_policy_transport.py", "test_passive_flows.py"}
-        cmd = ([sys.executable, path] if suite in policy_suites else
+        policy_suites = {"test_probe_policy.py", "test_probe_policy_transport.py", "test_passive_flows.py", "test_probe_wait_regressions.py", "test_managed_probe_defaults.py", "test_pipeline.py", "test_provider_admission.py", "test_legacy_policy_recovery.py", "test_policy_restart_recovery.py"}
+        cmd = ([sys.executable, path] if suite in policy_suites or suite in REGRESSION_SUITES else
                [sys.executable, os.path.join(HERE, "with_synthetic_policy.py"), path])
         print(f"\n{'#' * 66}\n# {suite}\n{'#' * 66}")
         r = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace",

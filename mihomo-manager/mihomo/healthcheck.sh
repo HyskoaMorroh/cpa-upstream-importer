@@ -43,6 +43,46 @@
 
 set -u
 
+# ---- 整体 30 秒硬上限（2026-10-13 并回）----------------------------------
+# 为什么必须有：下面每一步各自有超时（nc -w 5、wget -T 12），但**步数不定**
+# —— api_alive + group_node_count + probe_via_proxy + switch_to + probe_direct
+# 串起来最坏能超过 compose 里 `timeout: 40s` 的闸。docker 的 healthcheck 超时
+# 只会把这一轮判失败，**不会回收已经发出去的 wget/nc 子进程**，于是每 60 秒
+# 的检查周期都可能留下残留进程。
+#
+# 为什么要 setsid + 负 PID：busybox 的 timeout 只对**直接子进程**发信号。
+# 本脚本的 wget/nc 是孙子进程，直接 kill 子进程杀不到它们；把整个检查放进
+# 独立进程组（setsid），超时后用 `kill -- -$pid` 按进程组清理才干净。
+#
+# 两种基座都要能跑（见文件头的说明）：busybox 基座用 `busybox timeout` /
+# `busybox setsid`，Debian 基座用自带的。两者都没有时直接报缺工具而不是
+# 装作检查通过 —— 那会把"无法验证"误报成"健康"。
+if [ "${1:-}" != "--bounded-child" ]; then
+    _timeout=""
+    _setsid=""
+    if command -v timeout >/dev/null 2>&1; then _timeout="timeout"
+    elif command -v busybox >/dev/null 2>&1; then _timeout="busybox timeout"; fi
+    if command -v setsid >/dev/null 2>&1; then _setsid="setsid"
+    elif command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -qx setsid; then
+        _setsid="busybox setsid"
+    fi
+    if [ -z "$_timeout" ] || [ -z "$_setsid" ]; then
+        echo "[healthcheck] 缺少 timeout/setsid（装 busybox 或 coreutils 即可）；无法给检查设硬上限" >&2
+        exit 1
+    fi
+    $_setsid $_timeout -k 2 30 sh "$0" --bounded-child &
+    _check_pid=$!
+    cleanup() {
+        # 负 PID 只针对本次检查自己的进程组，不会碰 mihomo 主进程。
+        kill -KILL "-$_check_pid" 2>/dev/null || true
+    }
+    trap 'cleanup; exit 1' HUP INT TERM
+    wait "$_check_pid"
+    _result=$?
+    cleanup
+    exit "$_result"
+fi
+
 API_HOST="${MIHOMO_API_HOST:-127.0.0.1}"
 API_PORT="${MIHOMO_API_PORT:-9090}"
 PROXY_HOST="${MIHOMO_PROXY_HOST:-127.0.0.1}"
@@ -119,17 +159,24 @@ group_node_count() {
 }
 
 # ---- 经代理实际出一次网。wget -Y on 让 busybox 认 http_proxy ----
+# 必须清掉 no_proxy / NO_PROXY（2026-10-13 并回）：宿主或 compose 里只要
+# 有一条绕过规则命中探测地址，wget 就会**直连**出去并成功，于是代理全挂
+# 也报健康 —— 把"代理可用"误判成真，正是本脚本要防的那件事。
+# 四个变量大小写都给：busybox wget 与 GNU wget 认的拼写不完全一致。
 probe_via_proxy() {
     [ -n "$WGET" ] || return 1
     http_proxy="http://$PROXY_HOST:$PROXY_PORT/" \
     https_proxy="http://$PROXY_HOST:$PROXY_PORT/" \
+    HTTP_PROXY="http://$PROXY_HOST:$PROXY_PORT/" \
+    HTTPS_PROXY="http://$PROXY_HOST:$PROXY_PORT/" \
+    no_proxy="" NO_PROXY="" \
         $WGET -q -Y on -T 12 -O /dev/null "$PROBE_URL" >/dev/null 2>&1
 }
 
 # ---- 不经代理直连 ----
 probe_direct() {
     [ -n "$WGET" ] || return 1
-    http_proxy="" https_proxy="" \
+    http_proxy="" https_proxy="" HTTP_PROXY="" HTTPS_PROXY="" \
         $WGET -q -Y off -T 12 -O /dev/null "$PROBE_URL" >/dev/null 2>&1
 }
 

@@ -46,7 +46,15 @@ services:
       IMPORTER_PORT: "8765"
       IMPORTER_CONFIG: "/data/config.yaml"
       IMPORTER_BACKUP_DIR: "/backups"
+      # 源码缓存跨容器重建保留，网络失败时显示陈旧状态。
+      CPA_SOURCE_CACHE_DIR: "${CPA_SOURCE_CACHE_DIR:-/backups/source-cache}"
+      # 探测模式。默认 managed —— 点探测就真发请求，不需要预先配许可文件。
+      # 风控在请求层：同站串行、预算按站共享（换 Key 不解除）、最小间隔、
+      # 站方明确拒绝即对该站停手并持久记账。passive 只做分析、不发请求。
+      IMPORTER_PROBE_MODE: "${IMPORTER_PROBE_MODE:-managed}"
+      # 可选的站点覆盖文件：只为个别站单独调额度时才建，不存在不影响使用。
       IMPORTER_PROBE_POLICY_FILE: "${IMPORTER_PROBE_POLICY_FILE:-/backups/probe-policy.json}"
+      # 持久账本：记用量与「已停手」站点，删掉会让被拒站点重新被探测。
       IMPORTER_PROBE_LEDGER: "${IMPORTER_PROBE_LEDGER:-/backups/probe-policy.sqlite3}"
       # 不设则每次启动随机生成并打印到日志；也可直接用 CPA 后台管理密码登录
       IMPORTER_TOKEN: "${IMPORTER_TOKEN:-}"
@@ -207,8 +215,8 @@ services:
     volumes:
       - mihomo-config:/mihomo-config
     healthcheck:
-      # 不只判活，还会在节点全挂时把 PROXY 组切到 DIRECT ——
-      # docker 的 healthcheck 本身改不了 mihomo 选路，那件事得脚本自己做。
+      # 只读检查 API 与真实代理出口，均须返回 2xx；失败标为 unhealthy。
+      # 不切换 DIRECT/AUTO，不修改配置。restart 策略不会自动重启 unhealthy 容器。
       # 详见 mihomo-manager/mihomo/healthcheck.sh 的开头说明。
       #
       # 用 .sh 而不是 .py（2026-09-19 改）：本镜像是 Debian slim，
@@ -228,8 +236,6 @@ services:
       - MIHOMO_PROXY_PORT=7890
       - MIHOMO_SECRET=${MIHOMO_SECRET:-}
       - MIHOMO_PROBE_URL=${MIHOMO_PROBE_URL:-https://www.gstatic.com/generate_204}
-      - MIHOMO_STATE_FILE=${MIHOMO_STATE_FILE:-/tmp/mihomo-egress-state}
-      - MIHOMO_GROUP=${MIHOMO_GROUP:-PROXY}
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }

@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit
 
 from .parse import SECTIONS, ParsedRow, base_for_section, host_of
-from . import model_catalog
+from . import model_catalog, fingerprint
 # pipeline 不导入 plan，这个方向无环。只取白名单判定，
 # 目录读回来的名字必须过同一道白名单 —— 不然中转站目录里的
 # embedding / whisper / tts 之类会被注册成对话模型。
@@ -332,6 +332,23 @@ def _cooling_override(v) -> bool | None:
     return None
 
 
+def _existing_entry_for(cfg: dict, section: str, base_url: str,
+                        api_key: str) -> dict | None:
+    """按完整来源 URL 和 Key 查找原条目；compat 返回 provider 级配置。"""
+    scope = _source_url(base_url)
+    for entry in cfg.get(section) or []:
+        if not isinstance(entry, dict):
+            continue
+        if _source_url(str(entry.get("base-url") or "")) != scope:
+            continue
+        keys = (entry.get("api-key-entries") or []
+                if section == "openai-compatibility" else [entry])
+        if any(isinstance(key, dict) and str(key.get("api-key") or "") == api_key
+               for key in keys):
+            return entry
+    return None
+
+
 def existing_models_for(cfg: dict, section: str, base_url: str,
                         api_key: str) -> list[str]:
     """这个 (段, 站, Key) 在原 config.yaml 里注册着哪些模型。没有就空列表。
@@ -340,40 +357,16 @@ def existing_models_for(cfg: dict, section: str, base_url: str,
     它是先前一轮实测沉淀的。见 build_plan 里 seed 分支的说明。
 
     按完整来源 URL 和 Key 匹配；主机规范化不能把不同路径的模型证据混在一起。
+    compat 的 models 在 provider 级，组内所有 Key 共用同一份。
     """
-    scope = _source_url(base_url)
-
-    def names(models) -> list[str]:
-        out = []
-        for m in models or []:
-            if isinstance(m, dict):
-                n = str(m.get("name") or "").strip()
-                if n and n not in out:
-                    out.append(n)
-        return out
-
-    if section == "openai-compatibility":
-        # compat 的 models 在 provider 级，组内所有 Key 共用同一份 ——
-        # 所以只要这个 Key 在这个 provider 的 api-key-entries 里就算命中。
-        for prov in cfg.get("openai-compatibility") or []:
-            if not isinstance(prov, dict):
-                continue
-            if _source_url(str(prov.get("base-url") or "")) != scope:
-                continue
-            for ke in prov.get("api-key-entries") or []:
-                if isinstance(ke, dict) and str(ke.get("api-key") or "") == api_key:
-                    return names(prov.get("models"))
-        return []
-
-    for e in cfg.get(section) or []:
-        if not isinstance(e, dict):
-            continue
-        if str(e.get("api-key") or "") != api_key:
-            continue
-        if _source_url(str(e.get("base-url") or "")) != scope:
-            continue
-        return names(e.get("models"))
-    return []
+    entry = _existing_entry_for(cfg, section, base_url, api_key)
+    out = []
+    for model in (entry or {}).get("models") or []:
+        if isinstance(model, dict):
+            name = str(model.get("name") or "").strip()
+            if name and name not in out:
+                out.append(name)
+    return out
 
 
 def existing_pairs(cfg: dict) -> dict[str, set[str]]:
@@ -1873,6 +1866,8 @@ class SectionPlan:
     # 是对象数组），重新序列化既要处理缩进又要处理引号风格，而原文行拿来就能
     # 用、且逐字保真。键序也跟着原文，diff 干净。
     carry_lines: list[str] = field(default_factory=list)
+    # Exact source block is private writeback metadata, never a public preview.
+    source_block: list[str] = field(default_factory=list, repr=False)
     # 新条目要补的 request-scoped-errors（2026-09-13）
     #
     # 为什么需要它：carry_lines 只对**既有**条目有值（_prepare_source_plan 从
@@ -1943,6 +1938,8 @@ class SectionPlan:
     provider_name: str = ""
     # Additive API metadata; existing models and constructor positions stay intact.
     highest_models: list[str] = field(default_factory=list)
+    model_rebuild: bool = False
+    model_scan_pending: list[str] = field(default_factory=list)
     model_provenance: dict[str, str] = field(default_factory=dict)
     # 这一段探测的最终结论（照抄 SectionVerdict），供「建议写入」按证据判定。
     #
@@ -1956,6 +1953,9 @@ class SectionPlan:
     probe_action: str = ""
     probe_policy_code: str = ""
     probe_policy_reason: str = ""
+    # Raw successful model names, kept separately from selected/inferred names.
+    verified_models: list[str] = field(default_factory=list)
+    model_evidence_block: str = ""
 
     @property
     def hijacked(self) -> list[Impact]:
@@ -2006,7 +2006,10 @@ class SectionPlan:
         # write_blocked 非空 = 落盘那一层会拒掉它。界面必须与落盘一致 ——
         # 显示「可写」而实际写不进，操作员勾了也没有反馈，是 2026-09-03
         # 现场那一类缺陷的成因。
-        return not self.duplicate and bool(self.models) and not self.write_blocked
+        # 策略停止留下的 prior 清单只用于保留原配置，不是本轮新写入的证据。
+        # 与 recommended 的停止闸一致，避免统计报可写、手工勾选又绕过默认闸。
+        return (not self.probe_policy_code and not self.duplicate
+                and bool(self.models) and not self.write_blocked)
 
     @property
     def recommended(self) -> bool:
@@ -2135,7 +2138,7 @@ class SectionPlan:
         why = (self.probe_action or "").strip() or cat or "探测未通过"
         if cat in self._KEY_DEAD:
             return (f"站方明确拒绝这把 Key（{cat}：{why}）—— 写哪个模型都是死条目，"
-                    "默认不写；充值或换 Key 后重探会自动放行，确知可用可手工勾选")
+                    "不写入；充值或换 Key 后重新探测，取得当前模型的成功证据后再生成写回方案")
         # 2026-09-28 撤回 09-27 的第三次收紧（用户当日裁定）
         # ------------------------------------------------
         # 09-27 那版在这里加了「本轮没有一个模型实测通过 → catalog / prior /
@@ -2206,11 +2209,11 @@ class SectionPlan:
             if self.catalog_stale:
                 return (f"模型取自站方目录（{len(self.models)} 个），但"
                         f"{self.catalog_stale_why} —— 整份目录都是老款，"
-                        "默认不勾。确知该站只卖这些且够用，可手工勾上")
+                        "候选尚未验证；需逐模型探测成功后再生成写回方案")
             return (f"推理未通过，模型取自站方目录（{len(self.models)} 个）"
-                    " —— 参数已按试用期算全，确知可用再勾")
+                    " —— 目录仅提供候选，需当前凭证和端点的逐模型成功证据才能新增写入")
         if self.model_source == "manual":
-            return f"手填 {len(self.models)} 个模型，工具未验证 —— 参数已算全"
+            return f"手填 {len(self.models)} 个模型；手填不代表验证成功，新增写入仍需当前凭证和端点的逐模型成功证据"
         if self.model_source == "prior":
             return (f"推理未通过、目录也读不到，已沿用原 config.yaml 里这个"
                     f"条目的 {len(self.models)} 个模型 —— 那是先前一轮的实测"
@@ -2332,6 +2335,39 @@ def _fallback_headers(section: str, v, cfg: dict | None,
         # 而不是某个写死的数字 —— 宁可少几个头也不要发错协议的头。
         std = sorted((p for p in rungs if p.tier >= 1), key=lambda p: p.tier)
     return _render(dict(std[0].headers), api_key) if std else {}
+
+
+def _current_verified_models(row, result, verdict, base_url: str) -> list[str]:
+    """Only this credential's successful, model-matching calls prove a model.
+
+    Verdict model lists may contain discovery or shape-reuse candidates. They
+    cannot replace actual attempts for the exact credential and write target.
+    """
+    source = getattr(result, "row", None)
+    if (not getattr(verdict, "usable", False) or source is None
+            or source.api_key != row.api_key or source.bare != row.bare):
+        return []
+    try:
+        target = base_for_section(base_url, verdict.section, declared_base=True)
+    except ValueError:
+        return []
+    proven = set()
+    for attempt in getattr(verdict, "attempts", ()):
+        try:
+            attempted_base = base_for_section(
+                getattr(attempt, "successful_base_url", ""), verdict.section,
+                declared_base=True)
+        except ValueError:
+            continue
+        if (getattr(attempt, "section", None) == verdict.section
+                and getattr(attempt, "ok", False) is True
+                and attempted_base == target
+                # Missing identity is not a semantic failure, but cannot prove
+                # a newly proposed model. resp_model also covers modelVersion.
+                and bool(getattr(attempt, "resp_model", None))
+                and fingerprint.model_matches(attempt.model, attempt.resp_model)):
+            proven.add(attempt.model)
+    return [model for model in verdict.models if model in proven]
 
 
 def build_plan(
@@ -2501,7 +2537,20 @@ def build_plan(
             elif not successful and not mapped:
                 model_warns.append("代理来自显式运行配置，但尚无成功出口证据；请确认 CPA 可达")
         headers = dict(v.min_headers) if v.need_ua else {}
-        if not headers and not v.usable:
+        old_entry = _existing_entry_for(cfg, section, base, row.api_key)
+        keep_existing_headers = not v.usable and old_entry is not None
+        prior_headers = {str(k): str(val) for k, val
+                         in (old_entry or {}).get("headers", {}).items()
+                         } if isinstance((old_entry or {}).get("headers"), dict) else {}
+        # 空字典也代表既有配置；不能因为其为空就替换成猜测画像。
+        if keep_existing_headers:
+            # 判死段的默认画像是**猜测**，不是本轮实测；原条目的头是操作员
+            # 或先前实测沉淀的事实。拿猜测顶上去会静默改写既有门票 ——
+            # 实测复现：被动模式下自定义 User-Agent / originator 被换成
+            # 本工具写死的 codex-tui 画像。原值在，就用原值。
+            headers = dict(prior_headers)
+            model_warns.append("本轮未实测，请求头沿用 config.yaml 原值")
+        elif not headers and not v.usable:
             # 判死的段：min_headers 是空的（探测没走到「确定最省可用档」那步），
             # 但门禁站恰恰是判死里的多数 —— 它判死的原因往往就是门票不对。
             # 空 headers 写进 config.yaml 那条目必然废掉。
@@ -2656,8 +2705,9 @@ def build_plan(
         # 断言的正是最省档要保持最省。
         #
         # 用段标准档取值而不是全量档：设备指纹那类头有站方会拒（同 _fallback_headers）。
-        if section == "codex-api-key" and "originator" not in {
-                h.lower() for h in headers.keys()}:
+        # 无成功测量的既有条目只保留原状，不补头，也不因原状缺头而阻断预览。
+        if (section == "codex-api-key" and not keep_existing_headers
+                and "originator" not in {h.lower() for h in headers}):
             std = _fallback_headers(section, v, cfg, row.api_key)
             for sk, sv in std.items():
                 if sk.lower() == "originator" and sv:
@@ -2861,10 +2911,34 @@ def build_plan(
             if prior:
                 models, model_source = prior, "prior"
 
-        # The approved highest-family policy also applies to existing entries.
-        # Catalog and market names are suggestions, never probe successes.
-        if not forced_models:
-            prior = existing_models_for(cfg, section, base, row.api_key)
+        # 本轮没有实测证据时，既有清单原样保留（2026-10-02）。
+        # ------------------------------------------------------------
+        # 下面那套「同产品线取最高世代 + 补齐到市面最新」的前提是**本轮真的
+        # 探过**：有实测结论才谈得上「这个站现在卖什么」。策略拒绝（被动模式、
+        # 预算耗尽、站方限制）时尚无完整结果，拿市面猜测去重排既有清单，
+        # 等于用猜测覆盖先前实测沉淀的事实。
+        #
+        # 本机实跑（2026-10-02，173 条生产配置的副本）：被动模式下全量重探
+        # 把 969 个模型名改成 690 个 —— 删掉 417、换进 138 个这些站从没报过
+        # 的名字。没有条目被清空，所以界面上看不出来；要等 CPA 轮到那个条目、
+        # 对着站方没有的模型发请求才会暴露。
+        #
+        # 手填（forced_models）不受此约束：那是操作员的显式意图，不是猜测。
+        # 只为明确的策略中断保留原清单；普通完成路径仍应用原有代际规则。
+        # 部分模型成功也不能证明其余旧模型失效，保留旧顺序并追加本轮
+        # 确实验证过的协议兼容模型，不混入市面猜测。
+        prior = existing_models_for(cfg, section, base, row.api_key)
+        if (not forced_models and prior
+                and getattr(v, "probe_policy_code", "")):
+            verified = [m for m in v.models
+                        if model_catalog.section_protocol_ok(section, m)]
+            models = list(dict.fromkeys(list(prior) + verified))
+            model_source = "prior"
+            model_warns.append(
+                "本轮实测被策略打断，沿用原模型并保留未测项，未按市面最新重排"
+                if v.models else
+                "本轮未实测，模型清单沿用 config.yaml 原值，未按市面最新重排")
+        elif not forced_models:
             candidates = list(dict.fromkeys(
                 list(models) + list(v.models) + list(v.catalog) + prior))
             # 两级过滤，与上面 catalog 分支同一套判据（2026-09-12 接齐）
@@ -3008,9 +3082,46 @@ def build_plan(
                 models = model_catalog.collapse_effort_tiers(models)
                 model_source = "seed"
             catalog_stale, stale_why = False, ""
+        # Selection describes the complete family to investigate; a write proposal
+        # must additionally prove every change for this credential and endpoint.
+        # A successful subset says nothing about the untested historical models.
+        scan_pending = list(getattr(v, "model_scan_pending", []) or [])
+        if scan_pending:
+            model_warns.append(
+                "尚未完成补验：" + "、".join(scan_pending)
+                + "；" + (getattr(v, "model_scan_pending_reason", "") or "等待补验"))
+        highest_models = list(models)
+        verified_models = _current_verified_models(row, result, v, base)
+        verified_set = set(verified_models)
+        if not forced_models:
+            proposed = [m for m in models if m in verified_set]
+            family_complete = (bool(highest_models)
+                               and set(highest_models).issubset(verified_set)
+                               and not scan_pending
+                               and not getattr(v, "probe_policy_code", ""))
+            policy_removed = set()
+            if rebuild and family_complete:
+                policy_removed = set(model_catalog.policy_lower_models(prior, highest_models))
+            models = list(dict.fromkeys([m for m in prior if m not in policy_removed] + proposed))
+            pending = [m for m in highest_models
+                       if m not in prior and m not in verified_set]
+            if pending:
+                model_warns.append(
+                    f"完整模型族中 {len(pending)} 个新增候选待逐模型补探；"
+                    "候选仍保留展示，本次写回不加入未验证模型："
+                    + "、".join(pending))
+            if policy_removed:
+                model_warns.append("全量重探已完整验证最高族，按代际规则移除旧低代："
+                                   + "、".join(sorted(policy_removed)))
+            preserved = [m for m in prior if m not in highest_models and m not in policy_removed]
+            if preserved:
+                model_warns.append(
+                    ("最高族尚未全部验证或历史模型不属可替换低代，保留原清单："
+                     if rebuild else "添加账号保留历史模型清单：")
+                    + "、".join(preserved))
         provenance = {
-            m: ("verified" if v.usable and m in v.models else "inferred")
-            for m in models
+            m: ("verified" if m in verified_set else "inferred")
+            for m in dict.fromkeys(list(models) + highest_models)
         }
         inferred = [m for m, source in provenance.items() if source == "inferred"]
         if inferred:
@@ -3028,8 +3139,9 @@ def build_plan(
             # 直接 False，界面默认一个都不勾、`for_write` 为 0、写回没有 diff：
             # 探测跑完却什么都写不进去。
             #
-            # 而用户对补齐的要求原文是「如果检测出来没有高级模型按该系列该
-            # 类型模型的最高级进行**填充勾选**」—— 补齐项就是要勾上的。
+            # 用户要求完整最高族可见并参与补探；highest_models 保存完整候选，
+            # 实际 models 只新增逐模型验证成功项。完整族成功后的全量重建，
+            # 才允许按代际策略移除旧低代；添加账号仍保留历史清单。
             #
             # 依据强度并没有丢：逐模型的 verified / inferred 记在
             # `model_provenance` 里，经 server.py 带到界面；上面那条警告把
@@ -3165,8 +3277,11 @@ def build_plan(
                 or existing_models_for(cfg, section, base, row.api_key)),
             catalog_stale=catalog_stale,
             catalog_stale_why=stale_why,
-            highest_models=list(models),
+            highest_models=highest_models,
+            model_rebuild=bool(rebuild and not forced_models),
+            model_scan_pending=scan_pending,
             model_provenance=provenance,
+            verified_models=verified_models,
             probe_usable=bool(getattr(v, "usable", False)),
             probe_category=str(getattr(v, "category", "") or ""),
             probe_action=str(getattr(v, "action", "") or ""),
@@ -3187,8 +3302,9 @@ def build_plan(
         # 真实客户端形态），于是一个**明明带了** originator 的条目被判成缺失。
         # HTTP 头名本身大小写不敏感，`merge_entry_headers` 也是「大小写不敏感
         # 但保留原写法」，这里跟它同口径。
-        if section == "codex-api-key" and "originator" not in {
-                h.lower() for h in headers.keys()}:
+        # 无成功测量的既有条目只保留原状，不补头，也不因原状缺头而阻断预览。
+        if (section == "codex-api-key" and not keep_existing_headers
+                and "originator" not in {h.lower() for h in headers}):
             raise ValueError(
                 f"codex 段条目缺少 originator 头。base={base}, "
                 f"headers={list(headers.keys())}")
@@ -3254,10 +3370,10 @@ def build_plan(
         if forced_offfamily:
             sp.warnings.append(
                 f"手填的 {', '.join(forced_offfamily)} 不在本工具的四族清单"
-                "（gemini / gpt / claude / kimi）里 —— 已按你的指定写入。"
+                "（gemini / gpt / claude / kimi）里，已作为手工候选保留。"
                 "compat 段走 /chat/completions，CPA 侧对模型名零校验，"
                 "能不能用完全取决于上游认不认；本工具不会主动推荐这类模型，"
-                "也没有验证过它")
+                "手填不代表探测成功，新增写入仍需当前凭证和端点的逐模型成功证据")
 
         if model_source == "manual":
             # 手填现在也可能发生在**探测通过**的段上（2026-09-03）：操作员把
@@ -3270,15 +3386,15 @@ def build_plan(
                                if v.models else "（实测清单为空）")
                 sp.warnings.append(
                     f"探测判「{v.category or '可用'}」{probed_note}，"
-                    f"但已按你手填的清单写入：{', '.join(models)}。"
-                    "工具没有验证过手填的这些模型能用")
+                    f"手工指定的模型清单：{', '.join(models)}。"
+                    "手填不代表验证成功；缺少当前凭证和端点成功证据的新增模型不得写入，请先补探")
             else:
                 sp.priority_reason = (
                     f"人工接管（探测判「{v.category or '不可用'}」）· {reason}")
                 sp.warnings.append(
                     f"探测未通过（{v.category or '不可用'} — {v.action or ''}），"
                     f"模型清单由你手工指定：{', '.join(models)}。"
-                    "工具没有验证过这些模型能用")
+                    "手填不代表验证成功；缺少当前凭证和端点成功证据的新增模型不得写入，请先补探")
         elif model_source == "catalog":
             # 两种处境，措辞要分开（2026-09-03）：
             #   · usable=False —— 推理没通过，目录是唯一线索
@@ -3287,22 +3403,20 @@ def build_plan(
             #     说「推理请求未通过」在这一种下是错的。
             if v.usable:
                 sp.priority_reason = (
-                    f"未验证（端点通但返回的模型对不上，清单取自目录）· {reason}")
+                    f"未验证（端点有响应，但缺少逐模型成功证据）· {reason}")
                 sp.warnings.append(
-                    f"端点响应正常、凭证有效，但每次返回的模型都与请求不一致"
-                    f"（静默换模或 200 包错误体），实测清单为空 —— "
-                    f"已改用站方 /models 目录报的 {len(v.catalog)} 个里通过本段"
-                    f"规则的前 {len(models)} 个：{', '.join(models)}。"
-                    "这些名字是站方自己报的，比工具猜测可靠，但仍未经推理验证")
+                    f"端点有响应，但尚未取得可用于模型写回的逐项成功证据。"
+                    f"站方 /models 目录列出 {len(v.catalog)} 个候选模型；"
+                    "目录不代表当前凭证可用，也不能证明响应模型身份一致。"
+                    "候选待逐模型补探；新增写入须有当前凭证、同一端点且响应模型身份一致的成功证据")
             else:
                 sp.priority_reason = (
                     f"未验证（探测判「{v.category or '不可用'}」，模型取自目录）· {reason}")
                 sp.warnings.append(
                     f"推理请求未通过（{v.category or '不可用'} — {v.action or ''}），"
-                    f"但目录 GET 读到 {len(v.catalog)} 个模型，已取前 {len(models)} 个："
-                    f"{', '.join(models)}。"
-                    "站方目录只说明「声称有」，不等于这把 Key 的分组能用 —— "
-                    "很多站禁止推理测活却确实可用，确知可用再勾")
+                    f"目录 GET 读到 {len(v.catalog)} 个候选模型。"
+                    "目录仅说明站方列出了这些名字，不代表探测成功或当前凭证可用。"
+                    "候选待逐模型补探；新增写入须有当前凭证、同一端点且响应模型身份一致的成功证据")
             # 目录里一个四族的都没有、于是收下了四族之外的名字。
             # 这不是「工具推荐」，措辞必须说清为什么退这一步。
             kept_off = [m for m in models if m in catalog_offfamily]

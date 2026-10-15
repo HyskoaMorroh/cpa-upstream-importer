@@ -15,7 +15,7 @@
 
 | 问题 | 这个工具怎么办 |
 |---|---|
-| 一个新账号该进哪个段？带不带 `/v1`？ | 四段各打一次真实请求定归属，`base-url` 形态按段自动规范化 |
+| 一个新账号该进哪个段？带不带 `/v1`？ | 按协议、目录证据与共享请求预算探测定归属，`base-url` 形态按段自动规范化 |
 | `priority` 填多少？ | 读现有档位谱 + `weight:0` + 注释里的实测结论，给出**不挡在用站**的最高档 |
 | 站方静默换模了怎么办？ | 比对返回的 `model` 字段，换模的默认不勾选 |
 | 写完 `config.yaml` 后 CPA 不生效 | 自动 `PUT` 触发重载 + **读回校验**（抓 inode 分叉） |
@@ -32,26 +32,93 @@
 ---
 
 
-## 探测许可与封号风险
+## 已有共享 VPS 部署：先看这里
 
-默认只做被动分析，不向用户上游发送请求。配置解析、模型规则检查、定档、差异预览和写回仍可使用；“未实测”不是“不可用”，也不是“已验证可用”。
+### 同站多 Key 与模型能力的写回规则
 
-只有站方明确允许主动探测，并且管理员给该站配置了许可规则，才会发起请求。`/models`、生成请求、能力检查、WebSocket 握手、重试和代理请求共用预算。不要把公告中的“超过 10 次封禁”理解为 9 次安全；统计窗口和适用范围必须以站方政策为准。
+同站同段的 Key 保持相同优先级，并不表示每把 Key 都能调用同一组模型。`openai-compatibility` 按原 provider 身份、规范化端点和完整渲染能力分组，不跨能力组拼接模型并集，避免把某把 Key 未验证的模型注册到它名下。
 
-- `IMPORTER_PROBE_POLICY_FILE`：私有 JSON 许可文件，建议 `/backups/probe-policy.json`。
-- `IMPORTER_PROBE_LEDGER`：持久化 SQLite 账本，建议 `/backups/probe-policy.sqlite3`。已有 backup 卷必须保留，不能靠重启、换 Key、换代理或重建任务重置限额。
-- 缺文件、格式错误、账本不可写或损坏时拒绝主动请求，不自动放行。
-- 403/429 或明确禁测、封禁响应会停止该 provider；不会自动换凭据、代理或画像继续试，也不会自动解封。
-- HTTP 自动重定向不再跟随，避免隐藏的第二次请求绕开预算；确认站方许可后填写最终 API 地址。
-- CPA 管理重载与业务探针不同：管理重载可以完成，但未绑定实际目标的网关生成验证默认跳过。写回成功不能称为上游验证成功。
+未选中的凭据只有在能力完全不变时才可与更新结果保留在同一 provider；否则留在原 provider 并保留原模型清单，优先级仍与同域同段对齐。需要新组时使用避开已有名称的 `compat-group-N`，名称不包含域名、密钥、headers 或这些内容的摘要。后续按精确凭据找回来源，保留分组名称，重复写回不应重复建组。
 
-配置结构为 `{"version":1,"sites":{}}`，空站点表即被动模式。每个站点规则必须明确提供 `enabled`、`provider`、`max_requests`、`max_requests_per_credential`、`window_seconds`、`min_interval_seconds`。`provider` 用来把同一服务的不同域名归入一个共享预算；不支持通配符授权。额度、窗口与间隔没有“免封号默认值”，请按站方允许的政策设置。策略文件与账本不提交 Git，也不打入镜像。
+下文历史记录中的“保留 provider 名称”和“同站不分裂”，分别指保持已有身份和避免优先级漂移，不能解释为禁止按模型能力分组。分组仍须通过逐凭据证据检查；单元测试通过不代表最终镜像已完成真实探测、写回及下游路由验收。
+
+### 共享配置与升级入口
+
+实际运行配置位于 `/opt/deploy`：外层 `.env`、`docker-compose.yml`、`nginx.conf`、`config.yaml` 与另一个项目共用。只修改 importer 对应配置和必要的共享接口，保留其他服务、网络、卷、代理及其变量。仓库内同名文件是独立模板，不能整份覆盖外层文件；本地隔离测试的 compose 也不是生产配置替代品。
+
+| 配置位置 | 要核对的内容 |
+|---|---|
+| 外层 `.env` | 设置私有 `IMPORTER_TOKEN`；按外层 compose 提供 `CPA_MANAGEMENT_PASSWORD`。当前外层 compose 不引用 `CONFIG_PATH`，添加该变量不会改变挂载 |
+| 外层 compose 的 `upstream-importer` 服务 | 容器环境 `CPA_MANAGEMENT_TOKEN` 映射外层管理密码；CPA 地址可从容器网络访问；真实配置挂载可读写；备份和探测账本持久化 |
+| 仓库独立模板 | 服务名为 `cpa-upstream-importer`；用 `CONFIG_PATH` 指定宿主机源文件，管理口令直接使用 `CPA_MANAGEMENT_TOKEN`，不要与外层变量名混淆 |
+| 共享 mihomo | 复用已有服务和网络地址，保留订阅、控制器鉴权、持久卷与另一项目的引用；仓库的可选代理 profile 只用于需要独立部署的情况 |
+| nginx | 宿主机 nginx 可用回环端口；容器 nginx 应使用共同网络中的服务地址。入口鉴权、请求大小、CSP 与任务轮询都要核对 |
+
+当前外层 compose 使用 `./config.yaml` 作为宿主机挂载源；部署文件位于 `/opt/deploy/docker-compose.yml` 时，对应 `/opt/deploy/config.yaml`。容器内使用 `/data/config.yaml`，由 `IMPORTER_CONFIG` 交给镜像入口，入口再传给 `server.py --config`。改变宿主机文件位置应核对 compose 的 volume 源，不能只改容器路径或添加未被引用的 `.env` 变量。直接运行 Python 时应显式传 `--config`，程序不会自动读取 `.env` 的 `CONFIG_PATH`。
+
+在 VPS 上更新前先保存私有配置副本。以下命令明确选择实际部署文件，且仅更新 importer 服务；执行更新前确认拟部署镜像的标签或 digest。分支镜像不等于 `latest`，以 CI 实际生成的标签为准。
+
+```bash
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml config --quiet
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml pull upstream-importer
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml up -d --no-deps upstream-importer
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml ps upstream-importer
+```
+
+**验收必须覆盖四条真实流程。** 健康检查通过、单元测试通过或镜像构建成功，都不能单独证明网页可以使用。按添加账号→探测→定档→模型选择→预览 diff→写回→配置读回/CPA 重载的顺序检查；再分别完成路由批量管理、全局调优体检、全量重探的预览与写回验证。记录镜像 digest、前后端版本、任务终态及脱敏差异。真实测试使用私有配置副本和账号文件，保留原始生产配置作为基线。
+
+出现空白参数、`Failed to fetch`、轮询中断、未完成定档或无法解释的模型选择时，停止该方案写回并排查。目录候选不等于请求验证成功；“未实测”“证据不足”“站方拒绝”“预算耗尽”必须保留真实含义，不能转换成成功状态。写盘、读回、CPA 重载、业务请求验证是四个不同结果，应分别核对。
+
+源码提交前同时检查 Git 已跟踪文件、待提交差异和 Docker 构建上下文；忽略规则不会移除已经跟踪的文件。真实域名、上游地址、密钥、订阅、个人信息、MHTML、排查日志、私有教程与备份不进入仓库或镜像。本文后部保留历史设计和排查说明，它们不构成本轮实测通过的证明。
+
+策略预选与写回证据分开显示：最新代及上一代高端候选可以按策略预选，但没有对应协议的成功请求证据时，不能用候选替换已有模型列表。模型清单缺少变更证据时保留原清单，并显示阻断原因；这不代表所有参数或整段都冻结，独立的定档和调优变更仍按各自条件审查。停止任务意味着停止继续安排请求，已经完成的证据仍保留，不能把中止标成探测成功。
+
+**如何看次数和耗时。** 页面中的“推理尝试”只统计已记录的推理尝试，不包含模型目录等 HTTP 请求，也不包含发送前被策略拒绝的操作；显示 0 次不表示整个任务没有联网。排查性能时分别记录初始化、排队、目录查询、推理、定档和写回耗时，并同时查看成功数、失败数与阻断数。并发任务不能用单项耗时直接乘账号数估计总时长；全部被阻断的批次也不能用来证明正常探测更快。
+
+## 探测行为与封号风险
+
+你点「开始探测」「单站诊断」「全量重探」时**会真实请求目标站点** —— 这是本项目的核心功能，不需要预先准备任何许可文件。降低封号风险的手段落在请求本身，而不是靠关掉功能：
+
+- 同一凭据跨协议与别名串行，不同凭据在共享并发上限内运行；同一主机第 2 把 Key 起复用已探明的形态，只验凭证本身。
+- 预算按**站**共享，不按 Key 分摊 —— 换 Key、换代理都不能绕开限额。
+- 最小请求间隔 + 站方 `Retry-After` 退避。
+- 普通 403 / 429 会停止该站当次任务，并按 `Retry-After` 或默认 900 秒进入跨任务冷却；冷却到期只允许新任务重新核实，不能将旧失败变为成功。明确禁测、封禁或仅允许指定客户端的拒绝属于持续停止，保留账本证据，不能通过换凭据、代理或重启绕过。
+- `/models`、生成请求、能力检查、WebSocket 握手、重试与代理请求**共用**同一份预算。
+- HTTP 自动重定向不跟随，避免隐藏的第二次请求绕开预算。
+
+这是风险控制，不是安全保证：任何主动请求都可能被站方判定为异常。不要把公告里的「超过 10 次封禁」理解为 9 次安全 —— 统计窗口与适用范围以站方政策为准。
+
+环境变量：
+
+- `IMPORTER_PROBE_MODE`：`managed`（默认，按上述约束发真实探针）或 `passive`（只做解析与配置分析、完全不发上游请求，排障用）。
+- `IMPORTER_PROBE_LEDGER`：持久化 SQLite 账本，建议 `/backups/probe-policy.sqlite3`。**必须可写**，否则一切主动请求被拒（界面会直接说明是账本不可写，而不是假装探测完成）。已有 backup 卷必须保留，不能靠重启、换 Key、换代理或重建任务重置限额。
+- `IMPORTER_PROBE_POLICY_FILE`：**可选**的站点覆盖文件，只在要给个别站单独收紧/放宽额度时才建。文件不存在不影响使用；存在但格式错误会拒掉全部请求，不会静默放行。
+
+覆盖文件结构为 `{"version":1,"sites":{...}}`，每个站点规则必须明确提供 `enabled`、`provider`、`max_requests`、`max_requests_per_credential`、`window_seconds`、`min_interval_seconds`。`provider` 把同一服务的不同域名归入一个共享预算；不支持通配符。写了这个文件就以它为准：未列出的站点不再被探测。`sites` 为空表示显式关闭主动探测。策略文件与账本不提交 Git，也不打入镜像。
+
+**并发上限与账号隔离。** 可选 `max_inflight` 为 1～64 的整数，限制同一个 `provider` 同时占用的请求槽位；同一服务的别名规则必须使用相同限额。已有覆盖规则省略该字段时保持上限 1，明确填写 1 也保持串行；系统托管规则的默认上限为 4。同一凭据跨协议及别名仍串行，不同凭据才可在共享上限内并行。页面的任务并发数不等于单站同时请求数：请求间隔、预算、主机限制、冷却和停止状态仍同时生效。提高并发上限不会增加请求预算，也不能解除历史结果待核对的暂停。
+
+CPA 管理重载与业务探针不同：管理重载可以完成，但未绑定实际目标的网关生成验证会被跳过并如实标为「未实测」。写回成功不能称为上游验证成功。
 
 对不允许测试的站点，使用真实业务已有的日志、配置和模型说明进行被动检查；不要通过改写测试文本或伪装正常业务规避其限制。
 
-## 快速上手
 
-### 第 0 步：填 `.env`（唯一需要动手的配置文件）
+### 探测任务中断：账本与结算凭证配套保留
+
+页面显示“历史请求结果待核对”或“预约执行者未知”，表示某次请求的最终结果仍不确定，相关上游暂停新的探测。刷新页面、重复提交或重启容器不会自动解除暂停。
+
+探测账本与同目录的结算凭证数据库必须一起持久化；后者的文件名是在账本文件名后追加 `.settlements.sqlite3`。升级镜像时保留整个持久化目录，不要只迁移其中一个数据库，也不要删除、清空账本或换空目录来恢复探测。备份前停止新探测并等待正在执行的任务结束，使用一致快照；SQLite 写入期间直接复制单个数据库文件可能遗漏尚未归并的数据。恢复时使用同一时点的成对备份。
+
+1. 在原实例查看原任务状态和脱敏日志，确认是否仍在执行；避免多个实例重复提交同一上游。
+2. 核对容器是否被强制终止、重启或迁移，并检查原持久化目录以及配套结算凭证是否完整挂载。
+3. 已有匹配的完整结算凭证时，系统在读取策略账本时校验签名、预约与执行身份后恢复结算；校验不通过则继续暂停，应核对备份及存储完整性。
+4. 凭证缺失时继续核对原实例日志、任务结果及上游请求或用量记录。等待很久、当前没有任务或容器已重启都不能证明旧请求没有执行。当前版本没有跳过核对的一键解锁，缺失结果的预约仍保持暂停。
+
+恢复中断请求不会解除已确认的上游使用限制，也不会重置冷却时间或历史使用记录。旧版本缺少证据的限制标记按既有受控恢复规则处理，不应手工改成可用。结果未知的请求不能记为探测、定档或写回成功；验收须保留受影响范围与未完成原因，待实际执行及独立结果核对完成后再更新结论。
+
+## 独立部署模板：仅本地开发参考（VPS 使用共享主栈）
+
+### 第 0 步：核对挂载、网络与 `.env`
 
 ```bash
 git clone <你的仓库地址> && cd cpa-upstream-importer
@@ -59,17 +126,17 @@ cp .env.example .env
 $EDITOR .env
 ```
 
-逐行说明 —— 只有第一行是硬性必填，其余按需：
+以下是独立模板的变量。共享部署还必须核对外层 compose 的变量映射、CPA 管理鉴权、网络与文件写权限：
 
 | 变量 | 必填 | 填什么 | 不填的后果 |
 |---|---|---|---|
 | `CONFIG_PATH` | **是** | CPA 的 `config.yaml` 在宿主机上的**绝对路径**，例如 `/opt/deploy/config.yaml` | `docker compose up` 直接报错退出（compose 用 `${CONFIG_PATH:?}`） |
 | `IMPORTER_TOKEN` | 建议 | 投喂台登录口令，随便一串 | 每次启动随机生成并打印到日志，**重启就变**，得去日志里翻 |
-| `CPA_MANAGEMENT_TOKEN` | 建议 | CPA 后台的**管理密码**（原始密码，不是 config.yaml 里的 bcrypt 哈希） | 「按 CPA 运行状态定优先级」静默退回静态检测分，日志只有一行提示 |
+| `CPA_MANAGEMENT_TOKEN` | 建议 | CPA 后台的**管理密码**（原始密码，不是 config.yaml 里的 bcrypt 哈希） | 管理历史统计可能不可用；无匹配历史分时按检测分继续排序，并记录日志（不代表当前调度健康） |
 | `CPA_UPSTREAM_URL` | 否 | 默认 `http://cli-proxy-api:8317`；与 CPA 不在同一 compose 项目时改成可达地址 | 写回后不触发 CPA 重载，也拿不到运行时健康分 |
-| `IMPORTER_UID` / `IMPORTER_GID` | 视情况 | `stat -c '%u:%g' /opt/deploy/config.yaml` 的输出 | 属主不一致时写回 `PermissionError` |
-| `MIHOMO_SUB_WOG` / `MIHOMO_SUB_WOGB` | 用代理才填 | 机场订阅链接（含 token） | 不用代理可留模板值；用了 `--profile mihomo` 而没填，init 容器会报错退出 |
-| `MIHOMO_SECRET` | 用代理才填 | mihomo 9090 API 的鉴权串 | 留空则同网段任意容器都能改出口节点 |
+| `IMPORTER_UID` / `IMPORTER_GID` | 视情况 | `stat -c '%u:%g' /opt/deploy/config.yaml` 的输出 | 容器用户没有文件及所需目录的写权限时写回失败 |
+| `MIHOMO_SUB_WOG` / `MIHOMO_SUB_WOGB` | 新建独立代理时填写 | 机场订阅链接（含 token） | 不用代理可留模板值；用了 `--profile mihomo` 而没填，init 容器会报错退出 |
+| `MIHOMO_SECRET` | 新建独立代理时填写 | mihomo 9090 API 的鉴权串 | 留空则同网段任意容器都能改出口节点 |
 
 其余变量（`IMAGE`、`PULL_POLICY`、`BIND_ADDR`、`HOST_PORT`、`MEMORY_LIMIT`、
 `MIHOMO_BIND` 等）在 `.env.example` 里都有注释与默认值，一般不用动。
@@ -80,10 +147,10 @@ $EDITOR .env
 # 不用代理
 docker compose up -d
 
-# 站方按出口 IP 拦截（CF 人机验证等）时，连代理一起起
+# 仅新建独立代理时使用；已有共享 mihomo 的部署复用原服务
 docker compose --profile mihomo up -d
 
-docker compose logs cpa-upstream-importer | head -20    # 拿访问地址与 token
+docker compose ps cpa-upstream-importer    # 只检查服务状态；登录口令应在私有 .env 中预先设置
 ```
 
 浏览器开 `http://127.0.0.1:8765/`，用 `IMPORTER_TOKEN`（或 CPA 后台管理密码）登录。
@@ -99,8 +166,8 @@ docker compose stop cpa-upstream-importer   # 它持有明文上游 Key，别长
 
 ```bash
 # .env 里改两行
-IMAGE=ghcr.io/<owner>/cpa-upstream-importer:latest
-PULL_POLICY=missing
+IMAGE=swhesong/cpa-upstream-importer:latest
+PULL_POLICY=always
 ```
 
 ### 命令行（不开网页）
@@ -117,7 +184,7 @@ python3 cli.py -i accounts.txt --config /path/to/config.yaml --write     --mgmt-
 
 ### 只做诊断，不导入
 
-#### 命令行工具（零请求，只读分析）
+#### 命令行工具（结构分析与主动复核）
 
 ```bash
 python3 tools/diag403.py /path/to/config.yaml    # 结构性诊断：预算 vs 顶层池
@@ -167,7 +234,7 @@ max-retry-credentials: 4 → 5    【必改】
 | | `diag403.py` | 图形面板 |
 |---|---|---|
 | 形态 | CLI，只读报告 | 网页，能写回 |
-| 输入 | 手工指定文件路径 | 自动读 `.env` 的 `CONFIG_PATH` |
+| 输入 | 手工指定文件路径 | 读取启动参数 `--config`；镜像入口从 `IMPORTER_CONFIG` 传入容器路径（独立 compose 才用 `.env` 的 `CONFIG_PATH` 决定宿主挂载源） |
 | 输出 | 文本报告 | 改动预览 + diff + 一键写回 |
 | 适合 | CI / 自动化脚本 | 人工调优、快速修正 |
 
@@ -297,7 +364,10 @@ amd64/arm64 跳过编译工具链的安装。
 推完在 VPS 上升级：
 
 ```bash
-docker compose pull cpa-upstream-importer && docker compose up -d
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml config --quiet
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml pull upstream-importer
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml up -d --no-deps upstream-importer
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml ps upstream-importer
 ```
 
 ---
@@ -318,6 +388,133 @@ docker compose pull cpa-upstream-importer && docker compose up -d
 ---
 
 ## 核心机制
+
+### 分段目录请求也要带身份头（2026-10-12）
+
+**现象**：投喂 10 把同域名 Key，界面「0 次推理尝试 · 未勾选任何项 · 40 段不具备
+写入资格」，每行都是「✗ 已停止 — 服务商组限制记录阻止请求」。
+
+**根因（五跳逐一查实）**：
+
+1. `request.models_endpoint()` 组目录请求头时**只放凭据**，不放身份头
+   （`user-agent` / `x-app` / `originator`）。
+2. 主机预扫（`pipeline._sections_for_host`）早就知道这不够、自己补了
+   `profiles.catalog_identity_headers`；而**分段**目录请求（`_stage0_catalog`）
+   没补 —— 同一个站、同一把 Key，预扫 200、分段 401。
+3. 那个 401 的正文是 `unauthorized client detected`，`classify` 归「客户端」，
+   `probe_policy.finish` 升级成 `provider_restriction` **全站永久停止**。
+4. `_apply_result` 的作用域修正只认 `kind == "inference"`，目录请求的 kind 是
+   `model_catalog`，不在豁免内（那是 `test_catalog_restriction_scope` 钉死的
+   刻意契约）。
+5. `_assess` 从此拒绝该 provider 的全部预留 —— 另外 9 把 Key × 4 段
+   `attempts=0`，直接违反第 7 条「一个 KEY 不能拖垮全部」。
+
+**实测证据**（同一把 Key、同一 URL，直连与过代理结果一致 —— 与代理无关）：
+
+| 请求形态 | `/v1/models` |
+|---|---|
+| 裸 `Authorization: Bearer` / 裸 `x-api-key` / `Bearer` + curl UA | **401** |
+| `User-Agent: node` 或截断的 `claude-cli/1.0.0` | **401** |
+| `claude-cli/1.0.0 (external, cli)` | **200** + 真实目录 |
+
+门禁是**完整 UA 字符串**。四段的目录端点都认这一组头；没有该协议的段仍回 404
+（`Invalid URL`，与预扫判定一致），所以补头不会把「没有这个协议」误读成「有」。
+
+**修复**：`_stage0_catalog` 用 `setdefault` 补 `catalog_identity_headers`
+（站点自配 headers 优先级更高）。修前 0 次推理尝试 / 0 勾选 → 修后 **421 次
+尝试 / 56 项模型勾选 / 全站判死证据 0 条**。
+
+### 旧版限制证据的有界复核（2026-10-13）
+
+`restriction_evidence.classifier_version` 这一列从引入起一直写死 `1`、**从未被
+任何查询读过**。而上面那条修复改变了「同一条 401 意味着什么」：修复前它记录的
+是**我们自己发错了请求形态**，不是站方拒绝。旧账本不会自愈 —— 实测 2 条证据让
+2 个 provider 在新镜像下仍然 `provider_stopped`、`attempts=0`。**光升级镜像
+救不回已经被判死的站。**
+
+修法：`CLASSIFIER_VERSION = 2`。`_legacy_recovery` 与 `_assess` 的 `evidenced`
+闸都改成按 `classifier_version >= CLASSIFIER_VERSION` 过滤，低于当前版本的证据
+走**已有的**有界复核路径（显式任务作用域 + 同凭据 + 一次目录 404 后最多一次
+真实推理）；当前版本的证据语义完全不变，旧证据行不删不改。
+
+**实测**：同一个毒账本，修前 0 请求（2 秒结束）→ 修后 **56 请求 / 204 秒**，
+账本出现 `recovery_attempts.outcome='recovered'`，而旧证据 2 条原样保留。
+`tests/test_classifier_version_recovery.py` 7 项钉住。
+
+### 孤儿在途预留的人工核销（2026-10-13）
+
+**现象**：探测 `calls=0`，日志只有 `probe_policy_code=orphaned_inflight`。
+账本里预留卡在 `phase=reserved`，占死 provider 的 `inflight` —— 这些站
+`stopped` 是**空**（没被判死），照样一个请求都发不出去。
+
+**成因**：容器在探测途中被重建（部署用 `pull_policy: always`，每次 `up -d`
+都重建）→ 任务只在内存（`JobStore.jobs` 是普通 dict）→ 在途预留无人结算 →
+实测 9 条**一条结算凭证都没有**（请求发出后、签名结算前进程被杀）→ `_replay`
+无从恢复 → `_is_live` 靠进程内存字典判活，重启后必然为空 → 永久阻塞。
+
+**不做自动 TTL 清理**：`test_policy_restart_recovery` 的
+`test_no_evidence_retired_owner_remains_unresolved_without_ttl` 刻意钉死
+「没有 TTL 自愈」（时钟推到 `10**12` 仍阻塞）。那道 fail-closed 是对的 ——
+请求可能真发出去并计了费，自动当作没发生会掩盖真实用量，还可能重复发送。
+
+**修法**：给操作员一条显式核对的路，而不是放宽安全性。
+`/api/context` 的 `probe_policy.orphans` 列出明细（预留与服务商标识前缀、
+预留时间、请求类型、**有没有结算凭证**）；`POST /api/orphan-settle` 要求
+`confirm` + `outcome`（只接受 `executed` / `not-executed`）+ 核对依据。
+没有「跳过核对」的取值。
+
+实测四道闸全部挡住（无 `confirm` / 非法 `outcome` / 空依据 / 坏前缀 → 全 400）；
+9 条核销后 `orphaned_inflight_count` 9 → 0，而 `restriction_evidence` 仍 2 条、
+`stopped` 仍 2 个 —— **既有限制一个没动**。核销记为 `operator-not-executed`
+（与引擎自己的结算可区分），依据原文进 `job_stops` 审计留痕。
+
+### 探测节拍改为自适应，日志真的落盘（2026-10-13）
+
+**节拍**：`Prober(gap=...)` 的默认值原为 `3.0`，而注释自己写明那 3 秒是**另一个
+站**的 bulk probe guard 实测值 —— 它被当成所有站的起始节拍，又因为学到的值走
+`max(self.gap, forced)` 而同时成为**地板**。前端还把输入框硬写成 `value="3"`、
+把 `candidate_workers` 硬传 `4`，压掉后端已经写对的
+`min(len(hosts), clamp(opts, 16))`。
+
+本机实测该站的真实容忍度（容器内，同一把 Key、同一 URL）：
+
+| 并发 | 墙钟 | 结果 |
+|---|---|---|
+| 1 路 | 1.47s | 200 |
+| 10 路 | 1.42s | 全 200 |
+| **20 路（零间隔）** | **1.40s** | **20/20 全 200** |
+| 串行 12 次零间隔 | 15.8s | 全 200 |
+
+该站**根本没有** bulk probe guard。10 把同域名 Key 实跑 429 次尝试、墙钟
+1913.8 秒，等待占 ~98%，全是自己造的。
+
+改法：`gap` 留空 = 自适应（乐观起点 `_OPTIMISTIC_GAP = 0.15`），撞限流按
+`_BACKOFF_LADDER = (1, 3, 8, 20)` 退避并记住该站节奏；显式填值仍是**地板**，
+填 `0` 认作「明确要求零间隔」。限流信号从「只认带 `bulk probe` 字样的限频」
+扩到「限频 / 限流 / HTTP 429」三类（「临时」里真正的瞬时故障 `000`、连接中断
+**不**触发退避）。站方属性（静默换模、上下文窗口）按
+`(host, section, model)` 跨凭据复用一次实测，不落盘、只在一轮任务内有效。
+节拍移到服务商准入**之外**等待，不再占用账本的单在途位（并补回原本由
+`check_admission` 带的超时闸）。
+
+**效果**：单次预留成本 4.46s → **1.48s**（≈ 实测网络延迟 1.4s，自造等待基本
+清零）。`tests/test_probe_pacing_adaptive.py` 16 项钉住，含「显式 gap 时不凭空
+放慢」这条与 `test_full_redetect` 原有契约共存的边界。
+
+**日志**：`Job.emit` 原来只往内存事件表 append，一个 logging 调用都没有。
+于是 `IMPORTER_LOG_LEVEL=DEBUG` + `IMPORTER_LOG_TO_FILE=1` 全开时，10 候选 /
+421 次尝试 / 1913.8 秒的一整轮**落盘只有 1 行**。每站每段的判定只活在浏览器
+事件流里，浏览器一关、容器一换就没了 —— 而部署方式每次 `up -d` 都重建容器。
+VPS 上 `docker compose logs upstream-importer` 捞不到任何探测线索，这正是
+「我说全绿、你那边一堆问题」最难查的一环。
+
+现在每条事件同时写一条 DEBUG 日志，带任务号前缀便于在交织日志里分离。
+脱敏两层：host 只留词干（与前端 `tag()` 同口径，因为日志目录是 bind-mount
+出去的），字段走**白名单**而非黑名单 —— 将来加字段时漏一次判断的代价是把凭据
+写进落盘日志。实测 1 行 → **115 行**，且修好后第一次运行就立刻解释了一个
+`calls=0`：`prescan-miss status=blocked probe_policy_code=provider_stopped`。
+`tests/test_event_log_observability.py` 11 项钉住（含凭据、完整私有域名、
+未知字段都不得出现）。
 
 ### 路由批量管理（2026-09-11）
 
@@ -432,6 +629,60 @@ YAML 校验 → 备份落盘 → 推送重载 → 读回校验，并共用同一
 
 **适用范围**：对所有「直连 CLI 能用、经 CPA 报错」的站通用，不只限于 alfa.example。
 
+> **2026-10-14 实测修正（以项目实际行为为准）**
+>
+> 上面「门票是叠加型、与模型无关」这一条**只在部分站成立**。alfa.example 的实测
+> 把它推翻了：同一个站、同一把 Key、同一端点，`claude-haiku-4-5-20251001`
+> **不带任何 beta**（甚至用 `x-api-key` 而非 `Authorization`）就能拿到真实 200；
+> 而 `claude-opus-4-7` 不带 beta 必然 400、带上才变 503。
+>
+> 也就是说那条 400 是**按模型**出现的，不是站级门禁。把它一律当成「缺门票」
+> 会掩盖真因 —— 详见下一节。
+
+### 站方在失败正文里指名替代模型（2026-10-14）
+
+**现象**：claude 段目录报了十几个 `claude-*` 名字，探测却判「未实测」，
+推理尝试只有两三次。
+
+**根因**：站方把某个协议段的模型换了名字，并把正确用法写在 400 正文里。
+alfa.example 实测原文：
+
+```
+由于 claude 模型供应难以保证，上线 gpt-6-astra-cc-format 模型，
+支持 messages 格式，通过 claude --model 'gpt-6-astra-cc-format[1m]' 使用该模型
+```
+
+难查的点是**同一个段里不同模型返回不同的 400 正文**，而只有一种会触发补门票：
+
+| 模型 | 400 正文 | classify | 修复前的后果 |
+|---|---|---|---|
+| `claude-opus-5-5` | 「上线 gpt-6-astra-cc-format 模型…」 | `未知` | 不跑画像梯、不补 `spare` —— 基线额度白费 |
+| `claude-opus-4-7` | 「1m 上下文…请启用」 | `门禁` | 跑梯，`id:ctx-1m` 把 400 变 503（门禁已过） |
+
+`_BASELINE_MODELS = 2` 两个额度用尽后段判「未实测」，而**站方点名的那个模型
+一次都没被试过** —— 它在目录里排第 7，`spare` 的 3 个名额够不到。
+
+**机制**：`cpa_probe/betas.py` 新增 `substitute_model()`，从
+`--model '名字'` 与「上线 某名字 模型」两种措辞里读出名字；`[1m]` 这类后缀
+剥掉并映射成对应 beta（实测写进 `model` 字段**无效**，它是 claude 命令行的
+语法糖，由命令行翻译成请求头）。`pipeline._stage1` 把它插队试一次，不消耗
+基线额度，并发 `substitute-model` 事件（前端已渲染）。
+
+边界：**只跟随一次**（替代模型的响应里可能又提一个名字，无限跟随会变成被
+正文牵着走的请求放大器）；**只认正文写出来的名字**，过短或含路径分隔符的
+一律丢掉；正文没点名就一发都不多打。
+
+**验证**：`tests/test_substitute_model.py` 12 项。离线复现真机条件（第一发
+400「未知」+ 第二发整梯 503）后，`gpt-6-astra-cc-format` 被试到并接受。
+真机两次实跑 `substitute-model` 事件均触发；claude 段最终仍「未实测」，
+原因是并行的其他段撞到 429 导致账本 `provider_job_stopped` 本轮停手 ——
+那是账本的正确行为，不是这条修复失效。
+
+**429 / 503 不等于模型不可用**：两者表示请求**已过站方门禁**、转发上游后遇忙
+或限流，属可重试类，不得据此判死模型或段。收到 429 后账本会进入 900 秒冷却
+（`cooldowns.reason=status_429`）——紧接着复测会被挡住并提示剩余秒数，那不是
+修复没生效。复测前先确认冷却清零。
+
 ### 批量管理与全局调优写回修复（2026-09-18）
 
 **现象**："选好选项点执行根本不生效，没有任何反应"。
@@ -478,7 +729,7 @@ host 卡成 400（`server.py:4233`）。
 
 详见本地设计图解 `docs/tutorial.html` 的 07.95 章（该文件含真实站点记录，不随仓库发布）。
 
-### 异步定档：彻底绕开 Cloudflare 的 100 秒回源限制（2026-09-17）
+### 异步定档：减少长请求触发 Cloudflare 回源超时的风险（2026-09-17）
 
 上一节的缓存只减少了**重复**计算，没解决**单次**就超时。Cloudflare Free 套餐
 的回源超时是硬限 100 秒、**控制台改不了**（Configuration Rules 是付费功能），
@@ -496,7 +747,7 @@ id="p4" 在快照里出现 0 次           ← 第 4 步写回面板根本没渲
 无法写回                           ← 按钮不存在，点不了
 ```
 
-**写回代码本身没有缺陷** —— 它压根没被触发，卡在定档那一步。
+这份快照显示流程卡在定档阶段，尚未触发写回；它不能证明写回实现正确。写回仍须分别核对 YAML 校验、落盘、回读、CPA 重载和真实推理结果。
 
 #### 新流程
 
@@ -506,7 +757,7 @@ id="p4" 在快照里出现 0 次           ← 第 4 步写回面板根本没渲
 | 2. 轮询 | `POST /api/plan-status` 每 2 秒一次 | < 1 秒 |
 | 3. 完成 | `state:"done"` 时响应体带完整 `result` | — |
 
-每个 HTTP 请求都在 1 秒内完成，CF 的 100 秒窗口彻底无关。后台线程跑
+提交与轮询采用短请求，后台计算不再占用同一个长连接，可降低网关超时风险；网络、锁竞争和服务资源仍可能导致请求失败，需要保留超时与恢复处理。后台线程跑
 `_plan_body`，结果存进 `PlanTask.result`（`Store.plan_tasks` 表，8 条上限、
 与其余表同一套 TTL 与淘汰策略）。
 
@@ -524,7 +775,7 @@ id="p4" 在快照里出现 0 次           ← 第 4 步写回面板根本没渲
 
 详见本地设计图解 `docs/tutorial.html` 的 07.97 章。
 
-### 截图里的一堆问题：模型乱、待定、低档乱选（2026-09-16 全部修复）
+### 历史截图中的模型选择与定档问题（2026-09-16 排查记录）
 
 **现场现象**（2026-09-15 投喂台 mhtml 快照，173 站，1144 次请求）：
 
@@ -542,7 +793,7 @@ id="p4" 在快照里出现 0 次           ← 第 4 步写回面板根本没渲
 |---|---|---|
 | 692 个「待定」 | 全轮 1650s 触发 CF 524，响应在 plan 阶段就被 Cloudflare 截断 | 已在上一节说明，本轮加定档结果缓存（TTL 180s）减少重跑 |
 | low-tier 乱选 | `web/app.js` LOW_TIER 正则少 `flash\|fast` | 已补全，前后端正则一致，test_web 275 项通过 |
-| 420 次重复 502 | 「临时/未知」类不缓存，但同站后续 Key 重复问同一个挂掉的站 | 熔断机制：同 (站,段) 连续 3 次完整探测同码 → 后续 Key 零请求直接复用 |
+| 420 次重复 502 | 「临时/未知」类不缓存，同站后续 Key 可能重复请求故障站 | 对稳定站点故障采取限流、退避或熔断；短路的凭据应标为未实测，不能继承其他 Key 的成功或鉴权证据 |
 | `000` 打断熔断计数 | 网络抖动产生 `000`（连接失败）会清零已积累的连续 502 计数 | `000` 既不计数也不重置，不把「没拿到回答」当成「站方行为变了」 |
 | 代理永不启动 | `hc_block(url) % name` 二段式 `%` 格式化遇 `%2F` 崩溃 | 一次填完，`json.dumps` 处理 URL 保证 YAML 安全 |
 
@@ -553,9 +804,7 @@ id="p4" 在快照里出现 0 次           ← 第 4 步写回面板根本没渲
 | 「定档轮询无响应 —— 刷新页面后重试」 | 每次勾选变化防抖 180ms 发一次 `/api/plan`，缓存未命中就新建任务；任务表上限 8，正在被轮询的 done 任务被 LRU 淘汰 → `/api/plan-status` 404 → 前端连续 15 次 miss | 前端单飞：同一时刻只跑一个 refreshPlan，后到的只记「待重跑」；后端上限 32，done 后 300 秒内不淘汰 |
 | golf.example 探测判「客户端」，写回不带身份 | 画像梯 `cc-min` 把 401「客户端」推成 402「余额」—— **站方已认了 Claude Code 身份**，只是 Key 没钱；但最终类别按「最严重」评选，把这条证据盖回「客户端」 | 新增 `identity_proven`：整梯无 200 但有一档推进成凭据类拒绝时，记下那一档为门票，类别改凭据类；写回带 `headers` + `fingerprint-profile: claude-code-cli` |
 
-第二条就是「直连可用、经 CPA 499/503」的完整解释：直连时 Claude Code 自带身份，
-站方放行后再按余额拒；经 CPA 时没带身份，站方在门口就拒。写回身份后，
-这把 Key 充值恢复即可直接用，不必再探。
+第二条提供了「直连可用、经 CPA 499/503」的一种可能解释：请求身份不同可能改变站方拒绝类别。凭据类拒绝只证明请求进入了不同检查阶段，不能证明推理可用；修正身份或余额后仍须通过实际 CPA 路径重新验证。
 
 | 现象 | 根因 | 修复 |
 |---|---|---|
@@ -568,9 +817,9 @@ id="p4" 在快照里出现 0 次           ← 第 4 步写回面板根本没渲
 最后一条正是用户第 1 条「直连可用、经 CPA 499/503」的成因之一：判错类别就不会
 写身份配置，CPA 用默认形态转发，站方按同一条规则拒。
 
-**拉新镜像后还会出现这些问题吗？**
+**如何验证新镜像是否解决问题？**
 
-不会出现模型乱、待定、低档乱选这三类。具体保证：
+以下是应检查的行为边界；拉取镜像、单元测试通过或补齐目录均不能代替真实容器与前端流程验收：
 
 1. **LOW_TIER 前后端一致** —— `mini / nano / lite / flash / fast / haiku`
    六类在前端界面和后端写回两处用同一条正则，不会出现「界面已勾 → 写回被删」。
@@ -580,36 +829,40 @@ id="p4" 在快照里出现 0 次           ← 第 4 步写回面板根本没渲
    config.yaml；同世代时它因自成一条产品线，在 `_round_robin` 里**保证**占一个
    注册位，挤掉的反而是 `claude-opus-5-thinking`。注意 `-high` / `-low` 仍**不**
    进降级档（2026-09-26 定：`gemini-3.1-pro` 的后缀都算同一系列）。
-2. **待定不会发生** —— `topup_to_market_top()` 强制填充：检测到任何已通模型就
-   自动补全同 generation 全系列；若最新代全不通，也会填充最高档并保留次新代，
-   不会让任何条目停在空值。
-3. **熔断防超时** —— gorou / zulu 类稳定故障站在第 3 次完整探测后短路，
-   后续 Key 零请求复用，总请求量大幅下降，触发 524 的概率降低。
+2. **模型来源与待定原因应可见**：目录补齐、历史配置和实测成功必须分别标记。
+   `topup_to_market_top()` 生成的候选项不是成功推理证据；缺少实测或运行数据时，
+   应显示缺失原因和下一步验证方式，不可用填充值伪装已验证结果。
+3. **控制重复故障请求**：稳定站点故障可采用退避或熔断降低请求量。
+   同站协议形态可以辅助后续探测，但每把凭据的鉴权、余额和模型可用性需要自身证据；
+   被跳过的凭据必须明确显示未实测，不可按其他凭据的结果判成功。
 
-**还需要你手动操作的一件事**：compose 里加 `CPA_MANAGEMENT_TOKEN`，
-否则健康分定档会静默退回到「静态检测分」，见上一节。
+**核对实际部署的管理连接**：共享 VPS 的 `/opt/deploy/.env` 填写 `CPA_MANAGEMENT_PASSWORD`，
+由共享 `/opt/deploy/docker-compose.yml` 映射为投喂台容器的 `CPA_MANAGEMENT_TOKEN`。
+仓库独立模板使用 `CPA_MANAGEMENT_TOKEN`。管理地址不可达、鉴权失败、响应无效或没有匹配历史记录时，
+当前实现会在缺少历史分的条目上使用检测分继续排序，并记录日志；这不能证明当前调度健康，也不等于定档一律阻断。
 
 
 
-用户第 3⑶ 条要求「按 CPA 实际运行状态定优先级」——很多站是**故意被关掉但
-调用成功率很高**，那些参数的停用/调度开关应当重新打开、档位应当靠前。
+用户第 3⑶ 条要求「按 CPA 实际运行状态定优先级」。历史调用成功率可辅助排序，
+但不能证明当前可调度，更不能据此重新启用用户停用的账号或路由；停用状态应保持。
 
-这条链路的实现是：`plan.py` 调 `runtime_health.fetch_cpa_runtime_health()`
-拿 `/v0/management/api-key-usage`，算 `健康分 = 可调度比例×60% + 活跃比例×40%`，
-再按分降序排档。
+`plan.py` 调用 `runtime_health.fetch_cpa_runtime_health()` 读取
+`/v0/management/api-key-usage` 时，得到的是历史请求统计。相应加权分应解释为
+`历史请求成功率×60% + 有请求桶比例×40%`，不能称为真实可调度比例。
+当前调度状态、配额、冷却、凭据有效性及真实推理结果仍须独立核验。
 
-**它需要一个管理令牌，而这个令牌直到 2026-09-16 才进 compose。**
+下游 sub2api 必须按实际部署版本核验接口：普通账号 PUT 不应被当成 schedulable 恢复接口；公开源码提供专用 schedulable 路由与批量更新字段。TLS 指纹也取决于账号类型：公开源码仅对 Anthropic OAuth/SetupToken 启用该能力，API key 账号填写同名字段不代表生效；未设置模板 ID 可能使用内置模板。公开源码检查不能代替 VPS 上的授权读回与真实请求验收。
 
-`fetch_cpa_runtime_health(base_url)` 的签名里 `management_token` 是可选参数，
-而唯一的调用点**不传它** —— 只读环境变量 `CPA_MANAGEMENT_TOKEN`
-（`runtime_health.py:69`）。仓库的三份部署文件原来都没有这个变量，于是：
+**受保护的管理接口需要有效的原始管理密码。**
 
-```
-401/403 → 返回 None → 健康分退回「静态检测分」
-```
+`fetch_cpa_runtime_health(base_url)` 优先读取容器环境变量 `CPA_MANAGEMENT_TOKEN`。
+没有令牌时仍会发起请求；受保护的接口通常返回 401/403，函数返回 `None`。
+地址缺失、连接异常、非预期响应或没有可用统计，也可能导致历史分不可用。
+`plan.py` 对没有匹配历史分的条目采用检测分作为排序参考；已有优先级的锚定逻辑和其他写回门槛仍适用。
 
-日志里只有一行 `段 X：CPA 运行时数据不可用，将基于检测结果预测健康分数`。
-**特性静默失效，而部署文件看起来都是齐全的。**
+日志可能同时包含管理请求失败的原因和 `CPA 运行时数据不可用，将基于检测结果预测健康分数`。
+这是当前实现的回退行为：历史统计不可用并不会自动阻断全部定档。
+如果验收目标是“按当前调度状态排序”，仅有这条回退路径或历史调用统计都不足以完成验收。
 
 已补进本仓库的 `docker-compose.yml` / `docker-compose.local.yml` / `.env.example`。
 
@@ -652,7 +905,9 @@ docker exec upstream-importer sh -c 'echo "长度: ${#CPA_MANAGEMENT_TOKEN}"'
 段 claude-api-key：已获取 CPA 运行时健康数据，将基于实际运行状态分配优先级
 ```
 
-出现「不可用」那行就是令牌没生效，此时档位全部来自静态检测分。
+出现「不可用」时，结合前面的请求日志检查地址、连接、鉴权和响应格式，不能直接断定是令牌问题。
+上面的成功日志沿用旧的“运行时健康”措辞，实际读取的是历史请求统计；还须确认目标条目能匹配统计。
+没有匹配历史分的条目按检测分排序，已有优先级可能继续锚定，不能据此宣称所有档位来自静态分或当前调度状态已验证。
 
 ### 上游常量自动同步（2026-09-11）
 本项目对 CPA / CPAMP 的所有形态假设都**从上游源码实时解析**，不抄成常量：
@@ -923,14 +1178,14 @@ diff 无法复核。修复后 claude 段 8 个 `probed` 站占 493-500，5 个 `
   | `o1, o1-pro, o3, o3-mini, o3-pro, o4-mini, o4-mini-high` | `o3-pro, o4-mini, o4-mini-high` |
 
   某站全部模型都无版本号时清单会被清空，此时退到目录 / 兜底清单，界面提示手填；
-  手填走 `manual` 来源，**不受本规则约束**（显式意图优先）。
+  手填走 `manual` 来源，可保留不符合自动世代筛选的候选；写回仍需逐模型成功证据。
 
 - **实测清单也过「就高」闸，但既有条目在用的低世代不删** —— 四条模型来源里
   probed 原本是唯一不过闸的，于是 `_stage2` 按目录顺序补进来的旧款会与新款
   一起落盘。现在接上同一个 `newest_generation_per_line`；为防数据丢失
   （2026-09-06 第 2 号缺陷的现场：tango 的 claude 条目同时在用
   `claude-opus-5` 与 `claude-opus-4-8`），**原条目已经在用的低世代保留**，
-  被丢弃的写进 `sp.warnings`，手填可恢复。
+  被丢弃的写进 `sp.warnings`，手填可恢复为候选；新增写回仍需逐模型成功证据。
 
 - **候选顺序按世代降序，不用目录字母序** —— 目录来自
   `parse_models_response` 的 `sorted(set(...))`（字母序），而 `_stage2` 收满
@@ -950,10 +1205,10 @@ diff 无法复核。修复后 claude 段 8 个 `probed` 站占 493-500，5 个 `
   语音（`-tts`）、嵌入、开源小模型（`-oss-`）、批处理（`gemini-batch-inference`）。
   它们走的不是对话协议路径，写进去 CPA 路由必失配。
 
-### 手填走更宽的一套判据
+### 手填候选的协议判据更宽，写回仍需实测证据
 
 上面那张表管的是「**工具自己**要不要挑这个模型」。操作员在结果表里手填的清单
-走另一条：`section_protocol_ok`，只挡**协议层不可能成立的**。
+走另一条：`section_protocol_ok`，筛掉**协议层不可能成立的候选**。通过这一步不代表模型可用；新增写入仍需当前凭证、端点和协议对应的逐模型成功证据。
 
 两者唯一的差别是四族之外（`grok` / `glm` / `deepseek` / `qwen` / `llama`）：
 
@@ -976,26 +1231,26 @@ diff 无法复核。修复后 claude 段 8 个 `probed` 站占 493-500，5 个 `
 「有一个确认可用的模型」变成「只剩两个确认 503 的」。「本工具不主动推荐四族之外」
 是选型偏好，把它升级成「操作员显式指定也不许」就越权了。
 
-放行时界面会给一条警告说清「不在四族清单里、已按你的指定写入、工具没验证过」，
-不让它看起来像工具推荐的。手填框旁还有一条即时提示（不用等一次 `/api/plan` 往返）——
-判据同样是 `protoOk` 而不是 `famOk`，用后者会把 `grok-4.6` 标成红的，而它恰恰是该
-写进去的那一个。前端 `protoOk` 与后端 `section_protocol_ok` 由 `tests/test_web.py`
+上面的历史案例只解释协议兼容性，不授权跳过现行证据闸门。手填只保留为候选，不表示验证成功；
+缺少逐模型成功证据时，保留原模型清单，新增段不写入。手填框旁还有一条即时提示（不用等一次 `/api/plan` 往返）——
+判据同样是 `protoOk` 而不是 `famOk`，避免仅因族名把协议兼容的候选标成不兼容。
+前端 `protoOk` 与后端 `section_protocol_ok` 由 `tests/test_web.py`
 拿同一批模型名喂两边比对，并写死「两者的差别只在四族之外、且只在 compat 段放开」
 这条不变式。
 
-### 目录里一个四族的都没有时，收站方自己报的
+### 目录里一个四族的都没有时，保留站方候选
 
-同一个形态在**目录**路径上也会出现，而且是自动路径 —— 按四族过滤后清单变空，
-就落进种子兜底，写工具猜的名字。那时的选择是：
+同一个形态在**目录**路径上也会出现：按四族过滤后清单变空时，需要区分候选来源，
+避免把种子名录当作该站的可用模型：
 
 | 选项 | 后果 |
 |---|---|
-| 写工具猜的名字 | 这个站**从没报过**它们，CPA 路由过去大概率 404 |
-| 写站方自己报的名字 | 未验证，但至少是这个站说它有的 |
+| 内置种子候选 | 该站未报告这些名称，不能证明它支持这些模型 |
+| 站方目录候选 | 站方报告了名称，仍不能证明当前凭证可成功推理 |
 
-后者严格更好，所以现在退这一步：目录里一个四族的都没有时，收下协议层成立的全部
-名字，`model_source` 记成 `catalog`，界面与警告都说清「站方目录里没有本工具四族
-清单内的任何模型，上面列的是它自己报的 —— 退这一步是因为另一个选项更糟」。
+目录里一个四族的都没有时，保留协议层成立的站方名称作为候选，`model_source`
+记成 `catalog`。这只是候选发现规则；目录名与种子名都不能直接授权写回。
+新增写入仍需当前凭证、端点和协议对应的逐模型成功证据；缺失时保留原模型清单，新增段不写入。
 
 目录里**有**四族的名字时，四族之外的照旧不进清单 —— 选型偏好在有得选时仍然生效。
 前三段一律按族拒（协议层就发不出去），只有 compat 段的 `/chat/completions` 真的
@@ -1313,7 +1568,7 @@ bulk probe guard: ip 1.2.3.4 requested 4 distinct models in 60s
 | `headers` | 站 × 段 | **合并**：原值为底，探测值覆盖同名键 | 见下 |
 | `weight` | 用户显式意图 | 只搬原值，探测不产生 | `weight: 0` 是「逐出调度池」的唯一表达 |
 | `prefix` | 用户显式意图 | 只搬原值 | `dominant_prefix` 只是给**新条目**猜的默认值 |
-| compat 的 `name` | CPA 的 provider 身份 | 只搬原值 | 改名作废冷却状态与能力缓存 |
+| compat 的 `name` | CPA 的 provider 身份 | 能力不变的已有组保留；能力拆分按前文规则新增稳定组名 | 不应仅因重新探测就把原名称改为域名 |
 | `websockets` / `support-prompt-cache-key` | **上游能力** | 实测三态，见下 |
 | `max-context-length`（模型级） | 站 × 模型 | 本次实测 > 原值搬运 > 不写 | 不把 A 的窗口外推给 B |
 | `models[].alias` 等模型级字段 | 用户显式意图 | 只搬原值 | 段级兼容名是人配的 |
@@ -1635,12 +1890,14 @@ cpa-upstream-importer/
 
 ---
 
-## 快速开始
+## 历史独立源码部署记录
+
+> 以下保留早期源码排障记录，源码命令仅适用于本地 Linux 开发环境，`/path/to/local` 必须替换为本机路径。当前共享 VPS 使用本文开头的远程镜像拉取流程及 `upstream-importer` 服务名；不要把下方历史整目录上传、`build` 或旧服务名命令应用到共享部署。
 
 ### 第 0 步 · 自检（必做，只读）
 
 ```bash
-cd /opt/deploy/cpa-upstream-importer
+cd /path/to/local/upstream-importer
 bash deploy/preflight.sh
 ```
 
@@ -1654,42 +1911,17 @@ bash deploy/preflight.sh
 
 服务已并入主栈 `/opt/deploy/docker-compose.yml`，与 `cli-proxy-api`、`cpa-manager-plus` 并列。
 
-**先把代码传到 VPS**（在**你自己的电脑**上跑）：
+当前 VPS 只拉取镜像。旧版整目录上传、覆盖 compose、追加重复环境变量和 VPS 本地构建步骤已撤下。
+先核对共享 `/opt/deploy/.env` 中现有变量及 `/opt/deploy/docker-compose.yml` 的挂载和环境映射，保留另一项目配置。
 
 ```bash
-# 整个目录传过去。-r 必须有 —— 里面有 cpa_probe/、web/、deploy/、tests/ 四个子目录
-scp -r cpa-upstream-importer root@<你的VPS-IP>:/opt/deploy/
-
-# docker-compose.yml 也要传（cpa-upstream-importer 那段服务定义在里面）
-scp docker-compose.yml root@<你的VPS-IP>:/opt/deploy/
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml config --quiet
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml pull upstream-importer
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml up -d --no-deps upstream-importer
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml ps upstream-importer
 ```
 
-> `<你的VPS-IP>` 换成真实地址，**尖括号要去掉**。
-> 传完可以核对一下：`ssh root@<VPS> 'ls /opt/deploy/cpa-upstream-importer'`
-> 应看到 `cpa_probe deploy docs tests tools web README.md cli.py server.py docker-compose.yml`。
-
-然后在 **VPS** 上：
-
-```bash
-cd /opt/deploy
-
-# ① 确认 uid 与 config.yaml 属主一致（不一致则容器写回时 PermissionError）
-stat -c '%u:%g' config.yaml            # 通常 0:0
-# 不是 0:0 就写进 .env：
-#   stat -c 'IMPORTER_UID=%u' config.yaml >> .env
-#   stat -c 'IMPORTER_GID=%g' config.yaml >> .env
-
-# ② 可选：固定 token（不固定也能用 —— 直接拿 CPA 后台密码登录）
-echo "IMPORTER_TOKEN=$(openssl rand -hex 20)" >> .env
-
-# ③ 构建并启动
-docker compose build cpa-upstream-importer
-# up -d 立刻返回，但服务写 stdout 要一两秒 —— 直接 logs 会看到空白。
-# 两条连写，中间等 3 秒：
-docker compose up -d cpa-upstream-importer && sleep 3 && docker compose logs cpa-upstream-importer
-```
-
-日志里会有一行 `打开 : http://0.0.0.0:8765/?token=...`。
+登录使用私有 `.env` 中设置的凭据，不要复制或公开带令牌的日志链接。
 **容器内绑 `0.0.0.0` 是对的** —— 端口只发布到宿主 `127.0.0.1`（见 compose 的 `ports`），
 外网扫不到。
 
@@ -1874,49 +2106,20 @@ docker ps --format '{{.Names}}' | sort # 与预期对照
 
 ---
 
-### 更新已部署的服务（改了代码之后）
+### 更新已部署的服务（远程镜像）
 
-**`web/`、`cpa_probe/`、`server.py`、`cli.py` 都是 `COPY` 进镜像的，不是挂载。
-改了它们必须重建镜像 —— 只 `restart` 容器毫无作用，跑的还是旧代码。**
-
-在**你自己的电脑**上：
+代码在本机修改、验证，并经发布确认后交由镜像流水线构建。VPS 不接收整份源码，不执行 `build`；仅重启旧容器也不会更新镜像。
 
 ```bash
-scp -r cpa-upstream-importer root@<你的VPS-IP>:/opt/deploy/
-scp docker-compose.yml   root@<你的VPS-IP>:/opt/deploy/     # 改了 compose 才需要
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml config --quiet
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml pull upstream-importer
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml up -d --no-deps upstream-importer
+docker compose --env-file /opt/deploy/.env -f /opt/deploy/docker-compose.yml ps upstream-importer
 ```
 
-在 **VPS** 上：
+前端更新后硬刷新浏览器，并核对镜像 digest。共享 `.env` 或 compose 的 importer 配置变动后，使用同一条 `up -d --no-deps upstream-importer` 应用；不要启动或停止整栈。代理配置变更按代理专章处理，因为两个项目共用 mihomo。
 
-```bash
-cd /opt/deploy
-docker compose build cpa-upstream-importer          # 必须，不能省
-docker compose up -d cpa-upstream-importer
-```
-
-改完哪些要做什么：
-
-| 改了什么 | 要做什么 |
-|---|---|
-| `web/`（index.html / app.js） | `build` + `up -d` + **浏览器硬刷新**（`Ctrl+Shift+R`） |
-| `cpa_probe/`、`server.py`、`cli.py` | `build` + `up -d` |
-| `deploy/Dockerfile` | `build` + `up -d` |
-| `docker-compose.yml` | `up -d`（只改注释不会触发重建，正常） |
-| `.env`（token / uid） | `up -d`（compose 会重建容器读新环境变量） |
-
-> **浏览器硬刷新为什么必须**：`app.js` 与 `index.html` 是静态资源，浏览器会缓存。
-> 镜像换了但浏览器还在跑旧 `app.js` —— 表现成「明明修了却还是老样子」。
-> `Ctrl+Shift+R`（Mac 上 `Cmd+Shift+R`）跳过缓存。还不行就开无痕窗口验证一次。
-
-彻底重来（镜像层也不要）：
-
-```bash
-docker compose down cpa-upstream-importer
-docker compose build --no-cache cpa-upstream-importer
-docker compose up -d cpa-upstream-importer && sleep 3 && docker compose logs cpa-upstream-importer
-```
-
-`importer-backups` 是命名卷，`down` 不会删它 —— 写回前的备份都还在。要看：
+备份卷以共享 compose 的实际挂载为准。更新前保留已有卷，不执行整栈 `down` 或删除卷；下面仅为查看命名卷的参考：
 
 ```bash
 # 卷的真实名字 = <compose 项目名>_importer-backups。
@@ -2015,7 +2218,15 @@ CLI 与服务端都会**自动依次探测这两个**，不用手工选。
 
 ## 部署
 
-三种起法，按需选一种。**都只监听回环地址** —— 这个服务持有明文上游 Key 且能改写 `config.yaml`，不该直接对公网开。
+当前共享 VPS 使用下面的「Docker · 共享主栈」远程镜像流程。Python 和 systemd 两节只适用于另外准备的独立排障环境，不是共享 VPS 的更新步骤。宿主机入口只监听回环地址；容器内可以监听 `0.0.0.0`，由端口映射和 nginx 控制访问。这个服务持有上游凭据且能改写 `config.yaml`，不要直接公开端口。
+
+### 源码规则缓存与更新失败
+
+共享主栈和独立 Docker 模板在 importer 服务的 `environment` 中设置 `CPA_SOURCE_CACHE_DIR: "${CPA_SOURCE_CACHE_DIR:-/backups/source-cache}"`，沿用已有的 `/backups` 持久卷。使用默认路径时无需在外层 `.env` 重复添加变量；需要改路径时，修改已有的 `CPA_SOURCE_CACHE_DIR` 条目，并确认新路径也属于可写持久卷。仅修改 importer 服务这一项，保留另一项目的服务、网络和卷。
+
+启动后仍尝试同步在线源码规则。网络失败时，程序可使用同一仓库引用、提取规则和文件清单对应的最近成功快照；页面必须显示缓存陈旧、快照年龄和失败原因，不能将离线缓存标成最新规则或绿色一致。首次启动没有成功缓存、缓存损坏或缓存与当前规则不匹配时，应显示缺少证据。缓存只供源码规则参考，不能代替账号、模型的实际探测证据。
+
+验收时先完成一次在线同步，再在隔离测试环境验证断网回退和重建容器后的缓存保留，并检查页面状态。不要删除真实探测账本来测试缓存。源码直接运行时需要显式设置 `CPA_SOURCE_CACHE_DIR` 才启用磁盘缓存。
 
 ### 登录：两把钥匙都认
 
@@ -2034,20 +2245,20 @@ CPA 首次加载时自动转换的，见 `config_load.go:104-113`）。服务端
 失败 **5 次封该 IP 30 分钟**，与 CPA 自己的口径一致（`handler.go:301-302`）。
 不想开这条路径：`--no-cpa-key`。
 
-### 一次性（排障用，最简单）
+### 一次性（仅本地开发排障环境，不在 VPS 执行）
 
 ```bash
-cd /opt/deploy/cpa-upstream-importer
+cd /path/to/local/upstream-importer
 IMPORTER_TOKEN=$(openssl rand -hex 16) python3 server.py \
     --config /opt/deploy/config.yaml --port 8765
 ```
 
 用完 Ctrl-C。不留后台进程，事故面最小。
 
-### systemd（常驻）
+### systemd（仅本地 Linux 开发环境，不在 VPS 执行）
 
 ```bash
-cd /opt/deploy/cpa-upstream-importer/deploy
+cd /path/to/local/upstream-importer/deploy
 sudo ./install.sh                 # 装 unit + 生成 token + 起服务
 sudo systemctl status upstream-importer
 journalctl -u upstream-importer -f
@@ -2055,39 +2266,35 @@ journalctl -u upstream-importer -f
 
 `install.sh` 会做的事：校验 `config.yaml` 存在与可写、生成 32 字符随机 token 写进 `/etc/upstream-importer.env`（权限 600）、装 unit、`daemon-reload`、起服务、打印访问地址。已存在 token 时**不覆盖**。
 
-### Docker · 已并入主栈（推荐常用）
+### Docker · 共享主栈（当前 VPS 使用）
 
-服务定义就在 `/opt/deploy/docker-compose.yml` 的 `services.cpa-upstream-importer`，
-与 `cli-proxy-api`、`cpa-manager-plus` 并列。
+服务定义在外层 `/opt/deploy/docker-compose.yml` 的 `services.upstream-importer`。
+该文件和同目录的 `.env`、`nginx.conf` 由两个项目及其他服务共同使用。更新本项目只拉取并重建 importer；保留其他项目的服务、网络、卷、变量和 nginx 路由。不要将仓库内的同名模板覆盖外层文件，不要上传私密源码目录，也不在 VPS 执行源码构建。
+
+先核对外层文件的 importer 镜像及配置挂载。`./config.yaml` 是相对于外层 compose 的宿主机文件，容器内为 `/data/config.yaml`；外层未引用 `CONFIG_PATH`，增加这个变量不会改变挂载。外层 `.env` 的 `CPA_MANAGEMENT_PASSWORD` 映射到容器内 `CPA_MANAGEMENT_TOKEN`。共享部署中的 cpa2sub2api 使用 `CPA_MANAGEMENT_KEY`：显式设置且非空时优先使用，否则通过 `${CPA_MANAGEMENT_KEY:-${CPA_MANAGEMENT_PASSWORD:-}}` 复用同一管理口令；两者都为空时需要填写，不能把空值当作认证成功。修改已有变量时原位编辑，避免追加出多个同名条目；建议固定 `IMPORTER_TOKEN`，不要把真实值贴到终端共享记录或提交到 Git。
 
 ```bash
 cd /opt/deploy
 
-# 首次：确认 uid 与 config.yaml 属主一致，否则写回会 PermissionError
-stat -c '%u:%g' config.yaml                    # 通常 0:0
-# 不是 0:0 就写进 .env：
-#   stat -c 'IMPORTER_UID=%u' config.yaml >> .env
-#   stat -c 'IMPORTER_GID=%g' config.yaml >> .env
+# 核对属主并确保容器用户有配置写权限、备份卷有写权限
+stat -c '%u:%g' config.yaml
 
-# 可选：固定 token（不固定也能用 —— 直接拿 CPA 后台密码登录）
-echo "IMPORTER_TOKEN=$(openssl rand -hex 20)" >> .env
-
-docker compose build cpa-upstream-importer
-docker compose up -d cpa-upstream-importer
-docker compose logs cpa-upstream-importer | head -20     # 看访问地址
-
-docker compose stop cpa-upstream-importer                # 用完关掉，别长开
+# 仅更新本项目；代理升级另见「共享 mihomo」章节
+docker compose --env-file .env -f docker-compose.yml pull upstream-importer
+docker compose --env-file .env -f docker-compose.yml up -d --no-deps upstream-importer
+docker compose --env-file .env -f docker-compose.yml ps upstream-importer
+docker compose --env-file .env -f docker-compose.yml images upstream-importer
 ```
 
-`restart: "no"` 是有意的 —— 它是按需启的运维工具，不该随主栈自启常驻。
+重启策略以现有共享 compose 为准。核对新容器使用的镜像后，分别验证登录、探测终态、方案预览与写回读回；容器运行或健康状态正常不代表这些流程已通过。查看日志时仅在私有终端执行，并在对外提供前去除凭据和上游信息。
 
 三处刻意的设计，动之前先读注释：
 
 | 项 | 值 | 为什么 |
 |---|---|---|
 | `ports` | `127.0.0.1:8765:8765` | 写成 `8765:8765` 会暴露到公网 |
-| `volumes` | 只挂 `./config.yaml` 单文件 | 挂整个 `/opt/deploy` 等于把 `.env`、`secrets/`、`auths/` 一起递过去 |
-| `user` | `${IMPORTER_UID:-0}:${IMPORTER_GID:-0}` | 镜像里的 `USER importer(10001)` 写不了 root 的 `config.yaml` |
+| `volumes` | 配置单文件及独立备份卷 | 不挂整个 `/opt/deploy`，避免把其他项目和私密文件交给容器 |
+| `user` | `${IMPORTER_UID:-0}:${IMPORTER_GID:-0}` | 依配置及备份卷权限设置；属主相同是常见办法，仍须实测写入权限 |
 
 单文件挂载在容器启动时就把宿主 inode 解析定死了，所以 `writeback.write_local`
 **一律就地 `O_TRUNC` 覆写，绝不 `tmp + os.replace`** —— 换 inode 会让
@@ -2096,8 +2303,7 @@ docker compose stop cpa-upstream-importer                # 用完关掉，别长
 `importer-backups` 独立卷 —— 单文件挂载时同目录不可写。
 
 根目录另有一份 `docker-compose.yml`，是**只含本项目的参考模板**，
-用于在别的机器上单独跑（不带 CPA 主栈），或主栈那段被误改时对照恢复。
-日常不用它。
+用于在别的机器上单独运行。它的服务名是 `cpa-upstream-importer`，变量映射也与外层不同；不能用它整套恢复或替换共享主栈。
 
 ### 外网访问
 
@@ -2123,7 +2329,7 @@ ssh -N -L 8765:127.0.0.1:8765 root@203.0.113.7
 改任何代码后先跑这个：
 
 ```bash
-cd /opt/deploy/cpa-upstream-importer
+cd /path/to/local/upstream-importer
 python3 tests/run.py                        # 不读 config.yaml 的那些
 python3 tests/run.py /opt/deploy/config.yaml   # 加真实文件那一轮
 ```
@@ -2378,7 +2584,8 @@ timeout。实测 `timeout=1` 的调用被挂住 180 秒以上仍未返回。
 `dialer.HandshakeTimeout`（同文件 `:27` = 30 秒），gorilla 那个字段覆盖整次握手
 而不是单次读。
 
-现在加了 deadline，每次 recv 前把剩余时间设成 socket 超时。代码里那道
+这里的 deadline 限制本次握手响应的读取阶段，每次 recv 前把剩余时间设成 socket 超时。
+排队准入、连接和读取有各自的时间约束，不能据此宣称整个任务具有严格总截止时间。代码里那道
 `if left <= 0: return` **是防御性的不是承重的**（正常情形下 recv 自己的超时先
 触发），注释里写清了——否则下一个人会以为它没用而删掉，而删掉的后果是
 `settimeout(负数)` 抛 `ValueError` 让错误消息变成 Python 异常名。
@@ -2552,11 +2759,10 @@ claude 的 3 次尝试          1 次 200 · 最慢 37ms
 
 ---
 
-## 站方不给测活怎么办：人工接管
+## 探测未通过时：保留手工候选，核对阻断原因
 
-有些站探针式短消息会被拦，或分组只允许特定客户端（`This group is
-restricted to Claude Code clients`），而**真实对话完全正常**。这类站探测必然
-判死，但它确实可用。
+有些站会拒绝探测，或分组只允许特定客户端（`This group is
+restricted to Claude Code clients`）。拒绝响应不能证明模型可用。明确禁测或客户端限制需保留停止证据，不能借人工接管、换凭据或代理绕过。
 
 结果表里判死的那一行现在也有勾选框，右侧多一个模型输入框：
 
@@ -2565,25 +2771,17 @@ restricted to Claude Code clients`），而**真实对话完全正常**。这类
  ☐   claude  门禁   403 且无余额/CF 特征     [claude-opus-5, claude-opus-4-8]
 ```
 
-填了模型名（逗号分隔）才能勾上 —— 探测没验成功过任何模型，工具无从推断
-该注册什么。清空模型会同步取消勾选。
+手填模型名（逗号分隔）用于保留候选和生成预览，不代表允许写入。清空模型会同步取消勾选；
+即使界面保留选择，服务端仍检查逐模型成功证据。
 
-勾上后的方案里会看到：
-
-```
-定档理由: 人工接管（探测判「门禁」）· 试用期档位 70（挡 1 个在用站…）
-警告:     探测未通过（门禁 — 403 且无余额/CF 特征），模型清单由你手工指定：
-          claude-opus-5, claude-opus-4-8。工具没有验证过这些模型能用
-```
-
-**人工接管只绕过「能不能用」这一个判定。** 去重、定档、影响面计算、diff
-确认一道都不少 —— 那几道防的是写坏 `config.yaml`，与「这个站能不能用」是
-两件事。试用期策略照常生效，影响面按你给的模型清单实算。
+方案中的手工候选和警告用于说明选择来源。**人工接管保留手工候选与预览能力，不绕过实测证据闸门。**
+新增写入必须有当前凭证、端点和协议对应的逐模型成功证据；缺少证据则保留原模型清单，新增段不写入。
+去重、定档、影响面计算、diff 确认仍需完成。候选出现在预览中不等于已获准写回。
 
 命令行侧目前没有等价参数，要人工接管请用网页。
 
-> ⚠ 工具不会验证你填的模型名。写错会让 CPA 每次轮到它都失败，
-> 消耗重试预算。填之前先在站方后台或用 `/v1/models` 确认。
+> 站方后台与 `/v1/models` 只能辅助核对候选名称，不能证明推理可用。
+> 请查看每个模型的实际成功证据和写回阻断原因；未验证的手填名称不能直接写入。
 
 ---
 
@@ -3196,11 +3394,11 @@ headers 与 body 形态，不看模型名。假上游实测（全 403）：
 | 待探测单元 | 177 组合 | **79 凭据** | 55% |
 | 单凭据请求数 | 57 次 | **30 次** | 47% |
 | 总请求数（最坏） | 10,089 | **2,370** | **77%** |
-| 48 并发耗时 | 3.9 分钟 | **0.9 分钟** | 4.3× |
 
-**并发不放松任何单一端点的限频**。节流按 `(站, 段)` 分桶，同一个站的同一个段
-两次请求之间仍然严格保持 `gap` 秒。并发放大的是「不同站之间」和「同一站不同段
-之间」的吞吐——那些本来就互不相干。
+**并发仍受供应商共享策略约束**。同一供应商的不同凭据、协议和已配置别名域名
+共享请求预算与在途限制；本进程按供应商 FIFO 排队，实际发送前仍需取得账本许可。
+不同供应商可以并行，同一主机还受主机并发与请求间隔约束。请求数减少不能直接换算成耗时缩短，
+应在相同输入和可比上游状态下分别测量请求数、排队时间与端到端耗时。
 
 进度是实时的：
 
@@ -3237,11 +3435,11 @@ headers 与 body 形态，不看模型名。假上游实测（全 403）：
 
 | 本次这一段的模型清单来自 | 落盘 | 界面 |
 |---|---|---|
-| 实测跑通推理（`probed`） | 作为新条目写入 | 「实测」徽标 + 建议写入 |
-| 你手填的清单（`manual`） | 写入 | 「手填」徽标 + 建议写入 |
-| 站方 `/models` 目录声称有（`catalog`） | 写入 | 「目录」徽标 + 建议写入 |
-| 原 config.yaml 沿用（`prior`） | 更新既有条目 | 「沿用」徽标 + 建议写入 |
-| 工具按市面最新填充（`seed`） | 更新既有条目 | 「猜测」徽标 + 建议写入 |
+| 实测跑通推理（`probed`） | 逐模型证据及其他写回检查通过后可新增 | 「实测」徽标；以实际阻断原因和 diff 为准 |
+| 你手填的清单（`manual`） | 仅表示候选来源；新增模型仍需逐模型成功证据 | 「手填」徽标，不代表放行 |
+| 站方 `/models` 目录声称有（`catalog`） | 仅表示候选来源；新增模型仍需逐模型成功证据 | 「目录」徽标，不代表放行 |
+| 原 config.yaml 沿用（`prior`） | 原清单可保留；其他变更单独审查 | 「沿用」徽标，不代表当前实测成功 |
+| 工具按市面最新填充（`seed`） | 只补充候选，不能凭此新增或替换模型 | 「猜测」徽标，不代表放行 |
 
 **2026-09-17 起四类来源全部默认勾选**（用户规则 ④：「检测不通就按该系列
 最高级填充勾选，无论何种情况严禁出现不勾选模型」）。依据强弱不再靠「勾不勾」
@@ -3250,7 +3448,7 @@ headers 与 body 形态，不看模型名。假上游实测（全 403）：
 **`seed` 仍然不能新增 `(凭据, 段)`**（`_NEW_SECTION_SOURCES` 不含它）——
 它挡的是另一个方向的事故：2026-09-02 那次条目从 121 变 246，成因正是「四段都
 生成了方案、四段都写进去」，而那些新增段的清单只是工具猜测。凭据在原文件里
-本来就有的段，`seed` 照常更新；原文件里没有的段，`seed` 不凭空增加条目。
+本来就有的段，缺少模型变更证据时保留原清单；原文件里没有的段，`seed` 不凭空增加条目。
 
 `catalog` 与 `seed` 的差别不是「可信度高一档」这么模糊：目录里的名字是**这个站
 自己报的**，种子清单是本工具写死的猜测，与这个站没有任何关系。
@@ -3524,8 +3722,7 @@ requests** —— 而低并发时它是可用的。**是我打太快把它打成
 --workers 4  # 降并发也能缓解，但节流更精准（不同站本来就该并行）
 ```
 
-分桶键取 `(站, 段)` 而非全局 —— 站方限频按端点计，四段打不同路径，
-各自计时不会放松任何一段的限制。与 `cpa_probe.pipeline` 同口径。
+以上为历史节流参数说明；当前还受服务商共享预算和最小间隔约束。不同协议路径不代表独立限额，不能假设站方按端点限频。
 
 ### 「可用」的含义
 
@@ -3778,7 +3975,7 @@ openai-compatibility  顶层档位 500 · 12 个凭据 · 4 个站
 
 | | CLI `diag403.py` | 图形面板 |
 |---|---|---|
-| 输入 | 手工指定文件路径 | 自动读 `.env` 的 `CONFIG_PATH` |
+| 输入 | 手工指定文件路径 | 读取启动参数 `--config`；镜像入口从 `IMPORTER_CONFIG` 传入容器路径（独立 compose 才用 `.env` 的 `CONFIG_PATH` 决定宿主挂载源） |
 | 输出 | 文本报告 | 改动预览 + diff |
 | 操作 | 只读，不能写回 | 预览 → 确认 → 自动备份 → 写回 → 触发 CPA 重载 |
 | 适合 | CI / 定时巡检 | 人工调优、快速修正 |
@@ -3790,27 +3987,13 @@ openai-compatibility  顶层档位 500 · 12 个凭据 · 4 个站
 
 ---
 
-## 探测速度
+## 探测速度与验收边界
 
-用户实测：单站四段曾要 10 多分钟。**慢在等待与冗余请求，不在计算** ——
-换语言或单纯加线程救不了，瓶颈全在 I/O 与刻意的节流。已做四处：
+探测耗时取决于上游响应、连接超时、站点共享预算、最小请求间隔和任务排队。减少请求次数不能直接证明总耗时缩短；必须使用同一输入、同一策略和可比的上游状态，分别记录请求数、排队时间及端到端耗时。
 
-| 改动 | 原状 | 现状 |
-|---|---|---|
-| 节流分桶 | 四段共享一个 gap 桶，单站 56 次请求串成 55×3s = **165 秒纯睡** | 按 `(host, section)` 分桶，同段内仍严格保持 gap |
-| 四段并行 | 串行，总时间 = 四段之和 | 并行，总时间 = 最慢那一段 |
-| 候选并行 | 多站串行 | 多站并行，上限取**不同主机数** |
-| 上下文探测 | 先小后大，最多 6 次百万字符请求 | hi-first + 读错误正文里上游自报的上限，命中即 1 次 |
+任务可并行处理不同站点，但同一服务商的不同域名、Key 和协议仍受共享策略约束。不要假设限频仅按端点计算，也不要通过增加线程或切换代理绕开预算。HostLimiter 的 FIFO 排队用于避免同主机任务长期抢不到执行机会；公平性测试不代表真实网络加速已经通过验收。
 
-同主机多 Key 另有 `(host, section)` 的 **single-flight**：形态学习（最贵的动作，
-最多 12 次请求含 4 次大 body）只做一次，其余 Key 只验凭证本身。
-
-**并行不会放松任何站的限频。** 站方的 bulk probe guard 是按端点计的，四段打的是四个
-不同路径（`/v1beta/models/…:generateContent`、`/v1/responses`、`/v1/messages`、
-`/v1/chat/completions`），分桶后同段之间的 gap 一点没松。
-
-万一撞上按账号（而非按端点）全局限频的站：把 `--gap` 调大即可，不需要退回串行。
-要退回串行也行 —— 网页端取消勾选「并行探测」，命令行 `--workers 1 --candidate-workers 1`。
+模型目录、历史配置、上游自报的上下文上限与实际请求成功是不同证据。未知能力必须明确显示来源和未测原因，不能靠猜测、无限重试或超大载荷补出“成功”结果。写回前需要逐项检查差异与实测证据，写回后还要核对 YAML、CPA 重载和实际路由结果。
 
 ---
 
@@ -4024,3 +4207,26 @@ dnf install -y python3-pyyaml     # 别用 pip，会污染系统 Python
 
 只有 `writeback.validate()` 那一处是可选的 —— 未装时跳过本地 YAML 语法校验，
 但那时服务本身已经起不来了，所以实际上必须装。其余全部标准库。
+
+## 共享 mihomo 的镜像升级与初始化刷新
+
+两个项目共用代理时，在 VPS 的实际部署目录执行下面步骤。先结束正在进行的探测和写回，并安排维护窗口：重新创建 mihomo 会让两个项目的代理连接同时短暂中断。这里的服务名对应共享 compose；不要另起同名代理或替换另一个项目的网络。
+
+```sh
+cd /opt/deploy
+docker compose pull upstream-importer mihomo-init mihomo
+docker compose up -d --force-recreate mihomo-init
+docker compose logs --tail=80 mihomo-init
+```
+
+确认初始化容器成功退出、日志显示自举完成后，再继续。初始化失败应先解决原因，不要启动依赖它的新代理实例。
+
+```sh
+docker compose up -d --force-recreate mihomo
+docker compose up -d --no-deps upstream-importer
+docker compose ps mihomo upstream-importer
+```
+
+仅拉取或更新 upstream-importer 不会刷新既有 mihomo 数据卷内的健康检查脚本；必须重新运行 mihomo-init。正常升级不要删除共享卷，也不要设置 `MIHOMO_FORCE_REBUILD=1`；强制重建会重新生成代理配置，仅在已经审查订阅和配置变化时使用。随后分别检查两个项目的实际代理请求与 importer 的 CPA 管理连接，容器显示 healthy 不能代替这些业务检查。
+
+共享 compose 中的 `MIHOMO_IMAGE` 必须指向包含 `/app/mihomo-manager/bootstrap-mihomo.sh` 和 mihomo 二进制的本项目镜像；不能替换为只有 mihomo 二进制的官方基础镜像。若单独固定了该变量的版本，升级 importer 时也要显式更新对应代理镜像版本。共享 `.env`、完整 compose、nginx 配置和真实 config.yaml 只留在部署目录，不随源码提交。

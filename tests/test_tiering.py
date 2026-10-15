@@ -511,10 +511,17 @@ def main() -> int:
             b_without = cp.build_band(cfg_real, sec)
             eq(f"{sec} 不传 raw 时 unhealthy 为空",
                len(b_without.unhealthy_hosts), 0)
-            truthy(f"{sec} 传 raw 时解析出实测不可用站"
-                   f"（{len(b_with.unhealthy_hosts)} 个）",
-                   len(b_with.unhealthy_hosts) > 0,
-                   "解析不出说明注释形态没覆盖到，健康度信号形同虚设")
+            if _synthetic:
+                truthy(f"{sec} 样本注释中的不可用站被识别",
+                       len(b_with.unhealthy_hosts) > 0)
+            # 真实配置可以没有任何失败注释，不能要求它必有坏站。
+            # 只在内存中补一条明确失败证据，验证 raw 确实参与构建；
+            # 不修改原文件，也不把这一条测试结论用于实际定档。
+            alias, host = next(iter(b_with.alias.items()))
+            annotated = f"{sec}:" + chr(10) + f"# {alias}: 实测 503，不可用" + chr(10)
+            b_injected = cp.build_band(cfg_real, sec, raw=annotated)
+            truthy(f"{sec} 明确失败注释能影响对应站的健康信号",
+                   cp.host_matches_note(host, b_injected.unhealthy_hosts, b_injected.alias))
 
     # ── ⑨ 自查发现的 7 处缺陷（2026-08-30 第二轮） ──────────────────
     section("⑨-1 YAML 键名不能被当成站名")

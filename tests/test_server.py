@@ -109,6 +109,26 @@ class Client:
         except Exception as e:  # 连接层失败
             return 0, repr(e)
 
+    def req_headers(self, path: str, token="__default__"):
+        """与 req 同参，但返回 (status, headers_dict_lowercased)。
+
+        2026-10-12 加：`req` 丢掉响应头，于是全套件对 Cache-Control 零断言，
+        版本号闸只判 `"v=" in query` 的缺陷活到容器实测才被发现
+        （`?v=deadbeefdead` 拿到一年 immutable）。缓存策略必须有人钉。
+        """
+        url = f"http://127.0.0.1:{self.port}{path}"
+        rq = urllib.request.Request(url, method="GET")
+        tok = self.token if token == "__default__" else token
+        if tok:
+            rq.add_header("Authorization", "Bearer " + tok)
+        try:
+            with urllib.request.urlopen(rq, timeout=20) as rs:
+                return rs.status, {k.lower(): v for k, v in rs.headers.items()}
+        except urllib.error.HTTPError as e:
+            return e.code, {k.lower(): v for k, v in e.headers.items()}
+        except Exception as e:  # 连接层失败
+            return 0, {"error": repr(e)}
+
 
 
 def test_real_client_ip_behind_nginx():
@@ -1220,6 +1240,36 @@ def main() -> int:
         eq("首页 200", st, 200)
         eq("首页是 HTML", html.lstrip().startswith("<!"), True)
         eq("app.js 200", req("/static/app.js", token=None)[0], 200)
+        # ── 缓存策略（2026-10-12 容器实测后钉住）──
+        # 现场：`GET /static/app.js?v=deadbeefdead` 回 200 + 一年 immutable。
+        # 任何一层缓存里残留的旧版本号 URL 都能把陈旧 app.js 钉一年，与新
+        # index.html 的 JSON 契约错配 —— 「源码里根本不存在的错误字符串」
+        # 那类现场问题的来源形态。
+        import re as _cvre
+        _cvm = _cvre.search(r'src="/static/app\.js\?v=([0-9a-f]{12})"', html)
+        eq("首页注入了 12 位内容哈希版本号", bool(_cvm), True)
+        _cvver = _cvm.group(1) if _cvm else ""
+        _cvst, _cvh = req.req_headers(f"/static/app.js?v={_cvver}", token=None)
+        eq("正确版本号 200", _cvst, 200)
+        eq("正确版本号才给 immutable",
+           "immutable" in _cvh.get("cache-control", ""), True)
+        _cvst, _cvh = req.req_headers("/static/app.js?v=deadbeefdead", token=None)
+        eq("陈旧版本号仍 200（旧 URL 要能工作）", _cvst, 200)
+        eq("陈旧版本号不得 immutable",
+           "immutable" in _cvh.get("cache-control", ""), False)
+        eq("陈旧版本号是 no-store",
+           "no-store" in _cvh.get("cache-control", ""), True)
+        _cvst, _cvh = req.req_headers("/", token=None)
+        eq("首页永远 no-store（它是版本号的载体）",
+           "no-store" in _cvh.get("cache-control", ""), True)
+        # ── favicon（2026-10-12 本机浏览器实测后钉住）──
+        # 浏览器自动请求 /favicon.ico 且不带 token，原来落到鉴权分支回 401：
+        # 每次打开页面控制台都有一条红色 error，把真正的问题埋掉。
+        _cvst, _cvh = req.req_headers("/favicon.ico", token=None)
+        eq("favicon 回 204 而不是 401", _cvst, 204)
+        eq("favicon 空体", _cvh.get("content-length"), "0")
+        eq("首页声明了空图标，浏览器不再发 favicon 请求",
+           'rel="icon" href="data:,"' in html, True)
         eq("路径穿越被挡", req("/static/../server.py", token=None)[0], 403)
         eq("越界路径不返回源码", "BaseHTTPRequestHandler"
            in req("/static/../server.py", token=None)[1], False)

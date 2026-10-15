@@ -184,9 +184,77 @@ def entry_fingerprint(entry: dict) -> str:
     return config_revision(json.dumps(entry, sort_keys=True, ensure_ascii=True))
 
 
+_STAMP_MARK = "批量改档"
+
+
+# 本工具自己那行戳的识别判据。
+#
+# 必须与戳的**写法**同步演进（2026-10-12 踩过一次）
+# ------------------------------------------------
+# 原判据是「整行只有注释**且以** `_STAMP_MARK` 结尾」。2026-10-12 给戳加上
+# 「旧值 → 新值」的说明后，戳行不再以那四个字结尾，于是上几轮的戳**不再被
+# 识别**，又开始每轮累积一行 —— 正是 2026-10-06 修掉的那个缺陷
+# （实测连点三轮：戳从 12 行涨到 36 行）。`tests/test_bulk_stamp_idempotence.py`
+# 当场抓住。
+#
+# 新判据：整行只有注释，且 `_STAMP_MARK` **紧跟在时间戳之后**（`#` 与它之间
+# 只允许空白和时间戳字符）。这保留了原判据的全部安全性：
+#   · 行尾注释（`priority: 10  # … 批量改档`）不动 —— 不是「整行只有注释」。
+#   · 正文里提到这四个字的人工注释不动 —— 它们前面是正文，不是时间戳。
+# 同时对戳**后面**写什么完全不敏感，不会再因为改文案而失效。
+#
+# 两个分支并存：新写法按前缀认，旧写法按结尾认 —— 既有 config.yaml 里已经
+# 落着老格式的戳，不能因为升级就漏掉它们、让它们永久留存。
+_STAMP_LINE = re.compile(r"^\s*#[\s\d:/.\-]*" + _STAMP_MARK)
+
+
+def _is_own_stamp(line: str) -> bool:
+    stripped = line.lstrip()
+    if not stripped.startswith("#"):
+        return False
+    return bool(_STAMP_LINE.match(line)) or line.rstrip().endswith(_STAMP_MARK)
+
+
+def _replace_own_stamp(block: list[str], stamp_line: str) -> list[str]:
+    """写入本次改档戳，先清掉本工具上几轮留下的同类戳。
+
+    识别判据见 `_STAMP_LINE` / `_is_own_stamp` 上方的说明 —— 它刻意只认
+    「整行只有注释 + 时间戳 + 本工具标记」这一种形态，所以「替换自己的戳」
+    不会退化成「删别人的注释」。
+    """
+    kept = [line for line in block if not _is_own_stamp(line)]
+    if not kept:
+        return list(block)
+    if not kept[0].endswith(chr(10)):
+        kept[0] += chr(10)
+    kept.insert(1, stamp_line)
+    return kept
+
+
 def _set_priority(block: list[str], section: str, value: int,
-                  field: str) -> tuple[list[str], bool, str]:
+                  field: str) -> tuple[list[str], bool, str, str]:
+    """改写条目（及 compat 的 per-key）priority。
+
+    返回 (新块, 是否变化, 失败原因, 改档前的值)。
+
+    为什么要把**改档前的值**也带出来（2026-10-12 本机实跑后加）
+    ----------------------------------------------------------
+    本函数刻意只改 `priority:` 的**值**，行尾注释逐字保留 —— 那条注释常常
+    是这个档位的历史依据，删掉就没法追溯（与本项目整个写回路径同一条理由）。
+    但只改值会写出自相矛盾的一行，实测现场：
+
+        - priority: 122 # 2026-09-19 批量导入 · 得分 0 · 沿用该站在本段的原档 122…
+        + priority: 123 # 2026-09-19 批量导入 · 得分 0 · 沿用该站在本段的原档 122…
+
+    值已经是 123，注释还说「原档 122」。下一个人读这一行会直接判错当前档位的
+    来历，而注释正是本项目主要的可追溯性来源。
+
+    处置不是去改别人的注释（那会毁掉历史），而是让**本工具自己的那行戳**
+    把差异说清：`# <时间> 批量改档：122 → 123（行尾注释为改档前的依据）`。
+    于是矛盾被解释掉，历史依据与当前值同时可读。
+    """
     text = "".join(block)
+    previous = ""
     try:
         root = yaml.compose(text)
         entry = root.value[0]
@@ -195,6 +263,7 @@ def _set_priority(block: list[str], section: str, value: int,
         for key, node in entry.value:
             if key.value == "priority":
                 edits.append((node.start_mark.index, node.end_mark.index, str(value)))
+                previous = str(getattr(node, "value", "")).strip()
                 found = True
             if section == "openai-compatibility" and key.value == "api-key-entries":
                 for child in node.value:
@@ -208,9 +277,9 @@ def _set_priority(block: list[str], section: str, value: int,
             if not out[0].endswith("\n"):
                 out[0] += "\n"
             out.insert(1, f"{field}priority: {value}\n")
-        return out, "".join(out) != "".join(block), ""
+        return out, "".join(out) != "".join(block), "", previous
     except (yaml.YAMLError, AttributeError, TypeError, IndexError):
-        return block, False, "priority 结构无法安全改写"
+        return block, False, "priority 结构无法安全改写", ""
 
 
 def _entry_blocks(lines: list[str], section: str) -> list[tuple[int, int]]:
@@ -455,13 +524,27 @@ def apply_bulk(raw: str, ops: list[dict], *, stamp: str = "") -> tuple[str, list
                     problems.append(f"段 {section} 第 {idx} 条："
                                     f"priority 值不是整数")
                     continue
-                note = f"{stamp} 批量改档" if stamp else "批量改档"
-                nb, changed, why = _set_priority(block, section, val, field)
+                nb, changed, why, previous = _set_priority(block, section, val, field)
+                # 戳里带上「旧值 → 新值」。行尾注释保留的是改档**前**的依据，
+                # 不说明这件事就会写出「priority: 123 # …原档 122」这种自相
+                # 矛盾的行 —— 见 `_set_priority` 的说明。
+                transition = (f"：{previous} → {val}"
+                              if previous and previous != str(val) else f"：→ {val}")
+                note = (f"{stamp} 批量改档{transition}（行尾注释为改档前的依据，保留备查）"
+                        if stamp else
+                        f"批量改档{transition}（行尾注释为改档前的依据，保留备查）")
                 if why:
                     problems.append(f"段 {section} 第 {idx} 条：{why}")
                     continue
                 if changed:
-                    nb.insert(1, f"{field}# {note}\n")
+                    # 本工具自己的改档戳**替换**，不叠加（2026-10-06 本机实跑修）。
+                    #
+                    # 原来无条件 insert，于是每改一次档就多留一行
+                    # `# <时间> 批量改档`。实测连点三轮「统一优先级」：戳从 12 行涨到
+                    # 36 行、文件 6731 → 6767 行，而真正变的只有 12 个 priority 值。
+                    # 后果：真实改动被自己上几轮的戳埋掉，没法审；文件每轮 +12 行
+                    # 没有上界；操作员看到一串时间戳，分不清哪一个是本次。
+                    nb = _replace_own_stamp(nb, f"{field}# {note}" + chr(10))
                     lines[lo:hi] = nb
                     notes.append(f"{section}[{idx}] → priority {val}")
             elif action == "delete":

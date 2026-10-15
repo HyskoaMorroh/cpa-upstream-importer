@@ -78,23 +78,11 @@ class ProbeCompliance(unittest.TestCase):
             limit, _ = self.prober()._bisect(self.row(), v, "gpt-6")
         self.assertIsNone(limit)
 
-    def test_cache_isolates_paths_but_reuses_site_level_failures(self):
-        """路径不同要各探各的；同路径的第 2 把 Key 复用**站+段级**结论。
+    def test_cache_isolates_paths_and_credentials_but_reuses_identical_context(self):
+        """Account-specific failures cannot be copied to another credential.
 
-        两条轴的判据不同，不能混成一条（2026-09-12 厘清）：
-
-          · **路径**轴 —— 同一主机按路径挂的是互不相干的上游
-            （假上游脚本就是 `/good` 与 `/gate`）。形态与失败结论都是
-            「这个上游」的属性，`/a` 的一次门禁不该让 `/b` 连探都不探。
-            这一条原来是坏的：single-flight 的键用 `row.host`，路径被抹掉。
-          · **Key** 轴 —— 门禁 / WAF / IP封 / 死路 / 时段这些拒绝与凭据无关
-            （见 `_HOST_LEVEL_FAIL` 与 `_reuse_dead`），再问一遍答案一样。
-            同路径的第 2..N 把 Key 零请求复用是**有意的**：实测 15 个 Key
-            挂同一主机且该段不通时，从 15 次完整探测降到 1 次 + 14 次复用，
-            而且那 15 次因为门闩在是严格串行的。
-
-        所以三行输入（同路径两把 Key + 另一路径一把）应当只触发 **2** 次
-        完整探测：`/a` 一次、`/b` 一次。断言 3 会把上面那条省钱路径拆掉。
+        An identical request context still reuses its cached result; changing
+        either the path or credential requires independent evidence.
         """
         prober = self.prober()
         calls = []
@@ -102,11 +90,11 @@ class ProbeCompliance(unittest.TestCase):
             calls.append((row.bare, row.api_key))
             return p.SectionVerdict(sec, row.bare, category="门禁")
         with patch.object(prober, "_full_probe", side_effect=full):
-            for row in (self.row(), self.row(key="fixture-two"), self.row(base="https://unit.example/b")):
+            for row in (self.row(), self.row(), self.row(key="fixture-two"),
+                        self.row(base="https://unit.example/b")):
                 prober._probe_one_section(row, O)
         self.assertEqual([b for b, _k in calls],
-                         ["https://unit.example/a", "https://unit.example/b"])
-        # 凭证级的失败仍然逐 Key 各判各的 —— 那是 Key 自己的属性
+                         ["https://unit.example/a", "https://unit.example/a", "https://unit.example/b"])
         self.assertNotIn("鉴权", p.Prober._HOST_LEVEL_FAIL)
         self.assertNotIn("余额", p.Prober._HOST_LEVEL_FAIL)
 
@@ -143,37 +131,62 @@ class ProbeCompliance(unittest.TestCase):
             v = prober._stage1(self.row(), O)
         self.assertIn("gpt-6-c", v.models)
 
-    def test_same_generation_peers_come_from_topup_not_the_probe_budget(self):
-        """同代变体要全勾上，但那是**写回清单**那一层的事，不是探测预算。
+    def test_same_generation_peers_require_bounded_individual_evidence(self):
+        """Family coverage may exceed discovery quota; each peer needs a call.
 
-        2026-09-12 把这一项挪到正确的层。原来它要求 `_stage2` 在
-        `max_models=1` 下仍然收满 6 个 —— 那等于要求探测**忽略自己的预算**。
-
-        两个上限各管各的（见 `MAX_MODELS_PER_SECTION` 的说明）：
-          · `max_models` —— 每段最多**验**几个模型。每验一个就发一次推理
-            请求，79 个凭据规模下这是主要成本，也是撞站方限频的主因。
-          · 写进 config.yaml 几个 —— 不发请求，多写几行只是让 CPA 的模型
-            注册表多几项。
-
-        docx 第 4 条要的「勾了 gpt-5.6 却没勾 gpt-5.6-sol 是重大失误」由
-        `model_catalog.topup_to_market_top` 在**定方案**时补齐：拿实测到的
-        那一个去比市面名录，把同产品线同世代的变体全部带上。所以探测只花
-        1 次请求，而落盘清单仍然是完整的一代。
+        max_models limits discovery, while max_model_attempts bounds family
+        verification. Catalog membership alone never supplies write evidence.
         """
-        prober = self.prober(max_models=1, max_model_attempts=8)
+        from types import SimpleNamespace
+        from cpa_probe import model_catalog as mc, plan
         names = ["gpt-6-" + x for x in "abcdef"]
-        v = p.SectionVerdict(O, self.row().bare, usable=True, models=names[:1], catalog=names)
-        def send(url, **kw):
-            return client.Response("200", response(O, json.loads(kw["body"])["model"]), 1)
-        with patch.object(client, "send", side_effect=send):
-            prober._stage2(self.row(), v)
-        # 探测守住预算：只验了 1 个
-        self.assertEqual(v.models, names[:1])
-        # 而补齐那一层把同代变体全带上 —— 这才是「不许漏勾」的落点
-        from cpa_probe import model_catalog as mc
-        merged, added, _src = mc.topup_to_market_top(O, v.models, remote=names)
-        self.assertEqual(set(merged), set(names))
-        self.assertEqual(set(added), set(names[1:]))
+        for budget, expected_count in ((8, 6), (2, 3)):
+            with self.subTest(budget=budget):
+                prober = self.prober(max_models=1, max_model_attempts=budget)
+                row = self.row()
+                calls = []
+                def send(url, **kw):
+                    model = json.loads(kw["body"])["model"]
+                    calls.append(model)
+                    return client.Response("200", response(O, model), 1)
+                with patch.object(client, "send", side_effect=send), \
+                     patch.object(mc, "remote_names", return_value=(names, "fixture")):
+                    baseline = prober._call(O, row.bare, row.api_key, names[0], combo="baseline")
+                    v = p.SectionVerdict(O, row.bare, usable=True,
+                                         models=names[:1], catalog=names, attempts=[baseline])
+                    prober._stage2(row, v)
+                # Explicit request evidence, not merely copying the output list.
+                self.assertEqual(calls, names[:expected_count])
+                self.assertLessEqual(len(calls) - 1, budget)
+                self.assertEqual(v.model_scan_candidates, names)
+                self.assertEqual(v.model_scan_pending, names[expected_count:])
+                self.assertEqual(bool(v.model_scan_pending_reason), expected_count < len(names))
+                self.assertEqual(v.models, names[:expected_count])
+                self.assertEqual(plan._current_verified_models(
+                    row, SimpleNamespace(row=row), v, row.bare), names[:expected_count])
+                # An untested family peer inserted by a caller still has no proof.
+                v.models = list(names)
+                self.assertEqual(plan._current_verified_models(
+                    row, SimpleNamespace(row=row), v, row.bare), names[:expected_count])
+
+    def test_success_without_model_identity_cannot_prove_family_peer(self):
+        from types import SimpleNamespace
+        from cpa_probe import model_catalog as mc, plan
+        prober = self.prober(max_models=1, max_model_attempts=1)
+        row = self.row()
+        names = ["gpt-6-a", "gpt-6-b"]
+        v = p.SectionVerdict(O, row.bare, usable=True, models=names[:1], catalog=names)
+        body = json.loads(response(O, names[1]))
+        del body["model"]
+        with patch.object(client, "send", return_value=client.Response("200", json.dumps(body), 1)) as send, \
+             patch.object(mc, "remote_names", return_value=(names, "fixture")):
+            prober._stage2(row, v)
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(v.model_scan_candidates, names)
+        self.assertTrue(v.attempts[0].ok, "Semantic success alone is not identity evidence")
+        self.assertFalse(v.attempts[0].identity_verified)
+        self.assertEqual(plan._current_verified_models(
+            row, SimpleNamespace(row=row), v, row.bare), [])
 
     def test_mid_system_503_unknown(self):
         v = p.SectionVerdict(L, self.row().bare, usable=True, models=["claude-opus-5"])

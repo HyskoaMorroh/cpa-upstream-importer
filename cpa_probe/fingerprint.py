@@ -29,7 +29,7 @@ _ID_RULES: list[tuple[re.Pattern[str], str]] = [
 ]
 
 _ID_RE = re.compile(r'"id"\s*:\s*"((?:msg|resp|chatcmpl)[^"]{0,60})"')
-_MODEL_RE = re.compile(r'"model"\s*:\s*"([^"]+)"')
+_MODEL_RE = re.compile(r'"(?:model|modelVersion)"\s*:\s*"([^"]+)"')
 # 「这次请求的输入用了多少 token」的字段名，**按协议分**。
 #
 # 为什么必须覆盖 gemini（2026-09-05 修，审计发现）

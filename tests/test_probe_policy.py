@@ -72,6 +72,29 @@ class ProbePolicyTests(unittest.TestCase):
         if code:
             self.assertEqual(decision.code, code)
 
+    def test_cdn_cgi_assets_are_not_restriction_evidence(self):
+        from cpa_probe.classify import classify
+        for path in ("/cdn-cgi/rum", "/cdn-cgi/scripts/email-decode.min.js",
+                     "/cdn-cgi/image/width=200/example.png", "/cdn-cgi/trace"):
+            with self.subTest(path=path):
+                body = '<html><h1>Not Found</h1><script src="' + path + '"></script></html>'
+                self.assertEqual(classify("404", body)[0], "死路")
+                engine = self.engine(configuration(max_requests=100, max_requests_per_credential=100))
+                self.send(engine, status="404", body=body)
+                self.assertNotEqual(engine.check(URL, HEADERS).code, "provider_stopped")
+
+    def test_explicit_cloudflare_challenges_still_stop_provider(self):
+        from cpa_probe.classify import classify
+        for marker in ("/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1",
+                       "/cdn-cgi/l/chk_jschl", "/cdn-cgi/l/chk_captcha",
+                       "/cdn-cgi/challenge/", "cf-mitigated: challenge"):
+            with self.subTest(marker=marker):
+                self.assertEqual(classify("404", marker)[0], "IP封")
+                ledger = str(self.root / (str(len(marker)) + marker.replace('/', '_').replace(':', '_') + '.db'))
+                engine = self.module.ProbePolicy(configuration(), ledger)
+                self.send(engine, status="404", body=marker)
+                self.deny(engine.check(URL, HEADERS), "provider_stopped")
+
     def test_passive_defaults_never_create_ledger_or_open_network(self):
         for policy in ({}, {"version": 1, "sites": {}}, None, []):
             engine = self.module.ProbePolicy(policy, self.ledger)
@@ -224,7 +247,7 @@ class ProbePolicyTests(unittest.TestCase):
         self.deny(self.engine(cfg).reserve(URL, HEADERS), "provider_budget")
 
     def test_restrictions_persist_across_instances_windows_and_policy_changes(self):
-        outcomes = [("403", "", ""), ("429", "", ""),
+        outcomes = [("403", "account suspended", ""), ("429", "probing prohibited", ""),
                     ("200", "Automated probing is prohibited", ""),
                     ("200", "Your account has been suspended", ""),
                     ("200", "该站禁止探测，账号已封禁", ""),
@@ -248,12 +271,94 @@ class ProbePolicyTests(unittest.TestCase):
                 self.send(self.engine(), status=status, body=body)
                 self.deny(self.engine().check(URL, {"x-api-key": "different-key"}), "provider_stopped")
 
+    def test_plain_status_cooldown_expires_only_for_new_jobs(self):
+        for status in ("403", "429"):
+            with self.subTest(status=status):
+                self.ledger = str(self.root / ("cooldown-" + status + ".sqlite3"))
+                self.clock.return_value = 1000.0
+                engine = self.engine()
+                self.send(engine, status=status)
+                self.deny(engine.check(URL, HEADERS), "provider_job_stopped")
+                self.deny(self.engine().check(URL, HEADERS), "provider_cooldown")
+                self.clock.return_value = 1900.0
+                self.deny(engine.check(URL, HEADERS), "provider_job_stopped")
+                self.assertTrue(self.engine().check(URL, HEADERS).allowed)
+
+    def test_legacy_status_migration_uses_reservation_time_and_preserves_history(self):
+        engine = self.engine()
+        self.send(engine)
+        with closing(sqlite3.connect(self.ledger)) as db:
+            db.execute("UPDATE providers SET stopped='status_403', last_seen=1800")
+            db.execute("UPDATE reservations SET outcome='status_403'")
+            db.commit()
+            before = db.execute("SELECT * FROM reservations").fetchall()
+        self.clock.return_value = 1899.0
+        self.deny(self.engine().reserve(URL, HEADERS), "provider_cooldown")
+        self.clock.return_value = 1900.0
+        self.assertTrue(self.engine().check(URL, HEADERS).allowed)
+        with closing(sqlite3.connect(self.ledger)) as db:
+            self.assertEqual(before, db.execute("SELECT * FROM reservations").fetchall())
+            self.assertEqual(1900.0, db.execute("SELECT until FROM cooldowns").fetchone()[0])
+            self.assertEqual("status_403", db.execute("SELECT stopped FROM providers").fetchone()[0])
+
+    def test_retry_after_seconds_date_and_invalid_defaults(self):
+        for index, (header, deadline) in enumerate((("120", 1120.0),
+                ("Thu, 01 Jan 1970 00:20:00 GMT", 1200.0),
+                ("invalid", 1900.0), ("-1", 1900.0), ("NaN", 1900.0))):
+            self.ledger = str(self.root / ("retry-" + str(index) + ".sqlite3"))
+            self.clock.return_value = 1000.0
+            engine = self.engine()
+            permit = engine.reserve(URL, HEADERS)
+            self.assertTrue(engine.finish(permit, "429", retry_after=header))
+            self.clock.return_value = deadline - 0.1
+            self.deny(self.engine().check(URL, HEADERS), "provider_cooldown")
+            self.clock.return_value = deadline
+            self.assertTrue(self.engine().check(URL, HEADERS).allowed)
+
+    def test_job_scope_shared_across_worker_threads_and_reset_after_call(self):
+        module, engine = self.module, self.engine()
+        class Job:
+            session_id = "shared-fixture-job"
+            @module.policy_job_scope
+            def run(self, stop=False):
+                if stop:
+                    permit = engine.reserve(URL, HEADERS)
+                    engine.finish(permit, "429", retry_after="1")
+                return engine.check(URL, HEADERS)
+        job = Job()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            self.deny(pool.submit(job.run, True).result(), "provider_job_stopped")
+            self.clock.return_value = 1002.0
+            self.deny(pool.submit(job.run).result(), "provider_job_stopped")
+        self.assertIsNone(module._JOB_SCOPE.get())
+        self.assertTrue(engine.check(URL, HEADERS).allowed)
+
     def test_finish_reports_a_failed_ledger_write(self):
         engine = self.engine()
         permit = engine.reserve(URL, HEADERS)
         with patch.object(engine, "_connect", side_effect=sqlite3.OperationalError("synthetic")):
             self.assertIs(engine.finish(permit, "200"), False)
-        self.deny(engine.check(URL, HEADERS))
+            self.deny(engine.check(URL, HEADERS), "ledger_unavailable")
+        self.assertTrue(engine.check(URL, HEADERS).allowed)
+        self.assertEqual({}, engine._deferred_settlements)
+
+    def test_deferred_restriction_cannot_be_replaced_by_clean_outcome(self):
+        engine = self.engine()
+        permit = engine.reserve(URL, HEADERS)
+        with patch.object(engine, "_connect", side_effect=sqlite3.OperationalError("synthetic")):
+            self.assertFalse(engine.finish(permit, "429", retry_after="120"))
+        self.assertTrue(engine.finish(permit, "200"))
+        self.deny(engine.check(URL, HEADERS), "provider_job_stopped")
+        self.deny(self.engine().check(URL, HEADERS), "provider_cooldown")
+
+    def test_active_and_restart_leftover_permits_never_expire_by_ttl(self):
+        engine = self.engine()
+        permit = engine.reserve(URL, HEADERS)
+        now = self.module.time.time()
+        with patch.object(self.module.time, "time", return_value=now + 86400):
+            self.deny(engine.check(URL, HEADERS), "inflight")
+            self.deny(self.engine().check(URL, HEADERS), "inflight")
+        self.assertTrue(engine.finish(permit, "200"))
 
     def test_general_errors_do_not_pretend_to_be_provider_bans(self):
         for body in ("invalid model", "banned_model is not a known model", '{"banned": false}', "temporary timeout"):
@@ -291,7 +396,7 @@ class ProbePolicyTests(unittest.TestCase):
         # No write must leave the outstanding reservation blocking every new sender.
         self.deny(self.engine().reserve(URL, HEADERS), "inflight")
         engine.finish(permit, "403")
-        self.deny(self.engine().reserve(URL, HEADERS), "provider_stopped")
+        self.deny(self.engine().reserve(URL, HEADERS), "provider_cooldown")
 
     def test_sqlite_lock_returns_deny_without_retry_loop(self):
         engine = self.engine()
@@ -299,6 +404,23 @@ class ProbePolicyTests(unittest.TestCase):
         with closing(sqlite3.connect(self.ledger)) as lock:
             lock.execute("BEGIN IMMEDIATE")
             self.deny(engine.reserve(URL, HEADERS), "ledger_unavailable")
+
+    def test_failed_settlement_under_real_lock_retains_and_releases_original_permit(self):
+        cfg = configuration(max_requests=2, max_requests_per_credential=2)
+        engine = self.engine(cfg)
+        permit = engine.reserve(URL, HEADERS)
+        self.assertTrue(permit.allowed)
+        with closing(sqlite3.connect(self.ledger)) as lock:
+            lock.execute("BEGIN IMMEDIATE")
+            self.assertIs(engine.finish(permit, "200"), False)
+        # Durable response evidence is replayed without losing the counted request.
+        self.assertTrue(self.engine(cfg).check(URL, HEADERS).allowed)
+        self.assertTrue(engine.finish(permit, "200"))
+        next_engine = self.engine(cfg)
+        next_permit = next_engine.reserve(URL, HEADERS)
+        self.assertTrue(next_permit.allowed)
+        self.assertTrue(next_engine.finish(next_permit, "200"))
+        self.deny(self.engine(cfg).reserve(URL, HEADERS), "provider_budget")
 
     def test_ledger_and_diagnostics_do_not_contain_credentials_headers_or_urls(self):
         headers = {"Authorization": "Bearer synthetic-private-credential", "X-Private": "private-header"}
@@ -338,16 +460,40 @@ class ProbePolicyTests(unittest.TestCase):
                 engine = self.engine(cfg)
                 headers = HEADERS if same_key else {"x-api-key": "synthetic-" + str(index)}
                 sent = 0
+                unsettled = []
                 for _ in range(12):
                     permit = engine.reserve(URL, headers)
                     if permit.allowed:
                         sent += 1
-                        engine.finish(permit, "200")
-                return sent
+                        if not engine.finish(permit, "200"):
+                            unsettled.append((engine, permit))
+                return sent, unsettled
 
             with ThreadPoolExecutor(max_workers=8) as pool:
-                sent = sum(pool.map(attempts, range(8)))
-            self.assertEqual(sent, credential_max if same_key else maximum)
+                results = list(pool.map(attempts, range(8)))
+            sent = sum(count for count, _ in results)
+            expected = credential_max if same_key else maximum
+            self.assertLessEqual(sent, expected)
+            # SQLite contention may fail settlement closed. Retain its original
+            # owner/permit and settle after contenders exit; ignoring finish's
+            # False return leaves inflight occupied by design.
+            for _, unsettled in results:
+                for owner, permit in unsettled:
+                    self.assertTrue(owner.finish(permit, "200"))
+            # Immediate concurrent attempts can all see another owner's inflight
+            # reservation. Once owners finish, remaining budget must stay usable.
+            engine = self.engine(cfg)
+            for index in range(8):
+                headers = HEADERS if same_key else {"x-api-key": "synthetic-" + str(index)}
+                for _ in range(credential_max):
+                    permit = engine.reserve(URL, headers)
+                    if permit.allowed:
+                        sent += 1
+                        self.assertTrue(engine.finish(permit, "200"))
+            self.assertEqual(sent, expected)
+            for index in range(8):
+                headers = HEADERS if same_key else {"x-api-key": "synthetic-" + str(index)}
+                self.assertFalse(engine.reserve(URL, headers).allowed)
 
     def test_new_process_observes_usage_stop_and_unfinished_reservation(self):
         ctx = multiprocessing.get_context("spawn")
@@ -358,7 +504,8 @@ class ProbePolicyTests(unittest.TestCase):
             permit = engine.reserve(URL, HEADERS)
             self.assertTrue(permit.allowed)
             if state != "inflight":
-                engine.finish(permit, "403" if state == "stop" else "200")
+                engine.finish(permit, "403" if state == "stop" else "200",
+                              "account suspended" if state == "stop" else "")
             # Child uses real wall clock. A long window keeps the synthetic old usage in scope.
             child_cfg = configuration(max_requests=1, max_requests_per_credential=1, window_seconds=10 ** 12)
             output = ctx.Queue()
@@ -369,7 +516,7 @@ class ProbePolicyTests(unittest.TestCase):
             self.assertEqual(process.exitcode, 0)
             allowed, code = output.get(timeout=3)
             self.assertFalse(allowed)
-            self.assertEqual(code, {"usage": "provider_budget", "stop": "provider_stopped", "inflight": "inflight"}[state])
+            self.assertEqual(code, {"usage": "provider_budget", "stop": "provider_stopped", "inflight": "orphaned_inflight"}[state])
             output.close()
             output.join_thread()
 
@@ -379,7 +526,8 @@ class ProbePolicyTests(unittest.TestCase):
                "IMPORTER_BACKUP_DIR": str(self.root)}
         with patch.dict(os.environ, env):
             self.module.reset_policy_cache()
-            self.deny(self.module.get_policy().reserve(URL, HEADERS))
+            with patch.dict(os.environ, {"IMPORTER_PROBE_MODE": "passive"}):
+                self.deny(self.module.get_policy().reserve(URL, HEADERS))
             self.assertFalse((self.root / "probe-policy.sqlite3").exists())
             policy_path.write_text(json.dumps(configuration(max_requests=1)), encoding="utf-8")
             self.send(self.module.get_policy())
@@ -402,7 +550,7 @@ class ProbePolicyTests(unittest.TestCase):
         with patch.object(self.module.sqlite3, "connect", side_effect=sqlite3.OperationalError("disk full")):
             engine.finish(permit, "429")
         engine.finish(permit, "200")
-        self.deny(self.engine().reserve(URL, HEADERS), "provider_stopped")
+        self.deny(self.engine().reserve(URL, HEADERS), "provider_cooldown")
 
     def test_duplicate_json_fields_are_malformed_not_last_value_wins(self):
         policy_path = self.root / "policy.json"
@@ -438,7 +586,7 @@ class ProbePolicyTests(unittest.TestCase):
         self.deny(engine.check(URL, HEADERS), "minimum_interval")
         self.clock.return_value = 1010.0
         self.send(engine, status="403")
-        self.deny(engine.check(URL, HEADERS), "provider_stopped")
+        self.deny(engine.check(URL, HEADERS), "provider_job_stopped")
 
     def test_cache_reload_keeps_permit_owner_while_rules_are_removed(self):
         policy_path = self.root / "policy.json"
@@ -453,7 +601,7 @@ class ProbePolicyTests(unittest.TestCase):
             self.assertIs(reloaded, engine)
             reloaded.finish(permit, "403")
             policy_path.write_text(json.dumps(configuration()), encoding="utf-8")
-            self.deny(self.module.get_policy().check(URL, HEADERS), "provider_stopped")
+            self.deny(self.module.get_policy().check(URL, HEADERS), "provider_job_stopped")
 
     def test_environment_explicit_ledger_overrides_backup_dir(self):
         policy_path = self.root / "policy.json"
